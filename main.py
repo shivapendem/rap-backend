@@ -10,7 +10,7 @@ import os
 from contextlib import asynccontextmanager
 
 from database import engine, Base, get_db, AsyncSessionLocal
-from models import User
+from models import User, Requirement, Consultant
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-for-dev")
@@ -200,6 +200,7 @@ async def google_login(request: GoogleLoginRequest, response: Response, db: Asyn
 from typing import List, Optional
 
 class RequirementResponse(BaseModel):
+    model_config = {"from_attributes": True}
     id: str
     role: str
     vendor: str
@@ -267,6 +268,7 @@ async def get_requirements(
     )
 
 class ConsultantResponse(BaseModel):
+    model_config = {"from_attributes": True}
     id: str
     name: str
     email: str
