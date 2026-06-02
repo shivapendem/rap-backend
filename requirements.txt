@@ -3,6 +3,7 @@ uvicorn==0.30.1
 sqlalchemy==2.0.30
 asyncpg==0.29.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 pyjwt==2.8.0
 python-dotenv==1.0.1
 pydantic==2.7.2

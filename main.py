@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from database import engine, Base, get_db, AsyncSessionLocal
 from models import User, Requirement, Consultant
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto",bcrypt__truncate_error=False )
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-for-dev")
 ALGORITHM = "HS256"
 
