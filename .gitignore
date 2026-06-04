@@ -5,3 +5,5 @@ test.db
 *.db
 .env
 .env.local
+
+myenv/

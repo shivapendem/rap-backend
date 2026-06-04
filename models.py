@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, JSON
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, JSON, ARRAY
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -27,7 +27,7 @@ class Requirement(Base):
     vendor = Column(String, nullable=False)
     client = Column(String, nullable=False)
     location = Column(String, nullable=False)
-    employment_types = Column(JSON, nullable=False)
+    employment_types = Column(ARRAY(String), nullable=False)
     work_mode = Column(String, nullable=False)
     received_date = Column(String, nullable=False)
     status = Column(String, nullable=False)
