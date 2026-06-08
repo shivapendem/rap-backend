@@ -52,17 +52,17 @@ async def lifespan(app: FastAPI):
         if not result.scalars().first():
             print("Seeding database...")
             admin = User(
-                email="admin@example.com",
-                hashed_password=get_password_hash("password123!"),
-                role="ADMIN",
-                name="Admin User"
-            )
+   		 email="admin@example.com",
+   		 password_hash=pwd_context.hash("password123!"),
+   		 role="ADMIN",
+    		full_name="Admin User"
+		)
             recruiter = User(
-                email="recruiter@example.com",
-                hashed_password=get_password_hash("password123!"),
-                role="RECRUITER",
-                name="Recruiter User"
-            )
+    		email="recruiter@example.com",
+   		password_hash=pwd_context.hash("password123!"),
+    		role="RECRUITER",
+    		full_name="Recruiter User"
+		)
             session.add_all([admin, recruiter])
             await session.commit()
     
