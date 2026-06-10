@@ -5,15 +5,50 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# We expect an asyncpg URL, e.g., postgresql+asyncpg://user:pass@host/db
-# Fallback for local testing if not provided
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-engine = create_async_engine(DATABASE_URL, echo=True)
+if not DATABASE_URL:
+    # Fallback for local development only
+    import warnings
+    warnings.warn(
+        "DATABASE_URL not set. Falling back to SQLite for local dev. "
+        "Set DATABASE_URL (postgresql+asyncpg://...) for production.",
+        UserWarning,
+        stacklevel=2,
+    )
+    DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+
+# Validate driver compatibility
+if DATABASE_URL.startswith("postgresql://"):
+    # asyncpg requires the +asyncpg driver scheme
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+if DATABASE_URL.startswith("sqlite://") and not DATABASE_URL.startswith("sqlite+aiosqlite://"):
+    DATABASE_URL = DATABASE_URL.replace("sqlite://", "sqlite+aiosqlite://", 1)
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=os.getenv("DB_ECHO", "false").lower() == "true",  # Don't echo in production by default
+    pool_pre_ping=True,  # Detect stale connections
+    # pool_size / max_overflow only supported for non-SQLite
+    **({
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+    } if not DATABASE_URL.startswith("sqlite") else {})
+)
+
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 Base = declarative_base()
 
+
 async def get_db():
+    """Dependency that provides a database session and ensures it is closed after use."""
     async with AsyncSessionLocal() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
