@@ -74,7 +74,8 @@ class GoogleLoginRequest(BaseModel):
 class RequirementResponse(BaseModel):
     model_config = {"from_attributes": True}
 
-    id: int  # BUG FIX: BigInteger PK → int, not str
+    # id: int  # BUG FIX: BigInteger PK → int, not str
+    id: str
     role: str
     vendor: Optional[str] = None
     client: Optional[str] = None
@@ -101,7 +102,8 @@ class PaginatedRequirements(BaseModel):
 class ConsultantResponse(BaseModel):
     model_config = {"from_attributes": True}
 
-    id: int  # BUG FIX: BigInteger PK → int, not str
+    # id: int  # BUG FIX: BigInteger PK → int, not str
+    id: str
     full_name: Optional[str] = None
     email: Optional[str] = None
 
