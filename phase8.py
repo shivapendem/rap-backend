@@ -260,6 +260,95 @@ async def list_audit_logs(
     )
 
 
+# ---------------------------------------------------------------------------
+# Applications management
+# ---------------------------------------------------------------------------
+
+from models import Application
+
+@router.get("/applications", response_model=PaginatedApplicationsDTO)
+async def list_applications(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    consultant_id: Optional[str] = None,
+    requirement_id: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> PaginatedApplicationsDTO:
+    """Return paginated applications with optional filters."""
+    filters = []
+    if consultant_id:
+        filters.append(Application.consultant_id == consultant_id)
+    if requirement_id:
+        filters.append(Application.requirement_id == requirement_id)
+    if status:
+        filters.append(Application.status == status)
+    base_filter = and_(*filters) if filters else True
+
+    total = (await db.execute(select(func.count()).select_from(Application).where(base_filter))).scalar_one()
+    rows = (await db.execute(
+        select(Application)
+        .where(base_filter)
+        .order_by(Application.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )).scalars().all()
+
+    data = [
+        ApplicationSentRowDTO(
+            id=str(r.id),
+            timestamp=r.created_at.isoformat() if r.created_at else "",
+            consultant_name=r.consultant_id,  # placeholder, UI can resolve via consultant endpoint
+            consultant_id=r.consultant_id,
+            requirement_id=r.requirement_id,
+            role="UNKNOWN",
+            vendor_email=r.vendor_email,
+            ats_score=r.ats_score_at_send,
+            resume_id=None,
+            status=r.status,
+        )
+        for r in rows
+    ]
+    return PaginatedApplicationsDTO(
+        data=data,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=math.ceil(total / page_size) or 1,
+    )
+
+@router.post("/applications", response_model=ApplicationSentRowDTO)
+async def create_application(
+    payload: ApplicationSentRowDTO,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> ApplicationSentRowDTO:
+    """Create a new application record. UI supplies required fields via payload."""
+    new_app = Application(
+        consultant_id=payload.consultant_id,
+        requirement_id=payload.requirement_id,
+        vendor_email=payload.vendor_email,
+        status=payload.status,
+        ats_score_at_send=payload.ats_score,
+    )
+    db.add(new_app)
+    await db.commit()
+    await db.refresh(new_app)
+    return ApplicationSentRowDTO(
+        id=str(new_app.id),
+        timestamp=new_app.created_at.isoformat() if new_app.created_at else "",
+        consultant_name=payload.consultant_name,
+        consultant_id=new_app.consultant_id,
+        requirement_id=new_app.requirement_id,
+        role=payload.role,
+        vendor_email=new_app.vendor_email,
+        ats_score=None,
+        resume_id=None,
+        status=new_app.status,
+    )
+
+
 @router.get("/audit-logs/export")
 async def export_audit_logs_csv(
     db: AsyncSession = Depends(get_db),
