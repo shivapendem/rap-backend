@@ -71,23 +71,23 @@ class GoogleLoginRequest(BaseModel):
 
 class RequirementResponse(BaseModel):
     model_config = {"from_attributes": True}
-
-    # id: int  # BUG FIX: BigInteger PK → int, not str
     id: int
     role: str
     vendor: Optional[str] = None
+    vendor_email: Optional[str] = None
     client: Optional[str] = None
     location: Optional[str] = None
     employment_types: Optional[List[str]] = None
     work_mode: Optional[str] = None
     received_date: Optional[datetime] = None
+    received_at: Optional[datetime] = None
     status: str
     parsed_fields: Optional[dict] = None
     vendor_contact: Optional[str] = None
     rate: Optional[str] = None
     ats_match_count: Optional[int] = None
     parse_confidence: Optional[float] = None
-
+    raw_email_id: Optional[int] = None
 
 class PaginatedRequirements(BaseModel):
     data: List[RequirementResponse]
