@@ -43,6 +43,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
     recruiters = await ConsultantRepository.get_assigned_recruiters(db, c.id)
     return ConsultantAdminRowDTO(
         id=str(c.id),
+        user_id=str(c.user_id) if c.user_id else "",
         name=c.full_name or "",
         email=c.email or "",
         status=c.status,
@@ -102,6 +103,21 @@ class UserService:
             is_active=True,
         )
         user = await UserRepository.create(db, user)
+
+        # AUTO CREATE consultant profile when role is CONSULTANT
+        if req.role == "CONSULTANT":
+            from models import Consultant
+            consultant = Consultant(
+                user_id=user.id,
+                full_name=user.full_name,
+                email=user.email,
+                status="ACTIVE",
+                gmail_connected=False,
+                ats_score=0,
+                preferred_employment_types=[],
+            )
+            db.add(consultant)
+            await db.flush()
 
         await log_action(
             db, "USER_CREATED",

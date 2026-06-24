@@ -141,6 +141,7 @@ class RecruiterRefDTO(BaseModel):
 
 class ConsultantAdminRowDTO(BaseModel):
     id: str
+    user_id: str
     name: str
     email: str
     status: str

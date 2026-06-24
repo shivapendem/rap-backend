@@ -32,7 +32,7 @@ from auth import (
 # Security helpers
 # ---------------------------------------------------------------------------
 
-ALLOWED_SORT_COLUMNS = {"received_date", "role", "vendor", "client", "status", "created_at", "ats_match_count"}
+ALLOWED_SORT_COLUMNS = {"received_date", "received_at", "role", "vendor", "client", "status", "created_at", "ats_match_count"}
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -73,7 +73,7 @@ class RequirementResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     # id: int  # BUG FIX: BigInteger PK → int, not str
-    id: str
+    id: int
     role: str
     vendor: Optional[str] = None
     client: Optional[str] = None
@@ -148,9 +148,29 @@ app = FastAPI(lifespan=lifespan)
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[
+        # Production Frontend
+        "https://rap-swart.vercel.app",
+
+        # Local Development
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+
+        # Backend Server itself
+        "http://137.184.96.50:8000",
+        "http://137.184.96.50:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -354,7 +374,8 @@ async def get_requirements(
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar_one()
 
-    sort_col = getattr(Requirement, sort_by)
+    actual_sort = "received_date" if sort_by == "received_at" else sort_by
+    sort_col = getattr(Requirement, actual_sort)   
     query = query.order_by(sort_col.desc() if sort_dir == "desc" else sort_col.asc())
     query = query.offset((page - 1) * page_size).limit(page_size)
 
