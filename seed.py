@@ -19,13 +19,13 @@ SEED_USERS = [
     {
         "full_name": "Admin User",
         "email": "admin@rap.io",
-        "password": "password123!",
+        "password": "Password123!",
         "role": "ADMIN",
     },
     {
         "full_name": "Recruiter User",
         "email": "recruiter@rap.io",
-        "password": "password123!",
+        "password": "Password123!",
         "role": "RECRUITER",
     },
 ]
@@ -142,7 +142,7 @@ async def seed_db():
         from sqlalchemy import func
         count_result = await session.execute(select(func.count()).select_from(Requirement))
         existing_count = count_result.scalar_one()
-        target = 55
+        target = 0
         to_insert = target - existing_count
 
         if to_insert > 0:

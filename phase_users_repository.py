@@ -1,4 +1,5 @@
-# phase_users_repository.py
++
+ Z# phase_users_repository.py
 # ---------------------------------------------------------------------------
 # Admin User Management — Repository layer
 # Queries your REAL models (User, Consultant, RecruiterConsultant) from
@@ -180,9 +181,22 @@ class RecruiterConsultantRepository:
     @staticmethod
     async def replace_for_recruiter(db: AsyncSession, recruiter_id: int, consultant_ids: List[int]) -> None:
         """Used by PUT /admin/recruiters/{id}/consultants — sets exact assignment list."""
+        from models import Consultant
+        real_consultant_ids = []
+        for cid in consultant_ids:
+            result = await db.execute(select(Consultant).where(Consultant.id == cid))
+            c = result.scalars().first()
+            if c:
+                real_consultant_ids.append(c.id)
+            else:
+                result = await db.execute(select(Consultant).where(Consultant.user_id == cid))
+                c = result.scalars().first()
+                if c:
+                    real_consultant_ids.append(c.id)
+
         existing = await RecruiterConsultantRepository.get_assigned_consultant_ids(db, recruiter_id)
         existing_set = set(existing)
-        target_set = set(consultant_ids)
+        target_set = set(real_consultant_ids)
 
         to_remove = existing_set - target_set
         to_add = target_set - existing_set

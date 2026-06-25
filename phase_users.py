@@ -198,13 +198,7 @@ async def update_recruiter_consultants(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin),
 ):
-    from sqlalchemy.future import select
-    from models import Consultant
-    raw_ids = [int(c) for c in body.consultant_ids]
-    result = await db.execute(
-        select(Consultant.id).where(Consultant.user_id.in_(raw_ids))
-    )
-    consultant_ids = [row[0] for row in result.fetchall()]
+    consultant_ids = [int(c) for c in body.consultant_ids]
     await ConsultantAssignmentService.replace_assignments(
         db, recruiter_user_id=recruiter_id, consultant_ids=consultant_ids,
         admin_id=current_user.get("sub"),
