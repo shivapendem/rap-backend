@@ -251,6 +251,8 @@ class ConsultantAssignmentService:
         db: AsyncSession, consultant_id: int,
         primary_skills: Optional[str], availability_status: Optional[str],
         status: Optional[str], *, admin_id: str,
+        work_authorization: Optional[str] = None,
+        preferred_employment_types: Optional[list] = None,
     ) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -262,6 +264,10 @@ class ConsultantAssignmentService:
             consultant.availability_status = availability_status
         if status is not None:
             consultant.status = status
+        if work_authorization is not None:
+            consultant.work_authorization = work_authorization
+        if preferred_employment_types is not None:
+            consultant.preferred_employment_types = preferred_employment_types
 
         consultant = await ConsultantRepository.update(db, consultant)
 

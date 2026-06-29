@@ -182,6 +182,8 @@ class UpdateConsultantRequestDTO(BaseModel):
     primary_skills: Optional[str] = None
     availability_status: Optional[str] = None
     status: Optional[str] = None
+    work_authorization: Optional[str] = None
+    preferred_employment_types: Optional[List[str]] = None
 
     @field_validator("status")
     @classmethod

@@ -233,6 +233,8 @@ async def update_consultant(
         primary_skills=body.primary_skills,
         availability_status=body.availability_status,
         status=body.status,
+        work_authorization=body.work_authorization,
+        preferred_employment_types=body.preferred_employment_types,
         admin_id=current_user.get("sub"),
     )
     return UpdateConsultantResponseDTO(
