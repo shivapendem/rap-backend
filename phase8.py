@@ -193,6 +193,10 @@ class ApplicationSentRowDTO(BaseModel):
     ats_score: Optional[float] = None
     resume_id: Optional[str] = None
     status: str
+    candidate_id: Optional[str] = None
+    job_posting_id: Optional[str] = None
+    match_score: Optional[float] = None
+    applied_at: Optional[str] = None
 
 
 class PaginatedApplicationsDTO(BaseModel):
@@ -299,14 +303,18 @@ async def list_applications(
         ApplicationSentRowDTO(
             id=str(r.id),
             timestamp=r.created_at.isoformat() if r.created_at else "",
-            consultant_name=r.consultant_id,  # placeholder, UI can resolve via consultant endpoint
-            consultant_id=r.consultant_id,
-            requirement_id=r.requirement_id,
+            consultant_name=r.consultant_id,
+            consultant_id=str(r.consultant_id),
+            requirement_id=str(r.requirement_id),
             role="UNKNOWN",
-            vendor_email=r.vendor_email,
-            ats_score=r.ats_score_at_send,
+            vendor_email=r.vendor_email or "",
+            ats_score=float(r.ats_score_at_send) if r.ats_score_at_send else None,
             resume_id=None,
             status=r.status,
+            candidate_id=r.candidate_id,
+            job_posting_id=str(r.job_posting_id) if r.job_posting_id else None,
+            match_score=float(r.match_score) if r.match_score else None,
+            applied_at=r.applied_at.isoformat() if r.applied_at else None,
         )
         for r in rows
     ]
