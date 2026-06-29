@@ -310,7 +310,7 @@ async def parse_text_endpoint(
 from sqlalchemy import text
 
 @router.get(
-    "/admin/raw-emails/{email_id}",
+    "/api/admin/raw-emails/{email_id}",
     summary="Get raw email from gmail_emails table",
 )
 async def get_raw_email(
@@ -330,7 +330,7 @@ async def get_raw_email(
 
 
 @router.post(
-    "/admin/raw-emails/{email_id}/reparse",
+    "/api/admin/raw-emails/{email_id}/reparse",
     summary="Mark email for reprocessing",
 )
 async def reparse_email(
@@ -348,7 +348,7 @@ async def reparse_email(
 
 
 @router.get(
-    "/admin/gmail-emails",
+    "/api/admin/gmail-emails",
     summary="Get all emails from gmail_emails table for admin view",
 )
 async def get_gmail_emails(
