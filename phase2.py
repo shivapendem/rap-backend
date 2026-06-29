@@ -301,3 +301,84 @@ async def parse_text_endpoint(
 
     parsed = parse_requirement(subject=payload.subject, body=payload.body, headers=headers)
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Raw Email endpoints — reads from gmail_emails table
+# ---------------------------------------------------------------------------
+
+from sqlalchemy import text
+
+@router.get(
+    "/admin/raw-emails/{email_id}",
+    summary="Get raw email from gmail_emails table",
+)
+async def get_raw_email(
+    email_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    result = await db.execute(
+        text("SELECT * FROM gmail_emails WHERE id = :id"),
+        {"id": email_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return dict(row)
+
+
+@router.post(
+    "/admin/raw-emails/{email_id}/reparse",
+    summary="Mark email for reprocessing",
+)
+async def reparse_email(
+    email_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN")
+    await db.execute(
+        text("UPDATE gmail_emails SET processed = false WHERE id = :id"),
+        {"id": email_id}
+    )
+    await db.commit()
+    return {"success": True, "message": f"Email {email_id} queued for reparse"}
+
+
+@router.get(
+    "/admin/gmail-emails",
+    summary="Get all emails from gmail_emails table for admin view",
+)
+async def get_gmail_emails(
+    page: int = 1,
+    page_size: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    import math
+    count_result = await db.execute(text("SELECT COUNT(*) FROM gmail_emails"))
+    total = count_result.scalar_one()
+
+    offset = (page - 1) * page_size
+    result = await db.execute(
+        text("""
+            SELECT id, account_email, subject, from_address,
+                   from_name, date, is_read, category,
+                   priority, processed, folder
+            FROM gmail_emails
+            ORDER BY date DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        {"limit": page_size, "offset": offset}
+    )
+    rows = result.mappings().all()
+    return {
+        "data": [dict(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": math.ceil(total / page_size)
+    }
