@@ -17,6 +17,11 @@
 #   GET   /api/requirements/stats                      dashboard summary counts
 #   POST  /api/pipeline/process-email                  run one email through the full pipeline
 #   POST  /api/pipeline/parse-text                      test parser against raw subject/body
+#   GET   /api/admin/gmail-emails                      list all gmail emails
+#   GET   /api/admin/raw-emails/{id}                   get single raw email
+#   POST  /api/admin/raw-emails/{id}/reparse           reparse email
+#   GET   /api/admin/gmail-accounts                    list all gmail accounts
+#   GET   /api/admin/gmail-sync-logs                   list sync logs
 #
 # Note: GET /api/requirements (list, paginated, filterable) already exists
 # in main.py — not duplicated here.
@@ -25,11 +30,12 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, case, select
+from sqlalchemy import func, case, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -139,12 +145,6 @@ async def get_requirement_stats(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Registered before /api/requirements/{requirement_id} at the router level
-    is not required here since this is a distinct literal path ('stats' is not
-    a valid {requirement_id} value that would collide at the FastAPI routing layer
-    only if declared in the same router in the wrong order) — kept first for clarity.
-    """
     _require_role(current_user, "ADMIN", "RECRUITER")
 
     result = await db.execute(
@@ -255,18 +255,8 @@ async def process_email_endpoint(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Admin-only manual trigger. In production this same process_email() function
-    is intended to be called by a background Gmail-polling worker (not yet built —
-    that's Developer 4's task per the doc). This endpoint exists so the pipeline
-    can be exercised and verified without that worker existing yet.
-    """
     _require_role(current_user, "ADMIN")
 
-    # model_dump() includes keys with value None for unset Optional fields, which
-    # defeats gmail_reader.py's dict.get(key, default) fallback pattern (.get only
-    # applies its default when the key is MISSING, not when present-but-None).
-    # Strip None values here so downstream Phase 2 logic files behave as designed.
     gmail_msg = {k: v for k, v in payload.model_dump().items() if v is not None}
 
     result = await process_email(db, gmail_msg)
@@ -286,11 +276,6 @@ async def parse_text_endpoint(
     payload: ParseTextRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Admin-only diagnostic endpoint — runs parser.parse_requirement() directly,
-    no DB writes. Useful for validating regex patterns against real vendor
-    email samples before trusting the pipeline end-to-end.
-    """
     _require_role(current_user, "ADMIN")
 
     headers = {}
@@ -304,14 +289,13 @@ async def parse_text_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Raw Email endpoints — reads from gmail_emails table
+# Gmail Emails endpoints — reads from gmail_emails table
+# All columns included as per table structure
 # ---------------------------------------------------------------------------
-
-from sqlalchemy import text
 
 @router.get(
     "/api/admin/raw-emails/{email_id}",
-    summary="Get raw email from gmail_emails table",
+    summary="Get raw email from gmail_emails table by ID",
 )
 async def get_raw_email(
     email_id: int,
@@ -320,7 +304,15 @@ async def get_raw_email(
 ):
     _require_role(current_user, "ADMIN", "RECRUITER")
     result = await db.execute(
-        text("SELECT * FROM gmail_emails WHERE id = :id"),
+        text("""
+            SELECT id, account_id, account_email, message_id, uid, folder,
+                   subject, from_address, from_name, to_addresses, cc_addresses,
+                   bcc_addresses, reply_to, body_text, body_html, date,
+                   is_read, is_starred, has_attachments, attachments, labels,
+                   thread_id, raw_headers, fetched_at, category, priority,
+                   processed, classified_at, classifier_tier, job_posting_id
+            FROM gmail_emails WHERE id = :id
+        """),
         {"id": email_id}
     )
     row = result.mappings().first()
@@ -349,36 +341,133 @@ async def reparse_email(
 
 @router.get(
     "/api/admin/gmail-emails",
-    summary="Get all emails from gmail_emails table for admin view",
+    summary="Get all emails from gmail_emails table — all columns included",
 )
 async def get_gmail_emails(
     page: int = 1,
     page_size: int = 20,
+    account_email: Optional[str] = None,
+    category: Optional[str] = None,
+    processed: Optional[bool] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "ADMIN", "RECRUITER")
-    import math
-    count_result = await db.execute(text("SELECT COUNT(*) FROM gmail_emails"))
+
+    # Build WHERE clause
+    where_clauses = []
+    params = {"limit": page_size, "offset": (page - 1) * page_size}
+
+    if account_email:
+        where_clauses.append("account_email = :account_email")
+        params["account_email"] = account_email
+    if category:
+        where_clauses.append("category = :category")
+        params["category"] = category
+    if processed is not None:
+        where_clauses.append("processed = :processed")
+        params["processed"] = processed
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    # Count total
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) FROM gmail_emails {where_sql}"),
+        params
+    )
     total = count_result.scalar_one()
 
-    offset = (page - 1) * page_size
+    # Get data with ALL columns
     result = await db.execute(
-        text("""
-            SELECT id, account_email, subject, from_address,
-                   from_name, date, is_read, category,
-                   priority, processed, folder
+        text(f"""
+            SELECT id, account_id, account_email, message_id, uid, folder,
+                   subject, from_address, from_name, to_addresses, cc_addresses,
+                   bcc_addresses, reply_to, body_text, body_html, date,
+                   is_read, is_starred, has_attachments, attachments, labels,
+                   thread_id, raw_headers, fetched_at, category, priority,
+                   processed, classified_at, classifier_tier, job_posting_id
             FROM gmail_emails
+            {where_sql}
             ORDER BY date DESC
             LIMIT :limit OFFSET :offset
         """),
-        {"limit": page_size, "offset": offset}
+        params
     )
     rows = result.mappings().all()
+
     return {
         "data": [dict(row) for row in rows],
         "total": total,
         "page": page,
         "page_size": page_size,
-        "total_pages": math.ceil(total / page_size)
+        "total_pages": math.ceil(total / page_size) if total else 0
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gmail Accounts endpoints — reads from gmail_accounts table
+# All columns included as per table structure
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/api/admin/gmail-accounts",
+    summary="Get all Gmail accounts — all columns included",
+)
+async def get_gmail_accounts(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN")
+    result = await db.execute(
+        text("""
+            SELECT id, email, label, full_name, phone,
+                   skills, resume_url, imap_host, imap_port,
+                   active, last_synced, last_uid,
+                   sync_errors, created_at, updated_at
+            FROM gmail_accounts
+            ORDER BY id
+        """)
+    )
+    rows = result.mappings().all()
+    return {"data": [dict(row) for row in rows], "total": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# Gmail Sync Logs endpoints — reads from gmail_sync_logs table
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/api/admin/gmail-sync-logs",
+    summary="Get Gmail sync logs",
+)
+async def get_gmail_sync_logs(
+    page: int = 1,
+    page_size: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN")
+
+    count_result = await db.execute(text("SELECT COUNT(*) FROM gmail_sync_logs"))
+    total = count_result.scalar_one()
+
+    result = await db.execute(
+        text("""
+            SELECT id, account_id, account_email, started_at,
+                   finished_at, emails_found, emails_saved,
+                   status, error_msg, duration_ms
+            FROM gmail_sync_logs
+            ORDER BY started_at DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        {"limit": page_size, "offset": (page - 1) * page_size}
+    )
+    rows = result.mappings().all()
+
+    return {
+        "data": [dict(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": math.ceil(total / page_size) if total else 0
     }
