@@ -65,6 +65,7 @@ MAX_GENERATION_ATTEMPTS = 3      # per frontend RegenerateDialog MAX_ATTEMPTS = 
 RESUME_UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
 BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
+
 # ---------------------------------------------------------------------------
 # Helpers — reused patterns from phase3/phase4
 # ---------------------------------------------------------------------------

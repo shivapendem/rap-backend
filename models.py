@@ -388,6 +388,10 @@ class Application(Base):
     ats_score_at_send = Column(Numeric(5, 2), nullable=True)
     sent_at = Column(TIMESTAMP(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)
+    candidate_id = Column(Text, nullable=True)
+    job_posting_id = Column(FK_TYPE, nullable=True)
+    match_score = Column(Numeric(5, 2), nullable=True)
+    applied_at = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

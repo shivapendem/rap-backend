@@ -18,8 +18,10 @@
 #   POST  /api/pipeline/process-email                  run one email through the full pipeline
 #   POST  /api/pipeline/parse-text                      test parser against raw subject/body
 #   GET   /api/admin/gmail-emails                      list all gmail emails
-#   GET   /api/admin/raw-emails/{id}                   get single raw email
-#   POST  /api/admin/raw-emails/{id}/reparse           reparse email
+#   GET   /api/admin/raw-emails/{id}                   get single raw email (gmail_emails table)
+#   POST  /api/admin/raw-emails/{id}/reparse           reparse email (gmail_emails table)
+#   GET   /api/admin/emails/{id}                       get single email (emails table — what Requirement.raw_email_id links to)
+#   POST  /api/admin/emails/{id}/reparse                reparse email (emails table)
 #   GET   /api/admin/gmail-accounts                    list all gmail accounts
 #   GET   /api/admin/gmail-sync-logs                   list sync logs
 #
@@ -39,7 +41,7 @@ from sqlalchemy import func, case, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import User, Requirement
+from models import User, Requirement, Email
 from auth import get_current_user
 from pipeline import process_email
 from parser import parse_requirement
@@ -336,6 +338,66 @@ async def reparse_email(
         {"id": email_id}
     )
     await db.commit()
+    return {"success": True, "message": f"Email {email_id} queued for reparse"}
+
+
+# ---------------------------------------------------------------------------
+# `emails` table endpoints — separate from gmail_emails above.
+# Requirement.raw_email_id is a foreign key into `emails.id` (see
+# models.py), so these are the endpoints the Requirements admin page's
+# "View Raw" / "Re-parse" actions actually need — the gmail_emails ones
+# above query the wrong table for that purpose.
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/api/admin/emails/{email_id}",
+    summary="Get a single email from the `emails` table (the one Requirements link to via raw_email_id)",
+)
+async def get_source_email(
+    email_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    result = await db.execute(select(Email).where(Email.id == email_id))
+    email = result.scalars().first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    return {
+        "id": email.id,
+        "sender_email": email.sender_email,
+        "sender_name": email.sender_name,
+        "recruiter_email": email.recruiter_email,
+        "subject": email.subject,
+        "body_text": email.body_text,
+        "body_html": email.body_html,
+        "received_at": email.received_at.isoformat() if email.received_at else None,
+        "fetched_at": email.fetched_at.isoformat() if email.fetched_at else None,
+        "parse_status": email.parse_status,
+        "parse_attempts": email.parse_attempts,
+    }
+
+
+@router.post(
+    "/api/admin/emails/{email_id}/reparse",
+    summary="Mark an email (from the `emails` table) for reprocessing",
+)
+async def reparse_source_email(
+    email_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN")
+    result = await db.execute(select(Email).where(Email.id == email_id))
+    email = result.scalars().first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    email.parse_status = "NEW"
+    email.parse_attempts = 0
+    await db.commit()
+
     return {"success": True, "message": f"Email {email_id} queued for reparse"}
 
 
