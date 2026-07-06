@@ -535,3 +535,29 @@ class SystemEvent(Base):
     event_type = Column(Text, nullable=False, index=True)
     payload = JSONBColumn(nullable=True)
     broadcast_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), index=True)
+
+
+class EmailQueue(Base):
+    """Consultant-composed emails added to an outgoing queue
+    (Add to Email Queue feature — dashboard/email-queue screen).
+    Not sent immediately; queued for later processing/review.
+    """
+    __tablename__ = "email_queue"
+    id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
+    consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False, index=True)
+    requirement_id = Column(FK_TYPE, ForeignKey("requirements.id", ondelete="SET NULL"), nullable=True, index=True)
+    from_email = Column(Text, nullable=False)
+    to_email = Column(Text, nullable=False)
+    subject = Column(Text, nullable=False)
+    content = Column(Text, nullable=True)
+    attachments = Column(JSONB, nullable=True)
+    status = Column(Text, nullable=False, default="QUEUED")
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    VALID_STATUSES = {"QUEUED", "SENT", "FAILED"}
+
+    @validates("status")
+    def validate_status(self, key, value):
+        if value not in self.VALID_STATUSES:
+            raise ValueError(f"status must be one of {sorted(self.VALID_STATUSES)}, got '{value}'")
+        return value
