@@ -206,6 +206,9 @@ app.include_router(phase6_router)
 from phase7 import router as phase7_router  # noqa: E402
 app.include_router(phase7_router)
 
+from email_queue import router as email_queue_router  # noqa: E402
+app.include_router(email_queue_router)
+
 from phase8 import router as phase8_router  # noqa: E402
 app.include_router(phase8_router)
 
