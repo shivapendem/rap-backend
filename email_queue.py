@@ -3,6 +3,9 @@
 # Email Queue endpoints
 # Handles consultant email queue management
 # ---------------------------------------------------------------------------
+import os
+import uuid
+from fastapi import UploadFile, File
 
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
@@ -22,7 +25,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 class EmailQueueCreateRequest(BaseModel):
-    consultant_id: int
+    consultant_id: Optional[int] = None
     requirement_id: Optional[int] = None
     from_email: str
     to_email: str
@@ -39,7 +42,7 @@ class EmailQueueStatusUpdate(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@router.post("/consultant/email-queue")
+@router.post("/api/consultant/email-queue")
 async def create_email_queue(
     body: EmailQueueCreateRequest,
     db: AsyncSession = Depends(get_db),
@@ -47,8 +50,19 @@ async def create_email_queue(
 ):
     """Add email to queue."""
     from models import EmailQueue
+    # Get consultant_id from logged in user or body
+    from models import Consultant
+    from sqlalchemy import select as sa_select
+    cons_result = await db.execute(
+        sa_select(Consultant).where(Consultant.user_id == current_user.id)
+    )
+    consultant = cons_result.scalars().first()
+    consultant_id = consultant.id if consultant else body.consultant_id
+    if not consultant_id:
+        raise HTTPException(status_code=400, detail="Consultant profile not found.")
+
     item = EmailQueue(
-        consultant_id=body.consultant_id,
+        consultant_id=consultant_id,
         requirement_id=body.requirement_id,
         from_email=body.from_email,
         to_email=body.to_email,
@@ -67,7 +81,7 @@ async def create_email_queue(
     }
 
 
-@router.get("/consultant/email-queue")
+@router.get("/api/consultant/email-queue")
 async def list_email_queue(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -99,7 +113,7 @@ async def list_email_queue(
     }
 
 
-@router.get("/consultant/email-queue/{item_id}")
+@router.get("/api/consultant/email-queue/{item_id}")
 async def get_email_queue_item(
     item_id: int,
     db: AsyncSession = Depends(get_db),
@@ -128,7 +142,7 @@ async def get_email_queue_item(
     }
 
 
-@router.patch("/consultant/email-queue/{item_id}/status")
+@router.patch("/api/consultant/email-queue/{item_id}/status")
 async def update_email_queue_status(
     item_id: int,
     body: EmailQueueStatusUpdate,
@@ -156,7 +170,7 @@ async def update_email_queue_status(
     return {"success": True, "id": str(item.id), "status": item.status}
 
 
-@router.delete("/consultant/email-queue/{item_id}")
+@router.delete("/api/consultant/email-queue/{item_id}")
 async def delete_email_queue_item(
     item_id: int,
     db: AsyncSession = Depends(get_db),
@@ -173,3 +187,27 @@ async def delete_email_queue_item(
     await db.delete(item)
     await db.commit()
     return {"success": True, "message": f"Email queue item {item_id} deleted"}
+
+UPLOAD_DIR = "/tmp/email_attachments"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@router.post("/api/consultant/email-queue/upload-attachment")
+async def upload_attachment(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload attachment file and return file reference."""
+    ext = os.path.splitext(file.filename)[1]
+    unique_name = f"{uuid.uuid4()}{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    return {
+        "success": True,
+        "filename": file.filename,
+        "stored_name": unique_name,
+        "path": file_path,
+        "size_bytes": len(contents),
+        "content_type": file.content_type,
+    }
