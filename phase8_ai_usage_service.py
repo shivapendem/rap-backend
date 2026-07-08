@@ -19,6 +19,17 @@ MODEL_PRICING = {
 }
 DEFAULT_PRICING = {"input": 0.005, "output": 0.015}
 
+async def set_budget_threshold(db: AsyncSession, budget_usd: float, updated_by: str | None = None) -> float:
+    """Create or update the ai_budget_usd row in app_settings."""
+    result = await db.execute(select(AppSetting).where(AppSetting.key == "ai_budget_usd"))
+    setting = result.scalars().first()
+    if setting:
+        setting.value = str(budget_usd)
+        setting.updated_by = updated_by
+    else:
+        db.add(AppSetting(key="ai_budget_usd", value=str(budget_usd), updated_by=updated_by))
+    await db.commit()
+    return budget_usd
 
 async def get_budget_threshold(db: AsyncSession) -> float:
     """Fetch the AI budget threshold from app_settings, falling back to default."""
@@ -31,6 +42,17 @@ async def get_budget_threshold(db: AsyncSession) -> float:
             pass
     return DEFAULT_BUDGET_USD
 
+async def set_budget_threshold(db: AsyncSession, budget_usd: float, updated_by: str | None = None) -> float:
+    """Create or update the ai_budget_usd row in app_settings."""
+    result = await db.execute(select(AppSetting).where(AppSetting.key == "ai_budget_usd"))
+    setting = result.scalars().first()
+    if setting:
+        setting.value = str(budget_usd)
+        setting.updated_by = updated_by
+    else:
+        db.add(AppSetting(key="ai_budget_usd", value=str(budget_usd), updated_by=updated_by))
+    await db.commit()
+    return budget_usd
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate USD cost for an AI call based on model + token counts."""

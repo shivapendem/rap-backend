@@ -20,7 +20,7 @@ from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from sqlalchemy.future import select as fselect
@@ -35,7 +35,7 @@ from models import (
     AppSetting,
 )
 from phase8_audit_service import log_action, build_metadata_preview
-from phase8_ai_usage_service import get_budget_threshold, estimate_cost
+from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost
 from phase8_retry_service import attempt_retry
 from phase8_cache import cache_get, cache_set, check_redis_health
 
@@ -144,6 +144,10 @@ class AIUsageStatsDTO(BaseModel):
     total_calls: int
     budget_usd: float
     budget_used_pct: float
+
+
+class SetBudgetRequest(BaseModel):
+    budget_usd: float = Field(..., gt=0, description="AI spend budget in USD, must be greater than 0")
 
 
 class AdminStatsDTO(BaseModel):
@@ -546,6 +550,27 @@ async def ai_usage_stats(
         total_cost_usd=round(float(total_cost), 4),
         total_calls=total_calls,
         budget_usd=budget,
+        budget_used_pct=round(used_pct, 2),
+    )
+
+
+@router.put("/ai-usage/budget", response_model=AIUsageStatsDTO)
+async def update_ai_budget(
+    body: SetBudgetRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    updated_by = current_user.get("sub")
+    await set_budget_threshold(db, body.budget_usd, updated_by=updated_by)
+
+    total_cost = (await db.execute(select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0)))).scalar_one()
+    total_calls = (await db.execute(select(func.count()).select_from(AIUsageLog))).scalar_one()
+    used_pct = (float(total_cost) / body.budget_usd * 100) if body.budget_usd > 0 else 0.0
+
+    return AIUsageStatsDTO(
+        total_cost_usd=round(float(total_cost), 4),
+        total_calls=total_calls,
+        budget_usd=body.budget_usd,
         budget_used_pct=round(used_pct, 2),
     )
 
