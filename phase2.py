@@ -261,6 +261,15 @@ async def process_email_endpoint(
 
     result = await process_email(db, gmail_msg)
 
+    # Update gmail_emails processed status
+    if payload.raw_email_id:
+        from sqlalchemy import text
+        await db.execute(
+            text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
+            {"id": payload.raw_email_id}
+        )
+        await db.commit()
+
     return ProcessEmailResponse(
         email_status=result["email_status"],
         requirement_status=result["requirement_status"],
