@@ -142,7 +142,7 @@ async def get_email_queue_item(
     }
 
 
-@router.patch("/api/consultant/email-queue/{item_id}/status")
+@router.patch("/api/consultant/+-queue/{item_id}/status")
 async def update_email_queue_status(
     item_id: int,
     body: EmailQueueStatusUpdate,

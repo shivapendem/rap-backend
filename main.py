@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 
 from database import engine, Base, get_db, AsyncSessionLocal
 from models import User, Requirement, Consultant
+import asyncio
+from requirements_sync import sync_pending_emails
 from auth import (
     pwd_context,
     SECRET_KEY,
@@ -117,6 +119,26 @@ _DEFAULT_USERS = [
 ]
 
 
+GMAIL_SYNC_INTERVAL_SECONDS = int(os.getenv("GMAIL_SYNC_INTERVAL_SECONDS", "300"))  # default: every 5 min
+
+
+async def _gmail_to_requirements_loop():
+    """
+    Background loop: periodically bridges new gmail_emails rows into
+    requirements. Runs for the lifetime of the app so IMAP-synced emails
+    are turned into requirements without any manual/cron step.
+    """
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                summary = await sync_pending_emails(session)
+                if summary["total"]:
+                    print(f"[gmail-sync] {summary}")
+        except Exception as e:
+            print(f"[gmail-sync] loop error: {e}")
+        await asyncio.sleep(GMAIL_SYNC_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # CREATE TABLE IF NOT EXISTS — always safe to call on every startup
@@ -137,7 +159,15 @@ async def lifespan(app: FastAPI):
                 print(f"Seeded default user: {u['email']}")
         await session.commit()
 
+    sync_task = asyncio.create_task(_gmail_to_requirements_loop())
+
     yield
+
+    sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
 
 
 # ---------------------------------------------------------------------------
