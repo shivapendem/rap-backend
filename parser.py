@@ -57,6 +57,24 @@ DURATION_PATTERNS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Experience patterns
+# ---------------------------------------------------------------------------
+EXPERIENCE_PATTERNS = [
+    r'(?i)experience\s*[:\-]\s*(.+)',
+    r'(?i)exp\s*[:\-]\s*(.+)',
+    r'(?i)(\d+\+?\s*(?:to|-)?\s*\d*\+?\s*(?:years?|yrs?)\s*(?:of)?\s*experience)',
+]
+
+# ---------------------------------------------------------------------------
+# Skills patterns
+# ---------------------------------------------------------------------------
+SKILL_LABEL_PATTERNS = [
+    r'(?i)(?:primary|required|mandatory|technical|key)?\s*skills?\s*[:\-]\s*(.+)',
+    r'(?i)tech\s*stack\s*[:\-]\s*(.+)',
+    r'(?i)technologies\s*[:\-]\s*(.+)',
+]
+
+# ---------------------------------------------------------------------------
 # Work mode patterns
 # ---------------------------------------------------------------------------
 WORK_MODE_PATTERNS = {
@@ -110,6 +128,28 @@ def extract_employment_types(text: str) -> list:
     return result if result else ["UNKNOWN"]
 
 
+def extract_experience(text: str) -> Optional[str]:
+    """Extract required experience."""
+    for pattern in EXPERIENCE_PATTERNS:
+        m = re.search(pattern, text)
+        if m:
+            value = m.group(1).strip()
+            value = re.split(r'[\n\r|]', value)[0].strip()
+            return value
+    return None
+
+
+def extract_skills(text: str) -> Optional[str]:
+    """Extract required skills."""
+    for pattern in SKILL_LABEL_PATTERNS:
+        m = re.search(pattern, text)
+        if m:
+            value = m.group(1).strip()
+            value = re.split(r'[\n\r]', value)[0].strip()
+            return value
+
+    return None
+
 def extract_vendor_email(headers: dict, body: str) -> Optional[str]:
     """Extract vendor email from Reply-To header or body."""
     # Prefer Reply-To header
@@ -159,6 +199,8 @@ def parse_requirement(
     location = first_match(LOCATION_PATTERNS, full_text)
     rate = first_match(RATE_PATTERNS, full_text)
     duration = first_match(DURATION_PATTERNS, full_text)
+    experience = extract_experience(full_text)
+    skills = extract_skills(full_text)
     work_mode = extract_work_mode(full_text)
     employment_types = extract_employment_types(full_text)
     vendor_email = extract_vendor_email(headers, body)
@@ -172,17 +214,19 @@ def parse_requirement(
             vendor_name = name_match.group(1).strip().strip('"')
 
     parsed = {
-        "role": role,
-        "client": client,
-        "location": location,
-        "rate": rate,
-        "duration": duration,
-        "work_mode": work_mode,
-        "employment_types": employment_types,
-        "vendor_email": vendor_email,
-        "vendor": vendor_name,
-    }
-
+    "role": role,
+    "client": client,
+    "location": location,
+    "rate": rate,
+    "duration": duration,
+    "experience": experience,
+    "skills": skills,
+    "work_mode": work_mode,
+    "employment_types": employment_types,
+    "vendor_email": vendor_email,
+    "vendor": vendor_name,
+}
+    
     # Calculate confidence score
     confidence = calculate_confidence(parsed)
     parsed["parse_confidence"] = confidence

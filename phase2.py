@@ -81,6 +81,8 @@ class RequirementDetailResponse(BaseModel):
     employment_types: Optional[List[str]] = None
     rate: Optional[str] = None
     duration: Optional[str] = None
+    experience: Optional[str] = None
+    skills: Optional[str] = None  
     job_description: Optional[str] = None
     parsed_fields: Optional[dict] = None
     parse_confidence: Optional[float] = None
@@ -201,6 +203,8 @@ async def get_requirement_detail(
         employment_types=requirement.employment_types,
         rate=requirement.rate,
         duration=requirement.duration,
+        experience=requirement.experience,
+        skills=requirement.skills,
         job_description=requirement.job_description,
         parsed_fields=requirement.parsed_fields,
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
@@ -492,6 +496,8 @@ async def reparse_email(
         existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
         existing_req.rate = parsed.get("rate")
         existing_req.duration = parsed.get("duration")
+        existing_req.experience = parsed.get("experience")
+        existing_req.skills = parsed.get("skills")
         existing_req.job_description = cleaned_jd
         existing_req.jd_hash = jd_hash
         existing_req.dedup_key = dedup_key

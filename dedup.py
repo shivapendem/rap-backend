@@ -100,6 +100,8 @@ async def save_requirement(
         employment_types=parsed.get("employment_types", ["UNKNOWN"]),
         rate=parsed.get("rate"),
         duration=parsed.get("duration"),
+        experience=parsed.get("experience"),
+        skills=parsed.get("skills"),
         job_description=cleaned_jd,
         jd_hash=jd_hash,
         dedup_key=dedup_key,

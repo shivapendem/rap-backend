@@ -59,6 +59,8 @@ class User(Base):
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    needto_fetch_mail = Column(Boolean, nullable=False, default=True)
+    skills = Column(JSONB, nullable=False, default=list)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 
@@ -205,6 +207,8 @@ class Requirement(Base):
     employment_types = ArrayTextColumn(nullable=True)
     rate = Column(Text, nullable=True)
     duration = Column(Text, nullable=True)
+    experience = Column(Text, nullable=True)
+    skills = Column(Text, nullable=True)
     job_description = Column(Text, nullable=True)
     jd_hash = Column(Text, nullable=True, index=True)          # Phase 2: SHA-256 of normalized cleaned JD
     dedup_key = Column(Text, nullable=True, unique=True, index=True)  # Phase 2: vendor_email|role|jd_hash

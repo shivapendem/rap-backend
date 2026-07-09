@@ -87,6 +87,8 @@ class RequirementResponse(BaseModel):
     parsed_fields: Optional[dict] = None
     vendor_contact: Optional[str] = None
     rate: Optional[str] = None
+    experience: Optional[str] = None
+    skills: Optional[str] = None
     ats_match_count: Optional[int] = None
     parse_confidence: Optional[float] = None
     raw_email_id: Optional[int] = None
