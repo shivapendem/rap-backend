@@ -12,17 +12,38 @@ from sqlalchemy.future import select
 from models import Email
 
 
-async def save_raw_email(db: AsyncSession, gmail_msg: dict) -> str:
+async def save_raw_email(db: AsyncSession, gmail_msg: dict) -> dict:
     """
     Save a raw email to database.
-    Returns 'saved' or 'already_exists'
+
+    Returns {"status": "saved" | "already_exists", "id": <emails.id>}.
+
+    IMPORTANT: the returned "id" is always the real primary key of the
+    `emails` table — this is the only value that's safe to use as
+    Requirement.raw_email_id (that column is a FK into emails.id, NOT
+    into gmail_emails.id — a different table entirely). Callers must
+    use this returned id rather than any id that arrived in the payload
+    from the frontend/ingestion job, which is a gmail_emails.id.
     """
     # Check if email already exists
     result = await db.execute(
         select(Email).where(Email.gmail_message_id == gmail_msg["id"])
     )
-    if result.scalars().first():
-        return "already_exists"
+    existing = result.scalars().first()
+    if existing:
+        return {"status": "already_exists", "id": existing.id}
+
+    # BUG FIX: received_at often arrives as an ISO string (e.g. from JSON
+    # payloads sent by the frontend/sync job), but Email.received_at is a
+    # TIMESTAMPTZ column — asyncpg rejects a raw string outright with a
+    # DataError. This is very likely why "received date" has always shown
+    # blank: any payload that included a received_at string would 500 here.
+    received_at = gmail_msg.get("received_at")
+    if isinstance(received_at, str):
+        try:
+            received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+        except ValueError:
+            received_at = None
 
     # Save new email
     new_email = Email(
@@ -35,13 +56,13 @@ async def save_raw_email(db: AsyncSession, gmail_msg: dict) -> str:
         body_text=gmail_msg.get("plain_text_body", ""),
         body_html=gmail_msg.get("html_body", ""),
         reply_to_address=gmail_msg.get("reply_to_email"),
-        received_at=gmail_msg.get("received_at"),
+        received_at=received_at,
         parse_status="NEW",
     )
     db.add(new_email)
     await db.commit()
     await db.refresh(new_email)
-    return "saved"
+    return {"status": "saved", "id": new_email.id}
 
 
 def decode_gmail_body(payload: dict) -> tuple[str, str]:

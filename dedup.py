@@ -5,6 +5,7 @@
 
 import hashlib
 import re
+from datetime import datetime
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -58,6 +59,7 @@ async def save_requirement(
     parsed: dict,
     cleaned_jd: str,
     raw_email_id: Optional[int] = None,
+    received_date=None,  # BUG FIX: this was accepted nowhere before — column stayed NULL forever
 ) -> dict:
     """
     Save requirement to database if not duplicate.
@@ -77,6 +79,14 @@ async def save_requirement(
     if duplicate:
         return {"status": "duplicate", "id": None}
 
+    # received_date may arrive as an ISO string (from JSON payloads) or a
+    # datetime already (from gmail_emails.date) — normalize to datetime or None
+    if isinstance(received_date, str):
+        try:
+            received_date = datetime.fromisoformat(received_date.replace("Z", "+00:00"))
+        except ValueError:
+            received_date = None
+
     # Save new requirement — persist jd_hash and dedup_key so future duplicate checks work
     new_req = Requirement(
         raw_email_id=raw_email_id,
@@ -95,6 +105,7 @@ async def save_requirement(
         dedup_key=dedup_key,
         parsed_fields=parsed,
         parse_confidence=parsed.get("parse_confidence", 0.0),
+        received_date=received_date,
         status="NEW",
     )
 

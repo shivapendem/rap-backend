@@ -39,10 +39,12 @@ from sqlalchemy import func, case, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import User, Requirement
+from models import User, Requirement, Email
 from auth import get_current_user
 from pipeline import process_email
 from parser import parse_requirement
+from cleaner import clean_requirement_text, html_to_text
+from dedup import create_jd_hash, build_dedup_key, save_requirement
 
 logger = logging.getLogger(__name__)
 
@@ -304,14 +306,24 @@ async def parse_text_endpoint(
 
 @router.get(
     "/api/admin/raw-emails/{email_id}",
-    summary="Get raw email from gmail_emails table by ID",
+    summary="Get raw email — checks gmail_emails first, falls back to emails table",
 )
 async def get_raw_email(
     email_id: int,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    NOTE: Requirement.raw_email_id is a foreign key into `emails.id`, not
+    `gmail_emails.id` — those are two different tables with two different
+    ID sequences (see pipeline.py / gmail_reader.py fix). Older requirements
+    created before that fix may still carry a gmail_emails.id, so we check
+    gmail_emails first for backward compatibility, then fall back to the
+    emails table — which is where every correctly-linked raw_email_id
+    actually points.
+    """
     _require_role(current_user, "ADMIN", "RECRUITER")
+
     result = await db.execute(
         text("""
             SELECT id, account_id, account_email, message_id, uid, folder,
@@ -325,27 +337,199 @@ async def get_raw_email(
         {"id": email_id}
     )
     row = result.mappings().first()
-    if not row:
+    if row:
+        return {"source": "gmail_emails", **dict(row)}
+
+    # Fall back to the emails table — this is the correct source for any
+    # requirement created after the raw_email_id FK fix.
+    email_result = await db.execute(select(Email).where(Email.id == email_id))
+    email = email_result.scalars().first()
+    if not email:
         raise HTTPException(status_code=404, detail="Email not found")
-    return dict(row)
+
+    return {
+        "source": "emails",
+        "id": email.id,
+        "account_email": email.recruiter_email,
+        "message_id": email.gmail_message_id,
+        "thread_id": email.gmail_thread_id,
+        "subject": email.subject,
+        "from_address": email.sender_email,
+        "from_name": email.sender_name,
+        "to_addresses": email.to_addresses,
+        "cc_addresses": email.cc_addresses,
+        "bcc_addresses": email.bcc_addresses,
+        "reply_to": email.reply_to_address,
+        "body_text": email.body_text,
+        "body_html": email.body_html,
+        "date": email.received_at,
+        "is_read": email.is_read,
+        "is_starred": email.is_starred,
+        "has_attachments": email.has_attachments,
+        "attachments": email.attachment_details,
+        "labels": email.gmail_labels,
+        "raw_headers": email.raw_headers,
+        "fetched_at": email.fetched_at,
+        "processed": email.parse_status in ("PARSED", "SKIPPED"),
+        "parse_status": email.parse_status,
+    }
 
 
 @router.post(
     "/api/admin/raw-emails/{email_id}/reparse",
-    summary="Mark email for reprocessing",
+    summary="Actually re-run an email through the parser and refresh its requirement",
 )
 async def reparse_email(
     email_id: int,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    Previously this endpoint only flipped gmail_emails.processed = false —
+    nothing ever consumed that flag, so "reparse" silently did nothing.
+
+    Real behavior now:
+    1. Load the raw email — gmail_emails first (id sent by the frontend),
+       falling back to the emails table.
+    2. Ensure a corresponding `emails` row exists (creating it if this raw
+       email was never run through the pipeline), so we have a real
+       emails.id to use as the FK.
+    3. Re-run parser + cleaner on the raw text.
+    4. If a Requirement is already linked to this email, update it in place
+       (this IS a re-parse of the same email, so we intentionally bypass
+       the duplicate check rather than silently no-op on unchanged dedup keys).
+       Otherwise create a new Requirement via the normal dedup path.
+    5. Mark the raw email as processed/parsed.
+    """
     _require_role(current_user, "ADMIN")
-    await db.execute(
-        text("UPDATE gmail_emails SET processed = false WHERE id = :id"),
+
+    # ---- Step 1: load raw source (gmail_emails, falling back to emails) ----
+    gmail_row_result = await db.execute(
+        text("""
+            SELECT id, message_id, thread_id, account_email, subject,
+                   from_address, from_name, reply_to, body_text, body_html, date
+            FROM gmail_emails WHERE id = :id
+        """),
         {"id": email_id}
     )
+    gmail_row = gmail_row_result.mappings().first()
+
+    if gmail_row:
+        gmail_message_id = gmail_row["message_id"]
+        subject = gmail_row["subject"] or ""
+        body_text = gmail_row["body_text"] or ""
+        body_html = gmail_row["body_html"] or ""
+        headers = {"from": gmail_row["from_address"], "reply_to": gmail_row["reply_to"]}
+        source_gmail_emails_id = gmail_row["id"]
+        received_date = gmail_row["date"]
+        gmail_msg = {
+            "id": gmail_message_id,
+            "thread_id": gmail_row["thread_id"],
+            "recruiter_email": gmail_row["account_email"],
+            "from_email": gmail_row["from_address"],
+            "from_name": gmail_row["from_name"],
+            "subject": subject,
+            "plain_text_body": body_text,
+            "html_body": body_html,
+            "reply_to_email": gmail_row["reply_to"],
+            "received_at": gmail_row["date"],
+        }
+    else:
+        # Not in gmail_emails — check the emails table directly
+        email_result = await db.execute(select(Email).where(Email.id == email_id))
+        email = email_result.scalars().first()
+        if not email:
+            raise HTTPException(status_code=404, detail="Email not found")
+        gmail_message_id = email.gmail_message_id
+        subject = email.subject or ""
+        body_text = email.body_text or ""
+        body_html = email.body_html or ""
+        headers = {"from": email.sender_email, "reply_to": email.reply_to_address}
+        source_gmail_emails_id = None
+        gmail_msg = None
+        received_date = email.received_at
+
+    # ---- Step 2: ensure a real emails row exists, get its id ----
+    if gmail_msg is not None:
+        email_result = await db.execute(
+            select(Email).where(Email.gmail_message_id == gmail_message_id)
+        )
+        email = email_result.scalars().first()
+        if not email:
+            # Never went through the pipeline before — create it now
+            save_result = await process_email(db, gmail_msg)
+            email_result = await db.execute(
+                select(Email).where(Email.gmail_message_id == gmail_message_id)
+            )
+            email = email_result.scalars().first()
+
+    real_email_id = email.id
+
+    # ---- Step 3: re-run parser + cleaner on the raw text ----
+    body = body_text or html_to_text(body_html)
+    parsed = parse_requirement(subject, body, headers)
+    cleaned_jd = clean_requirement_text(body)
+
+    # ---- Step 4: update existing requirement in place, or create one ----
+    existing_req_result = await db.execute(
+        select(Requirement).where(Requirement.raw_email_id == real_email_id)
+    )
+    existing_req = existing_req_result.scalars().first()
+
+    vendor_email = parsed.get("vendor_email", "unknown@unknown.com")
+    role = parsed.get("role", "UNKNOWN")
+    jd_hash = create_jd_hash(cleaned_jd)
+    dedup_key = build_dedup_key(vendor_email, role, jd_hash)
+
+    if existing_req:
+        existing_req.role = role
+        existing_req.vendor = parsed.get("vendor")
+        existing_req.vendor_email = vendor_email
+        existing_req.vendor_contact = parsed.get("vendor_contact")
+        existing_req.client = parsed.get("client")
+        existing_req.location = parsed.get("location")
+        existing_req.work_mode = parsed.get("work_mode")
+        existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
+        existing_req.rate = parsed.get("rate")
+        existing_req.duration = parsed.get("duration")
+        existing_req.job_description = cleaned_jd
+        existing_req.jd_hash = jd_hash
+        existing_req.dedup_key = dedup_key
+        existing_req.parsed_fields = parsed
+        existing_req.parse_confidence = parsed.get("parse_confidence", 0.0)
+        if received_date and not existing_req.received_date:
+            existing_req.received_date = received_date
+        await db.commit()
+        requirement_status = "updated"
+        requirement_id = existing_req.id
+    else:
+        result = await save_requirement(
+            db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=real_email_id,
+            received_date=received_date,
+        )
+        requirement_status = result["status"]
+        requirement_id = result["id"]
+
+    # ---- Step 5: mark processed/parsed on whichever raw source we used ----
+    if source_gmail_emails_id is not None:
+        await db.execute(
+            text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
+            {"id": source_gmail_emails_id}
+        )
+    email.parse_status = "PARSED"
     await db.commit()
-    return {"success": True, "message": f"Email {email_id} queued for reparse"}
+
+    logger.info(
+        "Reparsed email_id=%s (emails.id=%s) -> requirement_status=%s requirement_id=%s by user=%s",
+        email_id, real_email_id, requirement_status, requirement_id, current_user.email,
+    )
+
+    return {
+        "success": True,
+        "message": f"Email {email_id} reparsed",
+        "requirement_status": requirement_status,
+        "requirement_id": str(requirement_id) if requirement_id is not None else None,
+    }
 
 
 @router.get(

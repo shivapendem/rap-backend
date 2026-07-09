@@ -26,7 +26,10 @@ async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
     # ---------------------------------------------------------------------------
     # Task 1: Save raw email
     # ---------------------------------------------------------------------------
-    email_status = await save_raw_email(db, gmail_msg)
+    email_result = await save_raw_email(db, gmail_msg)
+    email_status = email_result["status"]
+    real_email_id = email_result["id"]  # emails.id — the only valid raw_email_id FK value
+
     if email_status == "already_exists":
         return {
             "email_status": "already_exists",
@@ -40,7 +43,23 @@ async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
     subject = gmail_msg.get("subject", "")
     body_text = gmail_msg.get("plain_text_body", "")
     body_html = gmail_msg.get("html_body", "")
-    headers = gmail_msg.get("headers", {})
+
+    # BUG FIX: parser.extract_vendor_email() / vendor-name extraction both read
+    # headers["from"] and headers["reply_to"] — but the real production payload
+    # (ProcessEmailRequest) sends from_email/from_name/reply_to_email as FLAT
+    # top-level fields, not nested under "headers". That meant headers was
+    # almost always {} in real usage, so vendor_email/vendor/"from" silently
+    # came back None every time. Build headers from whichever shape we got.
+    headers = dict(gmail_msg.get("headers") or {})
+    if "from" not in headers:
+        from_email = gmail_msg.get("from_email")
+        from_name = gmail_msg.get("from_name")
+        if from_email:
+            headers["from"] = f'{from_name} <{from_email}>' if from_name else from_email
+    if "reply_to" not in headers:
+        reply_to_email = gmail_msg.get("reply_to_email")
+        if reply_to_email:
+            headers["reply_to"] = reply_to_email
 
     # Use plain text if available, else convert HTML
     body = body_text or html_to_text(body_html)
@@ -59,7 +78,8 @@ async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
         db=db,
         parsed=parsed,
         cleaned_jd=cleaned_jd,
-        raw_email_id=gmail_msg.get("raw_email_id"),
+        raw_email_id=real_email_id,
+        received_date=gmail_msg.get("received_at"),  # BUG FIX: was never passed through — column stayed NULL forever
     )
 
     return {
