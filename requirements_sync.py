@@ -12,6 +12,28 @@
 # directly, using gmail_emails.id as raw_email_id. Importable so it
 # can run both as a one-off CLI script and as a background job
 # inside the FastAPI app (see main.py).
+#
+# BUG FIX — column collision with the Node.js analyze-mail classifier:
+# gmail_emails.processed was being used by TWO unrelated systems for
+# TWO different meanings:
+#   - analyze-mail (Node, cron.js/db.js) sets processed=true the
+#     moment it FINISHES CLASSIFYING a row — even for category=
+#     'unclassified' or 'ignore' (see markEmailClassified/markEmailError
+#     in /home/analyze-mail/src/db.js).
+#   - this module used to treat processed=true as "already turned into
+#     a Requirement" and pulled everything with processed IS NOT TRUE,
+#     with NO category check at all.
+#
+# Whichever service touched a row first "won", which meant:
+#   1. Non-job emails (invites, newsletters, "welcome to X" emails)
+#      got converted into Requirements before they were ever classified.
+#   2. Once a row was marked processed=true by either service, the
+#      other service would never look at it again.
+#
+# Fix: stop reading/writing `processed` here entirely. Only pull rows
+# the classifier has confidently marked category='job_posting', and
+# use "does a Requirement already exist for this raw_email_id" as the
+# completion check instead of a shared boolean flag.
 # =============================================================
 
 from sqlalchemy import text
@@ -23,16 +45,22 @@ from dedup import save_requirement
 
 async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
     """
-    Process all unprocessed gmail_emails rows into requirements.
+    Process gmail_emails rows the classifier has marked as job postings
+    into requirements — skipping anything already converted.
+
     Returns a summary dict: {saved, duplicates, errors, total}.
     """
     result = await db.execute(
         text("""
-            SELECT id, message_id, thread_id, account_email, subject,
-                   from_address, from_name, reply_to, body_text, body_html, date
-            FROM gmail_emails
-            WHERE processed IS NOT TRUE
-            ORDER BY date ASC
+            SELECT ge.id, ge.message_id, ge.thread_id, ge.account_email, ge.subject,
+                   ge.from_address, ge.from_name, ge.reply_to, ge.body_text,
+                   ge.body_html, ge.date
+            FROM gmail_emails ge
+            WHERE ge.category = 'job_posting'
+              AND NOT EXISTS (
+                  SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
+              )
+            ORDER BY ge.date ASC
             LIMIT :limit
         """),
         {"limit": batch_size},
@@ -68,10 +96,10 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 received_date=row["date"],
             )
 
-            await db.execute(
-                text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
-                {"id": row["id"]},
-            )
+            # NOTE: we deliberately do NOT touch gmail_emails.processed here —
+            # that column belongs to the Node.js classifier. Completion is
+            # now tracked purely by requirements.raw_email_id existing (the
+            # NOT EXISTS check above), so nothing needs updating on this row.
             await db.commit()
 
             if save_result["status"] == "saved":
