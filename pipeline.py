@@ -2,18 +2,42 @@
 # Phase 2 - Main Pipeline
 # Connects all tasks: Gmail Reader → Parser → Cleaner → Dedup
 # =============================================================
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from gmail_reader import save_raw_email
 from parser import parse_requirement
 from cleaner import clean_requirement_text, html_to_text
 from dedup import create_jd_hash, save_requirement
 
 
-async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
+async def process_email(
+    db: AsyncSession,
+    gmail_msg: dict,
+    raw_email_id: Optional[int] = None,
+) -> dict:
     """
     Main pipeline function.
     Processes one email through all Phase 2 tasks.
+
+    IMPORTANT — raw_email_id:
+    requirements.raw_email_id is a foreign key into gmail_emails.id
+    (CONFIRMED via pg_constraint — see requirements_sync.py). It is
+    NOT a foreign key into emails.id, despite emails.id being what
+    save_raw_email() below returns for internal bookkeeping.
+
+    Previously this function used emails.id (from save_raw_email) as
+    raw_email_id directly, which either matched an unrelated
+    gmail_emails row by coincidence or hit a ForeignKeyViolationError
+    like:
+        Key (raw_email_id)=(98) is not present in table "gmail_emails"
+
+    Callers that know the real gmail_emails.id (e.g. reparse_email,
+    which already has source_gmail_emails_id) MUST pass it in via the
+    raw_email_id parameter. If it's genuinely unknown, we save NULL —
+    the column allows NULL (ON DELETE SET NULL) — rather than guessing
+    wrong and crashing the whole save.
 
     Returns:
     {
@@ -22,13 +46,12 @@ async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
         "requirement_id": id or None
     }
     """
-
     # ---------------------------------------------------------------------------
-    # Task 1: Save raw email
+    # Task 1: Save raw email (into `emails` table — internal bookkeeping only,
+    # NOT the same id space as gmail_emails / raw_email_id FK)
     # ---------------------------------------------------------------------------
     email_result = await save_raw_email(db, gmail_msg)
     email_status = email_result["status"]
-    real_email_id = email_result["id"]  # emails.id — the only valid raw_email_id FK value
 
     if email_status == "already_exists":
         return {
@@ -63,7 +86,6 @@ async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
 
     # Use plain text if available, else convert HTML
     body = body_text or html_to_text(body_html)
-
     parsed = parse_requirement(subject, body, headers)
 
     # ---------------------------------------------------------------------------
@@ -74,11 +96,13 @@ async def process_email(db: AsyncSession, gmail_msg: dict) -> dict:
     # ---------------------------------------------------------------------------
     # Task 5: Dedup and save requirement
     # ---------------------------------------------------------------------------
+    # Use the caller-supplied gmail_emails.id if we have it. Do NOT fall back
+    # to emails.id here — that was the source of the FK violation.
     result = await save_requirement(
         db=db,
         parsed=parsed,
         cleaned_jd=cleaned_jd,
-        raw_email_id=real_email_id,
+        raw_email_id=raw_email_id,
         received_date=gmail_msg.get("received_at"),  # BUG FIX: was never passed through — column stayed NULL forever
     )
 

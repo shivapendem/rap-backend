@@ -272,7 +272,11 @@ async def process_email_endpoint(
 
     gmail_msg = {k: v for k, v in payload.model_dump().items() if v is not None}
 
-    result = await process_email(db, gmail_msg)
+    # payload.raw_email_id is the gmail_emails.id the frontend/caller knows
+    # about (if any) — this is the value the FK actually needs. Passing it
+    # through here instead of letting pipeline.process_email() guess avoids
+    # ForeignKeyViolationError on requirements.raw_email_id.
+    result = await process_email(db, gmail_msg, raw_email_id=payload.raw_email_id)
 
     # Update gmail_emails processed status
     if payload.raw_email_id:
@@ -470,8 +474,12 @@ async def reparse_email(
         )
         email = email_result.scalars().first()
         if not email:
-            # Never went through the pipeline before — create it now
-            save_result = await process_email(db, gmail_msg)
+            # Never went through the pipeline before — create it now.
+            # source_gmail_emails_id is the real gmail_emails.id (the FK
+            # target for requirements.raw_email_id) — must be passed through
+            # explicitly, or process_email() would fall back to NULL and
+            # this requirement would end up unlinked from its raw email.
+            save_result = await process_email(db, gmail_msg, raw_email_id=source_gmail_emails_id)
             email_result = await db.execute(
                 select(Email).where(Email.gmail_message_id == gmail_message_id)
             )
