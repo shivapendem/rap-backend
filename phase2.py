@@ -191,6 +191,13 @@ async def get_requirement_detail(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    # experience/skills are NOT real columns on Requirement — they only
+    # ever live inside parsed_fields (see dedup.py / reparse_email below).
+    # Reading requirement.experience / requirement.skills directly would
+    # raise AttributeError the moment this endpoint is hit. Pull them out
+    # of parsed_fields instead.
+    parsed_fields = requirement.parsed_fields or {}
+
     return RequirementDetailResponse(
         id=str(requirement.id),
         role=requirement.role,
@@ -203,8 +210,8 @@ async def get_requirement_detail(
         employment_types=requirement.employment_types,
         rate=requirement.rate,
         duration=requirement.duration,
-        experience=requirement.experience,
-        skills=requirement.skills,
+        experience=parsed_fields.get("experience"),
+        skills=parsed_fields.get("skills"),
         job_description=requirement.job_description,
         parsed_fields=requirement.parsed_fields,
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
@@ -269,7 +276,6 @@ async def process_email_endpoint(
 
     # Update gmail_emails processed status
     if payload.raw_email_id:
-        from sqlalchemy import text
         await db.execute(
             text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
             {"id": payload.raw_email_id}
@@ -473,6 +479,16 @@ async def reparse_email(
 
     real_email_id = email.id
 
+    # requirements.raw_email_id's real FK constraint points at
+    # gmail_emails.id, NOT emails.id (confirmed via pg_constraint — see
+    # requirements_sync.py header comment for the full story). Using
+    # emails.id here was the same bug that used to break the sync job:
+    # it either violates the FK outright (500) or, worse, silently
+    # matches the wrong gmail_emails row on small overlapping ids.
+    # Prefer the true gmail_emails.id; only fall back to emails.id for
+    # the legacy case where this email never had a gmail_emails row.
+    fk_raw_email_id = source_gmail_emails_id if source_gmail_emails_id is not None else real_email_id
+
     # ---- Step 3: re-run parser + cleaner on the raw text ----
     body = body_text or html_to_text(body_html)
     parsed = parse_requirement(subject, body, headers)
@@ -480,7 +496,7 @@ async def reparse_email(
 
     # ---- Step 4: update existing requirement in place, or create one ----
     existing_req_result = await db.execute(
-        select(Requirement).where(Requirement.raw_email_id == real_email_id)
+        select(Requirement).where(Requirement.raw_email_id == fk_raw_email_id)
     )
     existing_req = existing_req_result.scalars().first()
 
@@ -500,11 +516,12 @@ async def reparse_email(
         existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
         existing_req.rate = parsed.get("rate")
         existing_req.duration = parsed.get("duration")
-        existing_req.experience = parsed.get("experience")
-        existing_req.skills = parsed.get("skills")
         existing_req.job_description = cleaned_jd
         existing_req.jd_hash = jd_hash
         existing_req.dedup_key = dedup_key
+        # experience/skills aren't real columns on Requirement (they live
+        # inside parsed_fields) — assigning them directly was a no-op that
+        # silently dropped the data; parsed_fields below carries them.
         existing_req.parsed_fields = parsed
         existing_req.parse_confidence = parsed.get("parse_confidence", 0.0)
         if received_date and not existing_req.received_date:
@@ -514,7 +531,7 @@ async def reparse_email(
         requirement_id = existing_req.id
     else:
         result = await save_requirement(
-            db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=real_email_id,
+            db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=fk_raw_email_id,
             received_date=received_date,
         )
         requirement_status = result["status"]
