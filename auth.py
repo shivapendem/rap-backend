@@ -105,8 +105,8 @@ def set_session_cookies(response, token: str) -> None:
         httponly=True,
         max_age=ACCESS_TOKEN_EXPIRE_HOURS * 3600,
         expires=ACCESS_TOKEN_EXPIRE_HOURS * 3600,
-        samesite=samesite,
-        secure=secure,
+        samesite="None",
+        secure=True,
     )
     response.set_cookie(key="rap_session", **cookie_kwargs)
     response.set_cookie(key="session", **cookie_kwargs)
