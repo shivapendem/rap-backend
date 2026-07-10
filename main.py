@@ -278,7 +278,7 @@ async def login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
-    return LoginResponse(role=user.role, name=user.full_name, access_token:token)
+    return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
 @app.post("/auth/logout")
@@ -365,7 +365,7 @@ async def google_login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
-    return LoginResponse(role=user.role, name=user.full_name, access_token:token)
+    return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
 @app.get("/api/requirements", response_model=PaginatedRequirements)
