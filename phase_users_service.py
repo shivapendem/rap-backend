@@ -36,6 +36,9 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
         status="Active" if u.is_active else "Inactive",
         is_active=u.is_active,
         created_at=u.created_at.isoformat() if u.created_at else "",
+        updated_at=u.updated_at.isoformat() if u.updated_at else "",
+        skills=u.skills if isinstance(u.skills, list) else None,
+        needsto_fetch_mail=bool(u.needsto_fetch_mail),
     )
 
 
@@ -55,6 +58,17 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
             RecruiterRefDTO(id=str(r.id), name=r.full_name, email=r.email) for r in recruiters
         ],
         created_at=c.created_at.isoformat() if c.created_at else "",
+        phone=c.phone,
+        sales_recruiter_user_id=str(c.sales_recruiter_user_id) if c.sales_recruiter_user_id else None,
+        current_location=c.current_location,
+        preferred_locations=c.preferred_locations,
+        availability_status=c.availability_status,
+        total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
+        secondary_skills=c.secondary_skills,
+        preferred_roles=c.preferred_roles,
+        ats_score=float(c.ats_score) if c.ats_score is not None else None,
+        updated_at=c.updated_at.isoformat() if c.updated_at else "",
+        has_resume=bool(c.base_resume_file_path or c.base_resume_text),
     )
 
 
@@ -147,6 +161,10 @@ class UserService:
         user.email = req.email
         user.role = req.role
         user.is_active = req.is_active
+        if req.skills is not None:
+            user.skills = req.skills
+        if req.needsto_fetch_mail is not None:
+            user.needsto_fetch_mail = req.needsto_fetch_mail
         user = await UserRepository.update(db, user)
 
         # Apply consultant-only fields if this user has a linked consultant profile
@@ -253,6 +271,12 @@ class ConsultantAssignmentService:
         status: Optional[str], *, admin_id: str,
         work_authorization: Optional[str] = None,
         preferred_employment_types: Optional[list] = None,
+        phone: Optional[str] = None,
+        current_location: Optional[str] = None,
+        preferred_locations: Optional[str] = None,
+        total_experience_years: Optional[float] = None,
+        secondary_skills: Optional[str] = None,
+        preferred_roles: Optional[str] = None,
     ) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -268,6 +292,18 @@ class ConsultantAssignmentService:
             consultant.work_authorization = work_authorization
         if preferred_employment_types is not None:
             consultant.preferred_employment_types = preferred_employment_types
+        if phone is not None:
+            consultant.phone = phone
+        if current_location is not None:
+            consultant.current_location = current_location
+        if preferred_locations is not None:
+            consultant.preferred_locations = preferred_locations
+        if total_experience_years is not None:
+            consultant.total_experience_years = total_experience_years
+        if secondary_skills is not None:
+            consultant.secondary_skills = secondary_skills
+        if preferred_roles is not None:
+            consultant.preferred_roles = preferred_roles
 
         consultant = await ConsultantRepository.update(db, consultant)
 

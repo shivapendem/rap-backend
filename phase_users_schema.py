@@ -25,6 +25,9 @@ class UserAdminRowDTO(BaseModel):
     status: str          # "Active" | "Inactive" — derived from is_active
     is_active: bool
     created_at: str
+    updated_at: str = ""
+    skills: Optional[List[str]] = None
+    needsto_fetch_mail: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -92,6 +95,9 @@ class EditUserRequestDTO(BaseModel):
     preferred_employment_types: Optional[List[str]] = None
     primary_skills: Optional[str] = None
     recruiter_id: Optional[str] = None
+    # user-level optional fields — apply regardless of role
+    skills: Optional[List[str]] = None
+    needsto_fetch_mail: Optional[bool] = None
 
     @field_validator("role")
     @classmethod
@@ -151,6 +157,19 @@ class ConsultantAdminRowDTO(BaseModel):
     gmail_connected: bool = False
     assigned_recruiters: List[RecruiterRefDTO] = []
     created_at: str
+    # Full profile fields — added so the admin detail page can show
+    # everything on the consultants table besides id/user_id.
+    phone: Optional[str] = None
+    sales_recruiter_user_id: Optional[str] = None
+    current_location: Optional[str] = None
+    preferred_locations: Optional[str] = None
+    availability_status: Optional[str] = None
+    total_experience_years: Optional[float] = None
+    secondary_skills: Optional[str] = None
+    preferred_roles: Optional[str] = None
+    ats_score: Optional[float] = None
+    updated_at: str = ""
+    has_resume: bool = False  # base_resume_file_path/base_resume_text can be large — expose presence, not raw content
 
     model_config = {"from_attributes": True}
 
@@ -184,6 +203,12 @@ class UpdateConsultantRequestDTO(BaseModel):
     status: Optional[str] = None
     work_authorization: Optional[str] = None
     preferred_employment_types: Optional[List[str]] = None
+    phone: Optional[str] = None
+    current_location: Optional[str] = None
+    preferred_locations: Optional[str] = None
+    total_experience_years: Optional[float] = None
+    secondary_skills: Optional[str] = None
+    preferred_roles: Optional[str] = None
 
     @field_validator("status")
     @classmethod

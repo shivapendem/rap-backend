@@ -589,6 +589,23 @@ class VendorContactDTO(BaseModel):
     phone: str
 
 
+def _coerce_skills_list(value) -> list:
+    """
+    parsed_fields['skills'] should be a List[str] (see parser.py's
+    extract_skills), but requirements parsed before that fix — or any
+    future bad data — may still have it stored as a raw comma-separated
+    string. RecruiterParsedFieldsDTO.skills is strictly List[str], and a
+    single bad row fails Pydantic response validation for the ENTIRE
+    /api/recruiter/requirements list (not just that row), so this
+    normalizes defensively rather than trusting what's in the DB.
+    """
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    if isinstance(value, str) and value.strip():
+        return [s.strip() for s in value.split(",") if s.strip()]
+    return []
+
+
 class RecruiterParsedFieldsDTO(BaseModel):
     experience: str = ""
     skills: List[str] = []
@@ -824,6 +841,43 @@ async def get_all_requirements_for_recruiter(
     if work_mode_filter:
         base_q = base_q.where(Requirement.work_mode == work_mode_filter)
         count_q = count_q.where(Requirement.work_mode == work_mode_filter)
+    # dateFrom/dateTo/status were accepted as query params but never applied
+    # to the query below — the FilterBar's date range and status filters had
+    # no effect at all. Applying them now.
+    if dateFrom:
+        try:
+            df = datetime.fromisoformat(dateFrom).replace(hour=0, minute=0, second=0, microsecond=0)
+            base_q = base_q.where(Requirement.received_date >= df)
+            count_q = count_q.where(Requirement.received_date >= df)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="dateFrom must be an ISO date (YYYY-MM-DD)")
+    if dateTo:
+        try:
+            dt = datetime.fromisoformat(dateTo).replace(hour=23, minute=59, second=59, microsecond=999999)
+            base_q = base_q.where(Requirement.received_date <= dt)
+            count_q = count_q.where(Requirement.received_date <= dt)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="dateTo must be an ISO date (YYYY-MM-DD)")
+    if status:
+        # This endpoint never joins RequirementConsultantMatch, so the
+        # displayed status (_match_status_to_recruiter_requirement_status
+        # called with match_status=None below) can only ever resolve to
+        # "New" or "Matched" — mirror that same two-way split here rather
+        # than filtering on the raw NEW/REVIEWING/SUBMITTED/... DB values,
+        # which the frontend never sends.
+        if status == "New":
+            base_q = base_q.where(Requirement.status == "NEW")
+            count_q = count_q.where(Requirement.status == "NEW")
+        elif status == "Matched":
+            base_q = base_q.where(Requirement.status != "NEW")
+            count_q = count_q.where(Requirement.status != "NEW")
+        else:
+            # "Resume Ready" / "Applied" / "Needs Review" / "Rejected" can't
+            # occur on this unfiltered list (those only exist once a
+            # consultant match exists) — correctly yields zero rows rather
+            # than silently ignoring the filter and showing everything.
+            base_q = base_q.where(False)
+            count_q = count_q.where(False)
 
     allowed_sort = {"received_date", "role", "vendor", "client", "status", "created_at"}
     sort_col_name = sortField if sortField in allowed_sort else "received_date"
@@ -849,7 +903,7 @@ async def get_all_requirements_for_recruiter(
             jobDescription=r.job_description or "",
             parsedFields=RecruiterParsedFieldsDTO(
                 experience=str((r.parsed_fields or {}).get("experience", "")) if r.parsed_fields else "",
-                skills=(r.parsed_fields or {}).get("skills", []) if r.parsed_fields else [],
+                skills=_coerce_skills_list((r.parsed_fields or {}).get("skills")) if r.parsed_fields else [],
                 education=str((r.parsed_fields or {}).get("education", "")) if r.parsed_fields else "",
                 budget=r.rate or "",
             ),

@@ -57,24 +57,6 @@ DURATION_PATTERNS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Experience patterns
-# ---------------------------------------------------------------------------
-EXPERIENCE_PATTERNS = [
-    r'(?i)experience\s*[:\-]\s*(.+)',
-    r'(?i)exp\s*[:\-]\s*(.+)',
-    r'(?i)(\d+\+?\s*(?:to|-)?\s*\d*\+?\s*(?:years?|yrs?)\s*(?:of)?\s*experience)',
-]
-
-# ---------------------------------------------------------------------------
-# Skills patterns
-# ---------------------------------------------------------------------------
-SKILL_LABEL_PATTERNS = [
-    r'(?i)(?:primary|required|mandatory|technical|key)?\s*skills?\s*[:\-]\s*(.+)',
-    r'(?i)tech\s*stack\s*[:\-]\s*(.+)',
-    r'(?i)technologies\s*[:\-]\s*(.+)',
-]
-
-# ---------------------------------------------------------------------------
 # Work mode patterns
 # ---------------------------------------------------------------------------
 WORK_MODE_PATTERNS = {
@@ -82,6 +64,29 @@ WORK_MODE_PATTERNS = {
     "ONSITE": [r'(?i)\bon.?site\b', r'(?i)\bin.?person\b', r'(?i)\bon\s*location\b'],
     "HYBRID": [r'(?i)\bhybrid\b'],
 }
+
+# ---------------------------------------------------------------------------
+# Experience patterns (years of experience required)
+# ---------------------------------------------------------------------------
+EXPERIENCE_PATTERNS = [
+    r'(?i)(\d+\+?\s*(?:-\s*\d+\s*)?years?\s*(?:of\s*)?experience)',
+    r'(?i)experience\s*[:\-]\s*(\d+\+?\s*(?:-\s*\d+\s*)?years?)',
+    r'(?i)(\d+\+?\s*yrs?\.?\s*(?:of\s*)?exp(?:erience)?)',
+    r'(?i)minimum\s*(?:of\s*)?(\d+\+?\s*years?)',
+]
+
+# ---------------------------------------------------------------------------
+# Skills patterns — labeled lines are checked first (most reliable).
+# ---------------------------------------------------------------------------
+SKILLS_PATTERNS = [
+    r'(?i)primary\s*skills?\s*[:\-]\s*(.+)',
+    r'(?i)required\s*skills?\s*[:\-]\s*(.+)',
+    r'(?i)technical\s*skills?\s*[:\-]\s*(.+)',
+    r'(?i)key\s*skills?\s*[:\-]\s*(.+)',
+    r'(?i)skills?\s*[:\-]\s*(.+)',
+    r'(?i)skill\s*set\s*[:\-]\s*(.+)',
+    r'(?i)tech(?:nology|nical)?\s*stack\s*[:\-]\s*(.+)',
+]
 
 
 def first_match(patterns: list, text: str) -> Optional[str]:
@@ -129,26 +134,39 @@ def extract_employment_types(text: str) -> list:
 
 
 def extract_experience(text: str) -> Optional[str]:
-    """Extract required experience."""
+    """Extract years-of-experience requirement from text, e.g. '5+ years experience'."""
     for pattern in EXPERIENCE_PATTERNS:
         m = re.search(pattern, text)
         if m:
-            value = m.group(1).strip()
-            value = re.split(r'[\n\r|]', value)[0].strip()
-            return value
+            return m.group(1).strip()
     return None
 
 
-def extract_skills(text: str) -> Optional[str]:
-    """Extract required skills."""
-    for pattern in SKILL_LABEL_PATTERNS:
-        m = re.search(pattern, text)
-        if m:
-            value = m.group(1).strip()
-            value = re.split(r'[\n\r]', value)[0].strip()
-            return value
+def extract_skills(text: str) -> list:
+    """
+    Extract a list of required skills, e.g. after 'Primary Skills:' or
+    'Required Skills:'. Always returns individual skill tokens (a list),
+    never the raw matched line — RecruiterParsedFieldsDTO.skills
+    (phase5.py) is typed List[str], and storing a bare string here
+    previously caused every requirement parsed with skills present to
+    fail Pydantic response validation on GET /api/recruiter/requirements,
+    500ing the whole list. Returns [] (not None) when nothing is found,
+    to stay consistent with that List[str] contract.
+    """
+    line = first_match(SKILLS_PATTERNS, text)
+    if not line:
+        return []
 
-    return None
+    # Split on common delimiters
+    parts = re.split(r'[,;|/]', line)
+    skills = [p.strip().strip('.') for p in parts if p.strip()]
+
+    # Drop obviously non-skill noise (too long = probably a full sentence, not a list)
+    skills = [s for s in skills if 0 < len(s) <= 40]
+
+    # Remove duplicates while preserving order
+    return list(dict.fromkeys(skills))
+
 
 def extract_vendor_email(headers: dict, body: str) -> Optional[str]:
     """Extract vendor email from Reply-To header or body."""
@@ -199,11 +217,11 @@ def parse_requirement(
     location = first_match(LOCATION_PATTERNS, full_text)
     rate = first_match(RATE_PATTERNS, full_text)
     duration = first_match(DURATION_PATTERNS, full_text)
-    experience = extract_experience(full_text)
-    skills = extract_skills(full_text)
     work_mode = extract_work_mode(full_text)
     employment_types = extract_employment_types(full_text)
     vendor_email = extract_vendor_email(headers, body)
+    experience = extract_experience(full_text)
+    skills = extract_skills(full_text)
 
     # Extract vendor name from From header
     from_header = headers.get("from", "")
@@ -214,19 +232,19 @@ def parse_requirement(
             vendor_name = name_match.group(1).strip().strip('"')
 
     parsed = {
-    "role": role,
-    "client": client,
-    "location": location,
-    "rate": rate,
-    "duration": duration,
-    "experience": experience,
-    "skills": skills,
-    "work_mode": work_mode,
-    "employment_types": employment_types,
-    "vendor_email": vendor_email,
-    "vendor": vendor_name,
-}
-    
+        "role": role,
+        "client": client,
+        "location": location,
+        "rate": rate,
+        "duration": duration,
+        "work_mode": work_mode,
+        "employment_types": employment_types,
+        "vendor_email": vendor_email,
+        "vendor": vendor_name,
+        "experience": experience,
+        "skills": skills,
+    }
+
     # Calculate confidence score
     confidence = calculate_confidence(parsed)
     parsed["parse_confidence"] = confidence
