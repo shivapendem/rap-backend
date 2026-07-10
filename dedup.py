@@ -104,8 +104,14 @@ async def save_requirement(
         jd_hash=jd_hash,
         dedup_key=dedup_key,
         parsed_fields={
-            **(parsed.get("parsed_fields") or {}),
+            # NOTE: parsed.get("parsed_fields") used to be spread in here,
+            # but parse_requirement() never actually returns a nested
+            # "parsed_fields" key — that always resolved to {}, silently
+            # dropping "skills" from every newly-synced requirement (it
+            # only ever showed up after a manual Reparse, which builds
+            # this dict differently). Pull both fields explicitly instead.
             "experience": parsed.get("experience"),
+            "skills": parsed.get("skills"),
         },
         received_date=received_date,
         status="NEW",

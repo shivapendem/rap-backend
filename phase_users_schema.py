@@ -3,6 +3,13 @@
 # Admin User Management — Pydantic schemas
 # Adapted from the standalone user_mgmt_backend to use your real User/
 # Consultant field names (full_name, password_hash, etc.)
+#
+# MIGRATION REQUIRED: users.experience_years (Numeric, nullable) was added
+# to the User model to back the Recruiter "Experience (Years)" field. Run
+# this against the real Postgres database before deploying this change:
+#     ALTER TABLE users ADD COLUMN experience_years NUMERIC;
+# Until that's applied, any query touching users will fail with
+# "column users.experience_years does not exist".
 # ---------------------------------------------------------------------------
 
 from typing import Optional, List
@@ -28,6 +35,7 @@ class UserAdminRowDTO(BaseModel):
     updated_at: str = ""
     skills: Optional[List[str]] = None
     needsto_fetch_mail: bool = False
+    experience_years: Optional[float] = None
 
     model_config = {"from_attributes": True}
 
@@ -98,6 +106,7 @@ class EditUserRequestDTO(BaseModel):
     # user-level optional fields — apply regardless of role
     skills: Optional[List[str]] = None
     needsto_fetch_mail: Optional[bool] = None
+    experience_years: Optional[float] = Field(None, ge=0, le=60)
 
     @field_validator("role")
     @classmethod

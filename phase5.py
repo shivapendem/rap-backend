@@ -48,7 +48,7 @@ from typing import List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, cast, Text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -814,6 +814,8 @@ async def get_all_requirements_for_recruiter(
     sortField: Optional[str] = Query(None),
     sortDir: Optional[str] = Query(None),
     roleSearch: Optional[str] = Query(None),
+    experienceSearch: Optional[str] = Query(None),
+    skillsSearch: Optional[str] = Query(None),
     workMode: Optional[str] = Query(None),
     dateFrom: Optional[str] = Query(None),
     dateTo: Optional[str] = Query(None),
@@ -834,6 +836,8 @@ async def get_all_requirements_for_recruiter(
     _require_role(current_user, "RECRUITER", "ADMIN")
 
     roleSearch = _validate_filter_text(roleSearch, "roleSearch")
+    experienceSearch = _validate_filter_text(experienceSearch, "experienceSearch")
+    skillsSearch = _validate_filter_text(skillsSearch, "skillsSearch")
     work_mode_filter = _validate_work_mode(workMode)
 
     base_q = select(Requirement)
@@ -842,6 +846,15 @@ async def get_all_requirements_for_recruiter(
     if roleSearch:
         base_q = base_q.where(Requirement.role.ilike(f"%{roleSearch}%"))
         count_q = count_q.where(Requirement.role.ilike(f"%{roleSearch}%"))
+    # experience/skills live inside parsed_fields (JSON) rather than their
+    # own columns, so match against the JSON blob cast to text — portable
+    # across Postgres and the SQLite dev fallback, unlike JSONB path ops.
+    if experienceSearch:
+        base_q = base_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{experienceSearch}%"))
+        count_q = count_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{experienceSearch}%"))
+    if skillsSearch:
+        base_q = base_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{skillsSearch}%"))
+        count_q = count_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{skillsSearch}%"))
     if work_mode_filter:
         base_q = base_q.where(Requirement.work_mode == work_mode_filter)
         count_q = count_q.where(Requirement.work_mode == work_mode_filter)
@@ -936,6 +949,8 @@ async def get_consultant_requirements_for_recruiter(
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     roleSearch: Optional[str] = Query(None),
+    experienceSearch: Optional[str] = Query(None),
+    skillsSearch: Optional[str] = Query(None),
     workMode: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
@@ -965,6 +980,8 @@ async def get_consultant_requirements_for_recruiter(
             raise HTTPException(status_code=403, detail="Consultant not assigned to this recruiter")
 
     roleSearch = _validate_filter_text(roleSearch, "roleSearch")
+    experienceSearch = _validate_filter_text(experienceSearch, "experienceSearch")
+    skillsSearch = _validate_filter_text(skillsSearch, "skillsSearch")
     work_mode_filter = _validate_work_mode(workMode)
 
     base_q = (
@@ -980,6 +997,10 @@ async def get_consultant_requirements_for_recruiter(
     )
     if roleSearch:
         base_q = base_q.where(Requirement.role.ilike(f"%{roleSearch}%"))
+    if experienceSearch:
+        base_q = base_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{experienceSearch}%"))
+    if skillsSearch:
+        base_q = base_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{skillsSearch}%"))
     if work_mode_filter:
         base_q = base_q.where(Requirement.work_mode == work_mode_filter)
 
@@ -1033,7 +1054,12 @@ async def get_consultant_requirements_for_recruiter(
             receivedDate=req.received_date.isoformat() if req.received_date else "",
             status=_match_status_to_recruiter_requirement_status(match.status, req.status),
             jobDescription=req.job_description or "",
-            parsedFields=RecruiterParsedFieldsDTO(budget=req.rate or ""),
+            parsedFields=RecruiterParsedFieldsDTO(
+                experience=str((req.parsed_fields or {}).get("experience", "")) if req.parsed_fields else "",
+                skills=_coerce_skills_list((req.parsed_fields or {}).get("skills")) if req.parsed_fields else [],
+                education=str((req.parsed_fields or {}).get("education", "")) if req.parsed_fields else "",
+                budget=req.rate or "",
+            ),
             vendorContact=VendorContactDTO(**_parse_vendor_contact(req.vendor_contact)),
             matchScore=float(match.match_score),
             matchedSkills=match.matched_skills or [],

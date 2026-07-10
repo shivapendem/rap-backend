@@ -61,6 +61,12 @@ class User(Base):
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     needsto_fetch_mail = Column("needto_fetch_mail", Boolean, nullable=False, default=False)
     skills = JSONBColumn(nullable=False, default=list)
+    # Recruiter-facing "Experience (Years)" field on the Users screen. Only
+    # meaningful for RECRUITER-role accounts today, but lives on User (not
+    # Consultant) since it's a recruiter attribute, not a consultant one.
+    # REQUIRES A DB MIGRATION before this is usable against the real
+    # Postgres database — see note at top of phase_users_schema.py.
+    experience_years = Column(Numeric, nullable=True)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 
@@ -552,7 +558,12 @@ class EmailQueue(Base):
     to_email = Column(Text, nullable=False)
     subject = Column(Text, nullable=False)
     content = Column(Text, nullable=True)
-    attachments = Column(JSONB, nullable=True)
+    # FIX: was `Column(JSONB, nullable=True)` — JSONB is only imported
+    # inside the `if _is_postgres:` branch above, so on SQLite (dev
+    # fallback) this name is undefined and importing this module raises
+    # NameError. Use the existing JSONBColumn() helper instead, which
+    # already picks the right underlying type for either backend.
+    attachments = JSONBColumn(nullable=True)
     status = Column(Text, nullable=False, default="QUEUED")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

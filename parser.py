@@ -48,6 +48,11 @@ RATE_PATTERNS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Phone patterns — used to build vendor_contact
+# ---------------------------------------------------------------------------
+PHONE_PATTERN = re.compile(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b')
+
+# ---------------------------------------------------------------------------
 # Duration patterns
 # ---------------------------------------------------------------------------
 DURATION_PATTERNS = [
@@ -187,14 +192,66 @@ def extract_vendor_email(headers: dict, body: str) -> Optional[str]:
     return None
 
 
-def calculate_confidence(parsed: dict) -> float:
+def extract_phone(text: str) -> Optional[str]:
+    """Find the first phone-number-shaped token in text, if any."""
+    m = PHONE_PATTERN.search(text)
+    return m.group(0).strip() if m else None
+
+
+def extract_vendor_contact(
+    headers: dict,
+    body: str,
+    vendor_name: Optional[str],
+    vendor_email: Optional[str],
+) -> Optional[str]:
+    """
+    Build a single 'Name <email> phone' string for Requirement.vendor_contact.
+
+    This was previously never populated at all — parse_requirement() had no
+    vendor_contact key in its returned dict, so every requirement saved
+    Requirement.vendor_contact = NULL, and phase5.py's _parse_vendor_contact()
+    always returned {"name": "", "email": "", "phone": ""} regardless of
+    which requirement was opened in the UI.
+
+    Reuses vendor_name/vendor_email already extracted from the From/Reply-To
+    headers (the actual sender is the best available proxy for "who to
+    contact" absent an explicit contact block), and looks for a phone
+    number anywhere in the body text.
+    """
+    phone = extract_phone(body)
+    if not vendor_name and not vendor_email and not phone:
+        return None
+    parts = []
+    if vendor_name:
+        if vendor_email:
+            parts.append(f"{vendor_name} <{vendor_email}>")
+        else:
+            parts.append(vendor_name)
+    elif vendor_email:
+        parts.append(vendor_email)
+    if phone:
+        parts.append(phone)
+    return " ".join(parts) if parts else None
+
+
+def calculate_confidence(parsed: dict, role_matched: bool) -> float:
     """
     Calculate parser confidence score (0.0 to 1.0)
     based on how many fields were extracted.
+
+    role_matched: whether `role` came from an actual ROLE_PATTERNS match,
+    as opposed to falling back to the raw subject line. Counting the
+    subject-line fallback as a real extraction meant every email — job
+    posting or not (calendar invites, "Verify your email", app
+    notifications, etc.) — always scored role as "found" (subject is
+    essentially never empty), which kept non-requirement emails above
+    zero confidence and let them slip into the Requirements table.
     """
-    important_fields = ["role", "client", "location", "rate", "employment_types"]
+    important_fields = ["client", "location", "rate", "employment_types"]
     extracted = sum(1 for f in important_fields if parsed.get(f) and parsed[f] != ["UNKNOWN"])
-    return round(extracted / len(important_fields), 2)
+    if role_matched:
+        extracted += 1
+    return round(extracted / (len(important_fields) + 1), 2)
 
 
 def parse_requirement(
@@ -210,7 +267,8 @@ def parse_requirement(
     full_text = f"{subject}\n{body}"
 
     # Extract role (fallback to subject line)
-    role = first_match(ROLE_PATTERNS, full_text) or subject or "UNKNOWN"
+    matched_role = first_match(ROLE_PATTERNS, full_text)
+    role = matched_role or subject or "UNKNOWN"
 
     # Extract other fields
     client = first_match(CLIENT_PATTERNS, full_text)
@@ -231,6 +289,8 @@ def parse_requirement(
         if name_match:
             vendor_name = name_match.group(1).strip().strip('"')
 
+    vendor_contact = extract_vendor_contact(headers, body, vendor_name, vendor_email)
+
     parsed = {
         "role": role,
         "client": client,
@@ -241,12 +301,22 @@ def parse_requirement(
         "employment_types": employment_types,
         "vendor_email": vendor_email,
         "vendor": vendor_name,
+        "vendor_contact": vendor_contact,
         "experience": experience,
         "skills": skills,
     }
 
     # Calculate confidence score
-    confidence = calculate_confidence(parsed)
+    confidence = calculate_confidence(parsed, role_matched=bool(matched_role))
     parsed["parse_confidence"] = confidence
+
+    # Zero confidence means nothing job-related was found at all — no role
+    # pattern, no client, no location, no rate, no employment type. That's
+    # the signature of a non-requirement email (calendar invite, app
+    # notification, "verify your email", etc.), not a badly-formatted job
+    # posting. Callers (requirements_sync.py, phase2.py) use this to skip
+    # saving a Requirement for it instead of storing the subject line as
+    # a fake "role".
+    parsed["is_likely_requirement"] = confidence > 0.0
 
     return parsed

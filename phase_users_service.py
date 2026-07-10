@@ -39,6 +39,7 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
         updated_at=u.updated_at.isoformat() if u.updated_at else "",
         skills=u.skills if isinstance(u.skills, list) else None,
         needsto_fetch_mail=bool(u.needsto_fetch_mail),
+        experience_years=float(u.experience_years) if u.experience_years is not None else None,
     )
 
 
@@ -165,6 +166,8 @@ class UserService:
             user.skills = req.skills
         if req.needsto_fetch_mail is not None:
             user.needsto_fetch_mail = req.needsto_fetch_mail
+        if req.experience_years is not None:
+            user.experience_years = req.experience_years
         user = await UserRepository.update(db, user)
 
         # Apply consultant-only fields if this user has a linked consultant profile

@@ -132,6 +132,7 @@ class ProfileResponse(BaseModel):
     model_config = {"from_attributes": True}
     id: str
     fullName: Optional[str] = None
+    email: Optional[str] = None
     location: Optional[str] = None
     phone: Optional[str] = None
     linkedInUrl: Optional[str] = None
@@ -148,6 +149,8 @@ class ProfileResponse(BaseModel):
     preferredRoles: Optional[str] = None
     preferredLocations: Optional[str] = None
     totalExperienceYears: Optional[float] = None
+    availabilityStatus: Optional[str] = None
+    createdAt: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +345,7 @@ def _consultant_to_profile_response(c: Consultant, experience_count: int = 0) ->
     return ProfileResponse(
         id=str(c.id),
         fullName=c.full_name,
+        email=c.email,
         location=c.current_location,
         phone=c.phone,
         linkedInUrl=None,  # not in model yet — Phase 8 extension
@@ -358,6 +362,8 @@ def _consultant_to_profile_response(c: Consultant, experience_count: int = 0) ->
         preferredRoles=c.preferred_roles,
         preferredLocations=c.preferred_locations,
         totalExperienceYears=float(c.total_experience_years) if c.total_experience_years is not None else None,
+        availabilityStatus=c.availability_status,
+        createdAt=c.created_at.isoformat() if c.created_at else None,
     )
 
 
