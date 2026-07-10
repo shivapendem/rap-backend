@@ -53,7 +53,7 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     role: str
     name: str
-    token: str
+    access_token: str
 
 
 class GoogleLoginRequest(BaseModel):
@@ -278,7 +278,7 @@ async def login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
-    return LoginResponse(role=user.role, name=user.full_name)
+    return LoginResponse(role=user.role, name=user.full_name, access_token:token)
 
 
 @app.post("/auth/logout")
@@ -365,7 +365,7 @@ async def google_login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
-    return LoginResponse(role=user.role, name=user.full_name, token:token)
+    return LoginResponse(role=user.role, name=user.full_name, access_token:token)
 
 
 @app.get("/api/requirements", response_model=PaginatedRequirements)
