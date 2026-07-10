@@ -75,14 +75,38 @@ def decode_access_token(token: str) -> dict:
 
 
 def set_session_cookies(response, token: str) -> None:
-    """Set both auth cookies consistently."""
+    """Set both auth cookies consistently.
+
+    The frontend now runs on a different origin than this API (no more
+    same-origin Express BFF sitting in front of it), so the browser treats
+    every request as cross-site. Cross-site cookies REQUIRE
+    SameSite=None + Secure=True — Lax/False (the old default) is silently
+    dropped by the browser on a cross-origin response, even though curl
+    (which doesn't enforce SameSite/Secure at all) shows the cookie was
+    sent just fine. That's why `curl` "works" but the browser stays
+    logged out.
+
+    IMPORTANT: Secure=True cookies are only ever set by browsers over
+    HTTPS. Until this API is served over HTTPS, SameSite=None cookies
+    will NOT be set by the browser no matter what this function does —
+    there is no code-only fix for that half. Once HTTPS is live, this
+    already defaults to the correct cross-site-safe settings.
+
+    Override via env if needed:
+      COOKIE_SAMESITE=lax|strict|none   (default: none)
+      COOKIE_SECURE=true|false          (default: true)
+    """
+    samesite = os.getenv("COOKIE_SAMESITE", "none").lower()
+    secure_env = os.getenv("COOKIE_SECURE")
+    secure = (secure_env.lower() == "true") if secure_env is not None else True
+
     cookie_kwargs = dict(
         value=token,
         httponly=True,
         max_age=ACCESS_TOKEN_EXPIRE_HOURS * 3600,
         expires=ACCESS_TOKEN_EXPIRE_HOURS * 3600,
-        samesite="lax",
-        secure=IS_PRODUCTION,
+        samesite=samesite,
+        secure=secure,
     )
     response.set_cookie(key="rap_session", **cookie_kwargs)
     response.set_cookie(key="session", **cookie_kwargs)
