@@ -573,6 +573,8 @@ class ConsultantRequirementResponse(BaseModel):
     vendorEmail: Optional[str] = None
     assignmentExists: bool
     appliedAt: Optional[str] = None
+    skills: List[str] = []
+    experience: Optional[str] = None
 
 
 class ConsultantRequirementsListResponse(BaseModel):
@@ -787,6 +789,8 @@ async def get_consultant_requirements(
             vendorEmail=req.vendor_email,
             assignmentExists=True,
             appliedAt=sent_at_by_req.get(req.id),
+            skills=_coerce_skills_list((req.parsed_fields or {}).get("skills")),
+            experience=(req.parsed_fields or {}).get("experience") or None,
         ))
 
     return ConsultantRequirementsListResponse(

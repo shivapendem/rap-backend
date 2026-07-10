@@ -82,7 +82,7 @@ class RequirementDetailResponse(BaseModel):
     rate: Optional[str] = None
     duration: Optional[str] = None
     experience: Optional[str] = None
-    skills: Optional[str] = None  
+    skills: Optional[str] = None
     job_description: Optional[str] = None
     parsed_fields: Optional[dict] = None
     parse_confidence: Optional[float] = None
@@ -405,7 +405,11 @@ async def reparse_email(
        Otherwise create a new Requirement via the normal dedup path.
     5. Mark the raw email as processed/parsed.
     """
-    _require_role(current_user, "ADMIN")
+    # Was ADMIN-only while every other Gmail admin endpoint (list, single
+    # raw-email view) allows ADMIN or RECRUITER — a RECRUITER could open
+    # the raw email modal but got a 403 (shown generically as "Failed to
+    # queue reparse") clicking Reparse. Aligned with the rest of this file.
+    _require_role(current_user, "ADMIN", "RECRUITER")
 
     # ---- Step 1: load raw source (gmail_emails, falling back to emails) ----
     gmail_row_result = await db.execute(

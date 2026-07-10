@@ -60,7 +60,7 @@ class User(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     needsto_fetch_mail = Column("needto_fetch_mail", Boolean, nullable=False, default=False)
-    skills = JSONBColumn(nullable=True)
+    skills = JSONBColumn(nullable=False, default=list)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 

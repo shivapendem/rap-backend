@@ -46,6 +46,8 @@ import logging
 import math
 import os
 import re
+import secrets
+import string
 import uuid
 from datetime import datetime, date
 from pathlib import Path
@@ -147,29 +149,69 @@ class ProfileResponse(BaseModel):
     preferredLocations: Optional[str] = None
     totalExperienceYears: Optional[float] = None
 
+
+# ---------------------------------------------------------------------------
+# Admin "Add Consultant" request/response — field names, enum values, and
+# response shape verified against the actual frontend form component
+# (AddConsultantDrawer.tsx): its useCreateConsultant() hook posts snake_case
+# keys straight from `form` state, validates work_auth against WORK_AUTHS =
+# ["USC","GC","H1B","OPT","CPT","EAD","TN","Other"] and employment_prefs
+# against EMP_PREFS = ["C2C","W2","1099","FULL_TIME","CONTRACT"], and reads
+# result.message / result.temp_password back from CreateConsultantResponseDTO
+# to show the "temporary password — shown once" panel. This DTO intentionally
+# does NOT follow the camelCase convention ProfileUpdateRequest uses — its
+# only consumer is this one admin form, so it matches that form's payload
+# shape exactly, same as the per-endpoint casing convention phase5.py uses.
+# ---------------------------------------------------------------------------
+
+_ADMIN_WORK_AUTHS = {"USC", "GC", "H1B", "OPT", "CPT", "EAD", "TN", "Other"}
+_ADMIN_EMPLOYMENT_PREFS = {"C2C", "W2", "1099", "FULL_TIME", "CONTRACT"}
+
+
 class AdminConsultantCreateRequest(BaseModel):
-    fullName: str = Field(..., min_length=1, max_length=200)
+    name: str = Field(..., min_length=2, max_length=100)
     email: EmailStr
+    work_auth: str
+    employment_prefs: List[str] = Field(..., min_length=1)
+    primary_skills: str = ""
+    recruiter_id: Optional[str] = None
     phone: Optional[str] = Field(None, max_length=30)
-    workAuth: Optional[str] = None
-    employmentTypes: List[str] = ["C2C"]
-    preferredRoles: Optional[str] = None
-    preferredLocations: Optional[str] = None
-    totalExperienceYears: Optional[float] = Field(None, ge=0, le=60)
+    current_location: Optional[str] = None
+    preferred_locations: Optional[str] = None
+    availability_status: Optional[str] = None
+    total_experience_years: Optional[float] = Field(None, ge=0, le=60)
+    secondary_skills: Optional[str] = None
+    preferred_roles: Optional[str] = None
 
     @field_validator("email")
     @classmethod
     def normalise_email(cls, v):
         return v.lower().strip()
 
-    @field_validator("employmentTypes")
+    @field_validator("work_auth")
     @classmethod
-    def validate_employment_types(cls, v):
-        allowed = {"C2C", "W2", "FULL_TIME"}
-        invalid = [t for t in v if t not in allowed]
+    def validate_work_auth(cls, v):
+        if v not in _ADMIN_WORK_AUTHS:
+            raise ValueError(f"work_auth must be one of {sorted(_ADMIN_WORK_AUTHS)}")
+        return v
+
+    @field_validator("employment_prefs")
+    @classmethod
+    def validate_employment_prefs(cls, v):
+        invalid = [t for t in v if t not in _ADMIN_EMPLOYMENT_PREFS]
         if invalid:
-            raise ValueError(f"Invalid employmentTypes: {invalid}")
+            raise ValueError(f"Invalid employment_prefs: {invalid}")
         return list(dict.fromkeys(v))
+
+
+class CreateConsultantResponse(BaseModel):
+    """Matches frontend CreateConsultantResponseDTO — the drawer reads
+    result.message and result.temp_password directly."""
+    message: str
+    temp_password: str
+    consultant_id: str
+    name: str
+    email: str
 
 
 class ConsultantListResponse(BaseModel):
@@ -405,6 +447,59 @@ def _extract_resume_text(file_bytes: bytes, content_type: str) -> str:
     return ""
 
 
+def _generate_temp_password(length: int = 12) -> str:
+    """Generate a random temporary password containing upper, lower, and digit chars."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    while True:
+        pwd = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (
+            any(c.islower() for c in pwd)
+            and any(c.isupper() for c in pwd)
+            and any(c.isdigit() for c in pwd)
+        ):
+            return pwd
+
+
+def _hash_password(password: str) -> str:
+    """
+    Hash a password for storage. Prefers auth.py's own hasher, so the login
+    flow (auth.py) verifies it with the exact same algorithm/config it was
+    hashed with; falls back to a local passlib bcrypt context only if
+    auth.py doesn't expose one.
+    """
+    try:
+        from auth import get_password_hash
+        return get_password_hash(password)
+    except ImportError:
+        pass
+    try:
+        from passlib.context import CryptContext
+        return CryptContext(schemes=["bcrypt"], deprecated="auto").hash(password)
+    except ImportError:
+        raise RuntimeError(
+            "No password hasher available for admin_create_consultant() — "
+            "add get_password_hash() to auth.py, or install passlib[bcrypt]."
+        )
+
+
+def _set_password_on_user(user: User, hashed_password: str) -> None:
+    """
+    Set the hashed password on a new User instance. The exact column name
+    isn't referenced anywhere else in this file, so this checks the common
+    candidates on the mapped class rather than guessing — update the
+    candidate list if your User model uses a different name.
+    """
+    for candidate in ("hashed_password", "password_hash", "password"):
+        if hasattr(User, candidate):
+            setattr(user, candidate, hashed_password)
+            return
+    raise RuntimeError(
+        "Could not find a password column on the User model (checked "
+        "hashed_password/password_hash/password) — update "
+        "_set_password_on_user() in phase3.py with the correct column name."
+    )
+
+
 # Canonical skill library — 100+ skills with aliases for detection
 _SKILL_ALIASES: dict[str, list[str]] = {
     "Python": ["python", "python3"],
@@ -634,38 +729,96 @@ async def update_consultant_by_id(
 
 @router.post(
     "/api/admin/consultants",
-    response_model=ProfileResponse,
+    response_model=CreateConsultantResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Create a new consultant profile (admin only)",
+    summary="Create a new consultant profile + login (admin only)",
 )
 async def admin_create_consultant(
     payload: AdminConsultantCreateRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    Creates both the login (User, role=CONSULTANT) and the Consultant
+    profile, optionally assigning the consultant to a recruiter. Returns a
+    one-time temporary password matching AddConsultantDrawer.tsx's expected
+    CreateConsultantResponseDTO shape ({ message, temp_password, ... }).
+    """
     _require_role(current_user, "ADMIN")
 
-    existing = await db.execute(select(Consultant).where(Consultant.email == payload.email))
-    if existing.scalars().first():
+    existing_user = await db.execute(select(User).where(User.email == payload.email))
+    if existing_user.scalars().first():
+        raise HTTPException(409, f"A user with email '{payload.email}' already exists")
+    existing_consultant = await db.execute(select(Consultant).where(Consultant.email == payload.email))
+    if existing_consultant.scalars().first():
         raise HTTPException(409, f"Consultant with email '{payload.email}' already exists")
 
+    recruiter_id_int: Optional[int] = None
+    if payload.recruiter_id:
+        try:
+            recruiter_id_int = int(payload.recruiter_id)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"Invalid recruiter_id: {payload.recruiter_id}")
+        r = await db.execute(
+            select(User).where(User.id == recruiter_id_int, User.role == "RECRUITER", User.is_active == True)
+        )
+        if not r.scalars().first():
+            raise HTTPException(404, f"Active recruiter with id={recruiter_id_int} not found")
+
+    temp_password = _generate_temp_password()
+
+    user = User(
+        email=payload.email,
+        full_name=payload.name,
+        role="CONSULTANT",
+        is_active=True,
+    )
+    _set_password_on_user(user, _hash_password(temp_password))
+    db.add(user)
+    await db.flush()  # populate user.id before creating the linked Consultant row
+
     consultant = Consultant(
-        full_name=payload.fullName,
+        user_id=user.id,
+        full_name=payload.name,
         email=payload.email,
         phone=payload.phone,
-        work_authorization=payload.workAuth,
-        preferred_employment_types=payload.employmentTypes,
+        work_authorization=payload.work_auth,
+        preferred_employment_types=payload.employment_prefs,
+        primary_skills=payload.primary_skills or "",
+        secondary_skills=payload.secondary_skills or "",
         status="ACTIVE",
-        preferred_roles=payload.preferredRoles,
-        preferred_locations=payload.preferredLocations,
-        total_experience_years=payload.totalExperienceYears,
+        preferred_roles=payload.preferred_roles,
+        preferred_locations=payload.preferred_locations,
+        current_location=payload.current_location,
+        total_experience_years=payload.total_experience_years,
     )
+    # availability_status isn't referenced elsewhere in this file, so only
+    # set it if the model actually defines that column.
+    if hasattr(Consultant, "availability_status"):
+        consultant.availability_status = payload.availability_status
+
     db.add(consultant)
+    await db.flush()  # populate consultant.id before the recruiter mapping
+
+    if recruiter_id_int is not None:
+        db.add(RecruiterConsultant(
+            recruiter_id=recruiter_id_int,
+            consultant_id=consultant.id,
+            is_active=True,
+        ))
+
     await db.commit()
     await db.refresh(consultant)
 
     logger.info("Admin %s created consultant id=%s email=%s", current_user.email, consultant.id, consultant.email)
-    return _consultant_to_profile_response(consultant)
+
+    return CreateConsultantResponse(
+        message=f"Consultant '{consultant.full_name}' created successfully.",
+        temp_password=temp_password,
+        consultant_id=str(consultant.id),
+        name=consultant.full_name or "",
+        email=consultant.email or "",
+    )
 
 
 @router.patch(
