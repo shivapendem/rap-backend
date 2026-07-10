@@ -55,11 +55,15 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 async def require_admin(request: Request, token: Optional[str] = Depends(oauth2_scheme)) -> dict:
     """
-    Accept a Bearer token OR fall back to your existing session cookie.
+    Accepts only Bearer token from the Authorization header.
     Returns the decoded JWT payload as a dict: {"sub": email, "role": ...}.
     """
     if not token:
-        token = request.cookies.get("rap_session") or request.cookies.get("session")
+        # Fallback to check header manually in case Swagger/OAuth2PasswordBearer doesn't catch it
+        auth_header = request.headers.get("authorization")
+        if auth_header and auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 

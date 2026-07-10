@@ -92,99 +92,20 @@ def _request_is_https(request: Request | None) -> bool:
 
 
 def set_session_cookies(response, token: str, request: Request | None = None) -> None:
-    """Set both auth cookies with the ONLY combination that can actually work.
-
-    The frontend runs on a different origin than this API (no same-origin
-    BFF in front of it anymore), so every request is cross-site. Cross-site
-    cookies require SameSite=None + Secure=True — there is no other legal
-    combination that a modern browser will honor on a cross-site
-    fetch/XHR call:
-
-      - SameSite=Lax/Strict cookies are simply not attached to cross-site
-        fetch/XHR requests (only to top-level navigations). Setting Lax
-        here, even though curl will happily show it "worked", means the
-        browser silently drops it — that's the exact symptom that was
-        reported (curl succeeds, browser stays logged out).
-      - SameSite=None without Secure is rejected by every modern browser
-        outright, regardless of curl behavior.
-      - Secure cookies are only ever stored/sent by browsers over HTTPS.
-        If this request did not arrive over HTTPS, a Secure cookie is
-        pointless — the browser will not persist it.
-
-    Net effect: cookie-based auth for a cross-site frontend is only
-    possible once this API is served over HTTPS (directly, or via a
-    TLS-terminating reverse proxy that forwards X-Forwarded-Proto).
-    There is no code-only workaround for that half.
-
-    Until HTTPS is in place, cookies are still set for same-site/local
-    dev convenience, but callers MUST also send the raw token back in the
-    JSON response body so the frontend can fall back to
-    `Authorization: Bearer <token>` (see get_current_user below, which
-    already accepts that header). This is the only path that reliably
-    works cross-site over plain HTTP.
-
-    Env overrides are intentionally NOT honored for samesite/secure
-    anymore — a prior version allowed COOKIE_SAMESITE/COOKIE_SECURE to be
-    set independently, which is exactly what produced the broken
-    SameSite=Lax, no-Secure cookie seen in production. The only thing you
-    can safely control is whether TLS is actually terminating in front of
-    this service (via X-Forwarded-Proto).
-    """
-    is_https = _request_is_https(request)
-
-    if is_https:
-        samesite = "none"
-        secure = True
-    else:
-        # Cannot legally set SameSite=None without Secure, and Secure is
-        # useless without HTTPS. Fall back to Lax purely so local
-        # same-origin/dev setups keep working; cross-site browser auth
-        # will NOT work until HTTPS is live — rely on the Bearer token
-        # fallback instead.
-        samesite = "lax"
-        secure = False
-        logger.warning(
-            "set_session_cookies: request not detected as HTTPS "
-            "(no X-Forwarded-Proto: https and scheme != https). "
-            "Cookies are being set as SameSite=Lax, Secure=False, which "
-            "will NOT be sent on cross-site browser requests. Frontend "
-            "must rely on the Authorization: Bearer token fallback until "
-            "this API is served over HTTPS."
-        )
-
-    cookie_kwargs = dict(
-        value=token,
-        httponly=True,
-        max_age=ACCESS_TOKEN_EXPIRE_HOURS * 3600,
-        expires=ACCESS_TOKEN_EXPIRE_HOURS * 3600,
-        samesite=samesite,
-        secure=secure,
-    )
-    response.set_cookie(key="rap_session", **cookie_kwargs)
-    response.set_cookie(key="session", **cookie_kwargs)
+    """No-op: Authentication is handled entirely via Authorization headers on the frontend."""
+    pass
 
 
 async def get_current_user(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Dependency: extract and verify the session, return the User.
-
-    Checks, in order:
-      1. Authorization: Bearer <token> header — the reliable path for a
-         cross-site frontend served over plain HTTP (see set_session_cookies
-         docstring for why cookies alone can't do this yet).
-      2. rap_session / session cookies — works once this API is behind
-         HTTPS, or for same-site/local dev setups.
-    """
+    """Dependency: extract and verify the JWT token from the Authorization header, return the User."""
     token = None
 
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
-
-    if not token:
-        token = request.cookies.get("rap_session") or request.cookies.get("session")
 
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")

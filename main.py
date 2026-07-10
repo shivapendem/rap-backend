@@ -282,9 +282,7 @@ async def login(
 
 
 @app.post("/auth/logout")
-async def logout(response: Response):
-    response.delete_cookie("rap_session")
-    response.delete_cookie("session")
+async def logout():
     return {"message": "Logged out successfully"}
 
 
@@ -376,8 +374,7 @@ async def get_requirements(
     sort_by: Optional[str] = "received_date",
     sort_dir: Optional[str] = "desc",
     db: AsyncSession = Depends(get_db),
-    # BUG FIX: protect this endpoint — uncomment once frontend sends cookies:
-    # current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     from sqlalchemy import func
 
@@ -430,8 +427,7 @@ async def get_requirements(
 @app.get("/api/consultants", response_model=List[ConsultantResponse])
 async def get_consultants(
     db: AsyncSession = Depends(get_db),
-    # BUG FIX: protect this endpoint — uncomment once frontend sends cookies:
-    # current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(Consultant))
     return result.scalars().all()
