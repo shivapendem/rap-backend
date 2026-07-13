@@ -142,6 +142,77 @@ async def _gmail_to_requirements_loop():
         await asyncio.sleep(GMAIL_SYNC_INTERVAL_SECONDS)
 
 
+EMAIL_QUEUE_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_QUEUE_SYNC_INTERVAL_SECONDS", "60"))
+
+async def _email_queue_worker_loop():
+    """
+    Background loop: periodically checks EmailQueue for QUEUED items and sends them
+    via consultant's Gmail API token.
+    """
+    from models import EmailQueue, ConsultantEmailToken
+    from gmail_send_service import send_application_email_async, decrypt_token
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(EmailQueue).where(EmailQueue.status == "QUEUED")
+                )
+                queued_items = result.scalars().all()
+                if queued_items:
+                    print(f"[email-queue] processing {len(queued_items)} items")
+                for item in queued_items:
+                    try:
+                        token_result = await session.execute(
+                            select(ConsultantEmailToken).where(
+                                ConsultantEmailToken.consultant_id == item.consultant_id
+                            )
+                        )
+                        token = token_result.scalars().first()
+                        if not token:
+                            print(f"[email-queue] item {item.id} failed: No Gmail token")
+                            item.status = "FAILED"
+                            await session.commit()
+                            continue
+                            
+                        access_token = decrypt_token(token.access_token_encrypted)
+                        
+                        import re
+                        if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
+                            print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
+                            item.status = "FAILED"
+                            await session.commit()
+                            continue
+                            
+                        attachment_path = None
+                        if item.attachments and len(item.attachments) > 0:
+                            attachment_path = item.attachments[0]
+                        
+                        send_result = await send_application_email_async(
+                            access_token=access_token,
+                            from_email=token.email_address,
+                            to_email=item.to_email,
+                            cc_email="",
+                            subject=item.subject,
+                            body=item.content or "",
+                            attachment_path=attachment_path
+                        )
+                        item.status = "SENT"
+                        await session.commit()
+                    except Exception as e:
+                        print(f"[email-queue] failed to send item {item.id}: {e}")
+                        await session.rollback()
+                        item.status = "FAILED"
+                        session.add(item)
+                        try:
+                            await session.commit()
+                        except Exception as inner_e:
+                            print(f"[email-queue] completely failed to update item {item.id}: {inner_e}")
+                            await session.rollback()
+        except Exception as e:
+            print(f"[email-queue] loop error: {e}")
+        await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # CREATE TABLE IF NOT EXISTS — always safe to call on every startup
@@ -163,12 +234,18 @@ async def lifespan(app: FastAPI):
         await session.commit()
 
     sync_task = asyncio.create_task(_gmail_to_requirements_loop())
+    email_queue_task = asyncio.create_task(_email_queue_worker_loop())
 
     yield
 
     sync_task.cancel()
+    email_queue_task.cancel()
     try:
         await sync_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await email_queue_task
     except asyncio.CancelledError:
         pass
 

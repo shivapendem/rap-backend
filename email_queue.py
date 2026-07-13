@@ -50,16 +50,32 @@ async def create_email_queue(
 ):
     """Add email to queue."""
     from models import EmailQueue
-    # Get consultant_id from logged in user or body
     from models import Consultant
     from sqlalchemy import select as sa_select
-    cons_result = await db.execute(
-        sa_select(Consultant).where(Consultant.user_id == current_user.id)
-    )
-    consultant = cons_result.scalars().first()
-    consultant_id = consultant.id if consultant else body.consultant_id
-    if not consultant_id:
-        raise HTTPException(status_code=400, detail="Consultant profile not found.")
+
+    consultant_id = None
+
+    if current_user.role == "ADMIN":
+        # Admin must provide consultant_id explicitly
+        if not body.consultant_id:
+            raise HTTPException(status_code=400, detail="Admin must specify consultant_id.")
+        # Verify the consultant exists
+        cons_result = await db.execute(
+            sa_select(Consultant).where(Consultant.id == body.consultant_id)
+        )
+        consultant = cons_result.scalars().first()
+        if not consultant:
+            raise HTTPException(status_code=404, detail="Consultant not found.")
+        consultant_id = consultant.id
+    else:
+        # Consultant: resolve from logged-in user
+        cons_result = await db.execute(
+            sa_select(Consultant).where(Consultant.user_id == current_user.id)
+        )
+        consultant = cons_result.scalars().first()
+        consultant_id = consultant.id if consultant else body.consultant_id
+        if not consultant_id:
+            raise HTTPException(status_code=400, detail="Consultant profile not found.")
 
     item = EmailQueue(
         consultant_id=consultant_id,
@@ -87,10 +103,20 @@ async def list_email_queue(
     current_user: User = Depends(get_current_user),
 ):
     """List all emails in queue."""
-    from models import EmailQueue
-    result = await db.execute(
-        select(EmailQueue).order_by(EmailQueue.created_at.desc())
-    )
+    from models import EmailQueue, Consultant
+    
+    query = select(EmailQueue)
+    
+    if current_user.role == "CONSULTANT":
+        result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
+        consultant = result.scalars().first()
+        if not consultant:
+            return {"data": [], "total": 0}
+        query = query.where(EmailQueue.consultant_id == consultant.id)
+    elif current_user.role != "ADMIN" and current_user.role != "RECRUITER":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    result = await db.execute(query.order_by(EmailQueue.created_at.desc()))
     items = result.scalars().all()
     return {
         "data": [
