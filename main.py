@@ -144,6 +144,11 @@ async def _gmail_to_requirements_loop():
 
 EMAIL_QUEUE_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_QUEUE_SYNC_INTERVAL_SECONDS", "60"))
 
+# TESTING GUARD: while we validate the email queue pipeline, only allow sends
+# to this domain. Remove/relax this check once testing is complete and real
+# sends to arbitrary vendor/client addresses are approved.
+EMAIL_QUEUE_TEST_DOMAIN_SUFFIX = "@savantisintelli.com"
+
 async def _email_queue_worker_loop():
     """
     Background loop: periodically checks EmailQueue for QUEUED items and sends them
@@ -173,20 +178,27 @@ async def _email_queue_worker_loop():
                             item.status = "FAILED"
                             await session.commit()
                             continue
-                            
+
                         access_token = decrypt_token(token.access_token_encrypted)
-                        
+
                         import re
                         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
                             print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
                             item.status = "FAILED"
                             await session.commit()
                             continue
-                            
+
+                        # TESTING GUARD: only send to the internal test domain.
+                        # Leaves the item as QUEUED (not FAILED) so it will go
+                        # out automatically once this guard is removed.
+                        if not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
+                            print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
+                            continue
+
                         attachment_path = None
                         if item.attachments and len(item.attachments) > 0:
                             attachment_path = item.attachments[0]
-                        
+
                         send_result = await send_application_email_async(
                             access_token=access_token,
                             from_email=token.email_address,
