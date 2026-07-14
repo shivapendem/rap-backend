@@ -13,7 +13,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
 from database import engine, Base, get_db, AsyncSessionLocal
-from models import User, Requirement, Consultant
+from models import User, Requirement, Consultant, Notification
 import asyncio
 from requirements_sync import sync_pending_emails
 from auth import (
@@ -54,6 +54,17 @@ class LoginResponse(BaseModel):
     role: str
     name: str
     access_token: str
+
+class NotificationResponse(BaseModel):
+    id: int
+    user_id: int
+    title: str
+    body: str
+    is_read: bool
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
 
 
 class GoogleLoginRequest(BaseModel):
@@ -367,6 +378,16 @@ async def login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
+    
+    # Insert Login Notification
+    new_notif = Notification(
+        user_id=user.id,
+        title="New Login Accessed",
+        body=f"Successful login recorded at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}."
+    )
+    db.add(new_notif)
+    await db.commit()
+
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
@@ -452,6 +473,16 @@ async def google_login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
+    
+    # Insert Login Notification
+    new_notif = Notification(
+        user_id=user.id,
+        title="New Login Accessed",
+        body=f"Successful Google login recorded at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}."
+    )
+    db.add(new_notif)
+    await db.commit()
+
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
@@ -566,3 +597,54 @@ async def update_me(
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+@app.get("/api/notifications", response_model=List[NotificationResponse])
+async def get_notifications(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Notification)
+        .where(Notification.user_id == current_user.id)
+        .order_by(Notification.created_at.desc())
+        .limit(50)
+    )
+    return result.scalars().all()
+
+
+@app.patch("/api/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Notification)
+        .where(Notification.id == notification_id, Notification.user_id == current_user.id)
+    )
+    notif = result.scalars().first()
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    
+    notif.is_read = True
+    await db.commit()
+    return {"success": True}
+
+
+@app.patch("/api/notifications/read-all")
+async def mark_all_notifications_read(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import update
+    await db.execute(
+        update(Notification)
+        .where(Notification.user_id == current_user.id, Notification.is_read == False)
+        .values(is_read=True)
+    )
+    await db.commit()
+    return {"success": True}

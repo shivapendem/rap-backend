@@ -574,3 +574,13 @@ class EmailQueue(Base):
         if value not in self.VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(self.VALID_STATUSES)}, got '{value}'")
         return value
+
+class Notification(Base):
+    """Stores notifications for users."""
+    __tablename__ = "notifications"
+    id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(Text, nullable=False)
+    body = Column(Text, nullable=False)
+    is_read = Column(Boolean, nullable=False, default=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
