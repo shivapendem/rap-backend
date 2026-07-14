@@ -189,6 +189,9 @@ async def _email_queue_worker_loop():
                         # TESTING GUARD: only send to the internal test domain.
                         if not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
                             print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
+                            item.status = "FAILED"
+                            item.status_text = "not test domain for now"
+                            await session.commit()
                             continue
 
                         from gmail_send_service import get_service_account_access_token
