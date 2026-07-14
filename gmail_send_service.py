@@ -158,3 +158,42 @@ def encrypt_token(raw_token: str) -> str:
     if not raw_token:
         return ""
     return base64.b64encode(raw_token.encode()).decode()
+
+def get_service_account_access_token(service_account_path: str, impersonate_email: str) -> str:
+    """
+    Get an OAuth access token using a Service Account with Domain-Wide Delegation.
+    """
+    import json
+    import jwt
+    import time
+    import httpx
+    
+    with open(service_account_path, "r") as f:
+        credentials = json.load(f)
+        
+    now = int(time.time())
+    payload = {
+        "iss": credentials["client_email"],
+        "sub": impersonate_email,
+        "scope": "https://www.googleapis.com/auth/gmail.send",
+        "aud": credentials["token_uri"],
+        "iat": now,
+        "exp": now + 3600
+    }
+    
+    signed_jwt = jwt.encode(
+        payload,
+        credentials["private_key"],
+        algorithm="RS256"
+    )
+    
+    response = httpx.post(
+        credentials["token_uri"],
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": signed_jwt
+        },
+        timeout=10.0
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]

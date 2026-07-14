@@ -165,7 +165,7 @@ async def _email_queue_worker_loop():
     Background loop: periodically checks EmailQueue for QUEUED items and sends them
     via consultant's Gmail API token.
     """
-    from models import EmailQueue, ConsultantEmailToken
+    from models import EmailQueue
     from gmail_send_service import send_application_email_async, decrypt_token
     while True:
         try:
@@ -178,21 +178,6 @@ async def _email_queue_worker_loop():
                     print(f"[email-queue] processing {len(queued_items)} items")
                 for item in queued_items:
                     try:
-                        token_result = await session.execute(
-                            select(ConsultantEmailToken).where(
-                                ConsultantEmailToken.consultant_id == item.consultant_id
-                            )
-                        )
-                        token = token_result.scalars().first()
-                        if not token:
-                            print(f"[email-queue] item {item.id} failed: No Gmail token")
-                            item.status = "FAILED"
-                            item.status_text = "No Gmail token"
-                            await session.commit()
-                            continue
-
-                        access_token = decrypt_token(token.access_token_encrypted)
-
                         import re
                         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
                             print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
@@ -202,11 +187,15 @@ async def _email_queue_worker_loop():
                             continue
 
                         # TESTING GUARD: only send to the internal test domain.
-                        # Leaves the item as QUEUED (not FAILED) so it will go
-                        # out automatically once this guard is removed.
                         if not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
                             print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
                             continue
+
+                        from gmail_send_service import get_service_account_access_token
+                        import os
+                        
+                        sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
+                        access_token = get_service_account_access_token(sa_path, item.from_email)
 
                         attachment_path = None
                         if item.attachments and len(item.attachments) > 0:
@@ -214,7 +203,7 @@ async def _email_queue_worker_loop():
 
                         send_result = await send_application_email_async(
                             access_token=access_token,
-                            from_email=token.email_address,
+                            from_email=item.from_email,
                             to_email=item.to_email,
                             cc_email="",
                             subject=item.subject,
