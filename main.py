@@ -227,14 +227,17 @@ async def _email_queue_worker_loop():
                     except Exception as e:
                         print(f"[email-queue] failed to send item {item.id}: {e}")
                         await session.rollback()
-                        item.status = "FAILED"
-                        item.status_text = str(e)
-                        session.add(item)
-                        try:
-                            await session.commit()
-                        except Exception as inner_e:
-                            print(f"[email-queue] completely failed to update item {item.id}: {inner_e}")
-                            await session.rollback()
+                        # Re-fetch item to update status safely after rollback
+                        result = await session.execute(select(EmailQueue).where(EmailQueue.id == item.id))
+                        failed_item = result.scalars().first()
+                        if failed_item:
+                            failed_item.status = "FAILED"
+                            failed_item.status_text = str(e)
+                            try:
+                                await session.commit()
+                            except Exception as inner_e:
+                                print(f"[email-queue] completely failed to update item {item.id}: {inner_e}")
+                                await session.rollback()
         except Exception as e:
             print(f"[email-queue] loop error: {e}")
         await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
