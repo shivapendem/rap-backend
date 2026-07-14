@@ -565,6 +565,7 @@ class EmailQueue(Base):
     # already picks the right underlying type for either backend.
     attachments = JSONBColumn(nullable=True)
     status = Column(Text, nullable=False, default="QUEUED")
+    status_text = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     VALID_STATUSES = {"QUEUED", "SENT", "FAILED"}

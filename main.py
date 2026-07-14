@@ -187,6 +187,7 @@ async def _email_queue_worker_loop():
                         if not token:
                             print(f"[email-queue] item {item.id} failed: No Gmail token")
                             item.status = "FAILED"
+                            item.status_text = "No Gmail token"
                             await session.commit()
                             continue
 
@@ -196,6 +197,7 @@ async def _email_queue_worker_loop():
                         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
                             print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
                             item.status = "FAILED"
+                            item.status_text = f"Invalid to_email '{item.to_email}'"
                             await session.commit()
                             continue
 
@@ -220,11 +222,13 @@ async def _email_queue_worker_loop():
                             attachment_path=attachment_path
                         )
                         item.status = "SENT"
+                        item.status_text = "Sent successfully"
                         await session.commit()
                     except Exception as e:
                         print(f"[email-queue] failed to send item {item.id}: {e}")
                         await session.rollback()
                         item.status = "FAILED"
+                        item.status_text = str(e)
                         session.add(item)
                         try:
                             await session.commit()
