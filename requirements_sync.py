@@ -111,6 +111,13 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
             await db.rollback()
             errors += 1
             print(f"[requirements_sync] FAILED gmail_emails.id={row['id']}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="requirements_sync",
+                error=e,
+                source_type="gmail_emails",
+                source_id=row["id"],
+            )
 
     return {"saved": saved, "duplicates": duplicates, "errors": errors, "total": len(rows)}
 

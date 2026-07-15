@@ -47,8 +47,10 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         try:
             yield session
-        except Exception:
+        except Exception as e:
             await session.rollback()
+            from error_logger import log_db_error
+            await log_db_error(stage="get_db_dependency", error=e)
             raise
         finally:
             await session.close()
