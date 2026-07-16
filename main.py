@@ -152,6 +152,12 @@ async def _gmail_to_requirements_loop():
             print(f"[gmail-sync] loop error: {e}")
             from error_logger import log_db_error
             await log_db_error(stage="gmail_to_requirements_loop", error=e)
+            try:
+                from notification_helper import notify_by_role
+                async with AsyncSessionLocal() as notif_session:
+                    await notify_by_role(notif_session, roles=["ADMIN"], title="Email sync failed", body=f"Gmail-to-requirements sync failed: {e}")
+            except Exception as notif_err:
+                print(f"[gmail-sync] notify failed: {notif_err}")
         await asyncio.sleep(GMAIL_SYNC_INTERVAL_SECONDS)
 
 
@@ -238,6 +244,12 @@ async def _email_queue_worker_loop():
             print(f"[email-queue] loop error: {e}")
             from error_logger import log_db_error
             await log_db_error(stage="email_queue_worker_loop", error=e)
+            try:
+                from notification_helper import notify_by_role
+                async with AsyncSessionLocal() as notif_session:
+                    await notify_by_role(notif_session, roles=["ADMIN"], title="Email queue sync failed", body=f"Email queue worker loop failed: {e}")
+            except Exception as notif_err:
+                print(f"[email-queue] notify failed: {notif_err}")
         await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
 
 @asynccontextmanager
@@ -369,6 +381,11 @@ async def login(
 
     # BUG FIX: avoid user enumeration — same error for bad user or bad password
     if not user or not user.password_hash or not verify_password(request.password, user.password_hash):
+        try:
+            from notification_helper import notify_by_role
+            await notify_by_role(db, roles=["ADMIN"], title="Failed login attempt", body=f"Failed login attempt for email: {request.email}")
+        except Exception as e:
+            print(f"[login-notify] FAILED: {e}")  # never let notification failure block the actual auth rejection
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",

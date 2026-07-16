@@ -420,6 +420,16 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
 
         assignment_count += 1
 
+    # BUG FIX: match_requirement() upserted rows into
+    # requirement_consultant_matches correctly, but never wrote back to
+    # requirements.ats_match_count — the column the admin Requirements
+    # table actually displays. Matching genuinely worked; the visible
+    # count just never reflected it (stuck at whatever seed.py's random
+    # demo value or the column default of 0 was). assignment_count here
+    # is exactly "consultants meeting MATCH_THRESHOLD in this run", which
+    # is the correct current match count for this requirement.
+    requirement.ats_match_count = assignment_count
+
     await db.commit()
     logger.info(
         "Matched requirement_id=%s — %d consultants scored, %d assignments created/updated (3 total queries)",
@@ -563,8 +573,27 @@ async def match_all_requirements(
 
     total_assignments = 0
     for requirement in requirements:
-        count = await match_requirement(db, requirement.id)
-        total_assignments += count
+        # BUG FIX: previously had no per-requirement error isolation — a DB
+        # failure on any single requirement (bad data, constraint violation,
+        # etc.) crashed the entire bulk run with an unhandled 500, silently
+        # dropping every requirement after it, and left the shared session
+        # in an aborted-transaction state for anything that followed.
+        # Isolate + log + continue, matching the pattern already used by
+        # sync_pending_emails() and the email queue worker loop.
+        try:
+            count = await match_requirement(db, requirement.id)
+            total_assignments += count
+        except Exception as e:
+            await db.rollback()
+            print(f"[match_all_requirements] FAILED requirement_id={requirement.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="match_all_requirements",
+                error=e,
+                source_type="requirement",
+                source_id=requirement.id,
+            )
+            continue
 
     return MatchAllResponse(
         requirements_processed=len(requirements),
