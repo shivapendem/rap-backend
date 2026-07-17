@@ -9,7 +9,7 @@ from fastapi import UploadFile, File
 
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -33,9 +33,41 @@ class EmailQueueCreateRequest(BaseModel):
     content: Optional[str] = None
     attachments: Optional[List[str]] = None
 
+    @field_validator('requirement_id', 'consultant_id', mode='before')
+    @classmethod
+    def zero_to_none(cls, v):
+        """Frontend sends Number('') = 0 for unset IDs — treat 0 as None."""
+        if v == 0 or v == '' or v is None:
+            return None
+        return v
+
 
 class EmailQueueStatusUpdate(BaseModel):
     status: str
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _assert_email_queue_access(db: AsyncSession, current_user: User, item) -> None:
+    """
+    BUG FIX: get/update-status/delete on a single email-queue item had NO
+    ownership or role check at all — any authenticated user could view,
+    change the status of, or delete ANY other consultant's queued
+    application email just by knowing the item id. list/create already
+    scoped correctly by role; this brings the single-item endpoints in
+    line with that same scoping.
+    """
+    from models import Consultant
+    if current_user.role in ("ADMIN", "RECRUITER"):
+        return
+    if current_user.role == "CONSULTANT":
+        result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
+        consultant = result.scalars().first()
+        if consultant and item.consultant_id == consultant.id:
+            return
+    raise HTTPException(status_code=403, detail="Insufficient permissions for this email queue item.")
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +185,7 @@ async def get_email_queue_item(
     item = result.scalars().first()
     if not item:
         raise HTTPException(status_code=404, detail="Email queue item not found")
+    await _assert_email_queue_access(db, current_user, item)
     return {
         "id": str(item.id),
         "consultant_id": str(item.consultant_id),
@@ -183,6 +216,7 @@ async def update_email_queue_status(
     item = result.scalars().first()
     if not item:
         raise HTTPException(status_code=404, detail="Email queue item not found")
+    await _assert_email_queue_access(db, current_user, item)
 
     valid_statuses = {"QUEUED", "SENT", "FAILED"}
     if body.status not in valid_statuses:
@@ -210,6 +244,7 @@ async def delete_email_queue_item(
     item = result.scalars().first()
     if not item:
         raise HTTPException(status_code=404, detail="Email queue item not found")
+    await _assert_email_queue_access(db, current_user, item)
     await db.delete(item)
     await db.commit()
     return {"success": True, "message": f"Email queue item {item_id} deleted"}

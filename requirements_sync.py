@@ -45,10 +45,25 @@ from dedup import save_requirement
 
 async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
     """
-    Process gmail_emails rows the classifier has marked as job postings
-    into requirements — skipping anything already converted.
+    Auto-parse every incoming Gmail email into a requirement — does NOT
+    wait on the external Node.js classifier to tag category='job_posting'
+    first. Previously this only picked up rows the classifier had already
+    confirmed, so any email sitting un-classified (classifier down, slow,
+    or hasn't gotten to it yet) stayed "Pending" on the Gmail screen
+    forever, with manual per-email Reparse as the only way through.
 
-    Returns a summary dict: {saved, duplicates, errors, total}.
+    Still respects an EXPLICIT non-job classification if the classifier
+    already made one (category NOT NULL and != 'job_posting') — that
+    guards against the original bug this file's header comment describes
+    (newsletters/invites becoming fake Requirements). What's removed is
+    only the requirement to WAIT for a positive classification; unclassified
+    (category IS NULL) rows are now eligible immediately.
+
+    The real safety gate is parse_requirement()'s own is_likely_requirement
+    check below — a row only becomes a Requirement if the parser itself
+    is confident it's an actual job posting, regardless of classifier state.
+
+    Returns a summary dict: {saved, duplicates, skipped_not_a_requirement, errors, total}.
     """
     result = await db.execute(
         text("""
@@ -56,7 +71,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                    ge.from_address, ge.from_name, ge.reply_to, ge.body_text,
                    ge.body_html, ge.date
             FROM gmail_emails ge
-            WHERE ge.category = 'job_posting'
+            WHERE (ge.category IS NULL OR ge.category = 'job_posting')
               AND NOT EXISTS (
                   SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
               )
@@ -67,7 +82,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
     )
     rows = result.mappings().all()
 
-    saved, duplicates, errors = 0, 0, 0
+    saved, duplicates, skipped_not_a_requirement, errors = 0, 0, 0, 0
 
     for row in rows:
         try:
@@ -86,6 +101,18 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 headers["reply_to"] = row["reply_to"]
 
             parsed = parse_requirement(subject, body, headers)
+
+            # Gate on the parser's own confidence instead of the external
+            # classifier — this IS the "auto-reparse every gmail" behavior:
+            # every email gets run through the parser automatically, but
+            # only ones it's actually confident are job postings become
+            # Requirement rows. Non-matches are simply skipped (not saved,
+            # not errored) — they'll be re-evaluated next cycle if still
+            # unclassified, which is cheap (regex-only, no DB writes).
+            if not parsed.get("is_likely_requirement"):
+                skipped_not_a_requirement += 1
+                continue
+
             cleaned_jd = clean_requirement_text(body)
 
             save_result = await save_requirement(
@@ -111,8 +138,21 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
             await db.rollback()
             errors += 1
             print(f"[requirements_sync] FAILED gmail_emails.id={row['id']}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="requirements_sync",
+                error=e,
+                source_type="gmail_emails",
+                source_id=row["id"],
+            )
 
-    return {"saved": saved, "duplicates": duplicates, "errors": errors, "total": len(rows)}
+    return {
+        "saved": saved,
+        "duplicates": duplicates,
+        "skipped_not_a_requirement": skipped_not_a_requirement,
+        "errors": errors,
+        "total": len(rows),
+    }
 
 
 if __name__ == "__main__":

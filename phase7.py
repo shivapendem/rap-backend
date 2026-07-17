@@ -435,6 +435,14 @@ async def confirm_send(
         raise
     except Exception as e:
         await db.rollback()
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="confirm_send",
+            error=e,
+            source_type="application",
+            requirement_id=request.requirement_id,
+            consultant_id=request.consultant_id,
+        )
         try:
             failed_app = Application(
                 requirement_id=request.requirement_id,

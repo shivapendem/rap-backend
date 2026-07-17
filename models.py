@@ -585,3 +585,21 @@ class Notification(Base):
     body = Column(Text, nullable=False)
     is_read = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+class Resume(Base):
+    __tablename__ = "resumes"
+
+    id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    target_role = Column(String(255), nullable=True)
+    job_description = Column(Text, nullable=True)
+    data = JSONBColumn(nullable=False, default=dict)
+    s3_key = Column(String(500), nullable=True)
+    ats_score = Column(Integer, nullable=True)
+    status = Column(String(50), nullable=False, default='draft', index=True)
+    download_count = Column(Integer, nullable=False, default=0)
+    last_downloaded = Column(TIMESTAMP(timezone=True), nullable=True)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(TIMESTAMP(timezone=True), nullable=True)

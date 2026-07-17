@@ -150,6 +150,14 @@ async def _gmail_to_requirements_loop():
                     print(f"[gmail-sync] {summary}")
         except Exception as e:
             print(f"[gmail-sync] loop error: {e}")
+            from error_logger import log_db_error
+            await log_db_error(stage="gmail_to_requirements_loop", error=e)
+            try:
+                from notification_helper import notify_by_role
+                async with AsyncSessionLocal() as notif_session:
+                    await notify_by_role(notif_session, roles=["ADMIN"], title="Email sync failed", body=f"Gmail-to-requirements sync failed: {e}")
+            except Exception as notif_err:
+                print(f"[gmail-sync] notify failed: {notif_err}")
         await asyncio.sleep(GMAIL_SYNC_INTERVAL_SECONDS)
 
 
@@ -218,6 +226,8 @@ async def _email_queue_worker_loop():
                         await session.commit()
                     except Exception as e:
                         print(f"[email-queue] failed to send item {item.id}: {e}")
+                        from error_logger import log_db_error
+                        await log_db_error(stage="email_queue_worker_item", error=e, source_type="email_queue", source_id=item.id)
                         await session.rollback()
                         # Re-fetch item to update status safely after rollback
                         result = await session.execute(select(EmailQueue).where(EmailQueue.id == item.id))
@@ -232,8 +242,15 @@ async def _email_queue_worker_loop():
                                 await session.rollback()
         except Exception as e:
             print(f"[email-queue] loop error: {e}")
+            from error_logger import log_db_error
+            await log_db_error(stage="email_queue_worker_loop", error=e)
+            try:
+                from notification_helper import notify_by_role
+                async with AsyncSessionLocal() as notif_session:
+                    await notify_by_role(notif_session, roles=["ADMIN"], title="Email queue sync failed", body=f"Email queue worker loop failed: {e}")
+            except Exception as notif_err:
+                print(f"[email-queue] notify failed: {notif_err}")
         await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -347,6 +364,9 @@ app.include_router(phase8_router)
 from phase_users import router as phase_users_router  # noqa: E402
 app.include_router(phase_users_router)
 
+from resume_router import router as resume_router  # noqa: E402
+app.include_router(resume_router)
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -364,6 +384,11 @@ async def login(
 
     # BUG FIX: avoid user enumeration — same error for bad user or bad password
     if not user or not user.password_hash or not verify_password(request.password, user.password_hash):
+        try:
+            from notification_helper import notify_by_role
+            await notify_by_role(db, roles=["ADMIN"], title="Failed login attempt", body=f"Failed login attempt for email: {request.email}")
+        except Exception as e:
+            print(f"[login-notify] FAILED: {e}")  # never let notification failure block the actual auth rejection
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -541,6 +566,26 @@ async def get_requirements(
         page_size=page_size,
         total_pages=total_pages,
     )
+
+@app.post("/api/admin/gmail-emails/sync-to-requirements")
+async def sync_gmail_to_requirements_endpoint(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    On-demand trigger: runs the same sync_pending_emails logic used by
+    the background loop, once, and returns a summary for the frontend.
+    """
+    try:
+        summary = await sync_pending_emails(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
+
+    return {
+        "scanned": summary.get("total", 0),
+        "requirements_created": summary.get("saved", 0),
+        "errors": summary.get("errors", 0),
+    }
 
 
 @app.get("/api/consultants", response_model=List[ConsultantResponse])

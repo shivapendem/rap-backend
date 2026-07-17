@@ -701,6 +701,15 @@ async def list_applications_feed(
     filters = [AuditLog.action.in_(["SEND", "APPLICATION_SENT"])]
     if date_from: filters.append(AuditLog.created_at >= datetime.fromisoformat(date_from))
     if date_to: filters.append(AuditLog.created_at <= datetime.fromisoformat(date_to + "T23:59:59+00:00"))
+    # BUG FIX: consultant_id was being filtered in Python AFTER the DB
+    # already paginated (.offset()/.limit()) on the unfiltered set — total
+    # counted every send regardless of consultant, and any given page could
+    # come back empty even when the filtered consultant had matching rows
+    # elsewhere in the full result set. Push the filter into the JSONB
+    # query itself so counting and pagination both reflect the actual
+    # filtered set.
+    if consultant_id:
+        filters.append(AuditLog.meta["consultant_id"].astext == consultant_id)
 
     total = (await db.execute(select(func.count()).select_from(AuditLog).where(and_(*filters)))).scalar_one()
     order = AuditLog.created_at.desc() if sort_dir == "desc" else AuditLog.created_at.asc()
@@ -712,8 +721,6 @@ async def list_applications_feed(
     data = []
     for r in rows:
         meta = r.meta or {}
-        if consultant_id and meta.get("consultant_id") != consultant_id:
-            continue
         data.append(ApplicationSentRowDTO(
             id=str(r.id), timestamp=r.created_at.isoformat() if r.created_at else "",
             consultant_name=meta.get("consultant_name", r.actor_name or ""),

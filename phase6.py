@@ -622,8 +622,29 @@ async def _run_generation_pipeline(
 
     # ── Step 8: Convert to PDF ────────────────────────────────────────────
     pdf_ok = _convert_to_pdf(docx_path, pdf_path)
+    s3_pdf_key = None
     if not pdf_ok:
         logger.warning("PDF conversion failed — DOCX available, PDF unavailable")
+    else:
+        try:
+            from s3_service import upload_file_to_s3
+            import uuid
+            s3_pdf_key = f"resumes/generated/{consultant.id}/{requirement.id}/{uuid.uuid4()}.pdf"
+            with open(pdf_path, "rb") as f:
+                upload_success = upload_file_to_s3(f, s3_pdf_key, "application/pdf")
+            if upload_success:
+                logger.info(f"Uploaded generated PDF to S3: {s3_pdf_key}")
+                # Optional: Delete local PDF to save space
+                try:
+                    pdf_path.unlink(missing_ok=True)
+                except Exception as del_err:
+                    logger.warning(f"Could not delete local PDF: {del_err}")
+            else:
+                logger.warning("S3 upload returned False, keeping local PDF")
+                s3_pdf_key = None
+        except Exception as e:
+            logger.error(f"S3 upload failed for generated PDF: {e}")
+            s3_pdf_key = None
 
     # ── Step 9: Mark previous versions non-final ─────────────────────────
     await db.execute(
@@ -652,7 +673,7 @@ async def _run_generation_pipeline(
         ats_matched_keywords=ats_matched,
         ats_missing_keywords=ats_missing,
         docx_path=str(docx_path),
-        pdf_path=str(pdf_path) if pdf_ok else None,
+        pdf_path=s3_pdf_key if s3_pdf_key else (str(pdf_path) if pdf_ok else None),
         pdf_url=f"/api/consultant/requirements/{requirement.id}/resume/download/pdf" if pdf_ok else None,
         filename=base_filename_with_ext,
         status=final_status,

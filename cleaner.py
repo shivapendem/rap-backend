@@ -30,17 +30,47 @@ NOISE_PATTERNS = [
 class HTMLToTextParser(HTMLParser):
     """Simple HTML to plain text converter."""
 
+    # Tags whose START should force a real line break — paragraph/row/list
+    # level structure. NOTE: td/th are deliberately NOT here — two cells in
+    # the same row (e.g. "Role:" | "Java Developer") usually belong on one
+    # logical line, so they get a space (below), not a hard newline.
+    _BLOCK_TAGS = {
+        "br", "p", "div", "li", "tr", "table", "ul", "ol",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+    }
+
     def __init__(self):
         super().__init__()
         self.text_parts = []
         self._skip_tags = {"script", "style", "head"}
         self._current_skip = False
 
+    def _last_char(self):
+        for part in reversed(self.text_parts):
+            if part:
+                return part[-1]
+        return ""
+
     def handle_starttag(self, tag, attrs):
-        if tag.lower() in self._skip_tags:
+        tag = tag.lower()
+        if tag in self._skip_tags:
             self._current_skip = True
-        if tag.lower() in ("br", "p", "div", "li", "tr"):
+            return
+        if tag in self._BLOCK_TAGS:
             self.text_parts.append("\n")
+        elif self._last_char() not in ("", "\n", " ", "\t"):
+            # BUG FIX: previously ONLY br/p/div/li/tr inserted any separator.
+            # Real recruiter HTML (Outlook/Word-pasted tables, <span>-only
+            # markup) puts each field in its own <td>/<span> with zero
+            # whitespace between tags in the source, e.g.
+            #   ...Trintech</td><td>Location: Drive, Plano...
+            # With no separator inserted here, that becomes the literal
+            # string "TrintechLocation: Drive, Plano..." — which is exactly
+            # the "TrintechLocation:" garbage seen in the Requirements table.
+            # A plain space (not a newline) is enough to stop labels/values
+            # fusing into one token, without breaking same-row "Label: Value"
+            # pairs onto separate lines.
+            self.text_parts.append(" ")
 
     def handle_endtag(self, tag):
         if tag.lower() in self._skip_tags:
