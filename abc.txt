@@ -1,0 +1,24 @@
+-- Update ownership
+ALTER TABLE IF EXISTS public.email_queue OWNER to rap_user;
+
+-- Add any missing columns (e.g. attachments) in case they weren't fully synced
+ALTER TABLE public.email_queue ADD COLUMN IF NOT EXISTS attachments jsonb;
+ALTER TABLE public.email_queue ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'QUEUED';
+
+-- Index: ix_email_queue_consultant_id
+CREATE INDEX IF NOT EXISTS ix_email_queue_consultant_id
+    ON public.email_queue USING btree
+    (consultant_id ASC NULLS LAST)
+    TABLESPACE pg_default;
+
+-- Index: ix_email_queue_id
+CREATE INDEX IF NOT EXISTS ix_email_queue_id
+    ON public.email_queue USING btree
+    (id ASC NULLS LAST)
+    TABLESPACE pg_default;
+
+-- Index: ix_email_queue_requirement_id
+CREATE INDEX IF NOT EXISTS ix_email_queue_requirement_id
+    ON public.email_queue USING btree
+    (requirement_id ASC NULLS LAST)
+    TABLESPACE pg_default;
