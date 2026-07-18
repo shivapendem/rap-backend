@@ -35,7 +35,7 @@ from models import (
     AppSetting,
 )
 from phase8_audit_service import log_action, build_metadata_preview
-from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost
+from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost, get_claude_rate_limits
 from phase8_retry_service import attempt_retry
 from phase8_cache import cache_get, cache_set, check_redis_health
 
@@ -142,6 +142,12 @@ class ReviewActionRequest(BaseModel):
     notes: Optional[str] = None
     correction_data: Optional[dict] = None
 
+
+class ClaudeUsageDTO(BaseModel):
+    tokens_limit: int
+    tokens_remaining: int
+    tokens_used_pct: float
+    tokens_reset: str
 
 class AIUsageStatsDTO(BaseModel):
     total_cost_usd: float
@@ -576,6 +582,30 @@ async def update_ai_budget(
         total_calls=total_calls,
         budget_usd=body.budget_usd,
         budget_used_pct=round(used_pct, 2),
+    )
+
+@router.get("/ai-usage/claude", response_model=ClaudeUsageDTO)
+async def get_claude_usage(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get the latest recorded Claude API rate limit information."""
+    if current_user.role != 'admin':
+        raise HTTPException(status_code=403, detail="Admin only")
+        
+    limits = await get_claude_rate_limits(db)
+    limit = limits["tokens_limit"]
+    remaining = limits["tokens_remaining"]
+    
+    used_pct = 0.0
+    if limit > 0:
+        used_pct = ((limit - remaining) / limit) * 100.0
+        
+    return ClaudeUsageDTO(
+        tokens_limit=limit,
+        tokens_remaining=remaining,
+        tokens_used_pct=round(used_pct, 2),
+        tokens_reset=limits["tokens_reset"]
     )
 
 

@@ -20,3 +20,4 @@ python-multipart==0.0.9
 openai==1.35.0
 reportlab==4.2.2
 redis==5.0.4
+anthropic>=0.18.1

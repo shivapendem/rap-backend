@@ -67,6 +67,7 @@ class User(Base):
     # REQUIRES A DB MIGRATION before this is usable against the real
     # Postgres database — see note at top of phase_users_schema.py.
     experience_years = Column(Numeric, nullable=True)
+    resume_info = JSONBColumn(nullable=True)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 

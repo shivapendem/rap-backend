@@ -36,6 +36,7 @@ class UserAdminRowDTO(BaseModel):
     skills: Optional[List[str]] = None
     needsto_fetch_mail: bool = False
     experience_years: Optional[float] = None
+    resume_info: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 
@@ -57,6 +58,7 @@ class CreateUserRequestDTO(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8)
     role: str
+    resume_info: Optional[dict] = None
 
     @field_validator("role")
     @classmethod
@@ -107,6 +109,7 @@ class EditUserRequestDTO(BaseModel):
     skills: Optional[List[str]] = None
     needsto_fetch_mail: Optional[bool] = None
     experience_years: Optional[float] = Field(None, ge=0, le=60)
+    resume_info: Optional[dict] = None
 
     @field_validator("role")
     @classmethod
