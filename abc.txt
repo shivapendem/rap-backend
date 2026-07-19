@@ -22,3 +22,493 @@ CREATE INDEX IF NOT EXISTS ix_email_queue_requirement_id
     ON public.email_queue USING btree
     (requirement_id ASC NULLS LAST)
     TABLESPACE pg_default;
+
+CREATE TABLE IF NOT EXISTS message_templates (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO message_templates (name, content) VALUES
+('Template 1', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 2', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 3', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 4', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 5', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 6', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 7', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 8', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 9', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 10', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 11', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 12', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 13', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 14', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 15', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 16', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 17', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 18', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 19', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 20', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 21', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 22', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 23', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 24', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 25', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 26', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 27', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 28', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 29', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 30', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 31', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 32', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 33', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 34', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 35', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 36', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 37', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 38', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 39', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}'),
+('Template 40', 'Hello,
+
+I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+
+My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+
+I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+
+I have attached my resume for your detailed review. I look forward to hearing from you soon.
+
+Best regards,
+{name}');
