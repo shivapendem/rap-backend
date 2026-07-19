@@ -43,6 +43,7 @@ class ResumeResponse(BaseModel):
     job_description: Optional[str] = None
     data: dict
     s3_key: Optional[str] = None
+    s3_url: Optional[str] = None
     ats_score: Optional[int] = None
     status: str
     download_count: int
@@ -239,8 +240,29 @@ async def list_resumes(
     resumes = (await db.execute(query)).scalars().all()
     total_pages = math.ceil(total / page_size) if page_size > 0 else 0
     
+    # generate s3_url for each resume
+    response_data = []
+    for r in resumes:
+        r_dict = {
+            "id": r.id,
+            "user_id": r.user_id,
+            "title": r.title,
+            "target_role": r.target_role,
+            "job_description": r.job_description,
+            "data": r.data or {},
+            "s3_key": r.s3_key,
+            "s3_url": generate_presigned_url(r.s3_key) if r.s3_key else None,
+            "ats_score": r.ats_score,
+            "status": r.status,
+            "download_count": r.download_count,
+            "last_downloaded": r.last_downloaded,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at
+        }
+        response_data.append(ResumeResponse(**r_dict))
+    
     return PaginatedResumes(
-        data=resumes,
+        data=response_data,
         total=total,
         page=page,
         page_size=page_size,
