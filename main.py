@@ -225,12 +225,13 @@ async def _email_queue_worker_loop():
                         item.status_text = "Sent successfully"
                         await session.commit()
                     except Exception as e:
-                        print(f"[email-queue] failed to send item {item.id}: {e}")
+                        item_id = item.id
+                        print(f"[email-queue] failed to send item {item_id}: {e}")
                         from error_logger import log_db_error
-                        await log_db_error(stage="email_queue_worker_item", error=e, source_type="email_queue", source_id=item.id)
+                        await log_db_error(stage="email_queue_worker_item", error=e, source_type="email_queue", source_id=item_id)
                         await session.rollback()
                         # Re-fetch item to update status safely after rollback
-                        result = await session.execute(select(EmailQueue).where(EmailQueue.id == item.id))
+                        result = await session.execute(select(EmailQueue).where(EmailQueue.id == item_id))
                         failed_item = result.scalars().first()
                         if failed_item:
                             failed_item.status = "FAILED"
@@ -238,7 +239,7 @@ async def _email_queue_worker_loop():
                             try:
                                 await session.commit()
                             except Exception as inner_e:
-                                print(f"[email-queue] completely failed to update item {item.id}: {inner_e}")
+                                print(f"[email-queue] completely failed to update item {item_id}: {inner_e}")
                                 await session.rollback()
         except Exception as e:
             print(f"[email-queue] loop error: {e}")
