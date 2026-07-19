@@ -321,6 +321,7 @@ app.add_middleware(
         "http://137.184.96.50:8000",
         "http://137.184.96.50:3000",
         "https://rapapi.techtroup.com",
+        "https://rap-ten-beta.vercel.app"
         
     ],
     allow_credentials=True,
