@@ -1280,12 +1280,20 @@ async def get_recruiter_applications(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     consultant_id: Optional[int] = Query(None),
+    sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Returns a typed, paginated response (Pydantic model, not a raw dict).
     total respects the consultant_id filter when present.
+
+    BUG FIX: sent_at ordering was previously hardcoded desc with no way
+    for a caller to request asc — the frontend was compensating by
+    re-sorting only the current page's already-fixed rows client-side,
+    which is incoherent across page boundaries (page 2 wouldn't continue
+    the same sequence, since the underlying data was always fetched
+    server-side in descending order regardless of what the UI showed).
     """
     _require_role(current_user, "RECRUITER", "ADMIN")
 
@@ -1311,8 +1319,9 @@ async def get_recruiter_applications(
 
     total = (await db.execute(count_q)).scalar_one()
 
+    order_col = Application.sent_at.asc().nullslast() if sort_dir == "asc" else Application.sent_at.desc().nullslast()
     results = (await db.execute(
-        q.order_by(Application.sent_at.desc().nullslast())
+        q.order_by(order_col)
         .offset((page - 1) * page_size).limit(page_size)
     )).all()
 
