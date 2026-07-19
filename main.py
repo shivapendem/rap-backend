@@ -320,6 +320,8 @@ app.add_middleware(
         # Backend Server itself
         "http://137.184.96.50:8000",
         "http://137.184.96.50:3000",
+        "https://rapapi.techtroup.com",
+        
     ],
     allow_credentials=True,
     allow_methods=["*"],
