@@ -647,6 +647,8 @@ async def get_me(
         "email": current_user.email,
         "role": current_user.role,
         "is_active": current_user.is_active,
+        "skills": current_user.skills if isinstance(current_user.skills, list) else [],
+        "experience_years": float(current_user.experience_years) if current_user.experience_years is not None else None,
     }
 
 
