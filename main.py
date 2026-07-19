@@ -517,6 +517,8 @@ async def get_requirements(
     status: Optional[str] = None,
     sort_by: Optional[str] = "received_date",
     sort_dir: Optional[str] = "desc",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -547,6 +549,32 @@ async def get_requirements(
     query = select(Requirement)
     if status:
         query = query.where(Requirement.status == status)
+
+    if date_from:
+        try:
+            from datetime import time
+            if "T" in date_from:
+                dt_from = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            else:
+                dt_from = datetime.combine(datetime.strptime(date_from, "%Y-%m-%d").date(), time.min)
+            if dt_from.tzinfo is None:
+                dt_from = dt_from.replace(tzinfo=timezone.utc)
+            query = query.where(Requirement.received_date >= dt_from)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_from format")
+
+    if date_to:
+        try:
+            from datetime import time
+            if "T" in date_to:
+                dt_to = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            else:
+                dt_to = datetime.combine(datetime.strptime(date_to, "%Y-%m-%d").date(), time.max)
+            if dt_to.tzinfo is None:
+                dt_to = dt_to.replace(tzinfo=timezone.utc)
+            query = query.where(Requirement.received_date <= dt_to)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_to format")
 
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar_one()
