@@ -88,17 +88,57 @@ async def create_email_queue(
     consultant_id = None
 
     if current_user.role == "ADMIN":
-        # Admin must provide consultant_id explicitly
-        if not body.consultant_id:
-            raise HTTPException(status_code=400, detail="Admin must specify consultant_id.")
-        # Verify the consultant exists
-        cons_result = await db.execute(
-            sa_select(Consultant).where(Consultant.id == body.consultant_id)
-        )
-        consultant = cons_result.scalars().first()
-        if not consultant:
-            raise HTTPException(status_code=404, detail="Consultant not found.")
-        consultant_id = consultant.id
+        if body.consultant_id:
+            # Admin provided consultant_id explicitly — verify it exists
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+            )
+            consultant = cons_result.scalars().first()
+            if not consultant:
+                raise HTTPException(status_code=404, detail="Consultant not found.")
+            consultant_id = consultant.id
+        else:
+            # Admin didn't provide consultant_id — try to resolve from user's email
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.email == current_user.email)
+            )
+            consultant = cons_result.scalars().first()
+            if consultant:
+                consultant_id = consultant.id
+            else:
+                # Fallback: pick first active consultant
+                cons_result = await db.execute(
+                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                )
+                consultant = cons_result.scalars().first()
+                if not consultant:
+                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
+                consultant_id = consultant.id
+    elif current_user.role == "RECRUITER":
+        # Recruiter: same logic — try to resolve or fallback
+        if body.consultant_id:
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+            )
+            consultant = cons_result.scalars().first()
+            if not consultant:
+                raise HTTPException(status_code=404, detail="Consultant not found.")
+            consultant_id = consultant.id
+        else:
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.email == current_user.email)
+            )
+            consultant = cons_result.scalars().first()
+            if consultant:
+                consultant_id = consultant.id
+            else:
+                cons_result = await db.execute(
+                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                )
+                consultant = cons_result.scalars().first()
+                if not consultant:
+                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
+                consultant_id = consultant.id
     else:
         # Consultant: resolve from logged-in user
         cons_result = await db.execute(

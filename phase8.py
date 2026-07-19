@@ -282,7 +282,7 @@ async def list_audit_logs(
 # Applications management
 # ---------------------------------------------------------------------------
 
-from models import Application
+from models import Application, Requirement, Consultant
 
 @router.get("/applications", response_model=PaginatedApplicationsDTO)
 async def list_applications(
@@ -291,46 +291,59 @@ async def list_applications(
     consultant_id: Optional[str] = None,
     requirement_id: Optional[str] = None,
     status: Optional[str] = None,
+    sort_dir: str = Query("desc"),
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ) -> PaginatedApplicationsDTO:
     """Return paginated applications with optional filters."""
     filters = []
     if consultant_id:
-        filters.append(Application.consultant_id == consultant_id)
+        try:
+            filters.append(Application.consultant_id == int(consultant_id))
+        except ValueError:
+            pass
     if requirement_id:
-        filters.append(Application.requirement_id == requirement_id)
+        try:
+            filters.append(Application.requirement_id == int(requirement_id))
+        except ValueError:
+            pass
     if status:
         filters.append(Application.status == status)
     base_filter = and_(*filters) if filters else True
 
     total = (await db.execute(select(func.count()).select_from(Application).where(base_filter))).scalar_one()
-    rows = (await db.execute(
-        select(Application)
+    
+    q = select(Application, Requirement, Consultant) \
+        .outerjoin(Requirement, Requirement.id == Application.requirement_id) \
+        .outerjoin(Consultant, Consultant.id == Application.consultant_id) \
         .where(base_filter)
-        .order_by(Application.created_at.desc())
+
+    order = Application.created_at.desc() if sort_dir == "desc" else Application.created_at.asc()
+    
+    results = (await db.execute(
+        q.order_by(order)
         .offset((page - 1) * page_size)
         .limit(page_size)
-    )).scalars().all()
+    )).all()
 
     data = [
         ApplicationSentRowDTO(
-            id=str(r.id),
-            timestamp=r.created_at.isoformat() if r.created_at else "",
-            consultant_name=r.consultant_id,
-            consultant_id=str(r.consultant_id),
-            requirement_id=str(r.requirement_id),
-            role="UNKNOWN",
-            vendor_email=r.vendor_email or "",
-            ats_score=float(r.ats_score_at_send) if r.ats_score_at_send else None,
-            resume_id=None,
-            status=r.status,
-            candidate_id=r.candidate_id,
-            job_posting_id=str(r.job_posting_id) if r.job_posting_id else None,
-            match_score=float(r.match_score) if r.match_score else None,
-            applied_at=r.applied_at.isoformat() if r.applied_at else None,
+            id=str(app.id),
+            timestamp=app.created_at.isoformat() if app.created_at else "",
+            consultant_name=cons.full_name if cons else str(app.consultant_id),
+            consultant_id=str(app.consultant_id),
+            requirement_id=str(app.requirement_id),
+            role=req.role if req else "UNKNOWN",
+            vendor_email=app.vendor_email or "",
+            ats_score=float(app.ats_score_at_send) if app.ats_score_at_send else None,
+            resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
+            status=app.status,
+            candidate_id=app.candidate_id,
+            job_posting_id=str(app.job_posting_id) if app.job_posting_id else None,
+            match_score=float(app.match_score) if app.match_score else None,
+            applied_at=app.applied_at.isoformat() if app.applied_at else None,
         )
-        for r in rows
+        for app, req, cons in results
     ]
     return PaginatedApplicationsDTO(
         data=data,
