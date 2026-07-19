@@ -587,11 +587,9 @@ async def update_ai_budget(
 @router.get("/ai-usage/claude", response_model=ClaudeUsageDTO)
 async def get_claude_usage(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    _: dict = Depends(require_admin)
 ):
     """Get the latest recorded Claude API rate limit information."""
-    if current_user.role != 'admin':
-        raise HTTPException(status_code=403, detail="Admin only")
         
     limits = await get_claude_rate_limits(db)
     limit = limits["tokens_limit"]
