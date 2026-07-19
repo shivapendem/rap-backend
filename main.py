@@ -371,6 +371,9 @@ app.include_router(phase_users_router)
 from resume_router import router as resume_router  # noqa: E402
 app.include_router(resume_router)
 
+from templates_router import router as templates_router  # noqa: E402
+app.include_router(templates_router)
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------

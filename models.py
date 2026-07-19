@@ -604,3 +604,12 @@ class Resume(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     deleted_at = Column(TIMESTAMP(timezone=True), nullable=True)
+
+class MessageTemplate(Base):
+    __tablename__ = "message_templates"
+
+    id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
