@@ -12,7 +12,7 @@
 # "column users.experience_years does not exist".
 # ---------------------------------------------------------------------------
 
-from typing import Optional, List
+from typing import Optional, List, Any
 from pydantic import BaseModel, EmailStr, field_validator, Field
 
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
@@ -36,7 +36,7 @@ class UserAdminRowDTO(BaseModel):
     skills: Optional[List[str]] = None
     needsto_fetch_mail: bool = False
     experience_years: Optional[float] = None
-    resume_info: Optional[dict] = None
+    resume_info: Optional[Any] = None
 
     model_config = {"from_attributes": True}
 
@@ -58,7 +58,7 @@ class CreateUserRequestDTO(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8)
     role: str
-    resume_info: Optional[dict] = None
+    resume_info: Optional[Any] = None
 
     @field_validator("role")
     @classmethod
@@ -109,7 +109,7 @@ class EditUserRequestDTO(BaseModel):
     skills: Optional[List[str]] = None
     needsto_fetch_mail: Optional[bool] = None
     experience_years: Optional[float] = Field(None, ge=0, le=60)
-    resume_info: Optional[dict] = None
+    resume_info: Optional[Any] = None
 
     @field_validator("role")
     @classmethod
