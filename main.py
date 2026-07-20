@@ -374,6 +374,9 @@ app.include_router(resume_router)
 from templates_router import router as templates_router  # noqa: E402
 app.include_router(templates_router)
 
+from reports_router import router as reports_router  # noqa: E402
+app.include_router(reports_router)
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
