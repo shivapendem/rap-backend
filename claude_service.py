@@ -90,7 +90,7 @@ TARGET JOB DESCRIPTION:
 Generate the tailored resume JSON now.
 """
         response = client.messages.with_raw_response.create(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-sonnet-4-6",
             max_tokens=2500,
             system=SYSTEM_PROMPT,
             messages=[

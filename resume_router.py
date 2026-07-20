@@ -13,7 +13,7 @@ from database import get_db
 from models import User, Resume, ConsultantExperience
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3
-from openai_service import generate_tailored_resume
+from claude_service import generate_tailored_resume
 from phase8_ai_usage_service import save_claude_rate_limits
 
 # You can import openai and use it if an API key is provided
@@ -83,7 +83,7 @@ async def generate_resume(
     }
 
     try:
-        generated_data, rate_limits = await generate_tailored_resume(resume_info, request.job_description or "General Role")
+        generated_data, rate_limits = generate_tailored_resume(resume_info, request.job_description or "General Role")
         if rate_limits:
             await save_claude_rate_limits(db, rate_limits)
     except Exception as e:

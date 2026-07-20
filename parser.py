@@ -668,6 +668,12 @@ def clean_client(client: Optional[str]) -> Optional[str]:
     return client or None
 
 
+_LOCATION_PREFERENCE_PATTERN = re.compile(
+    r'(?i)\b(?:preference|preferred|ideally|nice\s+to\s+have|'
+    r'in\s+or\s+near|candidates?\s+(?:in|near|located|based))\b'
+)
+
+
 def clean_location(location: Optional[str]) -> Optional[str]:
     """
     Clean location value.
@@ -690,6 +696,23 @@ def clean_location(location: Optional[str]) -> Optional[str]:
     # Try to find a real City/State pair first (includes full state name support)
     city_state = find_city_state(location_no_paren)
     if city_state:
+        # Edge case: a genuinely Remote/Hybrid role that only names a city as a
+        # soft geographic *preference* — e.g. "Remote (U.S.) — preference for
+        # candidates in or near Minneapolis, MN". City-first priority would
+        # wrongly promote that preference city to the primary location, making a
+        # remote role look onsite. When a Remote/Hybrid keyword is stated BEFORE
+        # a preference phrase and the city follows it, keep the work mode as the
+        # primary location. Normal strings like "Remote or Dallas, TX" or
+        # "Austin, TX (Hybrid)" have no preference phrase, so they're unaffected.
+        low = location_no_paren.lower()
+        pref_m = _LOCATION_PREFERENCE_PATTERN.search(location_no_paren)
+        if pref_m:
+            mode = 'Remote' if 'remote' in low else 'Hybrid' if 'hybrid' in low else None
+            if mode:
+                mode_idx = low.find(mode.lower())
+                city_idx = low.find(city_state.split(',')[0].lower())
+                if mode_idx != -1 and mode_idx < pref_m.start() and (city_idx == -1 or city_idx >= pref_m.start()):
+                    return f"{mode} (pref: {city_state})"
         return city_state
     # Keyword fallbacks — only reached when no city was found
     low = location_no_paren.lower()
