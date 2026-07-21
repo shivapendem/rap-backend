@@ -512,3 +512,21 @@ I have attached my resume for your detailed review. I look forward to hearing fr
 
 Best regards,
 {name}');
+
+
+
+CREATE TABLE IF NOT EXISTS consultant_email_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    consultant_id BIGINT NOT NULL UNIQUE,
+    email_provider TEXT NOT NULL DEFAULT 'GMAIL',
+    email_address TEXT,
+    access_token_encrypted TEXT,
+    refresh_token_encrypted TEXT,
+    token_expiry TIMESTAMP WITH TIME ZONE,
+    send_permission_granted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_consultant_email_tokens_consultants FOREIGN KEY (consultant_id) REFERENCES consultants (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_consultant_email_tokens_consultant_id ON consultant_email_tokens (consultant_id);

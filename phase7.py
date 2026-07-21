@@ -376,7 +376,8 @@ async def confirm_send(
 
         await check_duplicate_application(db, request.requirement_id, consultant.id)
 
-        token = await assert_gmail_connected(db, consultant.id)
+        token_res = await db.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id))
+        token = token_res.scalars().first()
 
         result = await db.execute(select(Requirement).where(Requirement.id == request.requirement_id))
         requirement = result.scalars().first()
@@ -394,10 +395,19 @@ async def confirm_send(
             primary_skills=consultant.primary_skills,
         )
 
-        access_token = decrypt_token(token.access_token_encrypted)
+        if token and token.access_token_encrypted:
+            access_token = decrypt_token(token.access_token_encrypted)
+            from_email = token.email_address
+        else:
+            from gmail_send_service import get_service_account_access_token
+            import os
+            sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
+            from_email = consultant.email
+            access_token = get_service_account_access_token(sa_path, from_email)
+
         send_result = await send_application_email_async(
             access_token=access_token,
-            from_email=token.email_address,
+            from_email=from_email,
             to_email=requirement.vendor_email or "",
             cc_email=cc_email,
             subject=email_content["subject"],

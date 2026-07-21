@@ -7,10 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from database import get_db
-from models import User, Resume, ConsultantExperience
+from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3
 from claude_service import generate_tailored_resume
@@ -27,6 +27,34 @@ class ResumeCreateRequest(BaseModel):
     job_description: Optional[str] = None
     experience_ids: Optional[List[int]] = [] # IDs of ConsultantExperience to include
     draft: bool = False # If True, don't generate PDF yet
+    user_id: Optional[int] = None # The candidate user_id to generate for
+
+async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: User):
+    if current_user.role == "ADMIN":
+        result = await db.execute(select(Resume).where(Resume.id == resume_id))
+        return result.scalar_one_or_none()
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        result = await db.execute(select(Resume).where(
+            Resume.id == resume_id,
+            or_(
+                Resume.user_id == current_user.id,
+                Resume.user_id.in_(consultant_users_query)
+            )
+        ))
+        return result.scalar_one_or_none()
+    else:
+        result = await db.execute(select(Resume).where(Resume.id == resume_id, Resume.user_id == current_user.id))
+        return result.scalar_one_or_none()
 
 class ResumeUpdateRequest(BaseModel):
     title: Optional[str] = None
@@ -67,20 +95,77 @@ async def generate_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # Fetch consultant experiences if provided
-    experiences_text = ""
+    target_user_id = current_user.id
+    target_user = current_user
+    if request.user_id and current_user.role in ("ADMIN", "RECRUITER"):
+        target_user_id = request.user_id
+        target_user_result = await db.execute(select(User).where(User.id == target_user_id))
+        target_user = target_user_result.scalar_one_or_none()
+        if not target_user:
+            raise HTTPException(status_code=404, detail="Target user not found")
+
+    if target_user.role != "CONSULTANT":
+        raise HTTPException(status_code=403, detail="Resumes can only be generated for consultants.")
+
+    # Fetch consultant to get profile experiences
+    consultant = None
+    if target_user.role == "CONSULTANT":
+        consultant_res = await db.execute(select(Consultant).where(Consultant.user_id == target_user.id))
+        consultant = consultant_res.scalar_one_or_none()
+
+    profile_experiences = []
+    if consultant:
+        exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.consultant_id == consultant.id).order_by(ConsultantExperience.sort_order))
+        profile_experiences = exp_results.scalars().all()
+    
+    explicit_experiences = []
     if request.experience_ids:
         exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.id.in_(request.experience_ids)))
-        experiences = exp_results.scalars().all()
-        for exp in experiences:
-            experiences_text += f"{exp.role} at {exp.company} ({exp.start_date} - {exp.end_date}): {exp.description}\n"
+        explicit_experiences = exp_results.scalars().all()
+    
+    # Merge avoiding duplicates
+    all_exps = {exp.id: exp for exp in profile_experiences}
+    for exp in explicit_experiences:
+        all_exps[exp.id] = exp
+    
+    merged_exps = list(all_exps.values())
+
+    manual_exp_entries = []
+    for exp in merged_exps:
+        bullets = []
+        if exp.responsibilities:
+            bullets.extend([b.strip() for b in exp.responsibilities.split('\n') if b.strip()])
+        if exp.achievements:
+            bullets.extend([b.strip() for b in exp.achievements.split('\n') if b.strip()])
+        
+        tech_str = ", ".join(exp.technologies) if exp.technologies else ""
+        if tech_str:
+            bullets.append(f"Technologies: {tech_str}")
+
+        start_str = exp.start_date.strftime("%b %Y") if exp.start_date else ""
+        end_str = "Present" if exp.is_present else (exp.end_date.strftime("%b %Y") if exp.end_date else "")
+        date_str = f"{start_str} - {end_str}".strip(" -")
+
+        manual_exp_entries.append({
+            "title": exp.role_title,
+            "company": exp.client_name,
+            "dates": date_str,
+            "bullets": bullets
+        })
 
     # Use resume_info if available, else build a basic profile from db
-    resume_info = current_user.resume_info or {
-        "full_name": current_user.email.split('@')[0],
-        "email": current_user.email,
-        "experience": [{"bullets": [experiences_text]}] if experiences_text else []
+    import copy
+    resume_info = copy.deepcopy(target_user.resume_info) if target_user.resume_info else {
+        "full_name": target_user.full_name or target_user.email.split('@')[0],
+        "email": target_user.email,
+        "experience": []
     }
+
+    if "experience" not in resume_info:
+        resume_info["experience"] = []
+    
+    # Prepend profile experiences so they are processed as most relevant/recent
+    resume_info["experience"] = manual_exp_entries + resume_info["experience"]
 
     try:
         generated_data, rate_limits = generate_tailored_resume(resume_info, request.job_description or "General Role")
@@ -90,7 +175,7 @@ async def generate_resume(
         raise HTTPException(status_code=500, detail=f"AI Generation failed: {e}")
     
     new_resume = Resume(
-        user_id=current_user.id,
+        user_id=target_user_id,
         title=request.title,
         target_role=request.target_role,
         job_description=request.job_description,
@@ -110,7 +195,7 @@ async def generate_resume(
     from phase6 import _generate_docx, _convert_to_pdf
     from pathlib import Path
     
-    resume_dir = Path("/tmp/resumes") / str(current_user.id) / str(new_resume.id)
+    resume_dir = Path("/tmp/resumes") / str(target_user_id) / str(new_resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
     
     docx_path = resume_dir / "resume.docx"
@@ -121,7 +206,7 @@ async def generate_resume(
         pdf_ok = _convert_to_pdf(docx_path, pdf_path)
         
         if pdf_ok:
-            s3_key = f"users/{current_user.id}/resumes/{new_resume.id}/resume.pdf"
+            s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.pdf"
             with open(pdf_path, "rb") as f:
                 if upload_file_to_s3(f, s3_key, "application/pdf"):
                     new_resume.s3_key = s3_key
@@ -149,8 +234,7 @@ async def finalize_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Resume).where(Resume.id == resume_id, Resume.user_id == current_user.id))
-    resume = result.scalar_one_or_none()
+    resume = await _get_resume_for_user(db, resume_id, current_user)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
         
@@ -162,7 +246,7 @@ async def finalize_resume(
     from phase6 import _generate_docx, _convert_to_pdf
     from pathlib import Path
     
-    resume_dir = Path("/tmp/resumes") / str(current_user.id) / str(resume.id)
+    resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
     
     docx_path = resume_dir / "resume.docx"
@@ -173,7 +257,7 @@ async def finalize_resume(
         pdf_ok = _convert_to_pdf(docx_path, pdf_path)
         
         if pdf_ok:
-            s3_key = f"users/{current_user.id}/resumes/{resume.id}/resume.pdf"
+            s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
             with open(pdf_path, "rb") as f:
                 if upload_file_to_s3(f, s3_key, "application/pdf"):
                     resume.s3_key = s3_key
@@ -226,10 +310,40 @@ async def upload_resume(
 async def list_resumes(
     page: int = 1,
     page_size: int = 10,
+    search: Optional[str] = None,
+    user_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    query = select(Resume).where(Resume.user_id == current_user.id)
+    if current_user.role == "ADMIN":
+        query = select(Resume)
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        query = select(Resume).where(
+            or_(
+                Resume.user_id == current_user.id,
+                Resume.user_id.in_(consultant_users_query)
+            )
+        )
+    else:
+        query = select(Resume).where(Resume.user_id == current_user.id)
+        
+    if user_id:
+        # Additional safety to only allow filtering if they have access
+        if current_user.role == "ADMIN" or current_user.role == "RECRUITER":
+            query = query.where(Resume.user_id == user_id)
+        
+    if search:
+        query = query.where(Resume.title.ilike(f"%{search}%"))
     
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar_one()
@@ -357,3 +471,42 @@ async def download_resume(
     await db.commit()
     
     return {"url": url}
+
+@router.get("/consultants")
+async def get_consultants_for_resumes(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    def map_user_consultant(u, c):
+        return {
+            "id": u.id, # Keep id for backward compatibility (maps to user_id)
+            "user_id": u.id,
+            "consultant_id": c.id if c else None,
+            "name": u.full_name or u.email,
+            "email": u.email,
+            "skills": u.skills,
+            "experience_years": u.experience_years or (c.total_experience_years if c else 0)
+        }
+
+    if current_user.role == "ADMIN":
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.role == "CONSULTANT")
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id.in_(consultant_users_query))
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+    else:
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id == current_user.id)
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
