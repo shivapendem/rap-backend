@@ -78,6 +78,7 @@ from auth import get_current_user, decode_access_token
 from s3_service import upload_file_to_s3, delete_file_from_s3
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,7 @@ class AdminConsultantCreateRequest(BaseModel):
     total_experience_years: Optional[float] = Field(None, ge=0, le=60)
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
+    resume_info: Optional[dict] = None
 
     @field_validator("email")
     @classmethod
@@ -778,6 +780,12 @@ async def admin_create_consultant(
         full_name=payload.name,
         role="CONSULTANT",
         is_active=True,
+        # resume_info lives on User (not Consultant) — see generate_resume()
+        # in resume_router.py, which reads target_user.resume_info to build
+        # the AI resume draft. Previously this creation flow had no way to
+        # set it at all, so every new consultant started with an empty
+        # profile until someone separately edited them via Users → Edit.
+        resume_info=payload.resume_info,
     )
     _set_password_on_user(user, _hash_password(temp_password))
     db.add(user)
@@ -896,23 +904,12 @@ async def upload_resume(
     if len(file_bytes) > MAX_RESUME_BYTES:
         raise HTTPException(413, "File exceeds 10 MB limit")
 
-    # Delete old object from Spaces if present (best-effort — never block the upload)
+    # Delete old file if present
     if consultant.base_resume_file_path:
-        try:
-            delete_file_from_s3(consultant.base_resume_file_path)
-        except Exception:
-            pass
+        _delete_file_if_exists(consultant.base_resume_file_path)
 
-    # Store the base resume in DigitalOcean Spaces — same object store the Resumes list uses.
-    # NOTE: base_resume_file_path now holds the Spaces object KEY, not a local disk path.
-    _ext_map = {
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-        "application/pdf": ".pdf",
-    }
-    ext = _ext_map.get(content_type, ".bin")
-    s3_key = f"users/{current_user.id}/base_resume/{uuid.uuid4().hex}{ext}"
-    if not upload_file_to_s3(io.BytesIO(file_bytes), s3_key, content_type=content_type):
-        raise HTTPException(500, "Failed to store resume in object storage")
+    # Store file
+    file_path = _save_resume_file(file_bytes, consultant.id, file.filename or "resume", content_type)
 
     # Extract text (best-effort — never fail the upload)
     extracted_text = _extract_resume_text(file_bytes, content_type)
@@ -924,16 +921,16 @@ async def upload_resume(
         merged = list(dict.fromkeys(existing + detected))
         consultant.primary_skills = ", ".join(merged)
 
-    consultant.base_resume_file_path = s3_key
+    consultant.base_resume_file_path = file_path
     consultant.base_resume_text = extracted_text
     await db.commit()
     await db.refresh(consultant)
 
-    logger.info("Resume uploaded consultant_id=%s s3_key=%s skills_detected=%d", consultant.id, s3_key, len(detected))
+    logger.info("Resume uploaded consultant_id=%s file=%s skills_detected=%d", consultant.id, file_path, len(detected))
 
     return ResumeUploadResponse(
         resume={
-            "filename": file.filename or Path(s3_key).name,
+            "filename": file.filename or Path(file_path).name,
             "uploadedAt": datetime.utcnow().isoformat(),
             "sizeBytes": len(file_bytes),
         }

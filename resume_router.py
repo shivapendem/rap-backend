@@ -78,6 +78,7 @@ class ResumeResponse(BaseModel):
     last_downloaded: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    is_base: bool = False
     
     class Config:
         from_attributes = True
@@ -173,7 +174,32 @@ async def generate_resume(
             await save_claude_rate_limits(db, rate_limits)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Generation failed: {e}")
-    
+    # Compute a real ATS score from the generated resume vs. the job description.
+    # Reuses phase6's keyword scorer and phase3's skill detector. Left as None
+    # (no badge shown) when the JD has no recognizable skills to match against.
+    ats_value = None
+    try:
+        from phase6 import _ats_score
+        from phase3 import _detect_skills
+        jd_skills = list(dict.fromkeys(
+            _detect_skills(request.job_description or "")
+            + (generated_data.get("missing_skills") or [])
+        ))
+        if jd_skills:
+            text_parts = [
+                generated_data.get("summary", ""),
+                " ".join(generated_data.get("skills", []) or []),
+                request.target_role or "",
+            ]
+            for exp in generated_data.get("experience", []) or []:
+                text_parts.append(exp.get("role", ""))
+                text_parts.append(" ".join(exp.get("bullets", []) or []))
+            resume_text = " ".join(text_parts)
+            ats_total, *_ = _ats_score(jd_skills, resume_text, request.target_role or "")
+            ats_value = int(round(ats_total))
+    except Exception as e:
+        print(f"ATS scoring failed, leaving score empty: {e}")
+        ats_value = None
     new_resume = Resume(
         user_id=target_user_id,
         title=request.title,
@@ -181,7 +207,7 @@ async def generate_resume(
         job_description=request.job_description,
         data=generated_data,
         status='draft' if request.draft else 'generating',
-        ats_score=85 # Dummy score
+        ats_score=ats_value,
     )
     
     db.add(new_resume)
