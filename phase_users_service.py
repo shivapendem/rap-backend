@@ -8,9 +8,10 @@ import math
 from typing import Optional, List
 
 from fastapi import HTTPException
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import User, Consultant
+from models import User, Consultant, Application, Resume
 from phase_users_repository import (
     UserRepository, ConsultantRepository, RecruiterConsultantRepository,
 )
@@ -46,6 +47,47 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
 
 async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdminRowDTO:
     recruiters = await ConsultantRepository.get_assigned_recruiters(db, c.id)
+
+    # Profile completeness — mirrors ProfileCompletenessBar.tsx so the admin
+    # screen and the consultant's own profile show the same number.
+    completeness = 0
+    if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
+        completeness += 30  # Skills
+    if c.base_resume_file_path or c.base_resume_text:
+        completeness += 30  # Resume
+    if c.preferred_employment_types:
+        completeness += 20  # Employment type
+    if (c.work_authorization or "").strip():
+        completeness += 10  # Work auth
+    if len((c.current_location or "").strip()) >= 2:
+        completeness += 10  # Location
+
+    # BUG FIX: last_login_at / total_applications_sent / total_resumes_generated
+    # were previously not returned by this endpoint at all — the frontend
+    # hardcoded null/0 for all three with a comment noting the backend gap.
+    # Computed here from real data: User.last_login_at (now tracked at
+    # login — see main.py), Application rows with status="SENT", and
+    # Resume rows for this consultant's linked user account.
+    last_login_at = None
+    total_applications_sent = 0
+    total_resumes_generated = 0
+
+    if c.user_id:
+        user_result = await db.execute(select(User.last_login_at).where(User.id == c.user_id))
+        last_login_at = user_result.scalar_one_or_none()
+
+        resumes_result = await db.execute(
+            select(func.count()).select_from(Resume).where(Resume.user_id == c.user_id)  # pylint: disable=not-callable  # pyright: ignore[reportOptionalCall, reportCallIssue]
+        )
+        total_resumes_generated = resumes_result.scalar_one() or 0
+
+    apps_result = await db.execute(
+        select(func.count()).select_from(Application).where(  # pylint: disable=not-callable  # pyright: ignore[reportOptionalCall, reportCallIssue]
+            Application.consultant_id == c.id, Application.status == "SENT"
+        )
+    )
+    total_applications_sent = apps_result.scalar_one() or 0
+
     return ConsultantAdminRowDTO(
         id=str(c.id),
         user_id=str(c.user_id) if c.user_id else "",
@@ -71,6 +113,10 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         ats_score=float(c.ats_score) if c.ats_score is not None else None,
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
         has_resume=bool(c.base_resume_file_path or c.base_resume_text),
+        last_login_at=last_login_at.isoformat() if last_login_at else None,
+        total_applications_sent=total_applications_sent,
+        total_resumes_generated=total_resumes_generated,
+        completeness_pct=completeness,
     )
 
 

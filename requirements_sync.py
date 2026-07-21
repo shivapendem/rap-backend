@@ -53,11 +53,14 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
     forever, with manual per-email Reparse as the only way through.
 
     Still respects an EXPLICIT non-job classification if the classifier
-    already made one (category NOT NULL and != 'job_posting') — that
-    guards against the original bug this file's header comment describes
-    (newsletters/invites becoming fake Requirements). What's removed is
-    only the requirement to WAIT for a positive classification; unclassified
-    (category IS NULL) rows are now eligible immediately.
+    already made one (category NOT NULL, not 'job_posting', and not
+    'unclassified') — that guards against the original bug this file's
+    header comment describes (newsletters/invites becoming fake
+    Requirements). What's removed is only the requirement to WAIT for a
+    positive classification; unclassified (category IS NULL, or the
+    literal string 'unclassified' — this classifier's actual "not decided
+    yet" value, confirmed from live gmail_emails rows) rows are now
+    eligible immediately.
 
     The real safety gate is parse_requirement()'s own is_likely_requirement
     check below — a row only becomes a Requirement if the parser itself
@@ -71,7 +74,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                    ge.from_address, ge.from_name, ge.reply_to, ge.body_text,
                    ge.body_html, ge.date
             FROM gmail_emails ge
-            WHERE (ge.category IS NULL OR ge.category = 'job_posting')
+            WHERE (ge.category IS NULL OR ge.category = 'job_posting' OR ge.category = 'unclassified')
               AND NOT EXISTS (
                   SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
               )
@@ -131,6 +134,28 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
 
             if save_result["status"] == "saved":
                 saved += 1
+                # BUG FIX: nothing ever called match_requirement() for
+                # requirements created here — only the manual admin
+                # "Rematch"/"Match All" buttons did. That left
+                # ats_match_count stuck at its column default of 0 for
+                # every auto-synced requirement forever, since this loop
+                # is the only path that creates new Requirement rows on
+                # an ongoing basis. Local import avoids a top-level
+                # circular import between this module and phase4.
+                try:
+                    from phase4 import match_requirement
+                    await match_requirement(db, save_result["id"])
+                except Exception as match_err:
+                    # Don't let a matching failure undo the successful
+                    # requirement save above — log and move on.
+                    print(f"[requirements_sync] auto-match FAILED for requirement_id={save_result['id']}: {match_err}")
+                    from error_logger import log_db_error
+                    await log_db_error(
+                        stage="requirements_sync_automatch",
+                        error=match_err,
+                        source_type="requirement",
+                        source_id=save_result["id"],
+                    )
             elif save_result["status"] == "duplicate":
                 duplicates += 1
 

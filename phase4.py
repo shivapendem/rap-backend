@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -155,15 +156,38 @@ def score_skills(requirement_skills: List[str], consultant_skills: List[str]) ->
     return round(score, 2), matched, missing
 
 
-def score_role(requirement_role: Optional[str], consultant_preferred_roles: Optional[str]) -> float:
-    """Role title token overlap — simple word-set comparison."""
-    if not requirement_role or not consultant_preferred_roles:
+def score_role(
+    requirement_role: Optional[str],
+    consultant_preferred_roles: Optional[str],
+    experiences: Optional[List[ConsultantExperience]] = None,
+) -> float:
+    """
+    Role title token overlap — simple word-set comparison.
+
+    BUG FIX: previously only compared against consultant.preferred_roles,
+    an optional free-text profile field that's rarely filled in — meaning
+    this factor silently scored 0 for nearly every consultant, dragging
+    every match's total below MATCH_THRESHOLD regardless of actual fit.
+    Now also pulls comparison tokens from the consultant's real job
+    titles (ConsultantExperience.role_title), which is populated far
+    more reliably than the preference field.
+    """
+    if not requirement_role:
         return 0.0
 
     req_tokens = set(requirement_role.lower().split())
-    pref_tokens = set(consultant_preferred_roles.lower().replace(",", " ").split())
-
     if not req_tokens:
+        return 0.0
+
+    pref_tokens = set()
+    if consultant_preferred_roles:
+        pref_tokens |= set(consultant_preferred_roles.lower().replace(",", " ").split())
+    if experiences:
+        for exp in experiences:
+            if exp.role_title:
+                pref_tokens |= set(exp.role_title.lower().split())
+
+    if not pref_tokens:
         return 0.0
 
     overlap = req_tokens & pref_tokens
@@ -182,13 +206,37 @@ def _calculate_total_experience_years(experiences: List[ConsultantExperience]) -
     return round(total_days / 365.25, 1)
 
 
+def _parse_min_years_required(requirement: Requirement) -> Optional[float]:
+    """
+    Extract the minimum years of experience the requirement is asking for,
+    from parser.py's extract_experience() output stored in
+    requirement.parsed_fields['experience'] (e.g. "5+ years", "3-5 years",
+    "10 years"). Returns None if the requirement never stated one.
+    """
+    exp_text = None
+    if requirement.parsed_fields:
+        exp_text = requirement.parsed_fields.get("experience")
+    if not exp_text:
+        return None
+    m = re.search(r"(\d+)", exp_text)
+    if not m:
+        return None
+    return float(m.group(1))
+
+
 def score_experience(requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]) -> float:
     """
-    Score based on consultant's total experience years.
-    Uses cached total_experience_years on Consultant if set,
-    otherwise calculates from consultant_experience rows.
-    No explicit "years required" field on Requirement, so this scores
-    presence and magnitude of experience rather than an exact match.
+    Score based on how the consultant's total experience compares to what
+    the requirement is actually asking for.
+
+    BUG FIX: previously scored the consultant's absolute years on a flat
+    0-8yr scale with NO reference to the requirement at all — a posting
+    asking for 10+ years and one asking for 1+ year scored a given
+    consultant identically, and a very senior consultant capped out at
+    100 regardless of whether the role wanted a junior. Now compares
+    against parser.py's extracted parsed_fields['experience'] minimum
+    when the requirement stated one, falling back to the old absolute
+    scale only when it didn't.
     """
     years = float(consultant.total_experience_years or 0)
     if years <= 0 and experiences:
@@ -196,21 +244,39 @@ def score_experience(requirement: Requirement, consultant: Consultant, experienc
 
     if years <= 0:
         return 0.0
-    if years >= 8:
+
+    required_years = _parse_min_years_required(requirement)
+    if required_years is None or required_years <= 0:
+        # Requirement didn't state a minimum — fall back to absolute scale
+        if years >= 8:
+            return 100.0
+        return round((years / 8) * 100, 2)
+
+    if years >= required_years:
         return 100.0
-    return round((years / 8) * 100, 2)
+    # Below the stated minimum — partial credit proportional to how close
+    return round((years / required_years) * 100, 2)
 
 
 def score_employment_type(requirement_types: Optional[List[str]], consultant_types: Optional[List[str]]) -> float:
-    """Employment type intersection — C2C/W2/FULLTIME."""
-    if not requirement_types or not consultant_types:
+    """
+    Employment type intersection — C2C/W2/FULLTIME.
+
+    BUG FIX: requirement_types defaults to ["UNKNOWN"] (see parser.py)
+    whenever the source email didn't clearly state an employment type —
+    this previously scored 0 for that case, identical to a genuine
+    mismatch, silently zeroing this factor for every ambiguously-worded
+    posting. Treat "not specified" as "don't penalize" instead, the same
+    way score_skills() already does when a JD has no extracted skills.
+    """
+    if not requirement_types or requirement_types == ["UNKNOWN"]:
+        return 100.0
+
+    if not consultant_types:
         return 0.0
 
     req_set = set(t.upper() for t in requirement_types)
     cons_set = set(t.upper() for t in consultant_types)
-
-    if not req_set:
-        return 0.0
 
     overlap = req_set & cons_set
     return 100.0 if overlap else 0.0
@@ -284,7 +350,7 @@ def score_match(
     consultant_skills = _consultant_skills(consultant)
 
     skill_raw, matched_skills, missing_skills = score_skills(requirement_skills, consultant_skills)
-    role_raw = score_role(requirement.role, consultant.preferred_roles)
+    role_raw = score_role(requirement.role, consultant.preferred_roles, experiences)
     exp_raw = score_experience(requirement, consultant, experiences)
     employment_raw = score_employment_type(requirement.employment_types, consultant.preferred_employment_types)
     location_raw = score_location(requirement, consultant, experiences)
@@ -470,6 +536,11 @@ class MatchAllResponse(BaseModel):
     total_assignments: int
 
 
+class NewMatchesCountResponse(BaseModel):
+    new_matches: int
+    days: int
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -599,3 +670,34 @@ async def match_all_requirements(
         requirements_processed=len(requirements),
         total_assignments=total_assignments,
     )
+
+
+@router.get(
+    "/api/admin/requirements/new-matches-count",
+    response_model=NewMatchesCountResponse,
+    summary="Count requirements that picked up a new match in the last N days (admin only)",
+)
+async def get_new_matches_count(
+    days: int = Query(7, ge=1, le=90),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Backs the admin dashboard's "New Matches (7d)" stat card. This endpoint
+    never existed before — the frontend (admin.api.ts) had it hardcoded to
+    0 with a comment explaining there was nothing real to call. Counts
+    DISTINCT requirements with at least one match row created (not just
+    updated) in the window — re-running match-all touches updated_at on
+    existing rows too, so filtering on created_at specifically counts
+    genuinely NEW matches, not re-scores of old ones.
+    """
+    _require_role(current_user, "ADMIN")
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    result = await db.execute(
+        select(func.count(func.distinct(RequirementConsultantMatch.requirement_id)))  # pylint: disable=not-callable  # pyright: ignore[reportOptionalCall, reportCallIssue]  # noqa: E1102
+        .where(RequirementConsultantMatch.created_at >= since)
+    )
+    count = result.scalar_one()
+
+    return NewMatchesCountResponse(new_matches=count, days=days)

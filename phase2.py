@@ -554,6 +554,25 @@ async def reparse_email(
     email.parse_status = "PARSED"
     await db.commit()
 
+    # BUG FIX: nothing here ever ran matching, so a manually reparsed
+    # requirement's ats_match_count stayed at 0 the same way auto-synced
+    # ones did (see requirements_sync.py) until an admin separately
+    # clicked "Rematch"/"Match All". Trigger it here too so reparse
+    # always leaves the requirement with a real match count.
+    if requirement_id is not None:
+        try:
+            from phase4 import match_requirement
+            await match_requirement(db, requirement_id)
+        except Exception as match_err:
+            print(f"[reparse_email] auto-match FAILED for requirement_id={requirement_id}: {match_err}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="reparse_email_automatch",
+                error=match_err,
+                source_type="requirement",
+                source_id=requirement_id,
+            )
+
     logger.info(
         "Reparsed email_id=%s (emails.id=%s) -> requirement_status=%s requirement_id=%s by user=%s",
         email_id, real_email_id, requirement_status, requirement_id, current_user.email,

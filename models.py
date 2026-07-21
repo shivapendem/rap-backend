@@ -59,6 +59,7 @@ class User(Base):
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    last_login_at = Column(TIMESTAMP(timezone=True), nullable=True)
     needsto_fetch_mail = Column("needto_fetch_mail", Boolean, nullable=False, default=False)
     skills = JSONBColumn(nullable=False, default=list)
     # Recruiter-facing "Experience (Years)" field on the Users screen. Only

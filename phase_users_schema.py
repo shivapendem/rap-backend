@@ -182,9 +182,15 @@ class ConsultantAdminRowDTO(BaseModel):
     ats_score: Optional[float] = None
     updated_at: str = ""
     has_resume: bool = False  # base_resume_file_path/base_resume_text can be large — expose presence, not raw content
+    last_login_at: Optional[str] = None
+    total_applications_sent: int = 0
+    total_resumes_generated: int = 0
+    last_login_at: Optional[str] = None
+    total_applications_sent: int = 0
+    total_resumes_generated: int = 0
+    completeness_pct: int = 0  # profile completeness %, mirrors the consultant-side formula
 
     model_config = {"from_attributes": True}
-
 
 class AssignConsultantRequestDTO(BaseModel):
     consultant_id: str

@@ -429,7 +429,12 @@ async def login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
-    
+
+    # Real last-login tracking — backs the admin Consultants screen's
+    # "Last Login" stat, which was previously hardcoded to null on the
+    # frontend since nothing ever populated it.
+    user.last_login_at = datetime.now(timezone.utc)
+
     # Insert Login Notification
     new_notif = Notification(
         user_id=user.id,
@@ -562,7 +567,10 @@ async def google_login(
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
-    
+
+    # Real last-login tracking — see matching note in /auth/login.
+    user.last_login_at = datetime.now(timezone.utc)
+
     # Insert Login Notification
     new_notif = Notification(
         user_id=user.id,

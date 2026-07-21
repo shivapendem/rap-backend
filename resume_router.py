@@ -374,7 +374,43 @@ async def list_resumes(
             "updated_at": r.updated_at
         }
         response_data.append(ResumeResponse(**r_dict))
-    
+
+    # --- Pin the consultant's base resume (from their profile) at the top ---
+    # It lives on the consultants table + Spaces, not the resumes table, so we surface it
+    # here as a read-only entry instead of duplicating a row (single source of truth).
+    if page == 1:
+        base_target_user_id = None
+        if current_user.role == "CONSULTANT":
+            base_target_user_id = current_user.id
+        elif user_id:  # admin/recruiter viewing a specific candidate
+            base_target_user_id = user_id
+
+        if base_target_user_id is not None and (not search or search.lower() in "base resume"):
+            base_consultant = (await db.execute(
+                select(Consultant).where(Consultant.user_id == base_target_user_id)
+            )).scalar_one_or_none()
+
+            if base_consultant and base_consultant.base_resume_file_path:
+                base_ts = base_consultant.updated_at or datetime.now(timezone.utc)
+                response_data.insert(0, ResumeResponse(
+                    id=-1,
+                    user_id=base_target_user_id,
+                    title="Base Resume",
+                    target_role="From profile",
+                    job_description=None,
+                    data={},
+                    s3_key=None,
+                    s3_url=generate_presigned_url(base_consultant.base_resume_file_path) or None,
+                    ats_score=None,
+                    status="base",
+                    download_count=0,
+                    last_downloaded=None,
+                    created_at=base_ts,
+                    updated_at=base_ts,
+                    is_base=True,
+                ))
+                total += 1
+
     return PaginatedResumes(
         data=response_data,
         total=total,
@@ -389,8 +425,9 @@ async def get_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Resume).where(Resume.id == id, Resume.user_id == current_user.id))
-    resume = result.scalars().first()
+    # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
+    # class of bug as /download. Uses the shared role-scoped helper instead.
+    resume = await _get_resume_for_user(db, id, current_user)
     
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
@@ -404,8 +441,9 @@ async def update_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Resume).where(Resume.id == id, Resume.user_id == current_user.id))
-    resume = result.scalars().first()
+    # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
+    # class of bug as /download. Uses the shared role-scoped helper instead.
+    resume = await _get_resume_for_user(db, id, current_user)
     
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
@@ -432,8 +470,9 @@ async def delete_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Resume).where(Resume.id == id, Resume.user_id == current_user.id))
-    resume = result.scalars().first()
+    # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
+    # class of bug as /download. Uses the shared role-scoped helper instead.
+    resume = await _get_resume_for_user(db, id, current_user)
     
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
@@ -452,8 +491,18 @@ async def download_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Resume).where(Resume.id == id, Resume.user_id == current_user.id))
-    resume = result.scalars().first()
+    # BUG FIX: was `select(Resume).where(Resume.id == id, Resume.user_id ==
+    # current_user.id)` — only ever matched when the CALLER owned the resume.
+    # /admin/apply/:reqId and /recruiter/apply/:reqId reuse this same page to
+    # apply on behalf of a consultant, so current_user is the admin/recruiter,
+    # not the consultant who owns the resume — this 404'd every single time
+    # for them ("Preparing resume attachment..." -> "Failed to download and
+    # attach resume"). Now uses the shared role-scoped helper (same one
+    # get_resume/update_resume/delete_resume already use above) instead of
+    # duplicating the ADMIN/RECRUITER/owner query logic inline: ADMIN sees
+    # any resume, RECRUITER sees their own + assigned consultants', everyone
+    # else only their own.
+    resume = await _get_resume_for_user(db, id, current_user)
     
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
