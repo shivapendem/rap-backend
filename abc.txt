@@ -530,3 +530,4 @@ CREATE TABLE IF NOT EXISTS consultant_email_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS ix_consultant_email_tokens_consultant_id ON consultant_email_tokens (consultant_id);
+ALTER TABLE email_queue ADD COLUMN cc_email TEXT;

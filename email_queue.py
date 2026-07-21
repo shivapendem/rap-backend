@@ -29,6 +29,7 @@ class EmailQueueCreateRequest(BaseModel):
     requirement_id: Optional[int] = None
     from_email: str
     to_email: str
+    cc_email: Optional[str] = None
     subject: str
     content: Optional[str] = None
     attachments: Optional[List[str]] = None
@@ -154,6 +155,7 @@ async def create_email_queue(
         requirement_id=body.requirement_id,
         from_email=body.from_email,
         to_email=body.to_email,
+        cc_email=body.cc_email,
         subject=body.subject,
         content=body.content,
         attachments=body.attachments,

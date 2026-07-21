@@ -557,6 +557,7 @@ class EmailQueue(Base):
     requirement_id = Column(FK_TYPE, ForeignKey("requirements.id", ondelete="SET NULL"), nullable=True, index=True)
     from_email = Column(Text, nullable=False)
     to_email = Column(Text, nullable=False)
+    cc_email = Column(Text, nullable=True)
     subject = Column(Text, nullable=False)
     content = Column(Text, nullable=True)
     # FIX: was `Column(JSONB, nullable=True)` — JSONB is only imported
