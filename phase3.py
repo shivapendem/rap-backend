@@ -41,6 +41,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import math
@@ -626,6 +627,20 @@ async def update_own_profile(
 
     await db.commit()
     await db.refresh(consultant)
+
+    # Re-run matching for this consultant so their requirement matches reflect
+    # the just-saved profile. Runs in the background with its own DB session so
+    # it never blocks or fails the profile save.
+    consultant_id = consultant.id
+    async def _rematch_in_background(cid: int):
+        from database import AsyncSessionLocal
+        from phase4 import match_consultant
+        try:
+            async with AsyncSessionLocal() as bg_session:
+                await match_consultant(bg_session, cid)
+        except Exception as e:
+            logger.error("Background auto-match failed for consultant_id=%s: %s", cid, e)
+    asyncio.create_task(_rematch_in_background(consultant_id))
 
     count_result = await db.execute(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)

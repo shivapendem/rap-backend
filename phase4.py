@@ -23,6 +23,8 @@
 #   score_match()             — combines all 6 factors per the doc's weights
 #   match_requirement()       — scores all active consultants against one requirement,
 #                                upserts into requirement_consultant_matches
+#   match_consultant()        — inverse of match_requirement: scores one consultant
+#                                against all open requirements, upserts matches
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -502,6 +504,88 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
         requirement_id, len(consultants), assignment_count,
     )
     return assignment_count
+
+
+async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
+    """
+    Inverse of match_requirement: score ONE consultant against all
+    still-open requirements and upsert into requirement_consultant_matches.
+    Called automatically when a consultant updates their profile so their
+    matches reflect the new skills/roles/etc. without an admin re-run.
+    Returns the number of requirements where they now meet MATCH_THRESHOLD.
+    """
+    cons_result = await db.execute(select(Consultant).where(Consultant.id == consultant_id))
+    consultant = cons_result.scalars().first()
+    if not consultant or consultant.status != "ACTIVE":
+        return 0
+
+    # Open requirements only — skip terminal states.
+    reqs_result = await db.execute(
+        select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+    )
+    requirements = reqs_result.scalars().all()
+    if not requirements:
+        return 0
+
+    exp_result = await db.execute(
+        select(ConsultantExperience).where(ConsultantExperience.consultant_id == consultant_id)
+    )
+    experiences = exp_result.scalars().all()
+
+    req_ids = [r.id for r in requirements]
+    existing_result = await db.execute(
+        select(RequirementConsultantMatch).where(
+            RequirementConsultantMatch.consultant_id == consultant_id,
+            RequirementConsultantMatch.requirement_id.in_(req_ids),
+        )
+    )
+    existing_by_req = {m.requirement_id: m for m in existing_result.scalars().all()}
+
+    match_count = 0
+    for requirement in requirements:
+        result = score_match(requirement, consultant, experiences)
+
+        if result["total"] < MATCH_THRESHOLD:
+            continue
+
+        existing = existing_by_req.get(requirement.id)
+
+        if existing:
+            existing.match_score = result["total"]
+            existing.skill_score = result["skill_score"]
+            existing.role_score = result["role_score"]
+            existing.experience_score = result["experience_score"]
+            existing.employment_score = result["employment_score"]
+            existing.location_score = result["location_score"]
+            existing.auth_score = result["auth_score"]
+            existing.matched_skills = result["matched_skills"]
+            existing.missing_skills = result["missing_skills"]
+            existing.match_reason = result["match_reason"]
+        else:
+            db.add(RequirementConsultantMatch(
+                requirement_id=requirement.id,
+                consultant_id=consultant_id,
+                match_score=result["total"],
+                skill_score=result["skill_score"],
+                role_score=result["role_score"],
+                experience_score=result["experience_score"],
+                employment_score=result["employment_score"],
+                location_score=result["location_score"],
+                auth_score=result["auth_score"],
+                matched_skills=result["matched_skills"],
+                missing_skills=result["missing_skills"],
+                match_reason=result["match_reason"],
+                status="ASSIGNED",
+            ))
+
+        match_count += 1
+
+    await db.commit()
+    logger.info(
+        "Auto-matched consultant_id=%s across %d open requirements — %d matches",
+        consultant_id, len(requirements), match_count,
+    )
+    return match_count
 
 
 # ---------------------------------------------------------------------------
