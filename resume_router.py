@@ -445,6 +445,45 @@ async def list_resumes(
         total_pages=total_pages
     )
 
+@router.get("/consultants")
+async def get_consultants_for_resumes(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    def map_user_consultant(u, c):
+        return {
+            "id": u.id, # Keep id for backward compatibility (maps to user_id)
+            "user_id": u.id,
+            "consultant_id": c.id if c else None,
+            "name": u.full_name or u.email,
+            "email": u.email,
+            "skills": u.skills,
+            "experience_years": u.experience_years or (c.total_experience_years if c else 0)
+        }
+
+    if current_user.role == "ADMIN":
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.role == "CONSULTANT")
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id.in_(consultant_users_query))
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+    else:
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id == current_user.id)
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+
 @router.get("/{id}", response_model=ResumeResponse)
 async def get_resume(
     id: int,
@@ -547,41 +586,3 @@ async def download_resume(
     
     return {"url": url}
 
-@router.get("/consultants")
-async def get_consultants_for_resumes(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    def map_user_consultant(u, c):
-        return {
-            "id": u.id, # Keep id for backward compatibility (maps to user_id)
-            "user_id": u.id,
-            "consultant_id": c.id if c else None,
-            "name": u.full_name or u.email,
-            "email": u.email,
-            "skills": u.skills,
-            "experience_years": u.experience_years or (c.total_experience_years if c else 0)
-        }
-
-    if current_user.role == "ADMIN":
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.role == "CONSULTANT")
-        results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
-    elif current_user.role == "RECRUITER":
-        consultant_users_query = select(Consultant.user_id).where(
-            or_(
-                Consultant.sales_recruiter_user_id == current_user.id,
-                Consultant.id.in_(
-                    select(RecruiterConsultant.consultant_id).where(
-                        RecruiterConsultant.recruiter_id == current_user.id
-                    )
-                )
-            )
-        )
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id.in_(consultant_users_query))
-        results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
-    else:
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id == current_user.id)
-        results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
