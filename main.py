@@ -580,7 +580,6 @@ async def google_login(
     db.add(new_notif)
     await db.commit()
 
-
     # Gmail OAuth Token Capture for Consultants
     if user.role == "CONSULTANT":
         from models import Consultant, ConsultantEmailToken
