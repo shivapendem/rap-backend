@@ -150,12 +150,19 @@ async def create_email_queue(
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
 
+    final_cc = body.cc_email.strip() if body.cc_email else ""
+    if final_cc:
+        if current_user.email not in final_cc:
+            final_cc = f"{final_cc},{current_user.email}"
+    else:
+        final_cc = current_user.email
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
         from_email=body.from_email,
         to_email=body.to_email,
-        cc_email=body.cc_email,
+        cc_email=final_cc,
         subject=body.subject,
         content=body.content,
         attachments=body.attachments,
