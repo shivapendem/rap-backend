@@ -556,7 +556,7 @@ class ResumeInfoDTO(BaseModel):
     viewUrl: Optional[str] = None
     downloadPdfUrl: Optional[str] = None
     downloadDocxUrl: Optional[str] = None
-
+    atsScore: Optional[float] = None 
 
 class ConsultantRequirementResponse(BaseModel):
     """consultant.ts RequirementDTO — used by GET /api/consultant/requirements."""
@@ -784,6 +784,11 @@ async def get_consultant_requirements(
                 downloadPdfUrl=resume.pdf_url if resume_generated else None,
                 downloadDocxUrl=(
                     f"/api/consultant/requirements/{req.id}/resume/download/docx" if resume_generated else None
+                ),
+                atsScore=(
+                    float(resume.ats_score)
+                    if resume_generated and resume.ats_score is not None
+                    else None
                 ),
             ),
             vendorEmail=req.vendor_email,

@@ -1,4 +1,6 @@
+
 import os
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from dotenv import load_dotenv
@@ -47,6 +49,17 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         try:
             yield session
+        except HTTPException:
+            # BUG FIX: this except block used to catch bare `Exception`,
+            # which also caught HTTPException — meaning every routine 401
+            # "Not authenticated" and 403 "Requires role: [...]" rejection
+            # from an ordinary auth/permission check anywhere in the app
+            # got logged to the Error Queue as if it were an application
+            # bug. That's expected control flow, not an error: re-raise it
+            # untouched (still rolling back first) without logging noise
+            # that buries genuine crashes.
+            await session.rollback()
+            raise
         except Exception as e:
             await session.rollback()
             from error_logger import log_db_error
@@ -54,3 +67,4 @@ async def get_db():
             raise
         finally:
             await session.close()
+ 

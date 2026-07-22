@@ -4,6 +4,7 @@ import math
 from typing import Optional, List
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -12,7 +13,7 @@ from sqlalchemy import func, or_
 from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
 from auth import get_current_user
-from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3
+from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3
 from claude_service import generate_tailored_resume
 from phase8_ai_usage_service import save_claude_rate_limits
 
@@ -79,7 +80,7 @@ class ResumeResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     is_base: bool = False
-    
+
     class Config:
         from_attributes = True
 
@@ -118,17 +119,17 @@ async def generate_resume(
     if consultant:
         exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.consultant_id == consultant.id).order_by(ConsultantExperience.sort_order))
         profile_experiences = exp_results.scalars().all()
-    
+
     explicit_experiences = []
     if request.experience_ids:
         exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.id.in_(request.experience_ids)))
         explicit_experiences = exp_results.scalars().all()
-    
+
     # Merge avoiding duplicates
     all_exps = {exp.id: exp for exp in profile_experiences}
     for exp in explicit_experiences:
         all_exps[exp.id] = exp
-    
+
     merged_exps = list(all_exps.values())
 
     manual_exp_entries = []
@@ -138,7 +139,7 @@ async def generate_resume(
             bullets.extend([b.strip() for b in exp.responsibilities.split('\n') if b.strip()])
         if exp.achievements:
             bullets.extend([b.strip() for b in exp.achievements.split('\n') if b.strip()])
-        
+
         tech_str = ", ".join(exp.technologies) if exp.technologies else ""
         if tech_str:
             bullets.append(f"Technologies: {tech_str}")
@@ -164,7 +165,7 @@ async def generate_resume(
 
     if "experience" not in resume_info:
         resume_info["experience"] = []
-    
+
     # Prepend profile experiences so they are processed as most relevant/recent
     resume_info["experience"] = manual_exp_entries + resume_info["experience"]
 
@@ -209,28 +210,28 @@ async def generate_resume(
         status='draft' if request.draft else 'generating',
         ats_score=ats_value,
     )
-    
+
     db.add(new_resume)
     await db.commit()
     await db.refresh(new_resume)
-    
+
     if request.draft:
         return new_resume
 
     # Generate DOCX and PDF using phase6 logic
     from phase6 import _generate_docx, _convert_to_pdf
     from pathlib import Path
-    
+
     resume_dir = Path("/tmp/resumes") / str(target_user_id) / str(new_resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
-    
+
     docx_path = resume_dir / "resume.docx"
     pdf_path = resume_dir / "resume.pdf"
-    
+
     try:
         _generate_docx(generated_data, docx_path)
         pdf_ok = _convert_to_pdf(docx_path, pdf_path)
-        
+
         if pdf_ok:
             s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.pdf"
             with open(pdf_path, "rb") as f:
@@ -244,10 +245,10 @@ async def generate_resume(
     except Exception as e:
         new_resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
-        
+
     await db.commit()
     await db.refresh(new_resume)
-    
+
     return new_resume
 
 class FinalizeResumeRequest(BaseModel):
@@ -263,25 +264,25 @@ async def finalize_resume(
     resume = await _get_resume_for_user(db, resume_id, current_user)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-        
+
     resume.data = request.data
     resume.status = 'generating'
     await db.commit()
     await db.refresh(resume)
-    
+
     from phase6 import _generate_docx, _convert_to_pdf
     from pathlib import Path
-    
+
     resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
-    
+
     docx_path = resume_dir / "resume.docx"
     pdf_path = resume_dir / "resume.pdf"
-    
+
     try:
         _generate_docx(resume.data, docx_path)
         pdf_ok = _convert_to_pdf(docx_path, pdf_path)
-        
+
         if pdf_ok:
             s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
             with open(pdf_path, "rb") as f:
@@ -295,10 +296,10 @@ async def finalize_resume(
     except Exception as e:
         resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
-        
+
     await db.commit()
     await db.refresh(resume)
-    
+
     return resume
 
 @router.post("/upload", response_model=ResumeResponse)
@@ -311,13 +312,13 @@ async def upload_resume(
 ):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-        
+
     s3_key = f"users/{current_user.id}/resumes/{uuid.uuid4()}/final.pdf"
-    
+
     success = upload_file_to_s3(file.file, s3_key, content_type="application/pdf")
     if not success:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
-        
+
     new_resume = Resume(
         user_id=current_user.id,
         title=title,
@@ -325,11 +326,11 @@ async def upload_resume(
         s3_key=s3_key,
         status='completed'
     )
-    
+
     db.add(new_resume)
     await db.commit()
     await db.refresh(new_resume)
-    
+
     return new_resume
 
 @router.get("/list", response_model=PaginatedResumes)
@@ -362,24 +363,24 @@ async def list_resumes(
         )
     else:
         query = select(Resume).where(Resume.user_id == current_user.id)
-        
+
     if user_id:
         # Additional safety to only allow filtering if they have access
         if current_user.role == "ADMIN" or current_user.role == "RECRUITER":
             query = query.where(Resume.user_id == user_id)
-        
+
     if search:
         query = query.where(Resume.title.ilike(f"%{search}%"))
-    
+
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar_one()
-    
+
     query = query.order_by(Resume.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
-    
+
     resumes = (await db.execute(query)).scalars().all()
     total_pages = math.ceil(total / page_size) if page_size > 0 else 0
-    
+
     # generate s3_url for each resume
     response_data = []
     for r in resumes:
@@ -426,7 +427,7 @@ async def list_resumes(
                     job_description=None,
                     data={},
                     s3_key=None,
-                    s3_url=generate_presigned_url(base_consultant.base_resume_file_path) or None,
+                    s3_url=None,  # resolved on demand via GET /api/resume/base/download
                     ats_score=None,
                     status="base",
                     download_count=0,
@@ -443,6 +444,95 @@ async def list_resumes(
         page=page,
         page_size=page_size,
         total_pages=total_pages
+    )
+
+@router.get("/base/download")
+async def download_base_resume(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Stream the consultant's BASE resume (from their profile) on demand.
+
+    Declared before /{id}/download so "base" is never parsed as an int id.
+
+    Resolves consultants.base_resume_file_path at request time rather than
+    embedding a presigned URL in the list response. Presigned URLs are a
+    snapshot: they break when the file is replaced (old key deleted ->
+    NoSuchKey) and expire after an hour. Reading fresh on each click removes
+    both failure modes and needs no cache invalidation anywhere.
+
+    Tolerates BOTH storage formats so records written before the Spaces
+    migration keep working: a value that resolves to a real file on disk is
+    streamed from disk, anything else is treated as a Spaces object key.
+    """
+    # Role scoping mirrors the base-resume injection in list_resumes().
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    elif current_user.role == "ADMIN":
+        target_user_id = user_id or current_user.id
+    elif current_user.role == "RECRUITER":
+        if not user_id or user_id == current_user.id:
+            target_user_id = current_user.id
+        else:
+            target_consultant = (await db.execute(
+                select(Consultant).where(Consultant.user_id == user_id)
+            )).scalar_one_or_none()
+            if not target_consultant:
+                raise HTTPException(status_code=404, detail="Consultant not found")
+            allowed = (await db.execute(
+                select(RecruiterConsultant).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.consultant_id == target_consultant.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )).scalars().first()
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Consultant not assigned to this recruiter")
+            target_user_id = user_id
+    else:
+        target_user_id = current_user.id
+
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == target_user_id)
+    )).scalar_one_or_none()
+
+    if not consultant or not consultant.base_resume_file_path:
+        raise HTTPException(status_code=404, detail="No base resume uploaded yet.")
+
+    stored = consultant.base_resume_file_path
+    ext = os.path.splitext(stored)[1].lower()
+    media_type = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if ext == ".docx" else "application/pdf"
+    )
+    display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
+
+    # Legacy local-disk record (pre-Spaces migration).
+    try:
+        if os.path.isfile(stored):
+            with open(stored, "rb") as fh:
+                body = fh.read()
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+            )
+    except OSError:
+        pass
+
+    body, content_type = download_file_from_s3(stored)
+    if body is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Base resume file is missing from storage. Please re-upload it in your profile.",
+        )
+
+    return Response(
+        content=body,
+        media_type=content_type or media_type,
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
 
 @router.get("/consultants")
@@ -493,10 +583,10 @@ async def get_resume(
     # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
     # class of bug as /download. Uses the shared role-scoped helper instead.
     resume = await _get_resume_for_user(db, id, current_user)
-    
+
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-        
+
     return resume
 
 @router.put("/{id}", response_model=ResumeResponse)
@@ -509,10 +599,10 @@ async def update_resume(
     # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
     # class of bug as /download. Uses the shared role-scoped helper instead.
     resume = await _get_resume_for_user(db, id, current_user)
-    
+
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-        
+
     if request.title is not None:
         resume.title = request.title
     if request.target_role is not None:
@@ -523,10 +613,10 @@ async def update_resume(
         resume.data = request.data
     if request.status is not None:
         resume.status = request.status
-        
+
     await db.commit()
     await db.refresh(resume)
-    
+
     return resume
 
 @router.delete("/{id}")
@@ -538,16 +628,16 @@ async def delete_resume(
     # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
     # class of bug as /download. Uses the shared role-scoped helper instead.
     resume = await _get_resume_for_user(db, id, current_user)
-    
+
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-        
+
     if resume.s3_key:
         delete_file_from_s3(resume.s3_key)
-        
+
     await db.delete(resume)
     await db.commit()
-    
+
     return {"success": True}
 
 @router.get("/{id}/download")
@@ -568,7 +658,7 @@ async def download_resume(
     # any resume, RECRUITER sees their own + assigned consultants', everyone
     # else only their own.
     resume = await _get_resume_for_user(db, id, current_user)
-    
+
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -610,15 +700,55 @@ async def download_resume(
                 status_code=400,
                 detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
             )
-        
+
     url = generate_presigned_url(resume.s3_key)
     if not url:
         raise HTTPException(status_code=500, detail="Failed to generate download link.")
-        
+
     # Update download stats
     resume.download_count += 1
     resume.last_downloaded = datetime.now(timezone.utc)
     await db.commit()
-    
+
     return {"url": url}
 
+@router.get("/{id}/download/file")
+async def download_resume_file(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Stream the resume PDF bytes through the API.
+
+    Why this exists alongside /{id}/download (which returns a presigned URL):
+    presigned Spaces URLs work for window.open()/navigation, but a browser
+    fetch() of one is a cross-origin XHR and is blocked unless the Space has
+    a CORS policy. The compose/apply screens need the actual bytes to build a
+    File for attachment, so they call this instead - same origin as the rest
+    of the API, auth enforced, no bucket CORS required.
+    """
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    if not resume.s3_key:
+        raise HTTPException(status_code=400, detail="Resume does not have a generated PDF.")
+
+    body, content_type = download_file_from_s3(resume.s3_key)
+    if body is None:
+        raise HTTPException(status_code=502, detail="Could not retrieve the resume file from storage.")
+
+    safe_title = "".join(c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_").strip()
+    filename = f"{safe_title or f'Resume_{id}'}.pdf"
+
+    resume.download_count += 1
+    resume.last_downloaded = datetime.now(timezone.utc)
+    await db.commit()
+
+    return Response(
+        content=body,
+        media_type=content_type or "application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

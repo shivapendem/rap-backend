@@ -71,3 +71,20 @@ def delete_file_from_s3(s3_key: str) -> bool:
     except ClientError as e:
         print(f"Failed to delete file from DO Spaces: {e}")
         return False
+
+def download_file_from_s3(s3_key: str):
+    """
+    Fetch an object's bytes from Spaces.
+    Returns (body_bytes, content_type) or (None, None) on any failure.
+    Used to proxy downloads through the API so browsers never make a
+    cross-origin XHR to Spaces (which would require a bucket CORS policy).
+    """
+    if not DO_SPACES_BUCKET:
+        print("DO Spaces bucket not configured")
+        return None, None
+    try:
+        obj = s3_client.get_object(Bucket=DO_SPACES_BUCKET, Key=s3_key)
+        return obj["Body"].read(), obj.get("ContentType", "application/pdf")
+    except ClientError as e:
+        print(f"Failed to download file from DO Spaces: {e}")
+        return None, None

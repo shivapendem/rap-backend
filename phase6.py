@@ -901,6 +901,24 @@ async def download_resume(
         raise HTTPException(status_code=404, detail="No generated resume found.")
 
     file_path = generated.pdf_path if file_type == "pdf" else generated.docx_path
+
+    # pdf_path may hold a Spaces object KEY rather than a local path (see
+    # _run_generation_pipeline — the local file is deleted after upload).
+    # Path(key).exists() is always False, so stream it back from Spaces.
+    if file_path and not Path(file_path).exists():
+        from s3_service import download_file_from_s3
+        body, content_type = download_file_from_s3(file_path)
+        if body:
+            from fastapi.responses import Response
+            return Response(
+                content=body,
+                media_type=content_type or "application/pdf",
+                headers={
+                    "Content-Disposition":
+                        f'attachment; filename="{generated.filename or Path(file_path).name}"'
+                },
+            )
+
     if not file_path or not Path(file_path).exists():
         raise HTTPException(
             status_code=404,

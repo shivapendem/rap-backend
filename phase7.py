@@ -32,6 +32,7 @@ from models import (
     Requirement,
     Application,
     ConsultantEmailToken,
+    Resume,
 )
 
 router = APIRouter()
@@ -405,15 +406,63 @@ async def confirm_send(
             from_email = consultant.email
             access_token = get_service_account_access_token(sa_path, from_email)
 
-        send_result = await send_application_email_async(
-            access_token=access_token,
-            from_email=from_email,
-            to_email=requirement.vendor_email or "",
-            cc_email=cc_email,
-            subject=email_content["subject"],
-            body=email_content["body"],
-            attachment_path=None,  # Phase 6 resume path can be wired in here
-        )
+        # BUG FIX: attachment_path was hardcoded to None here — the resume
+        # was fully wired up for preview/download in the compose UI
+        # (resume_router.py's /download and /download/file), but the
+        # actual send call never fetched those bytes server-side, so
+        # every application email went out with no resume attached
+        # regardless of what the consultant selected on screen. Fetch the
+        # selected resume's PDF from Spaces and write it to a temp file
+        # send_application_email_async can attach; a missing/unfetchable
+        # resume degrades to sending without an attachment rather than
+        # blocking the whole application.
+        attachment_path = None
+        tmp_resume_path = None
+        if request.generated_resume_id:
+            try:
+                from s3_service import download_file_from_s3
+                resume_result = await db.execute(select(Resume).where(Resume.id == request.generated_resume_id))
+                selected_resume = resume_result.scalars().first()
+                if selected_resume and selected_resume.s3_key:
+                    body_bytes, _ = download_file_from_s3(selected_resume.s3_key)
+                    if body_bytes:
+                        import tempfile
+                        safe_title = "".join(
+                            c for c in (selected_resume.title or f"Resume_{selected_resume.id}")
+                            if c.isalnum() or c in " -_"
+                        ).strip() or f"Resume_{selected_resume.id}"
+                        tmp_dir = tempfile.mkdtemp(prefix="rap_apply_")
+                        tmp_resume_path = os.path.join(tmp_dir, f"{safe_title}.pdf")
+                        with open(tmp_resume_path, "wb") as f:
+                            f.write(body_bytes)
+                        attachment_path = tmp_resume_path
+            except Exception as attach_err:
+                print(f"[confirm_send] resume attach FAILED for resume_id={request.generated_resume_id}: {attach_err}")
+                from error_logger import log_db_error
+                await log_db_error(
+                    stage="confirm_send_resume_attach",
+                    error=attach_err,
+                    source_type="resume",
+                    source_id=request.generated_resume_id,
+                )
+
+        try:
+            send_result = await send_application_email_async(
+                access_token=access_token,
+                from_email=from_email,
+                to_email=requirement.vendor_email or "",
+                cc_email=cc_email,
+                subject=email_content["subject"],
+                body=email_content["body"],
+                attachment_path=attachment_path,
+            )
+        finally:
+            if tmp_resume_path:
+                try:
+                    os.remove(tmp_resume_path)
+                    os.rmdir(os.path.dirname(tmp_resume_path))
+                except OSError:
+                    pass
 
         # NOTE: status="SENT" (existing VALID_STATUSES), not "APPLIED"
         application = Application(
