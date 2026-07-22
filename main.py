@@ -485,8 +485,9 @@ async def login(
     await db.commit()
 
 
-    # Gmail OAuth Token Capture for Consultants
-    if user.role == "CONSULTANT":
+    # Gmail OAuth Token Capture (Role check commented for admin testing)
+    # if user.role == "CONSULTANT":
+    if True:
         from models import Consultant, ConsultantEmailToken
         from gmail_send_service import encrypt_token
         
@@ -495,8 +496,10 @@ async def login(
         expires_in = token_data.get("expires_in", 3599)
         
         if access_token:
-            # Find the consultant record
-            cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
+            if user.role == "CONSULTANT":
+                cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
+            else:
+                cons_result = await db.execute(select(Consultant))
             consultant = cons_result.scalars().first()
             
             if consultant:
@@ -622,8 +625,9 @@ async def google_login(
     db.add(new_notif)
     await db.commit()
 
-    # Gmail OAuth Token Capture for Consultants
-    if user.role == "CONSULTANT":
+    # Gmail OAuth Token Capture (Role check commented for admin testing)
+    # if user.role == "CONSULTANT":
+    if True:
         from models import Consultant, ConsultantEmailToken
         from gmail_send_service import encrypt_token
         
@@ -632,8 +636,10 @@ async def google_login(
         expires_in = token_data.get("expires_in", 3599)
         
         if access_token:
-            # Find the consultant record
-            cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
+            if user.role == "CONSULTANT":
+                cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
+            else:
+                cons_result = await db.execute(select(Consultant))
             consultant = cons_result.scalars().first()
             
             if consultant:
