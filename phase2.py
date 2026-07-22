@@ -328,13 +328,19 @@ async def get_raw_email(
     current_user: User = Depends(get_current_user),
 ):
     """
-    NOTE: Requirement.raw_email_id is a foreign key into `emails.id`, not
-    `gmail_emails.id` — those are two different tables with two different
-    ID sequences (see pipeline.py / gmail_reader.py fix). Older requirements
-    created before that fix may still carry a gmail_emails.id, so we check
-    gmail_emails first for backward compatibility, then fall back to the
-    emails table — which is where every correctly-linked raw_email_id
-    actually points.
+    BUG FIX: this docstring previously said raw_email_id is a foreign key
+    into `emails.id` — that was backwards and contradicted the confirmed
+    truth stated elsewhere in this same codebase (pipeline.py,
+    requirements_sync.py, and this file's own get_gmail_emails endpoint
+    below): requirements.raw_email_id references gmail_emails.id,
+    CONFIRMED via pg_constraint. That wrong comment is the likely reason
+    models.py's FK got "corrected" back to emails.id at least once —
+    trust this codebase's other three confirmations over any comment
+    that disagrees with them.
+
+    Checks gmail_emails first since that's where raw_email_id actually
+    points; falls back to the emails table only for any legacy rows that
+    predate this pipeline (there shouldn't be any going forward).
     """
     _require_role(current_user, "ADMIN", "RECRUITER")
 
@@ -345,7 +351,8 @@ async def get_raw_email(
                    bcc_addresses, reply_to, body_text, body_html, date,
                    is_read, is_starred, has_attachments, attachments, labels,
                    thread_id, raw_headers, fetched_at, category, priority,
-                   processed, classified_at, classifier_tier, job_posting_id
+                   processed, classified_at, classifier_tier, job_posting_id,
+                   EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = gmail_emails.id) AS has_requirement
             FROM gmail_emails WHERE id = :id
         """),
         {"id": email_id}
@@ -627,15 +634,18 @@ async def get_gmail_emails(
     # Get data with ALL columns
     result = await db.execute(
         text(f"""
-            SELECT id, account_id, account_email, message_id, uid, folder,
-                   subject, from_address, from_name, to_addresses, cc_addresses,
-                   bcc_addresses, reply_to, body_text, body_html, date,
-                   is_read, is_starred, has_attachments, attachments, labels,
-                   thread_id, raw_headers, fetched_at, category, priority,
-                   processed, classified_at, classifier_tier, job_posting_id
-            FROM gmail_emails
+            SELECT ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
+                   ge.subject, ge.from_address, ge.from_name, ge.to_addresses, ge.cc_addresses,
+                   ge.bcc_addresses, ge.reply_to, ge.body_text, ge.body_html, ge.date,
+                   ge.is_read, ge.is_starred, ge.has_attachments, ge.attachments, ge.labels,
+                   ge.thread_id, ge.raw_headers, ge.fetched_at, ge.category, ge.priority,
+                   ge.processed, ge.classified_at, ge.classifier_tier, ge.job_posting_id,
+                   EXISTS (
+                       SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
+                   ) AS has_requirement
+            FROM gmail_emails ge
             {where_sql}
-            ORDER BY date DESC
+            ORDER BY ge.date DESC
             LIMIT :limit OFFSET :offset
         """),
         params

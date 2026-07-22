@@ -532,9 +532,45 @@ async def download_resume(
     
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-        
+
     if not resume.s3_key:
-        raise HTTPException(status_code=400, detail="Resume does not have a generated PDF.")
+        # SELF-HEAL: some resumes (e.g. "ATS DevOps" in the bug report) have
+        # tailored content (resume.data) but never got a PDF — the earlier
+        # generate/finalize call hit a transient LibreOffice/S3 failure and
+        # left status as 'failed_pdf_conversion'/'failed_upload' with no
+        # s3_key. Previously this just 400'd forever ("Resume does not have
+        # a generated PDF"), which is what the frontend's generic catch
+        # turns into "Failed to download and attach resume" — the user has
+        # no way to recover short of clicking "Generate Tailored Resume"
+        # again from scratch. Instead, retry building the PDF from the data
+        # that's already there before giving up.
+        if resume.data:
+            from phase6 import _generate_docx, _convert_to_pdf
+            from pathlib import Path
+
+            resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+            resume_dir.mkdir(parents=True, exist_ok=True)
+            docx_path = resume_dir / "resume.docx"
+            pdf_path = resume_dir / "resume.pdf"
+
+            try:
+                _generate_docx(resume.data, docx_path)
+                if _convert_to_pdf(docx_path, pdf_path):
+                    s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
+                    with open(pdf_path, "rb") as f:
+                        if upload_file_to_s3(f, s3_key, "application/pdf"):
+                            resume.s3_key = s3_key
+                            resume.status = 'completed'
+                            await db.commit()
+                            await db.refresh(resume)
+            except Exception as e:
+                print(f"Lazy PDF regeneration failed for resume {resume.id}: {e}")
+
+        if not resume.s3_key:
+            raise HTTPException(
+                status_code=400,
+                detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
+            )
         
     url = generate_presigned_url(resume.s3_key)
     if not url:

@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -40,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user
 from database import get_db
+from claude_service import generate_tailored_resume
 from models import (
     Consultant,
     ConsultantExperience,
@@ -58,8 +60,10 @@ router = APIRouter()
 # Config
 # ---------------------------------------------------------------------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")   # legacy - unused since Claude migration
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # legacy - unused since Claude migration
+# Kept in sync with claude_service.generate_tailored_resume()
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ATS_PASS_THRESHOLD = 80          # per Phase 6 doc — NOT configurable
 MAX_GENERATION_ATTEMPTS = 3      # per frontend RegenerateDialog MAX_ATTEMPTS = 3
 RESUME_UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
@@ -215,91 +219,110 @@ async def _call_ai_tailoring(
     requirement: Requirement,
     matched_skills: List[str],
     missing_skills: List[str],
+    db: Optional[AsyncSession] = None,
 ) -> dict:
-    """Call GPT-4o to tailor the resume — Task 2."""
-    if not OPENAI_API_KEY:
+    """
+    Generate a tailored resume via Anthropic Claude (claude_service).
+
+    MIGRATION NOTE: this previously called OpenAI/GPT-4o directly. The rest of
+    the platform (resume_router -> claude_service) standardised on Claude and
+    OPENAI_API_KEY was never provisioned in any environment, so this code path
+    failed for every consultant while "My Resumes" worked. Same JSON contract,
+    one provider, one key to manage.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key or api_key.startswith("your_"):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OPENAI_API_KEY is not configured. Set it in .env to enable resume generation.",
+            detail="ANTHROPIC_API_KEY is not configured. Set it in .env to enable resume generation.",
         )
 
-    exp_lines = []
+    # ── Structured profile ────────────────────────────────────────────────
+    # Key names mirror claude_service's internal mock_fallback shape so its
+    # offline fallback still yields sensible data instead of placeholders.
+    experience_payload: List[Dict[str, Any]] = []
     for exp in sorted(experiences, key=lambda e: e.sort_order):
-        start_str = exp.start_date.strftime("%b %Y") if exp.start_date else "Unknown"
-        end_str = "Present" if exp.is_present else (exp.end_date.strftime("%b %Y") if exp.end_date else "Unknown")
-        tech_str = ", ".join(exp.technologies or [])
-        exp_lines.append(
-            f"- {exp.role_title} at {exp.client_name} ({start_str} - {end_str})\n"
-            f"  Technologies: {tech_str}\n"
-            f"  Responsibilities: {exp.responsibilities or 'Not specified'}\n"
-            f"  Achievements: {exp.achievements or 'None listed'}"
+        raw = f"{exp.responsibilities or ''}\n{exp.achievements or ''}"
+        bullets = [ln.strip(" -*\u2022\t") for ln in re.split(r"[\r\n]+", raw) if ln.strip(" -*\u2022\t")]
+        experience_payload.append(
+            {
+                "company": exp.client_name or "",
+                "role": exp.role_title or "",
+                "start_date": exp.start_date.strftime("%b %Y") if exp.start_date else "",
+                "end_date": "Present"
+                if exp.is_present
+                else (exp.end_date.strftime("%b %Y") if exp.end_date else ""),
+                "technologies": exp.technologies or [],
+                "bullets": bullets,
+            }
         )
 
-    full_name = consultant.full_name or ""
+    primary = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()]
+    secondary = [s.strip() for s in (consultant.secondary_skills or "").split(",") if s.strip()]
 
-    user_message = f"""CONSULTANT PROFILE:
-Name: {full_name}
-Email: {consultant.email or ''}
-Phone: {consultant.phone or ''}
-Total Experience: {consultant.total_experience_years or 'Unknown'} years
-Primary Skills: {consultant.primary_skills or 'Not specified'}
-Secondary Skills: {consultant.secondary_skills or 'Not specified'}
-Work Authorization: {consultant.work_authorization or 'Not specified'}
+    resume_info: Dict[str, Any] = {
+        "full_name": consultant.full_name or "",
+        "email": consultant.email or "",
+        "phone": consultant.phone or "",
+        "total_experience_years": float(consultant.total_experience_years)
+        if consultant.total_experience_years is not None
+        else None,
+        "work_authorization": consultant.work_authorization or "",
+        "current_location": consultant.current_location or "",
+        "tech_stack": {"expert": primary, "familiar": secondary},
+        "base_resume_text": consultant.base_resume_text or "",
+        "experience": experience_payload,
+    }
 
-BASE RESUME TEXT:
-{consultant.base_resume_text or 'No base resume uploaded.'}
-
-STRUCTURED EXPERIENCE:
-{chr(10).join(exp_lines) if exp_lines else 'No experience entries.'}
-
-JOB REQUIREMENT:
-Role: {requirement.role}
+    # ── Requirement context (preserves everything the old prompt carried) ──
+    jd_context = f"""Role: {requirement.role}
 Client: {requirement.client or 'Not specified'}
 Location: {requirement.location or 'Not specified'}
 Work Mode: {requirement.work_mode or 'Not specified'}
-Employment Types: {', '.join(requirement.employment_types or [])}
+Employment Types: {', '.join(requirement.employment_types or []) or 'Not specified'}
 
 JOB DESCRIPTION:
 {requirement.job_description or 'No job description available.'}
 
-MATCHED SKILLS (in profile): {', '.join(matched_skills) if matched_skills else 'None'}
-MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) if missing_skills else 'None'}
+MATCHED SKILLS (already in profile): {', '.join(matched_skills) or 'None'}
+MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
 
-Generate a tailored resume using ONLY the information above."""
-
+    # ── Call Claude off the event loop ────────────────────────────────────
+    # generate_tailored_resume() is synchronous and blocks for the duration of
+    # the HTTP call. Running it inline would freeze this uvicorn worker for
+    # every other request, so it goes to a thread.
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENAI_MODEL,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_message},
-                    ],
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-    except httpx.RequestError as exc:
-        logger.error("OpenAI API request failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"AI service unreachable: {exc}")
+        resume_data, rate_limits = await asyncio.to_thread(
+            generate_tailored_resume, resume_info, jd_context
+        )
+    except Exception as exc:  # noqa: BLE001 - surface any client/transport error
+        logger.error("Claude resume generation failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"AI service error: {exc}")
 
-    if response.status_code != 200:
-        logger.error("OpenAI API error %d: %s", response.status_code, response.text[:500])
-        raise HTTPException(status_code=502, detail=f"AI service error {response.status_code}")
-
-    try:
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        resume_data = json.loads(content)
-    except (KeyError, json.JSONDecodeError) as exc:
-        logger.error("Failed to parse AI response: %s", exc)
+    if not isinstance(resume_data, dict) or not resume_data.get("experience"):
+        logger.error("Claude returned unusable payload: %r", resume_data)
         raise HTTPException(status_code=502, detail="AI returned malformed response. Please retry.")
+
+    # claude_service swallows API errors and silently returns mock data.
+    # Persisting that as a real resume would be worse than failing loudly.
+    if "Mock generated" in (resume_data.get("generation_notes") or ""):
+        logger.error(
+            "Claude returned mock fallback (consultant_id=%s requirement_id=%s) - check ANTHROPIC_API_KEY",
+            consultant.id, requirement.id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="AI service is unavailable right now. Please retry in a moment.",
+        )
+
+    # Best-effort telemetry — powers the admin AI Usage screen. Never fatal.
+    if db is not None and rate_limits:
+        try:
+            from phase8_ai_usage_service import save_claude_rate_limits
+
+            await save_claude_rate_limits(db, rate_limits)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist Claude rate limits: %s", exc)
 
     return resume_data
 
@@ -551,7 +574,7 @@ async def _run_generation_pipeline(
 
     # ── Step 1: Call AI ───────────────────────────────────────────────────
     resume_data = await _call_ai_tailoring(
-        consultant, experiences, requirement, matched_skills, missing_skills
+        consultant, experiences, requirement, matched_skills, missing_skills, db
     )
 
     # ── Step 2: Validate — reject invented skills ─────────────────────────
@@ -662,7 +685,7 @@ async def _run_generation_pipeline(
         consultant_id=consultant.id,
         requirement_id=requirement.id,
         created_by_user_id=current_user.id,
-        ai_model=OPENAI_MODEL,
+        ai_model=ANTHROPIC_MODEL,
         generation_notes=generation_notes,
         generation_attempt=attempt,
         resume_content=resume_data,

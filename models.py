@@ -204,7 +204,18 @@ class Requirement(Base):
 
     id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
     recruiter_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    raw_email_id = Column(FK_TYPE, ForeignKey("emails.id", ondelete="SET NULL"), nullable=True)
+    # BUG FIX: was ForeignKey("emails.id") — every writer of this column
+    # (requirements_sync.py / dedup.py / gmail_reader.py / pipeline.py)
+    # actually passes gmail_emails.id, not emails.id. On any environment
+    # where this model creates the table fresh (new DB, redeploy, local
+    # sqlite fallback), the mismatched constraint rejected every real
+    # auto-synced insert with a silent FK violation — new mail parsed fine
+    # but never became a Requirement row. Old/seeded requirements were
+    # unaffected because they leave raw_email_id NULL.
+    # (NOTE: this line reverted once already — if it comes back a second
+    # time, check whether something is regenerating models.py from an
+    # older source/branch.)
+    raw_email_id = Column(FK_TYPE, ForeignKey("gmail_emails.id", ondelete="SET NULL"), nullable=True)
     role = Column(Text, nullable=False)
     vendor = Column(Text, nullable=True)
     vendor_email = Column(Text, nullable=True)
