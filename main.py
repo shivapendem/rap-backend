@@ -209,16 +209,56 @@ async def _email_queue_worker_loop():
                         access_token = None
                         
                         # 1. Try Consultant OAuth Token First
-                        user_res = await session.execute(select(User).where(User.email == item.from_email))
-                        from_user = user_res.scalars().first()
-                        if from_user and from_user.role == "CONSULTANT":
-                            cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
-                            cons = cons_res.scalars().first()
-                            if cons:
-                                tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
-                                email_tok = tok_res.scalars().first()
-                                if email_tok and email_tok.access_token_encrypted:
-                                    access_token = decrypt_token(email_tok.access_token_encrypted)
+                        email_tok = None
+                        
+                        # First try looking up by the new email_address column
+                        tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
+                        email_tok = tok_res.scalars().first()
+                        
+                        # Fallback to the old method (User -> Consultant -> Token)
+                        if not email_tok:
+                            user_res = await session.execute(select(User).where(User.email == item.from_email))
+                            from_user = user_res.scalars().first()
+                            if from_user and from_user.role == "CONSULTANT":
+                                cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
+                                cons = cons_res.scalars().first()
+                                if cons:
+                                    tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
+                                    email_tok = tok_res.scalars().first()
+
+                        if email_tok and email_tok.access_token_encrypted:
+                            from datetime import datetime, timezone, timedelta
+                            import httpx
+                            from gmail_send_service import encrypt_token
+                            
+                            now = datetime.now(timezone.utc)
+                            # Check if token is expired or about to expire in next 5 mins
+                            if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
+                                if email_tok.refresh_token_encrypted:
+                                    ref_token = decrypt_token(email_tok.refresh_token_encrypted)
+                                    client_id = os.getenv("GOOGLE_CLIENT_ID")
+                                    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+                                    if client_id and client_secret:
+                                        async with httpx.AsyncClient() as client:
+                                            res = await client.post(
+                                                "https://oauth2.googleapis.com/token",
+                                                data={
+                                                    "client_id": client_id,
+                                                    "client_secret": client_secret,
+                                                    "refresh_token": ref_token,
+                                                    "grant_type": "refresh_token"
+                                                }
+                                            )
+                                            if res.status_code == 200:
+                                                new_data = res.json()
+                                                access_token = new_data["access_token"]
+                                                email_tok.access_token_encrypted = encrypt_token(access_token)
+                                                if "refresh_token" in new_data:
+                                                    email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
+                                                email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
+                                                await session.commit()
+                            else:
+                                access_token = decrypt_token(email_tok.access_token_encrypted)
                         
                         # 2. Fallback to Domain Delegation
                         if not access_token:
@@ -469,12 +509,14 @@ async def login(
                 if not email_token:
                     email_token = ConsultantEmailToken(
                         consultant_id=consultant.id,
+                        email_address=user.email,
                         access_token_encrypted=encrypt_token(access_token),
                         refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
                         token_expiry=expiry_dt
                     )
                     db.add(email_token)
                 else:
+                    email_token.email_address = user.email
                     email_token.access_token_encrypted = encrypt_token(access_token)
                     if refresh_token:
                         email_token.refresh_token_encrypted = encrypt_token(refresh_token)
@@ -604,12 +646,14 @@ async def google_login(
                 if not email_token:
                     email_token = ConsultantEmailToken(
                         consultant_id=consultant.id,
+                        email_address=user.email,
                         access_token_encrypted=encrypt_token(access_token),
                         refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
                         token_expiry=expiry_dt
                     )
                     db.add(email_token)
                 else:
+                    email_token.email_address = user.email
                     email_token.access_token_encrypted = encrypt_token(access_token)
                     if refresh_token:
                         email_token.refresh_token_encrypted = encrypt_token(refresh_token)
