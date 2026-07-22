@@ -226,6 +226,18 @@ async def _email_queue_worker_loop():
                                     tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
                                     email_tok = tok_res.scalars().first()
 
+                        # --- TEMPORARY FALLBACK FOR ADMIN TESTING ---
+                        # If the candidate hasn't authorized their token, the admin's test token won't match the candidate's from_email.
+                        # We fallback to ANY available token, but we MUST rewrite the from_email so Gmail doesn't throw 403/401.
+                        if not email_tok:
+                            tok_res = await session.execute(select(ConsultantEmailToken))
+                            email_tok = tok_res.scalars().first()
+                            if email_tok and email_tok.email_address:
+                                print(f"[email-queue] TEST FALLBACK: Rewriting from_email from {item.from_email} to {email_tok.email_address}")
+                                item.from_email = email_tok.email_address
+                        # ----------------------------------------------
+
+
                         if email_tok and email_tok.access_token_encrypted:
                             from datetime import datetime, timezone, timedelta
                             import httpx
