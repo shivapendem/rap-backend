@@ -167,7 +167,15 @@ def get_service_account_access_token(service_account_path: str, impersonate_emai
     import jwt
     import time
     import httpx
+    import os
     
+    if not os.path.exists(service_account_path):
+        env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if env_path and os.path.exists(env_path):
+            service_account_path = env_path
+        else:
+            raise Exception("Gmail not connected via OAuth and service-account-key.json is missing.")
+            
     with open(service_account_path, "r") as f:
         credentials = json.load(f)
         
@@ -195,5 +203,7 @@ def get_service_account_access_token(service_account_path: str, impersonate_emai
         },
         timeout=10.0
     )
+    if response.status_code != 200:
+        raise Exception(f"Google OAuth failed with {response.status_code}: {response.text}")
     response.raise_for_status()
     return response.json()["access_token"]
