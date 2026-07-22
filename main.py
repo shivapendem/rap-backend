@@ -279,13 +279,16 @@ async def _email_queue_worker_loop():
 
                         attachment_path = None
                         if item.attachments and len(item.attachments) > 0:
-                            attachment_path = item.attachments[0]
+                            import os
+                            attachment_filename = item.attachments[0]
+                            # Security: frontend only sends the filename, so we prepend the upload dir
+                            attachment_path = os.path.join("/tmp/email_attachments", attachment_filename)
 
                         send_result = await send_application_email_async(
                             access_token=access_token,
                             from_email=item.from_email,
                             to_email=item.to_email,
-                            cc_email="",
+                            cc_email=item.cc_email or "",
                             subject=item.subject,
                             body=item.content or "",
                             attachment_path=attachment_path
