@@ -204,6 +204,7 @@ async def list_email_queue(
                 "content": item.content,
                 "attachments": item.attachments,
                 "status": item.status,
+                "status_message": item.status_text,
                 "created_at": item.created_at.isoformat() if item.created_at else None,
                 "updated_at": item.updated_at.isoformat() if item.updated_at else None,
             }
@@ -238,6 +239,7 @@ async def get_email_queue_item(
         "content": item.content,
         "attachments": item.attachments,
         "status": item.status,
+        "status_message": item.status_text,
         "created_at": item.created_at.isoformat() if item.created_at else None,
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
     }
