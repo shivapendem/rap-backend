@@ -66,6 +66,8 @@ from models import (
     Consultant,
     RecruiterConsultant,
     ConsultantExperience,
+    Application,
+    Resume,
     PK_TYPE,
     FK_TYPE,
 )
@@ -153,6 +155,12 @@ class ProfileResponse(BaseModel):
     totalExperienceYears: Optional[float] = None
     availabilityStatus: Optional[str] = None
     createdAt: Optional[str] = None
+    # BUG FIX: previously missing — recruiter roster grid (ConsultantCard)
+    # and the recruiter/admin detail views hardcoded these to 0 on the
+    # frontend because this endpoint never returned them. Now computed for
+    # real in _consultant_to_profile_response below.
+    profileCompleteness: int = 0
+    activeApplicationsCount: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +338,9 @@ async def _get_consultant_for_user(db: AsyncSession, user: User) -> Consultant:
     return c
 
 
-def _consultant_to_profile_response(c: Consultant, experience_count: int = 0) -> ProfileResponse:
+async def _consultant_to_profile_response(
+    db: AsyncSession, c: Consultant, experience_count: int = 0
+) -> ProfileResponse:
     """Map ORM Consultant → ProfileResponse matching frontend ConsultantProfileDTO."""
     primary = [s.strip() for s in (c.primary_skills or "").split(",") if s.strip()]
     secondary = [s.strip() for s in (c.secondary_skills or "").split(",") if s.strip()]
@@ -344,6 +354,49 @@ def _consultant_to_profile_response(c: Consultant, experience_count: int = 0) ->
             "uploadedAt": c.updated_at.isoformat() if c.updated_at else datetime.utcnow().isoformat(),
             "sizeBytes": 0,  # size not stored — safe default
         }
+
+    # BUG FIX: was `float(c.ats_score or 0)` — Consultant.ats_score is a
+    # column that is never written anywhere in the codebase (only ever read
+    # here and in phase_users_service.py), so it was permanently stuck at
+    # its default of 0 and every "ATS Score" in the UI showed 0. The real,
+    # meaningful ATS score lives per-generated-resume (Resume.ats_score,
+    # written by phase6.py/resume_router.py whenever a tailored resume is
+    # built). Use the consultant's most recently generated resume's score
+    # instead — same signal the resume screens already show.
+    latest_resume_result = await db.execute(
+        select(Resume.ats_score)
+        .where(Resume.user_id == c.user_id, Resume.ats_score.isnot(None))
+        .order_by(Resume.created_at.desc())
+        .limit(1)
+    )
+    latest_ats_score = latest_resume_result.scalar_one_or_none() if c.user_id else None
+
+    # BUG FIX: profileCompleteness and activeApplicationsCount were not
+    # returned by this endpoint at all — ConsultantCard (recruiter roster
+    # grid) and the recruiter/admin detail pages hardcoded both to 0 on the
+    # frontend with a comment noting the backend gap. Completeness formula
+    # mirrors ProfileCompletenessBar.tsx / phase_users_service.py so every
+    # screen agrees on the same number. Active apps = applications actually
+    # SENT for this consultant (same definition phase_users_service.py uses
+    # for total_applications_sent).
+    completeness = 0
+    if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
+        completeness += 30  # Skills
+    if c.base_resume_file_path or c.base_resume_text:
+        completeness += 30  # Resume
+    if c.preferred_employment_types:
+        completeness += 20  # Employment type
+    if (c.work_authorization or "").strip():
+        completeness += 10  # Work auth
+    if len((c.current_location or "").strip()) >= 2:
+        completeness += 10  # Location
+
+    active_apps_result = await db.execute(
+        select(func.count()).select_from(Application).where(
+            Application.consultant_id == c.id, Application.status == "SENT"
+        )
+    )
+    active_applications_count = active_apps_result.scalar_one() or 0
 
     return ProfileResponse(
         id=str(c.id),
@@ -360,13 +413,15 @@ def _consultant_to_profile_response(c: Consultant, experience_count: int = 0) ->
         experienceCount=experience_count,
         gmailConnected=c.gmail_connected,
         baseResumeUploaded=bool(c.base_resume_file_path),
-        atsScore=float(c.ats_score or 0),
+        atsScore=float(latest_ats_score) if latest_ats_score is not None else 0.0,
         status=c.status,
         preferredRoles=c.preferred_roles,
         preferredLocations=c.preferred_locations,
         totalExperienceYears=float(c.total_experience_years) if c.total_experience_years is not None else None,
         availabilityStatus=c.availability_status,
         createdAt=c.created_at.isoformat() if c.created_at else None,
+        profileCompleteness=completeness,
+        activeApplicationsCount=active_applications_count,
     )
 
 
@@ -597,7 +652,7 @@ async def get_own_profile(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
     )
     exp_count = count_result.scalar_one()
-    return _consultant_to_profile_response(consultant, exp_count)
+    return await _consultant_to_profile_response(db, consultant, exp_count)
 
 
 @router.put(
@@ -646,7 +701,7 @@ async def update_own_profile(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
     )
     exp_count = count_result.scalar_one()
-    return _consultant_to_profile_response(consultant, exp_count)
+    return await _consultant_to_profile_response(db, consultant, exp_count)
 
 
 @router.get(
@@ -680,7 +735,7 @@ async def list_consultants(
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     rows = (await db.execute(query.order_by(Consultant.created_at.desc()).offset((page - 1) * page_size).limit(page_size))).scalars().all()
 
-    data = [_consultant_to_profile_response(c) for c in rows]
+    data = [await _consultant_to_profile_response(db, c) for c in rows]
     return ConsultantListResponse(
         data=data,
         total=total,
@@ -709,7 +764,7 @@ async def get_consultant_by_id(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant_id)
     )
     exp_count = count_result.scalar_one()
-    return _consultant_to_profile_response(consultant, exp_count)
+    return await _consultant_to_profile_response(db, consultant, exp_count)
 
 
 @router.put(
@@ -747,7 +802,7 @@ async def update_consultant_by_id(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant_id)
     )
     exp_count = count_result.scalar_one()
-    return _consultant_to_profile_response(consultant, exp_count)
+    return await _consultant_to_profile_response(db, consultant, exp_count)
 
 
 @router.post(
@@ -866,7 +921,7 @@ async def deactivate_consultant(
     await db.commit()
     await db.refresh(consultant)
     logger.info("Admin %s deactivated consultant id=%s", current_user.email, consultant_id)
-    return _consultant_to_profile_response(consultant)
+    return await _consultant_to_profile_response(db, consultant)
 
 
 @router.patch(
@@ -884,7 +939,7 @@ async def activate_consultant(
     consultant.status = "ACTIVE"
     await db.commit()
     await db.refresh(consultant)
-    return _consultant_to_profile_response(consultant)
+    return await _consultant_to_profile_response(db, consultant)
 
 
 # ---------------------------------------------------------------------------

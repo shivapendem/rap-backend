@@ -678,6 +678,7 @@ async def get_consultant_requirements(
     roleKeyword: Optional[str] = Query(None),
     workMode: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    employmentTypes: Optional[List[str]] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):

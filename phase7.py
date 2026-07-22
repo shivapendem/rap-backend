@@ -14,6 +14,7 @@
 import os
 import math
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import List, Optional
 
 import httpx
@@ -32,7 +33,7 @@ from models import (
     Requirement,
     Application,
     ConsultantEmailToken,
-    Resume,
+    GeneratedResume,
 )
 
 router = APIRouter()
@@ -67,6 +68,15 @@ class EmailPreviewResponse(BaseModel):
     consultant_name: str
     consultant_email: str
     requirement_role: str
+    # BUG FIX: previously missing — confirm-send needs the consultant's
+    # actual generated resume for this requirement (id + real ATS score) to
+    # send along, and the frontend had nothing to forward, so every
+    # confirm-send silently defaulted ats_score to 0 (always failing the
+    # server-side >=80 gate) and generated_resume_id to None (no attachment
+    # ever sent). Populated from the current is_final GeneratedResume below.
+    generated_resume_id: Optional[int] = None
+    ats_score: Optional[float] = None
+    attachment_filename: Optional[str] = None
 
 
 class ConfirmSendRequest(BaseModel):
@@ -334,6 +344,19 @@ async def get_email_preview(
         primary_skills=consultant.primary_skills,
     )
 
+    # BUG FIX: preview previously returned nothing about the generated
+    # resume — confirm-send needs its id (to attach) and real ats_score
+    # (for the server-side >=80 re-check). Same is_final lookup pattern
+    # phase6.py uses for the consultant-side download/history endpoints.
+    generated_resume_result = await db.execute(
+        select(GeneratedResume).where(
+            GeneratedResume.consultant_id == consultant.id,
+            GeneratedResume.requirement_id == request.requirement_id,
+            GeneratedResume.is_final == True,
+        )
+    )
+    generated_resume = generated_resume_result.scalars().first()
+
     return EmailPreviewResponse(
         subject=email_content["subject"],
         body=email_content["body"],
@@ -342,6 +365,9 @@ async def get_email_preview(
         consultant_name=consultant.full_name or "",
         consultant_email=consultant.email or "",
         requirement_role=requirement.role,
+        generated_resume_id=generated_resume.id if generated_resume else None,
+        ats_score=float(generated_resume.ats_score) if generated_resume and generated_resume.ats_score is not None else None,
+        attachment_filename=generated_resume.filename if generated_resume else None,
     )
 
 
@@ -406,33 +432,40 @@ async def confirm_send(
             from_email = consultant.email
             access_token = get_service_account_access_token(sa_path, from_email)
 
-        # BUG FIX: attachment_path was hardcoded to None here — the resume
-        # was fully wired up for preview/download in the compose UI
-        # (resume_router.py's /download and /download/file), but the
-        # actual send call never fetched those bytes server-side, so
-        # every application email went out with no resume attached
-        # regardless of what the consultant selected on screen. Fetch the
-        # selected resume's PDF from Spaces and write it to a temp file
-        # send_application_email_async can attach; a missing/unfetchable
-        # resume degrades to sending without an attachment rather than
-        # blocking the whole application.
+        # BUG FIX: was querying the `Resume` table (self-service consultant
+        # resume builder) by generated_resume_id — but Application.generated_resume_id's
+        # actual foreign key points at `generated_resumes` (GeneratedResume),
+        # the per-requirement tailored resume this screen is previewing/
+        # sending. Querying the wrong table meant `selected_resume` was
+        # always None here, so no resume was ever attached even when
+        # request.generated_resume_id was populated. Also handles pdf_path
+        # holding a Spaces object key instead of a local path — same
+        # pattern phase6.py's download endpoint uses, since the local file
+        # is deleted after upload.
         attachment_path = None
         tmp_resume_path = None
         if request.generated_resume_id:
             try:
-                from s3_service import download_file_from_s3
-                resume_result = await db.execute(select(Resume).where(Resume.id == request.generated_resume_id))
+                resume_result = await db.execute(
+                    select(GeneratedResume).where(GeneratedResume.id == request.generated_resume_id)
+                )
                 selected_resume = resume_result.scalars().first()
-                if selected_resume and selected_resume.s3_key:
-                    body_bytes, _ = download_file_from_s3(selected_resume.s3_key)
+                if selected_resume and selected_resume.pdf_path:
+                    body_bytes = None
+                    if Path(selected_resume.pdf_path).exists():
+                        with open(selected_resume.pdf_path, "rb") as f:
+                            body_bytes = f.read()
+                    else:
+                        from s3_service import download_file_from_s3
+                        body_bytes, _ = download_file_from_s3(selected_resume.pdf_path)
                     if body_bytes:
                         import tempfile
                         safe_title = "".join(
-                            c for c in (selected_resume.title or f"Resume_{selected_resume.id}")
-                            if c.isalnum() or c in " -_"
-                        ).strip() or f"Resume_{selected_resume.id}"
+                            c for c in (selected_resume.filename or f"Resume_{selected_resume.id}.pdf")
+                            if c.isalnum() or c in " -_."
+                        ).strip() or f"Resume_{selected_resume.id}.pdf"
                         tmp_dir = tempfile.mkdtemp(prefix="rap_apply_")
-                        tmp_resume_path = os.path.join(tmp_dir, f"{safe_title}.pdf")
+                        tmp_resume_path = os.path.join(tmp_dir, safe_title)
                         with open(tmp_resume_path, "wb") as f:
                             f.write(body_bytes)
                         attachment_path = tmp_resume_path

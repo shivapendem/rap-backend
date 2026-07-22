@@ -88,6 +88,22 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
     )
     total_applications_sent = apps_result.scalar_one() or 0
 
+    # BUG FIX: c.ats_score is a Consultant column that is never written
+    # anywhere in the codebase, so it was permanently stuck at its default
+    # of 0 — every "ATS Score" shown from this endpoint (admin consultants
+    # table / user detail page) was 0. Same fix as phase3.py's
+    # _consultant_to_profile_response: use the most recent generated
+    # resume's real ATS score instead.
+    latest_ats_score = None
+    if c.user_id:
+        latest_resume_result = await db.execute(
+            select(Resume.ats_score)
+            .where(Resume.user_id == c.user_id, Resume.ats_score.isnot(None))
+            .order_by(Resume.created_at.desc())
+            .limit(1)
+        )
+        latest_ats_score = latest_resume_result.scalar_one_or_none()
+
     return ConsultantAdminRowDTO(
         id=str(c.id),
         user_id=str(c.user_id) if c.user_id else "",
@@ -110,7 +126,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
         secondary_skills=c.secondary_skills,
         preferred_roles=c.preferred_roles,
-        ats_score=float(c.ats_score) if c.ats_score is not None else None,
+        ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
         has_resume=bool(c.base_resume_file_path or c.base_resume_text),
         last_login_at=last_login_at.isoformat() if last_login_at else None,
