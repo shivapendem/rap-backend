@@ -826,6 +826,173 @@ async def get_resume(
     return _build_resume_data_dto(generated, requirement)
 
 
+class GeneratedResumeContentDTO(BaseModel):
+    resumeContent: dict
+    requirementRole: str
+    clientName: str
+
+
+@router.get(
+    "/api/consultant/requirements/{requirement_id}/resume/content",
+    response_model=GeneratedResumeContentDTO,
+    summary="Get the editable structured content behind a tailored resume",
+)
+async def get_resume_content(
+    requirement_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    NEW: powers the dashboard's Edit action for tailored resumes. Nothing
+    previously exposed resume_content — only the PDF/DOCX and ATS
+    breakdown, via get_resume above. Same authorization lookup as that
+    endpoint, just returning the structured JSON instead of file links.
+    """
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+    requirement = await _get_requirement_or_404(db, requirement_id)
+
+    result = await db.execute(
+        select(GeneratedResume).where(
+            GeneratedResume.consultant_id == consultant.id,
+            GeneratedResume.requirement_id == requirement_id,
+            GeneratedResume.is_final == True,
+        )
+    )
+    generated = result.scalars().first()
+    if not generated:
+        raise HTTPException(status_code=404, detail="No generated resume found.")
+
+    return GeneratedResumeContentDTO(
+        resumeContent=generated.resume_content or {},
+        requirementRole=requirement.role,
+        clientName=requirement.client or "",
+    )
+
+
+class UpdateGeneratedResumeRequest(BaseModel):
+    resumeContent: dict
+
+
+@router.put(
+    "/api/consultant/requirements/{requirement_id}/resume/content",
+    summary="Save edits to a tailored resume and regenerate its PDF/DOCX",
+)
+async def update_resume_content(
+    requirement_id: int,
+    request: UpdateGeneratedResumeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    NEW: the dashboard previously had no way to edit a tailored resume at
+    all — this saves the edited content AND regenerates the actual
+    downloadable files, so the PDF/DOCX a consultant downloads always
+    matches what they last edited. Re-scores ATS against the same
+    requirement/match so the score stays meaningful after edits, using
+    the same pipeline as initial generation (_generate_docx,
+    _convert_to_pdf, upload_file_to_s3).
+    """
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+    requirement = await _get_requirement_or_404(db, requirement_id)
+
+    result = await db.execute(
+        select(GeneratedResume).where(
+            GeneratedResume.consultant_id == consultant.id,
+            GeneratedResume.requirement_id == requirement_id,
+            GeneratedResume.is_final == True,
+        )
+    )
+    generated = result.scalars().first()
+    if not generated:
+        raise HTTPException(status_code=404, detail="No generated resume found.")
+
+    resume_data = request.resumeContent
+    generated.resume_content = resume_data
+
+    # Re-score against the same requirement/match this resume was
+    # originally tailored for, so editing doesn't silently zero the score.
+    match_result = await db.execute(
+        select(RequirementConsultantMatch).where(
+            RequirementConsultantMatch.consultant_id == consultant.id,
+            RequirementConsultantMatch.requirement_id == requirement_id,
+        )
+    )
+    match = match_result.scalars().first()
+    matched_skills = (match.matched_skills if match else None) or []
+    missing_skills = (match.missing_skills if match else None) or []
+    jd_skills = matched_skills + missing_skills
+
+    resume_text_parts = [
+        resume_data.get("summary", ""),
+        " ".join(resume_data.get("skills", [])),
+        requirement.role,
+    ]
+    for exp in resume_data.get("experience", []):
+        resume_text_parts.append(exp.get("role", ""))
+        resume_text_parts.append(" ".join(exp.get("bullets", [])))
+    resume_text = " ".join(resume_text_parts)
+
+    if jd_skills:
+        ats_total, kw_score, role_score, fmt_score, ats_matched, ats_missing = _ats_score(
+            jd_skills, resume_text, requirement.role
+        )
+        generated.ats_score = ats_total
+        generated.ats_keyword_score = kw_score
+        generated.ats_role_score = role_score
+        generated.ats_format_score = fmt_score
+        generated.ats_matched_keywords = ats_matched
+        generated.ats_missing_keywords = ats_missing
+
+    # Rebuild the actual files from the edited content — same file layout
+    # and naming as initial generation, so download links keep working.
+    full_name = (consultant.full_name or "").strip()
+    name_parts = full_name.split() if full_name else ["", ""]
+    first_name = name_parts[0] if name_parts else ""
+    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+    base_filename_with_ext = _build_resume_filename(
+        first_name=first_name,
+        last_name=last_name,
+        role=requirement.role,
+        client_name=requirement.client,
+        vendor_name=requirement.vendor,
+        years_exp=consultant.total_experience_years,
+    )
+    base_stem = base_filename_with_ext.removesuffix(".pdf")
+
+    resume_dir = RESUME_UPLOAD_DIR / "generated" / str(consultant.id) / str(requirement.id)
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    docx_path = resume_dir / f"{base_stem}.docx"
+    pdf_path = resume_dir / f"{base_stem}.pdf"
+
+    try:
+        _generate_docx(resume_data, docx_path)
+        pdf_ok = _convert_to_pdf(docx_path, pdf_path)
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate DOCX: {exc}")
+
+    s3_pdf_key = None
+    if pdf_ok:
+        from s3_service import upload_file_to_s3
+        s3_pdf_key = f"generated/{consultant.id}/{requirement.id}/{base_stem}.pdf"
+        with open(pdf_path, "rb") as f:
+            if not upload_file_to_s3(f, s3_pdf_key, "application/pdf"):
+                s3_pdf_key = None
+
+    generated.filename = base_filename_with_ext
+    generated.docx_path = str(docx_path)
+    generated.pdf_path = s3_pdf_key if s3_pdf_key else (str(pdf_path) if pdf_ok else None)
+    generated.generation_status = "COMPLETED" if pdf_ok else generated.generation_status
+
+    await db.commit()
+    await db.refresh(generated)
+
+    return _build_resume_data_dto(generated, requirement)
+
+
 @router.get(
     "/api/consultant/requirements/{requirement_id}/resume/history",
     summary="Get all generation attempts — returns ResumeHistoryDTO",

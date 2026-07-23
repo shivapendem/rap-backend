@@ -106,6 +106,12 @@ BARE_RATE_PATTERN = re.compile(
     r'(?:hr|hour|day|month|year|yr)',
     re.IGNORECASE
 )
+# Context that means a nearby bare-rate match is portal/subscription
+# boilerplate, not a real client rate — see the rate-fallback fix below.
+_RATE_FALSE_POSITIVE_CONTEXT = re.compile(
+    r'(?i)(hire\s+(?:our|a)\s+.{0,20}?recruiter|sign[\s\-]?up|subscri|'
+    r'broadcast|recruiting\s+portal|prohires|powerhouse)'
+)
 
 # ---------------------------------------------------------------------------
 # Location helpers
@@ -872,9 +878,24 @@ def parse_requirement(
     if rate and is_email_body(rate):
         rate = None
     if not rate:
-        bare_match = BARE_RATE_PATTERN.search(full_text)
-        if bare_match:
+        # BUG FIX: BARE_RATE_PATTERN used to grab the FIRST bare $NNN/period
+        # string anywhere in the email with zero context check. Recruiter
+        # broadcast templates (ProHires and similar) often end with a
+        # subscription ad like "Hire our IT Recruiter at just $499/month" —
+        # that ad was being picked up as the requirement's rate on every
+        # single email from that template, since real rates are frequently
+        # unlabeled in these bodies and this fallback ran unconditionally.
+        # Now: walk every bare-rate match in order and skip any whose
+        # surrounding text looks like portal/subscription boilerplate
+        # rather than an actual client rate.
+        for bare_match in BARE_RATE_PATTERN.finditer(full_text):
+            window_start = max(0, bare_match.start() - 60)
+            window_end = min(len(full_text), bare_match.end() + 60)
+            context_window = full_text[window_start:window_end]
+            if _RATE_FALSE_POSITIVE_CONTEXT.search(context_window):
+                continue
             rate = bare_match.group(0).strip()
+            break
 
     # ── Duration ──────────────────────────────────────────────────────────
     raw_duration = (

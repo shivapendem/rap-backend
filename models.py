@@ -215,7 +215,21 @@ class Requirement(Base):
     # (NOTE: this line reverted once already — if it comes back a second
     # time, check whether something is regenerating models.py from an
     # older source/branch.)
-    raw_email_id = Column(FK_TYPE, ForeignKey("gmail_emails.id", ondelete="SET NULL"), nullable=True)
+    # BUG FIX: gmail_emails has no SQLAlchemy ORM class anywhere in this
+    # codebase — every access to it goes through raw SQL (see phase2.py,
+    # dedup.py, requirements_sync.py, pipeline.py). Declaring a real
+    # ForeignKey() here works fine for ordinary reads/writes of
+    # Requirement in isolation, but the moment any flush needs to compute
+    # insert/delete ordering across multiple related tables (e.g.
+    # match_requirement committing a RequirementConsultantMatch in the
+    # same session as a loaded Requirement), SQLAlchemy tries to resolve
+    # every reachable FK target table and crashes with
+    # NoReferencedTableError since "gmail_emails" isn't a mapped table.
+    # Kept as a plain column — still semantically the gmail_emails.id
+    # this row came from, just without an ORM-level constraint pointing
+    # at a table SQLAlchemy can't see. Any real FK enforcement should
+    # live at the DB/migration level, independent of this.
+    raw_email_id = Column(FK_TYPE, nullable=True)
     role = Column(Text, nullable=False)
     vendor = Column(Text, nullable=True)
     vendor_email = Column(Text, nullable=True)
@@ -633,6 +647,11 @@ class Resume(Base):
 
     id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
     user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Links a manually-authored resume back to the specific requirement it
+    # was generated for — only set when created via the dashboard's
+    # "no job description" custom-resume flow. Requires the manual
+    # migration above; create_all() won't add this to an existing table.
+    requirement_id = Column(FK_TYPE, ForeignKey("requirements.id", ondelete="SET NULL"), nullable=True, index=True)
     title = Column(String(255), nullable=False)
     target_role = Column(String(255), nullable=True)
     job_description = Column(Text, nullable=True)

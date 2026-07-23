@@ -29,6 +29,10 @@ class ResumeCreateRequest(BaseModel):
     experience_ids: Optional[List[int]] = [] # IDs of ConsultantExperience to include
     draft: bool = False # If True, don't generate PDF yet
     user_id: Optional[int] = None # The candidate user_id to generate for
+    # Set when generated from the dashboard's "no job description" custom
+    # resume flow — links this Resume back to that specific requirement so
+    # the dashboard can find it and unlock the Apply button.
+    requirement_id: Optional[int] = None
 
 async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: User):
     if current_user.role == "ADMIN":
@@ -67,6 +71,7 @@ class ResumeUpdateRequest(BaseModel):
 class ResumeResponse(BaseModel):
     id: int
     user_id: int
+    requirement_id: Optional[int] = None
     title: str
     target_role: Optional[str] = None
     job_description: Optional[str] = None
@@ -203,6 +208,7 @@ async def generate_resume(
         ats_value = None
     new_resume = Resume(
         user_id=target_user_id,
+        requirement_id=request.requirement_id,
         title=request.title,
         target_role=request.target_role,
         job_description=request.job_description,
@@ -387,6 +393,7 @@ async def list_resumes(
         r_dict = {
             "id": r.id,
             "user_id": r.user_id,
+            "requirement_id": r.requirement_id,
             "title": r.title,
             "target_role": r.target_role,
             "job_description": r.job_description,
@@ -422,6 +429,7 @@ async def list_resumes(
                 response_data.insert(0, ResumeResponse(
                     id=-1,
                     user_id=base_target_user_id,
+                    requirement_id=None,
                     title="Base Resume",
                     target_role="From profile",
                     job_description=None,

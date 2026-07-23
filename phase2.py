@@ -474,92 +474,120 @@ async def reparse_email(
         gmail_msg = None
         received_date = email.received_at
 
-    # ---- Step 2: ensure a real emails row exists, get its id ----
-    if gmail_msg is not None:
-        email_result = await db.execute(
-            select(Email).where(Email.gmail_message_id == gmail_message_id)
-        )
-        email = email_result.scalars().first()
-        if not email:
-            # Never went through the pipeline before — create it now.
-            # source_gmail_emails_id is the real gmail_emails.id (the FK
-            # target for requirements.raw_email_id) — must be passed through
-            # explicitly, or process_email() would fall back to NULL and
-            # this requirement would end up unlinked from its raw email.
-            save_result = await process_email(db, gmail_msg, raw_email_id=source_gmail_emails_id)
+    try:
+        # ---- Step 2: ensure a real emails row exists, get its id ----
+        if gmail_msg is not None:
             email_result = await db.execute(
                 select(Email).where(Email.gmail_message_id == gmail_message_id)
             )
             email = email_result.scalars().first()
+            if not email:
+                # Never went through the pipeline before — create it now.
+                # source_gmail_emails_id is the real gmail_emails.id (the FK
+                # target for requirements.raw_email_id) — must be passed through
+                # explicitly, or process_email() would fall back to NULL and
+                # this requirement would end up unlinked from its raw email.
+                save_result = await process_email(db, gmail_msg, raw_email_id=source_gmail_emails_id)
+                email_result = await db.execute(
+                    select(Email).where(Email.gmail_message_id == gmail_message_id)
+                )
+                email = email_result.scalars().first()
 
-    real_email_id = email.id
+        # BUG FIX: was `real_email_id = email.id` with no None check — if
+        # gmail_message_id is missing/NULL on the source gmail_emails row
+        # (happens for some manually-inserted or legacy rows), the lookup
+        # above can come back empty even after process_email runs, and this
+        # crashed with an unhandled AttributeError ('NoneType' has no
+        # attribute 'id') — an opaque 500 with zero detail, and nothing
+        # logged anywhere, exactly what showed up in the Network tab with
+        # no explanation. Now raises a clear, diagnosable error instead.
+        if email is None:
+            raise ValueError(
+                f"Could not create or locate an emails row for gmail_emails.id={email_id} "
+                f"(gmail_message_id={gmail_message_id!r}). This usually means the source "
+                f"row has no message_id set."
+            )
+        real_email_id = email.id
 
-    # requirements.raw_email_id's real FK constraint points at
-    # gmail_emails.id, NOT emails.id (confirmed via pg_constraint — see
-    # requirements_sync.py header comment for the full story). Using
-    # emails.id here was the same bug that used to break the sync job:
-    # it either violates the FK outright (500) or, worse, silently
-    # matches the wrong gmail_emails row on small overlapping ids.
-    # Prefer the true gmail_emails.id; only fall back to emails.id for
-    # the legacy case where this email never had a gmail_emails row.
-    fk_raw_email_id = source_gmail_emails_id if source_gmail_emails_id is not None else real_email_id
+        # requirements.raw_email_id's real FK constraint points at
+        # gmail_emails.id, NOT emails.id (confirmed via pg_constraint — see
+        # requirements_sync.py header comment for the full story). Using
+        # emails.id here was the same bug that used to break the sync job:
+        # it either violates the FK outright (500) or, worse, silently
+        # matches the wrong gmail_emails row on small overlapping ids.
+        # Prefer the true gmail_emails.id; only fall back to emails.id for
+        # the legacy case where this email never had a gmail_emails row.
+        fk_raw_email_id = source_gmail_emails_id if source_gmail_emails_id is not None else real_email_id
 
-    # ---- Step 3: re-run parser + cleaner on the raw text ----
-    body = body_text or html_to_text(body_html)
-    parsed = parse_requirement(subject, body, headers)
-    cleaned_jd = clean_requirement_text(body)
+        # ---- Step 3: re-run parser + cleaner on the raw text ----
+        body = body_text or html_to_text(body_html)
+        parsed = parse_requirement(subject, body, headers)
+        cleaned_jd = clean_requirement_text(body)
 
-    # ---- Step 4: update existing requirement in place, or create one ----
-    existing_req_result = await db.execute(
-        select(Requirement).where(Requirement.raw_email_id == fk_raw_email_id)
-    )
-    existing_req = existing_req_result.scalars().first()
+        # ---- Step 4: update existing requirement in place, or create one ----
+        existing_req_result = await db.execute(
+            select(Requirement).where(Requirement.raw_email_id == fk_raw_email_id)
+        )
+        existing_req = existing_req_result.scalars().first()
 
-    vendor_email = parsed.get("vendor_email", "unknown@unknown.com")
-    role = parsed.get("role", "UNKNOWN")
-    jd_hash = create_jd_hash(cleaned_jd)
-    dedup_key = build_dedup_key(vendor_email, role, jd_hash)
+        vendor_email = parsed.get("vendor_email", "unknown@unknown.com")
+        role = parsed.get("role", "UNKNOWN")
+        jd_hash = create_jd_hash(cleaned_jd)
+        dedup_key = build_dedup_key(vendor_email, role, jd_hash)
 
-    if existing_req:
-        existing_req.role = role
-        existing_req.vendor = parsed.get("vendor")
-        existing_req.vendor_email = vendor_email
-        existing_req.vendor_contact = parsed.get("vendor_contact")
-        existing_req.client = parsed.get("client")
-        existing_req.location = parsed.get("location")
-        existing_req.work_mode = parsed.get("work_mode")
-        existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
-        existing_req.rate = parsed.get("rate")
-        existing_req.duration = parsed.get("duration")
-        existing_req.job_description = cleaned_jd
-        existing_req.jd_hash = jd_hash
-        existing_req.dedup_key = dedup_key
-        # experience/skills aren't real columns on Requirement (they live
-        # inside parsed_fields) — assigning them directly was a no-op that
-        # silently dropped the data; parsed_fields below carries them.
-        existing_req.parsed_fields = parsed
-        existing_req.parse_confidence = parsed.get("parse_confidence", 0.0)
-        if received_date and not existing_req.received_date:
-            existing_req.received_date = received_date
+        if existing_req:
+            existing_req.role = role
+            existing_req.vendor = parsed.get("vendor")
+            existing_req.vendor_email = vendor_email
+            existing_req.vendor_contact = parsed.get("vendor_contact")
+            existing_req.client = parsed.get("client")
+            existing_req.location = parsed.get("location")
+            existing_req.work_mode = parsed.get("work_mode")
+            existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
+            existing_req.rate = parsed.get("rate")
+            existing_req.duration = parsed.get("duration")
+            existing_req.job_description = cleaned_jd
+            existing_req.jd_hash = jd_hash
+            existing_req.dedup_key = dedup_key
+            # experience/skills aren't real columns on Requirement (they live
+            # inside parsed_fields) — assigning them directly was a no-op that
+            # silently dropped the data; parsed_fields below carries them.
+            existing_req.parsed_fields = parsed
+            existing_req.parse_confidence = parsed.get("parse_confidence", 0.0)
+            if received_date and not existing_req.received_date:
+                existing_req.received_date = received_date
+            await db.commit()
+            requirement_status = "updated"
+            requirement_id = existing_req.id
+        else:
+            result = await save_requirement(
+                db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=fk_raw_email_id,
+                received_date=received_date,
+            )
+            requirement_status = result["status"]
+            requirement_id = result["id"]
+
+        # ---- Step 5: mark processed/parsed on whichever raw source we used ----
+        if source_gmail_emails_id is not None:
+            await db.execute(
+                text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
+                {"id": source_gmail_emails_id}
+            )
+        email.parse_status = "PARSED"
         await db.commit()
-        requirement_status = "updated"
-        requirement_id = existing_req.id
-    else:
-        result = await save_requirement(
-            db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=fk_raw_email_id,
-            received_date=received_date,
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        print(f"[reparse_email] FAILED for email_id={email_id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="reparse_email",
+            error=e,
+            source_type="gmail_email",
+            source_id=str(email_id),
         )
-        requirement_status = result["status"]
-        requirement_id = result["id"]
-
-    # ---- Step 5: mark processed/parsed on whichever raw source we used ----
-    if source_gmail_emails_id is not None:
-        await db.execute(
-            text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
-            {"id": source_gmail_emails_id}
-        )
-    email.parse_status = "PARSED"
-    await db.commit()
+        raise HTTPException(status_code=500, detail=f"Reparse failed: {e}")
 
     # BUG FIX: nothing here ever ran matching, so a manually reparsed
     # requirement's ats_match_count stayed at 0 the same way auto-synced

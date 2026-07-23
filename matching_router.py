@@ -23,8 +23,22 @@ async def run_matching_for_requirement(db: AsyncSession, req: Requirement) -> in
 
     new_matches = 0
     
-    # Construct Requirement Document
-    req_text = f"{req.job_title or ''} {req.skills or ''} {req.job_description or ''} {req.role or ''}"
+    # BUG FIX: was `req.job_title` and `req.skills` — neither exists on the
+    # Requirement model (verified against models.py: the real fields are
+    # `role` and `job_description`; there is no `skills` column at all —
+    # skills, when the parser extracted any, live inside the `parsed_fields`
+    # JSON blob). Accessing a nonexistent SQLAlchemy column attribute
+    # raises AttributeError — this function would have crashed on every
+    # real requirement. It never actually surfaced because the status
+    # filter bug below (`== "OPEN"`, a status that never exists) meant this
+    # function was never actually reached with real data, so matching
+    # silently always found nothing rather than erroring loudly.
+    req_skills = ""
+    if isinstance(req.parsed_fields, dict):
+        skills_list = req.parsed_fields.get("skills")
+        if isinstance(skills_list, list):
+            req_skills = " ".join(str(s) for s in skills_list)
+    req_text = f"{req.role or ''} {req_skills} {req.job_description or ''}"
     if not req_text.strip():
         return 0
 
@@ -108,8 +122,17 @@ async def run_matching_engine(
     if current_user.role not in ["ADMIN", "RECRUITER"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    # Fetch active requirements
-    reqs_res = await db.execute(select(Requirement).where(Requirement.status == "OPEN"))
+    # BUG FIX: was `Requirement.status == "OPEN"` — "OPEN" is not a valid
+    # Requirement status (Requirement.VALID_STATUSES in models.py is
+    # {NEW, REVIEWING, SUBMITTED, INTERVIEWING, CLOSED, REJECTED} — no
+    # "OPEN"). This filter matched zero rows, always, on every real
+    # database — the engine "ran successfully" and always reported 0 new
+    # matches no matter how many requirements existed, which is why
+    # Pending Applications stayed permanently empty. Match against every
+    # non-terminal status instead.
+    reqs_res = await db.execute(
+        select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+    )
     requirements = reqs_res.scalars().all()
 
     new_matches = 0
@@ -136,7 +159,23 @@ async def get_pending_matches(
         if not cons:
             return {"matches": []}
         query = query.where(JobMatch.consultant_id == cons.id)
-    # For recruiter, we could filter by assigned consultants, but for MVP let's return all or just assigned
+    elif current_user.role == "RECRUITER":
+        # BUG FIX: this branch didn't exist — recruiters fell through with
+        # no filter at all and saw every consultant's pending matches
+        # system-wide, not just their own assigned ones (this file's own
+        # comment already flagged it as an MVP gap). Same scoping already
+        # applied to the Applications tracker for recruiters — apply it
+        # here too so "Pending Applications" only shows what's actually
+        # theirs to act on.
+        from models import RecruiterConsultant
+        assigned_res = await db.execute(
+            select(RecruiterConsultant.consultant_id).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.is_active == True,
+            )
+        )
+        assigned_ids = [row[0] for row in assigned_res.all()]
+        query = query.where(JobMatch.consultant_id.in_(assigned_ids))
     
     result = await db.execute(query)
     matches = result.scalars().all()
@@ -151,11 +190,15 @@ async def get_pending_matches(
         cons = cons_res.scalars().first()
         
         if req and cons:
+            # BUG FIX: was req.job_title (doesn't exist — real field is
+            # `role`) and req.client_name or req.vendor_name (real fields
+            # are `client` and `vendor`). Would have crashed this endpoint
+            # with AttributeError the moment any real JobMatch row existed.
             output.append({
                 "id": match.id,
                 "requirement_id": req.id,
-                "requirement_title": req.job_title,
-                "requirement_company": req.client_name or req.vendor_name,
+                "requirement_title": req.role,
+                "requirement_company": req.client or req.vendor,
                 "consultant_id": cons.id,
                 "consultant_name": cons.full_name,
                 "consultant_email": cons.email,

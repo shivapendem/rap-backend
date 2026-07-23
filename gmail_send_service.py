@@ -10,7 +10,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from typing import Optional
+from typing import Optional, List
 
 
 def build_mime_message(
@@ -19,13 +19,18 @@ def build_mime_message(
     cc: str,
     subject: str,
     body: str,
-    attachment_path: Optional[str] = None,
+    attachment_paths: Optional[List[str]] = None,
 ) -> str:
     """
-    Build MIME email message with optional PDF attachment.
+    Build MIME email message with optional attachments (one or many).
     Returns base64url encoded string for Gmail API.
+    FIX: previously took a single attachment_path, so only ever one file
+    could ever be sent even when a consultant/recruiter attached several.
+    Now loops over every path given and attaches each one that actually
+    exists on disk at build time.
     """
-    if attachment_path:
+    paths = [p for p in (attachment_paths or []) if p]
+    if paths:
         msg = MIMEMultipart()
     else:
         msg = MIMEMultipart("alternative")
@@ -38,7 +43,9 @@ def build_mime_message(
 
     msg.attach(MIMEText(body, "plain"))
 
-    if attachment_path and os.path.exists(attachment_path):
+    for attachment_path in paths:
+        if not os.path.exists(attachment_path):
+            continue
         with open(attachment_path, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -61,7 +68,7 @@ def send_via_gmail_api(
     cc_email: str,
     subject: str,
     body: str,
-    attachment_path: Optional[str] = None,
+    attachment_paths: Optional[List[str]] = None,
 ) -> dict:
     """
     Send email via Gmail API using consultant's OAuth access token.
@@ -78,7 +85,7 @@ def send_via_gmail_api(
             cc=cc_email,
             subject=subject,
             body=body,
-            attachment_path=attachment_path,
+            attachment_paths=attachment_paths,
         )
 
         response = httpx.post(
@@ -114,9 +121,15 @@ async def send_application_email_async(
     cc_email: str,
     subject: str,
     body: str,
-    attachment_path: Optional[str] = None,
+    attachment_paths: Optional[List[str]] = None,
 ) -> dict:
-    """Async wrapper for Gmail send. Used by FastAPI endpoints."""
+    """
+    Async wrapper for Gmail send. Used by FastAPI endpoints.
+    FIX: kept in sync with build_mime_message/send_via_gmail_api's move
+    from a single attachment_path to attachment_paths — this wrapper is
+    what callers (e.g. the email queue worker) actually call, so it has
+    to accept/forward the same param or every call downstream breaks.
+    """
     import asyncio
 
     loop = asyncio.get_event_loop()
@@ -129,7 +142,7 @@ async def send_application_email_async(
             cc_email=cc_email,
             subject=subject,
             body=body,
-            attachment_path=attachment_path,
+            attachment_paths=attachment_paths,
         ),
     )
     return result

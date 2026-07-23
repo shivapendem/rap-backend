@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, text
 from sqlalchemy.future import select as fselect
 
 from database import get_db
@@ -166,6 +166,12 @@ class AdminStatsDTO(BaseModel):
     pending_reviews: int
     total_ai_cost_usd: float
 
+class ClassifierHealthDTO(BaseModel):
+    unclassified_count: int
+    processed_last_5_min: int
+    last_classified_at: Optional[datetime] = None
+    minutes_since_last_cycle: Optional[float] = None
+    status: str  # "healthy" | "stuck" | "no_recent_activity"
 
 class HealthIndicator(BaseModel):
     name: str
@@ -275,6 +281,46 @@ async def list_audit_logs(
     return PaginatedAuditLogsDTO(
         data=data, total=total, page=page, page_size=page_size,
         total_pages=math.ceil(total / page_size) or 1,
+    )
+
+
+class AuditLogFacetsDTO(BaseModel):
+    actions: List[str]
+    entity_types: List[str]
+
+
+@router.get("/audit-logs/facets", response_model=AuditLogFacetsDTO)
+async def get_audit_log_facets(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Real distinct action/entity_type values currently present in
+    audit_logs — used to build the Action Type / Entity Type filter
+    options dynamically.
+
+    BUG FIX: the frontend's Action Type filter chips and Entity Type
+    dropdown were a hardcoded guessed list (LOGIN, LOGOUT, GENERATE, SEND,
+    CONNECT, DISCONNECT, MATCH, ERROR, PARSE, ARCHIVE / User, Requirement,
+    Consultant, Resume, Email, OAuth, System) that doesn't match what this
+    codebase actually logs anywhere (the real values written by
+    log_action() are things like USER_CREATED, USER_UPDATED, USER_DELETED,
+    USER_STATUS_CHANGED, CONSULTANT_ASSIGNED, ERROR_RETRY,
+    REVIEW_APPROVED, REVIEW_REJECTED / User, Consultant, ManualReviewQueue,
+    ProcessingError). Since the backend filter does an exact match
+    (`AuditLog.action == action`), clicking any of the guessed chips
+    filtered for a value that had never once been logged — always
+    returning zero rows, which is exactly why the filter looked broken.
+    """
+    actions_result = await db.execute(
+        select(AuditLog.action).where(AuditLog.action.isnot(None)).distinct().order_by(AuditLog.action)
+    )
+    entity_types_result = await db.execute(
+        select(AuditLog.entity_type).where(AuditLog.entity_type.isnot(None)).distinct().order_by(AuditLog.entity_type)
+    )
+    return AuditLogFacetsDTO(
+        actions=[row[0] for row in actions_result.all()],
+        entity_types=[row[0] for row in entity_types_result.all()],
     )
 
 
@@ -663,6 +709,45 @@ async def admin_stats(
         open_errors=open_errors,
         pending_reviews=pending_reviews,
         total_ai_cost_usd=round(float(total_ai_cost), 4),
+    )
+
+
+@router.get("/classifier-health", response_model=ClassifierHealthDTO)
+async def classifier_health(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    unclassified_count = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE category IS NULL OR category = 'unclassified'")
+    )).scalar_one()
+
+    processed_last_5_min = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE classified_at > now() - interval '5 minutes'")
+    )).scalar_one()
+
+    last_classified_at = (await db.execute(
+        text("SELECT MAX(classified_at) FROM gmail_emails WHERE classified_at IS NOT NULL")
+    )).scalar_one()
+
+    minutes_since_last_cycle = None
+    if last_classified_at:
+        if last_classified_at.tzinfo is None:
+            last_classified_at = last_classified_at.replace(tzinfo=timezone.utc)
+        minutes_since_last_cycle = (datetime.now(timezone.utc) - last_classified_at).total_seconds() / 60
+
+    if minutes_since_last_cycle is not None and minutes_since_last_cycle > 5:
+        status = "no_recent_activity"
+    elif processed_last_5_min == 0 and unclassified_count > 100:
+        status = "stuck"
+    else:
+        status = "healthy"
+
+    return ClassifierHealthDTO(
+        unclassified_count=unclassified_count,
+        processed_last_5_min=processed_last_5_min,
+        last_classified_at=last_classified_at,
+        minutes_since_last_cycle=minutes_since_last_cycle,
+        status=status,
     )
 
 

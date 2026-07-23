@@ -12,8 +12,8 @@ import math
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
-from database import engine, Base, get_db, AsyncSessionLocal
-from models import User, Requirement, Consultant, Notification
+from database import engine, Base, get_db, AsyncSessionLocal, DATABASE_URL
+from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch
 import asyncio
 from requirements_sync import sync_pending_emails
 from auth import (
@@ -163,18 +163,18 @@ async def _gmail_to_requirements_loop():
 
 EMAIL_QUEUE_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_QUEUE_SYNC_INTERVAL_SECONDS", "60"))
 
-# TESTING GUARD: while we validate the email queue pipeline, only allow sends
-# to this domain. Remove/relax this check once testing is complete and real
-# sends to arbitrary vendor/client addresses are approved.
-EMAIL_QUEUE_TEST_DOMAIN_SUFFIX = "@savantisintelli.com"
-
 async def _email_queue_worker_loop():
     """
     Background loop: periodically checks EmailQueue for QUEUED items and sends them
     via consultant's Gmail API token.
+
+    Per-item send/attachment/Application-upsert logic lives in
+    email_queue.process_single_email_queue_item — shared with the
+    send-now endpoint used by the Apply-to-Requirement page, so both
+    paths behave identically instead of risking two diverging copies.
     """
     from models import EmailQueue
-    from gmail_send_service import send_application_email_async, decrypt_token
+    from email_queue import process_single_email_queue_item
     while True:
         try:
             async with AsyncSessionLocal() as session:
@@ -185,134 +185,7 @@ async def _email_queue_worker_loop():
                 if queued_items:
                     print(f"[email-queue] processing {len(queued_items)} items")
                 for item in queued_items:
-                    try:
-                        import re
-                        if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
-                            print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
-                            item.status = "FAILED"
-                            item.status_text = f"Invalid to_email '{item.to_email}'"
-                            await session.commit()
-                            continue
-
-                        # TESTING GUARD: only send to the internal test domain.
-                        if not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
-                            print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
-                            item.status = "FAILED"
-                            item.status_text = "not test domain for now"
-                            await session.commit()
-                            continue
-
-                        from gmail_send_service import get_service_account_access_token, decrypt_token
-                        from models import User, Consultant, ConsultantEmailToken
-                        import os
-                        
-                        access_token = None
-                        
-                        # 1. Try Consultant OAuth Token First
-                        email_tok = None
-                        
-                        # First try looking up by the new email_address column
-                        tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
-                        email_tok = tok_res.scalars().first()
-                        
-                        # Fallback to the old method (User -> Consultant -> Token)
-                        if not email_tok:
-                            user_res = await session.execute(select(User).where(User.email == item.from_email))
-                            from_user = user_res.scalars().first()
-                            if from_user and from_user.role == "CONSULTANT":
-                                cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
-                                cons = cons_res.scalars().first()
-                                if cons:
-                                    tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
-                                    email_tok = tok_res.scalars().first()
-
-                        # --- TEMPORARY FALLBACK FOR ADMIN TESTING ---
-                        # If the candidate hasn't authorized their token, the admin's test token won't match the candidate's from_email.
-                        # We fallback to ANY available token, but we MUST rewrite the from_email so Gmail doesn't throw 403/401.
-                        if not email_tok:
-                            tok_res = await session.execute(select(ConsultantEmailToken))
-                            email_tok = tok_res.scalars().first()
-                            if email_tok and email_tok.email_address:
-                                print(f"[email-queue] TEST FALLBACK: Rewriting from_email from {item.from_email} to {email_tok.email_address}")
-                                item.from_email = email_tok.email_address
-                        # ----------------------------------------------
-
-
-                        if email_tok and email_tok.access_token_encrypted:
-                            from datetime import datetime, timezone, timedelta
-                            import httpx
-                            from gmail_send_service import encrypt_token
-                            
-                            now = datetime.now(timezone.utc)
-                            # Check if token is expired or about to expire in next 5 mins
-                            if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
-                                if email_tok.refresh_token_encrypted:
-                                    ref_token = decrypt_token(email_tok.refresh_token_encrypted)
-                                    client_id = os.getenv("GOOGLE_CLIENT_ID")
-                                    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-                                    if client_id and client_secret:
-                                        async with httpx.AsyncClient() as client:
-                                            res = await client.post(
-                                                "https://oauth2.googleapis.com/token",
-                                                data={
-                                                    "client_id": client_id,
-                                                    "client_secret": client_secret,
-                                                    "refresh_token": ref_token,
-                                                    "grant_type": "refresh_token"
-                                                }
-                                            )
-                                            if res.status_code == 200:
-                                                new_data = res.json()
-                                                access_token = new_data["access_token"]
-                                                email_tok.access_token_encrypted = encrypt_token(access_token)
-                                                if "refresh_token" in new_data:
-                                                    email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
-                                                email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
-                                                await session.commit()
-                            else:
-                                access_token = decrypt_token(email_tok.access_token_encrypted)
-                        
-                        # 2. Fallback to Domain Delegation
-                        if not access_token:
-                            sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
-                            access_token = get_service_account_access_token(sa_path, item.from_email)
-
-                        attachment_path = None
-                        if item.attachments and len(item.attachments) > 0:
-                            import os
-                            attachment_filename = item.attachments[0]
-                            # Security: frontend only sends the filename, so we prepend the upload dir
-                            attachment_path = os.path.join("/tmp/email_attachments", attachment_filename)
-
-                        send_result = await send_application_email_async(
-                            access_token=access_token,
-                            from_email=item.from_email,
-                            to_email=item.to_email,
-                            cc_email=item.cc_email or "",
-                            subject=item.subject,
-                            body=item.content or "",
-                            attachment_path=attachment_path
-                        )
-                        item.status = "SENT"
-                        item.status_text = "Sent successfully"
-                        await session.commit()
-                    except Exception as e:
-                        item_id = item.id
-                        print(f"[email-queue] failed to send item {item_id}: {e}")
-                        from error_logger import log_db_error
-                        await log_db_error(stage="email_queue_worker_item", error=e, source_type="email_queue", source_id=item_id)
-                        await session.rollback()
-                        # Re-fetch item to update status safely after rollback
-                        result = await session.execute(select(EmailQueue).where(EmailQueue.id == item_id))
-                        failed_item = result.scalars().first()
-                        if failed_item:
-                            failed_item.status = "FAILED"
-                            failed_item.status_text = str(e)
-                            try:
-                                await session.commit()
-                            except Exception as inner_e:
-                                print(f"[email-queue] completely failed to update item {item_id}: {inner_e}")
-                                await session.rollback()
+                    await process_single_email_queue_item(session, item)
         except Exception as e:
             print(f"[email-queue] loop error: {e}")
             from error_logger import log_db_error
@@ -501,49 +374,6 @@ async def login(
     db.add(new_notif)
     await db.commit()
 
-
-    # Gmail OAuth Token Capture (Role check commented for admin testing)
-    # if user.role == "CONSULTANT":
-    if True:
-        from models import Consultant, ConsultantEmailToken
-        from gmail_send_service import encrypt_token
-        
-        access_token = token_data.get("access_token")
-        refresh_token = token_data.get("refresh_token")
-        expires_in = token_data.get("expires_in", 3599)
-        
-        if access_token:
-            if user.role == "CONSULTANT":
-                cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
-            else:
-                cons_result = await db.execute(select(Consultant))
-            consultant = cons_result.scalars().first()
-            
-            if consultant:
-                # Find existing token or create new one
-                token_result = await db.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id))
-                email_token = token_result.scalars().first()
-                
-                expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                
-                if not email_token:
-                    email_token = ConsultantEmailToken(
-                        consultant_id=consultant.id,
-                        email_address=user.email,
-                        access_token_encrypted=encrypt_token(access_token),
-                        refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
-                        token_expiry=expiry_dt
-                    )
-                    db.add(email_token)
-                else:
-                    email_token.email_address = user.email
-                    email_token.access_token_encrypted = encrypt_token(access_token)
-                    if refresh_token:
-                        email_token.refresh_token_encrypted = encrypt_token(refresh_token)
-                    email_token.token_expiry = expiry_dt
-                
-                await db.commit()
-
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
@@ -696,6 +526,16 @@ async def get_requirements(
     sort_dir: Optional[str] = "desc",
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    # BUG FIX: backs the admin dashboard's "New Matches (7d)" stat card,
+    # which used to link straight to /admin/requirements with no filter at
+    # all — clicking it just showed every requirement, not the matched
+    # ones the card was actually counting. matched_only mirrors the exact
+    # definition new-matches-count uses (distinct requirements with a
+    # RequirementConsultantMatch.created_at within matched_days).
+    matched_only: bool = False,
+    matched_days: int = 7,
+    confidence_filter: Optional[str] = None,
+    employment_type: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -726,6 +566,31 @@ async def get_requirements(
     query = select(Requirement)
     if status:
         query = query.where(Requirement.status == status)
+    if matched_only:
+        since = datetime.now(timezone.utc) - timedelta(days=matched_days)
+        query = query.where(
+            Requirement.id.in_(
+                select(RequirementConsultantMatch.requirement_id)
+                .where(RequirementConsultantMatch.created_at >= since)
+            )
+        )
+
+    # BUG FIX: the FilterBar (admin Requirements page) has always sent
+    # confidence_filter and employment_type as real query params, but this
+    # endpoint never declared or read either one — FastAPI silently drops
+    # unrecognized query params rather than erroring, so both filters were
+    # completely non-functional: picking "Low confidence" or an employment
+    # type and clicking Apply returned the exact same unfiltered list.
+    if confidence_filter == "low":
+        query = query.where(Requirement.parse_confidence < 0.5)
+
+    if employment_type:
+        # employment_types is a real Postgres ARRAY(Text) column in
+        # production (see models.py ArrayTextColumn) — .any() checks
+        # array membership. Falls back to a no-op filter on the SQLite dev
+        # path where this column is stored as JSON text instead.
+        if DATABASE_URL.startswith("postgresql"):
+            query = query.where(Requirement.employment_types.any(employment_type))
 
     if date_from:
         try:
@@ -789,6 +654,8 @@ async def sync_gmail_to_requirements_endpoint(
     return {
         "scanned": summary.get("total", 0),
         "requirements_created": summary.get("saved", 0),
+        "duplicates": summary.get("duplicates", 0),
+        "skipped_not_a_requirement": summary.get("skipped_not_a_requirement", 0),
         "errors": summary.get("errors", 0),
     }
 

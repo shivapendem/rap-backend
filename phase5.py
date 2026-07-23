@@ -556,7 +556,13 @@ class ResumeInfoDTO(BaseModel):
     viewUrl: Optional[str] = None
     downloadPdfUrl: Optional[str] = None
     downloadDocxUrl: Optional[str] = None
-    atsScore: Optional[float] = None 
+    atsScore: Optional[float] = None
+    # "generated" = tailored GeneratedResume (auto, ATS-scored against the
+    # requirement's JD). "manual" = a Resume the consultant authored
+    # themselves via the no-JD custom flow, linked by requirement_id.
+    sourceType: Optional[str] = None
+    resumeId: Optional[str] = None
+
 
 class ConsultantRequirementResponse(BaseModel):
     """consultant.ts RequirementDTO — used by GET /api/consultant/requirements."""
@@ -575,6 +581,10 @@ class ConsultantRequirementResponse(BaseModel):
     appliedAt: Optional[str] = None
     skills: List[str] = []
     experience: Optional[str] = None
+    # True when this requirement has no job_description at all — the
+    # tailored GeneratedResume pipeline needs a JD to work from, so for
+    # these the dashboard offers the manual custom-resume flow instead.
+    hasJobDescription: bool = True
 
 
 class ConsultantRequirementsListResponse(BaseModel):
@@ -760,6 +770,24 @@ async def get_consultant_requirements(
         )).all()
         sent_at_by_req = {rid: sent_at.isoformat() if sent_at else None for rid, sent_at in sent_at_rows}
 
+    # Batch-load manually-authored resumes for JD-less requirements — the
+    # tailored GeneratedResume pipeline needs a real job_description to
+    # tailor against, so requirements without one are satisfied by a
+    # Resume the consultant wrote themselves via the custom-resume flow,
+    # linked back here via Resume.requirement_id.
+    manual_resume_by_req: dict[int, "Resume"] = {}
+    if page_requirement_ids:
+        from models import Resume
+        manual_rows = (await db.execute(
+            select(Resume).where(
+                Resume.user_id == current_user.id,
+                Resume.requirement_id.in_(page_requirement_ids),
+                Resume.status == "completed",
+            )
+        )).scalars().all()
+        for r in manual_rows:
+            manual_resume_by_req[r.requirement_id] = r
+
     rows: List[ConsultantRequirementResponse] = []
     for match, req, resume in results:
         frontend_status = _match_status_to_consultant_requirement_status(match.status)
@@ -768,6 +796,47 @@ async def get_consultant_requirements(
 
         already_applied = req.id in sent_application_req_ids
         resume_generated = bool(resume and resume.generation_status == "COMPLETED")
+        has_job_description = bool(req.job_description and req.job_description.strip())
+        # BUG FIX: this used to hide an already-created manual resume the
+        # moment a JD later appeared on the requirement (e.g. an admin
+        # edits it, or a reparse finds one) — the consultant's completed
+        # work would vanish and Apply would re-lock. Once a manual resume
+        # exists for this requirement, it stays valid regardless of the
+        # requirement's current JD state; has_job_description should only
+        # decide which "Generate" button to offer when NO resume exists
+        # at all yet, never whether an existing one is hidden.
+        manual_resume = manual_resume_by_req.get(req.id)
+
+        if resume_generated:
+            resume_dto = ResumeInfoDTO(
+                generated=True,
+                viewUrl=f"/api/consultant/requirements/{req.id}/resume",
+                downloadPdfUrl=resume.pdf_url,
+                downloadDocxUrl=f"/api/consultant/requirements/{req.id}/resume/download/docx",
+                atsScore=float(resume.ats_score) if resume.ats_score is not None else None,
+                sourceType="generated",
+                resumeId=None,
+            )
+        elif manual_resume:
+            resume_dto = ResumeInfoDTO(
+                generated=True,
+                viewUrl=f"/api/resume/{manual_resume.id}",
+                downloadPdfUrl=f"/api/resume/{manual_resume.id}/download/file",
+                downloadDocxUrl=f"/api/resume/{manual_resume.id}/download/file",
+                # Deliberately always null, even though Resume.ats_score may
+                # have a real computed value. This is the whole point of the
+                # no-JD manual flow — there's no real job description to
+                # meaningfully score against, so holding it to the same >=80
+                # bar as an auto-tailored resume would strand consultants on
+                # "Resume Not Ready" for doing exactly what was asked of
+                # them. The Apply gate already treats null as "not scored,
+                # don't block" (see ApplyButton.tsx resolveApplyState).
+                atsScore=None,
+                sourceType="manual",
+                resumeId=str(manual_resume.id),
+            )
+        else:
+            resume_dto = ResumeInfoDTO(generated=False)
 
         rows.append(ConsultantRequirementResponse(
             id=str(req.id),
@@ -779,24 +848,13 @@ async def get_consultant_requirements(
             employmentTypes=_employment_types_for_consultant(req.employment_types),
             matchScore=float(match.match_score),
             status=frontend_status,
-            resume=ResumeInfoDTO(
-                generated=resume_generated,
-                viewUrl=f"/api/consultant/requirements/{req.id}/resume" if resume_generated else None,
-                downloadPdfUrl=resume.pdf_url if resume_generated else None,
-                downloadDocxUrl=(
-                    f"/api/consultant/requirements/{req.id}/resume/download/docx" if resume_generated else None
-                ),
-                atsScore=(
-                    float(resume.ats_score)
-                    if resume_generated and resume.ats_score is not None
-                    else None
-                ),
-            ),
+            resume=resume_dto,
             vendorEmail=req.vendor_email,
             assignmentExists=True,
             appliedAt=sent_at_by_req.get(req.id),
             skills=_coerce_skills_list((req.parsed_fields or {}).get("skills")),
             experience=(req.parsed_fields or {}).get("experience") or None,
+            hasJobDescription=has_job_description,
         ))
 
     return ConsultantRequirementsListResponse(
@@ -1307,6 +1365,27 @@ async def get_recruiter_applications(
         .join(Requirement, Requirement.id == Application.requirement_id) \
         .join(Consultant, Consultant.id == Application.consultant_id)
     count_q = select(func.count(Application.id))
+
+    # BUG FIX: this only ever restricted by RecruiterConsultant assignment
+    # when a specific consultant_id filter was passed. The frontend's
+    # ApplicationsTable never sends consultant_id for the recruiter view
+    # (only the admin view supports that filter today), so every recruiter
+    # hitting this endpoint saw every application from every consultant in
+    # the system — not just the ones assigned to them, despite the page
+    # itself being labeled "applications sent on behalf of your
+    # consultants". Scope to the recruiter's active assignments whenever
+    # no explicit consultant_id is given, same as every other recruiter-
+    # facing endpoint (e.g. _assert_recruiter_mapped) already does.
+    if current_user.role == "RECRUITER" and not consultant_id:
+        assigned_result = await db.execute(
+            select(RecruiterConsultant.consultant_id).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.is_active == True,
+            )
+        )
+        assigned_ids = [row[0] for row in assigned_result.all()]
+        q = q.where(Application.consultant_id.in_(assigned_ids))
+        count_q = count_q.where(Application.consultant_id.in_(assigned_ids))
 
     if consultant_id:
         await _validate_consultant_id_exists(db, consultant_id)
