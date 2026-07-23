@@ -447,7 +447,9 @@ from templates_router import router as templates_router  # noqa: E402
 app.include_router(templates_router)
 
 from reports_router import router as reports_router  # noqa: E402
+from matching_router import router as matching_router  # noqa: E402
 app.include_router(reports_router)
+app.include_router(matching_router, prefix="/api/matching", tags=["matching"])
 
 # ---------------------------------------------------------------------------
 # Routes

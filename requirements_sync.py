@@ -145,6 +145,17 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 try:
                     from phase4 import match_requirement
                     await match_requirement(db, save_result["id"])
+                    
+                    # Also run the JobMatch engine to populate Pending Applications
+                    from models import Requirement
+                    from sqlalchemy.future import select
+                    from matching_router import run_matching_for_requirement
+                    req_res = await db.execute(select(Requirement).where(Requirement.id == save_result["id"]))
+                    req_obj = req_res.scalars().first()
+                    if req_obj:
+                        await run_matching_for_requirement(db, req_obj)
+                        await db.commit()
+                        
                 except Exception as match_err:
                     # Don't let a matching failure undo the successful
                     # requirement save above — log and move on.
