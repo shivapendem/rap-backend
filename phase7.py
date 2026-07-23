@@ -480,15 +480,15 @@ async def confirm_send(
                 )
 
         try:
-            send_result = await send_application_email_async(
-                access_token=access_token,
-                from_email=from_email,
-                to_email=requirement.vendor_email or "",
-                cc_email=cc_email,
-                subject=email_content["subject"],
-                body=email_content["body"],
-                attachment_path=attachment_path,
-            )
+           send_result = await send_application_email_async(
+    access_token=access_token,
+    from_email=from_email,
+    to_email=requirement.vendor_email or "",
+    cc_email=cc_email,
+    subject=email_content["subject"],
+    body=email_content["body"],
+    attachment_paths=[attachment_path] if attachment_path else [],
+)
         finally:
             if tmp_resume_path:
                 try:
