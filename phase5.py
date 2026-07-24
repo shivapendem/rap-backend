@@ -741,6 +741,7 @@ async def get_consultant_requirements(
             & (GeneratedResume.consultant_id == RequirementConsultantMatch.consultant_id)
             & (GeneratedResume.is_final == True),
         )
+    )
     filters = [RequirementConsultantMatch.consultant_id == consultant.id]
     if roleKeyword:
         filters.append(Requirement.role.ilike(f"%{roleKeyword}%"))
@@ -1085,6 +1086,7 @@ async def get_consultant_requirements_for_recruiter(
             & (GeneratedResume.consultant_id == consultant_id)
             & (GeneratedResume.is_final == True),
         )
+    )
     filters = [RequirementConsultantMatch.consultant_id == consultant_id]
     if roleSearch:
         filters.append(Requirement.role.ilike(f"%{roleSearch}%"))
