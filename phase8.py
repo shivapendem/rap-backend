@@ -225,6 +225,19 @@ class ApplicationSentRowDTO(BaseModel):
     gmail_message_id: Optional[str] = None
     sent_by_name: Optional[str] = None
     sent_by_role: Optional[str] = None
+    # BUG FIX: "Applications Sent (7d)" undercounted real sends — the
+    # frontend's date filter (admin.api.ts) already checked `sent_at`
+    # first, before falling back to `timestamp` (created_at) or
+    # `applied_at`, but this endpoint never returned sent_at at all. That
+    # matters because created_at is set once at row creation and never
+    # changes, and applied_at is preserved as-is on updates
+    # (`existing_app.applied_at or now`) — neither refreshes when an
+    # existing consultant+requirement Application row gets re-sent. Only
+    # Application.sent_at is genuinely updated to "now" on every real
+    # send, so it's the only field that correctly reflects recent activity
+    # when re-applying to an existing match (which is the common case with
+    # a large pre-existing match backlog).
+    sent_at: Optional[str] = None
 
 
 class PaginatedApplicationsDTO(BaseModel):
@@ -368,7 +381,7 @@ async def list_applications(
     base_filter = and_(*filters) if filters else True
 
     total = (await db.execute(select(func.count()).select_from(Application).where(base_filter))).scalar_one()
-    
+
     q = select(Application, Requirement, Consultant, User) \
         .outerjoin(Requirement, Requirement.id == Application.requirement_id) \
         .outerjoin(Consultant, Consultant.id == Application.consultant_id) \
@@ -376,7 +389,7 @@ async def list_applications(
         .where(base_filter)
 
     order = Application.created_at.desc() if sort_dir == "desc" else Application.created_at.asc()
-    
+
     results = (await db.execute(
         q.order_by(order)
         .offset((page - 1) * page_size)
@@ -403,6 +416,7 @@ async def list_applications(
             gmail_message_id=app.gmail_message_id,
             sent_by_name=(sender.full_name if sender else (cons.full_name if cons else None)),
             sent_by_role=(sender.role if sender else ("CONSULTANT" if cons else None)),
+            sent_at=app.sent_at.isoformat() if app.sent_at else None,
         )
         for app, req, cons, sender in results
     ]
@@ -664,15 +678,15 @@ async def get_claude_usage(
     _: dict = Depends(require_admin)
 ):
     """Get the latest recorded Claude API rate limit information."""
-        
+
     limits = await get_claude_rate_limits(db)
     limit = limits["tokens_limit"]
     remaining = limits["tokens_remaining"]
-    
+
     used_pct = 0.0
     if limit > 0:
         used_pct = ((limit - remaining) / limit) * 100.0
-        
+
     return ClaudeUsageDTO(
         tokens_limit=limit,
         tokens_remaining=remaining,
@@ -874,3 +888,5 @@ async def list_applications_feed(
         ))
     return PaginatedApplicationsDTO(data=data, total=total, page=page,
         page_size=page_size, total_pages=math.ceil(total / page_size) or 1)
+
+        
