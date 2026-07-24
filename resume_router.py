@@ -603,7 +603,10 @@ async def get_consultants_for_resumes(
                 )
             )
         )
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id.in_(consultant_users_query))
+        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(
+            User.id.in_(consultant_users_query),
+            User.role == "CONSULTANT"
+        )
         results = (await db.execute(query)).all()
         return [map_user_consultant(u, c) for u, c in results]
     else:
