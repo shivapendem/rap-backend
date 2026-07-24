@@ -1369,7 +1369,8 @@ async def get_consultant_applications(
 async def get_recruiter_applications(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    consultant_id: Optional[int] = Query(None),
+    consultant_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -1414,20 +1415,34 @@ async def get_recruiter_applications(
         q = q.where(Application.consultant_id.in_(assigned_ids))
         count_q = count_q.where(Application.consultant_id.in_(assigned_ids))
 
+    filters = []
+    
     if consultant_id:
-        await _validate_consultant_id_exists(db, consultant_id)
-        if current_user.role == "RECRUITER":
-            rc = (await db.execute(
-                select(RecruiterConsultant).where(
-                    RecruiterConsultant.recruiter_id == current_user.id,
-                    RecruiterConsultant.consultant_id == consultant_id,
-                    RecruiterConsultant.is_active == True,
-                )
-            )).scalars().first()
-            if not rc:
-                raise HTTPException(status_code=403, detail="Consultant not assigned to you")
-        q = q.where(Application.consultant_id == consultant_id)
-        count_q = count_q.where(Application.consultant_id == consultant_id)
+        try:
+            ids = [int(x.strip()) for x in consultant_id.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid consultant_id format")
+            
+        if ids:
+            if current_user.role == "RECRUITER":
+                rcs = (await db.execute(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id,
+                        RecruiterConsultant.consultant_id.in_(ids),
+                        RecruiterConsultant.is_active == True,
+                    )
+                )).scalars().all()
+                if len(set(rcs)) != len(set(ids)):
+                    raise HTTPException(status_code=403, detail="One or more consultants not assigned to you")
+            filters.append(Application.consultant_id.in_(ids))
+
+    if status:
+        filters.append(Application.status == status)
+
+    if filters:
+        base_filter = and_(*filters)
+        q = q.where(base_filter)
+        count_q = count_q.where(base_filter)
 
     total = (await db.execute(count_q)).scalar_one()
 

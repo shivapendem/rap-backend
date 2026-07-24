@@ -632,6 +632,8 @@ async def get_gmail_emails(
     category: Optional[str] = None,
     processed: Optional[bool] = None,
     search: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -653,6 +655,12 @@ async def get_gmail_emails(
     if search:
         where_clauses.append("(subject ILIKE :search OR from_address ILIKE :search OR from_name ILIKE :search)")
         params["search"] = f"%{search}%"
+    if date_from:
+        where_clauses.append("date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where_clauses.append("date <= :date_to")
+        params["date_to"] = date_to
 
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 

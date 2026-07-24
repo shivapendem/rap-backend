@@ -353,7 +353,9 @@ async def list_applications(
     filters = []
     if consultant_id:
         try:
-            filters.append(Application.consultant_id == int(consultant_id))
+            ids = [int(x.strip()) for x in consultant_id.split(",") if x.strip()]
+            if ids:
+                filters.append(Application.consultant_id.in_(ids))
         except ValueError:
             pass
     if requirement_id:
