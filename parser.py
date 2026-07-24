@@ -916,10 +916,15 @@ def parse_requirement(
     vendor_name = None
     vendor_email = None
     from_header = safe_headers.get('from', '')
-    if from_header:
-        email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-zA-Z]+', from_header)
+    reply_to_header = safe_headers.get('reply-to', '')
+
+    target_email_header = reply_to_header if reply_to_header else from_header
+    if target_email_header:
+        email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-zA-Z]+', target_email_header)
         if email_match:
             vendor_email = email_match.group(0).lower()
+
+    if from_header:
         name_match = re.match(r'^([^<]+)<', from_header)
         if name_match:
             vendor_name = name_match.group(1).strip().strip('"\'')

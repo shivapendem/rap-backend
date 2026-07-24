@@ -522,6 +522,7 @@ async def get_requirements(
     page: int = 1,
     page_size: int = 10,
     status: Optional[str] = None,
+    search: Optional[str] = None,
     sort_by: Optional[str] = "received_date",
     sort_dir: Optional[str] = "desc",
     date_from: Optional[str] = None,
@@ -591,6 +592,15 @@ async def get_requirements(
         # path where this column is stored as JSON text instead.
         if DATABASE_URL.startswith("postgresql"):
             query = query.where(Requirement.employment_types.any(employment_type))
+
+    if search:
+        search_term = f"%{search}%"
+        query = query.where(
+            or_(
+                Requirement.role.ilike(search_term),
+                Requirement.vendor_email.ilike(search_term)
+            )
+        )
 
     if date_from:
         try:

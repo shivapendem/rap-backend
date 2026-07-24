@@ -706,6 +706,7 @@ async def get_consultant_requirements(
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     roleKeyword: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     workMode: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     employmentTypes: Optional[List[str]] = Query(None),
@@ -740,18 +741,24 @@ async def get_consultant_requirements(
             & (GeneratedResume.consultant_id == RequirementConsultantMatch.consultant_id)
             & (GeneratedResume.is_final == True),
         )
-        .where(RequirementConsultantMatch.consultant_id == consultant.id)
-    )
-
+    filters = [RequirementConsultantMatch.consultant_id == consultant.id]
     if roleKeyword:
-        base_q = base_q.where(Requirement.role.ilike(f"%{roleKeyword}%"))
+        filters.append(Requirement.role.ilike(f"%{roleKeyword}%"))
+    if search:
+        search_term = f"%{search}%"
+        filters.append(or_(
+            Requirement.role.ilike(search_term),
+            Requirement.vendor_email.ilike(search_term)
+        ))
     if work_mode_filter:
-        base_q = base_q.where(Requirement.work_mode == work_mode_filter)
+        filters.append(Requirement.work_mode == work_mode_filter)
+
+    base_q = base_q.where(and_(*filters))
 
     count_q = select(func.count()).select_from(
         select(RequirementConsultantMatch.id)
         .join(Requirement, Requirement.id == RequirementConsultantMatch.requirement_id)
-        .where(RequirementConsultantMatch.consultant_id == consultant.id)
+        .where(and_(*filters))
         .subquery()
     )
     total = (await db.execute(count_q)).scalar_one()
@@ -1033,6 +1040,7 @@ async def get_consultant_requirements_for_recruiter(
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     roleSearch: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     experienceSearch: Optional[str] = Query(None),
     skillsSearch: Optional[str] = Query(None),
     workMode: Optional[str] = Query(None),
@@ -1077,20 +1085,28 @@ async def get_consultant_requirements_for_recruiter(
             & (GeneratedResume.consultant_id == consultant_id)
             & (GeneratedResume.is_final == True),
         )
-        .where(RequirementConsultantMatch.consultant_id == consultant_id)
-    )
+    filters = [RequirementConsultantMatch.consultant_id == consultant_id]
     if roleSearch:
-        base_q = base_q.where(Requirement.role.ilike(f"%{roleSearch}%"))
+        filters.append(Requirement.role.ilike(f"%{roleSearch}%"))
+    if search:
+        search_term = f"%{search}%"
+        filters.append(or_(
+            Requirement.role.ilike(search_term),
+            Requirement.vendor_email.ilike(search_term)
+        ))
     if experienceSearch:
-        base_q = base_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{experienceSearch}%"))
+        filters.append(cast(Requirement.parsed_fields, Text).ilike(f"%{experienceSearch}%"))
     if skillsSearch:
-        base_q = base_q.where(cast(Requirement.parsed_fields, Text).ilike(f"%{skillsSearch}%"))
+        filters.append(cast(Requirement.parsed_fields, Text).ilike(f"%{skillsSearch}%"))
     if work_mode_filter:
-        base_q = base_q.where(Requirement.work_mode == work_mode_filter)
+        filters.append(Requirement.work_mode == work_mode_filter)
+
+    base_q = base_q.where(and_(*filters))
 
     count_q = select(func.count()).select_from(
         select(RequirementConsultantMatch.id)
-        .where(RequirementConsultantMatch.consultant_id == consultant_id)
+        .join(Requirement, Requirement.id == RequirementConsultantMatch.requirement_id)
+        .where(and_(*filters))
         .subquery()
     )
     total = (await db.execute(count_q)).scalar_one()

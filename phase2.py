@@ -657,10 +657,16 @@ async def get_gmail_emails(
         params["search"] = f"%{search}%"
     if date_from:
         where_clauses.append("date >= :date_from")
-        params["date_from"] = date_from
+        try:
+            params["date_from"] = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+        except ValueError:
+            params["date_from"] = date_from
     if date_to:
         where_clauses.append("date <= :date_to")
-        params["date_to"] = date_to
+        try:
+            params["date_to"] = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+        except ValueError:
+            params["date_to"] = date_to
 
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
