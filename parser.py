@@ -916,7 +916,7 @@ def parse_requirement(
     vendor_name = None
     vendor_email = None
     from_header = safe_headers.get('from', '')
-    reply_to_header = safe_headers.get('reply-to', '')
+    reply_to_header = safe_headers.get('reply-to', '') or safe_headers.get('reply_to', '')
 
     target_email_header = reply_to_header if reply_to_header else from_header
     if target_email_header:
