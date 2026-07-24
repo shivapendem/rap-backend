@@ -484,6 +484,19 @@ class ApplicationHistoryRow(BaseModel):
     sent_at: Optional[str] = None
     resume_url: Optional[str] = None
     ats_score: Optional[float] = None
+    # BUG FIX: resume_url comes from GeneratedResume.pdf_url, a real column
+    # that is never actually written anywhere in this codebase — always
+    # None. resume_id (used for the authenticated download endpoint, same
+    # pattern as the admin Applications Tracker) is the field that
+    # actually works.
+    resume_id: Optional[str] = None
+    # BUG FIX: client was never returned (blank UI column); sent_by fields
+    # let a consultant see whether they applied themselves or a
+    # recruiter/admin sent it on their behalf.
+    client: Optional[str] = None
+    gmail_message_id: Optional[str] = None
+    sent_by_name: Optional[str] = None
+    sent_by_role: Optional[str] = None
 
 
 class PaginatedApplicationHistory(BaseModel):
@@ -505,6 +518,13 @@ class RecruiterApplicationRow(BaseModel):
     vendor_email: Optional[str] = None
     status: str
     sent_at: Optional[str] = None
+    # BUG FIX: client, gmail_message_id, sent_by, and resume were all
+    # missing — same UI gaps as the admin Applications Tracker.
+    client: Optional[str] = None
+    gmail_message_id: Optional[str] = None
+    resume_id: Optional[str] = None
+    sent_by_name: Optional[str] = None
+    sent_by_role: Optional[str] = None
 
 
 class PaginatedRecruiterApplications(BaseModel):
@@ -822,7 +842,7 @@ async def get_consultant_requirements(
                 generated=True,
                 viewUrl=f"/api/resume/{manual_resume.id}",
                 downloadPdfUrl=f"/api/resume/{manual_resume.id}/download/file",
-                downloadDocxUrl=f"/api/resume/{manual_resume.id}/download/file",
+                downloadDocxUrl=f"/api/resume/{manual_resume.id}/download/file/docx",
                 # Deliberately always null, even though Resume.ats_score may
                 # have a real computed value. This is the whole point of the
                 # no-JD manual flow — there's no real job description to
@@ -1304,9 +1324,10 @@ async def get_consultant_applications(
     )).scalar_one()
 
     results = (await db.execute(
-        select(Application, Requirement, GeneratedResume)
+        select(Application, Requirement, GeneratedResume, User)
         .join(Requirement, Requirement.id == Application.requirement_id)
         .outerjoin(GeneratedResume, GeneratedResume.id == Application.generated_resume_id)
+        .outerjoin(User, User.id == Application.recruiter_id)
         .where(Application.consultant_id == consultant.id)
         .order_by(Application.sent_at.desc().nullslast())
         .offset((page - 1) * page_size)
@@ -1314,7 +1335,7 @@ async def get_consultant_applications(
     )).all()
 
     rows = []
-    for app, req, resume in results:
+    for app, req, resume, sender in results:
         rows.append(ApplicationHistoryRow(
             application_id=str(app.id),
             requirement_id=str(req.id),
@@ -1324,7 +1345,12 @@ async def get_consultant_applications(
             application_status=app.status,
             sent_at=app.sent_at.isoformat() if app.sent_at else None,
             resume_url=resume.pdf_url if resume else None,
+            resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
             ats_score=float(resume.ats_score) if resume and resume.ats_score else None,
+            client=req.client,
+            gmail_message_id=app.gmail_message_id,
+            sent_by_name=sender.full_name if sender else consultant.full_name,
+            sent_by_role=sender.role if sender else "CONSULTANT",
         ))
 
     return PaginatedApplicationHistory(
@@ -1361,9 +1387,10 @@ async def get_recruiter_applications(
     """
     _require_role(current_user, "RECRUITER", "ADMIN")
 
-    q = select(Application, Requirement, Consultant) \
+    q = select(Application, Requirement, Consultant, User) \
         .join(Requirement, Requirement.id == Application.requirement_id) \
-        .join(Consultant, Consultant.id == Application.consultant_id)
+        .join(Consultant, Consultant.id == Application.consultant_id) \
+        .outerjoin(User, User.id == Application.recruiter_id)
     count_q = select(func.count(Application.id))
 
     # BUG FIX: this only ever restricted by RecruiterConsultant assignment
@@ -1421,8 +1448,13 @@ async def get_recruiter_applications(
             vendor_email=app.vendor_email,
             status=app.status,
             sent_at=app.sent_at.isoformat() if app.sent_at else None,
+            client=req.client,
+            gmail_message_id=app.gmail_message_id,
+            resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
+            sent_by_name=sender.full_name if sender else cons.full_name,
+            sent_by_role=sender.role if sender else "CONSULTANT",
         )
-        for app, req, cons in results
+        for app, req, cons, sender in results
     ]
 
     return PaginatedRecruiterApplications(

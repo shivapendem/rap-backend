@@ -248,6 +248,23 @@ async def generate_resume(
                     new_resume.status = 'failed_upload'
         else:
             new_resume.status = 'failed_pdf_conversion'
+
+        # DOCX upload — was never wired up for this resume type before,
+        # only the PDF ever got persisted. Key is derived from s3_key's
+        # own naming pattern (same folder, extension swapped) so no new
+        # column/migration is needed — the download endpoint derives the
+        # same key back. Isolated in its own try/except on purpose: a
+        # DOCX-only failure here must never downgrade the PDF status set
+        # just above.
+        try:
+            docx_s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.docx"
+            with open(docx_path, "rb") as f:
+                upload_file_to_s3(
+                    f, docx_s3_key,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+        except Exception as docx_exc:
+            print(f"DOCX upload failed (PDF result unaffected): {docx_exc}")
     except Exception as e:
         new_resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
@@ -299,6 +316,18 @@ async def finalize_resume(
                     resume.status = 'failed_upload'
         else:
             resume.status = 'failed_pdf_conversion'
+
+        # Same DOCX addition as generate_resume above — isolated so a
+        # DOCX-only failure can't downgrade the PDF status set just above.
+        try:
+            docx_s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+            with open(docx_path, "rb") as f:
+                upload_file_to_s3(
+                    f, docx_s3_key,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+        except Exception as docx_exc:
+            print(f"DOCX upload failed (PDF result unaffected): {docx_exc}")
     except Exception as e:
         resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
@@ -758,5 +787,37 @@ async def download_resume_file(
     return Response(
         content=body,
         media_type=content_type or "application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{id}/download/file/docx")
+async def download_resume_docx(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """DOCX counterpart of download_resume_file above. Derives the key
+    from s3_key's own naming pattern (extension swapped) rather than a
+    separate column, since the upload above always writes it that way."""
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    if not resume.s3_key:
+        raise HTTPException(status_code=400, detail="Resume does not have a generated file.")
+
+    docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx"
+    body, content_type = download_file_from_s3(docx_key)
+    if body is None:
+        raise HTTPException(status_code=400, detail="Resume does not have a generated DOCX.")
+
+    safe_title = "".join(c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_").strip()
+    filename = f"{safe_title or f'Resume_{id}'}.docx"
+
+    return Response(
+        content=body,
+        media_type=content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

@@ -1,4 +1,3 @@
-
 # ---------------------------------------------------------------------------
 # Email Queue endpoints
 # Handles consultant email queue management
@@ -7,24 +6,24 @@ import os
 import uuid
 import math
 from fastapi import UploadFile, File
- 
+
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
- 
+
 from database import get_db
 from auth import get_current_user
 from models import User
- 
+
 router = APIRouter()
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
- 
+
 class EmailQueueCreateRequest(BaseModel):
     consultant_id: Optional[int] = None
     requirement_id: Optional[int] = None
@@ -34,7 +33,7 @@ class EmailQueueCreateRequest(BaseModel):
     subject: str
     content: Optional[str] = None
     attachments: Optional[List[str]] = None
- 
+
     @field_validator('requirement_id', 'consultant_id', mode='before')
     @classmethod
     def zero_to_none(cls, v):
@@ -42,16 +41,16 @@ class EmailQueueCreateRequest(BaseModel):
         if v == 0 or v == '' or v is None:
             return None
         return v
- 
- 
+
+
 class EmailQueueStatusUpdate(BaseModel):
     status: str
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
- 
+
 async def _assert_email_queue_access(db: AsyncSession, current_user: User, item) -> None:
     """
     BUG FIX: get/update-status/delete on a single email-queue item had NO
@@ -70,12 +69,12 @@ async def _assert_email_queue_access(db: AsyncSession, current_user: User, item)
         if consultant and item.consultant_id == consultant.id:
             return
     raise HTTPException(status_code=403, detail="Insufficient permissions for this email queue item.")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
- 
+
 @router.post("/api/consultant/email-queue")
 async def create_email_queue(
     body: EmailQueueCreateRequest,
@@ -86,9 +85,9 @@ async def create_email_queue(
     from models import EmailQueue
     from models import Consultant
     from sqlalchemy import select as sa_select
- 
+
     consultant_id = None
- 
+
     if current_user.role == "ADMIN":
         if body.consultant_id:
             # Admin provided consultant_id explicitly — verify it exists
@@ -150,14 +149,14 @@ async def create_email_queue(
         consultant_id = consultant.id if consultant else body.consultant_id
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
- 
+
     final_cc = body.cc_email.strip() if body.cc_email else ""
     if final_cc:
         if current_user.email not in final_cc:
             final_cc = f"{final_cc},{current_user.email}"
     else:
         final_cc = current_user.email
- 
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
@@ -168,6 +167,7 @@ async def create_email_queue(
         content=body.content,
         attachments=body.attachments,
         status="QUEUED",
+        sent_by_user_id=current_user.id,
     )
     db.add(item)
     # BUG FIX: the Apply button on the dashboard and "My Applications" both
@@ -216,8 +216,8 @@ async def create_email_queue(
         "id": str(item.id),
         "status": item.status,
     }
- 
- 
+
+
 @router.get("/api/consultant/email-queue")
 async def list_email_queue(
     page: int = 1,
@@ -226,11 +226,11 @@ async def list_email_queue(
     current_user: User = Depends(get_current_user),
 ):
     """List all emails in queue."""
-    from models import EmailQueue, Consultant
- 
-    query = select(EmailQueue)
+    from models import EmailQueue, Consultant, RecruiterConsultant
+
+    query = select(EmailQueue, Consultant).outerjoin(Consultant, Consultant.id == EmailQueue.consultant_id)
     count_query = select(func.count()).select_from(EmailQueue)
- 
+
     if current_user.role == "CONSULTANT":
         result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
         consultant = result.scalars().first()
@@ -238,9 +238,22 @@ async def list_email_queue(
             return {"data": [], "total": 0, "page": page, "page_size": page_size, "pages": 1}
         query = query.where(EmailQueue.consultant_id == consultant.id)
         count_query = count_query.where(EmailQueue.consultant_id == consultant.id)
-    elif current_user.role != "ADMIN" and current_user.role != "RECRUITER":
+    elif current_user.role == "RECRUITER":
+        # BUG FIX: recruiters saw every consultant's queue items, not just
+        # their own assigned ones -- same scoping gap already fixed on the
+        # Applications tracker and Pending Matches. Admin still sees all.
+        assigned_result = await db.execute(
+            select(RecruiterConsultant.consultant_id).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.is_active == True,
+            )
+        )
+        assigned_ids = [row[0] for row in assigned_result.all()]
+        query = query.where(EmailQueue.consultant_id.in_(assigned_ids))
+        count_query = count_query.where(EmailQueue.consultant_id.in_(assigned_ids))
+    elif current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Insufficient permissions")
- 
+
     # BUG FIX: page/page_size were accepted by the frontend
     # (fetchEmailQueueItems always sent them) but silently ignored here —
     # every request returned the entire table regardless of page, and the
@@ -249,18 +262,19 @@ async def list_email_queue(
     # Next/Prev controls looked like they worked but always showed the
     # same full list. Now actually paginated server-side.
     total = (await db.execute(count_query)).scalar_one()
- 
+
     result = await db.execute(
         query.order_by(EmailQueue.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    items = result.scalars().all()
+    rows = result.all()
     return {
         "data": [
             {
                 "id": str(item.id),
                 "consultant_id": str(item.consultant_id),
+                "consultant_name": cons.full_name if cons else str(item.consultant_id),
                 "requirement_id": str(item.requirement_id) if item.requirement_id else None,
                 "from_email": item.from_email,
                 "to_email": item.to_email,
@@ -272,15 +286,15 @@ async def list_email_queue(
                 "created_at": item.created_at.isoformat() if item.created_at else None,
                 "updated_at": item.updated_at.isoformat() if item.updated_at else None,
             }
-            for item in items
+            for item, cons in rows
         ],
         "total": total,
         "page": page,
         "page_size": page_size,
         "pages": math.ceil(total / page_size) if total else 1,
     }
- 
- 
+
+
 @router.get("/api/consultant/email-queue/{item_id}")
 async def get_email_queue_item(
     item_id: int,
@@ -310,8 +324,8 @@ async def get_email_queue_item(
         "created_at": item.created_at.isoformat() if item.created_at else None,
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
     }
- 
- 
+
+
 @router.patch("/api/consultant/email-queue/{item_id}/status")
 async def update_email_queue_status(
     item_id: int,
@@ -328,19 +342,19 @@ async def update_email_queue_status(
     if not item:
         raise HTTPException(status_code=404, detail="Email queue item not found")
     await _assert_email_queue_access(db, current_user, item)
- 
+
     valid_statuses = {"QUEUED", "SENT", "FAILED"}
     if body.status not in valid_statuses:
         raise HTTPException(
             status_code=422,
             detail=f"status must be one of: {sorted(valid_statuses)}"
         )
- 
+
     item.status = body.status
     await db.commit()
     return {"success": True, "id": str(item.id), "status": item.status}
- 
- 
+
+
 @router.delete("/api/consultant/email-queue/{item_id}")
 async def delete_email_queue_item(
     item_id: int,
@@ -359,28 +373,28 @@ async def delete_email_queue_item(
     await db.delete(item)
     await db.commit()
     return {"success": True, "message": f"Email queue item {item_id} deleted"}
- 
+
 UPLOAD_DIR = "/tmp/email_attachments"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
- 
+
 # Prefix so download_file_from_s3 in the send worker can tell "this is a
 # Spaces key" apart from a bare local filename (legacy queue rows saved
 # before this fix still have a plain filename with no prefix).
 EMAIL_ATTACHMENT_S3_PREFIX = "email-queue-attachments/"
- 
+
 # TESTING GUARD: while we validate the email queue pipeline, only allow sends
 # to this domain. Remove/relax this check once testing is complete and real
 # sends to arbitrary vendor/client addresses are approved. Lives here (not
 # main.py) so both the background worker and the send-now endpoint below
 # read the exact same value.
 EMAIL_QUEUE_TEST_DOMAIN_SUFFIX = "@savantisintelli.com"
- 
+
 async def process_single_email_queue_item(session: AsyncSession, item) -> None:
     """
     Send one QUEUED EmailQueue item via Gmail and update its status
     (SENT/FAILED), including creating/updating the matching Application row
     on success.
- 
+
     Shared by:
       - main.py's _email_queue_worker_loop (polls for QUEUED items on a
         timer)
@@ -388,7 +402,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         admin/recruiter/consultant "Apply" actions send immediately instead
         of waiting for the next poll cycle, and so they get a real
         success/failure result back instead of a generic "queued")
- 
+
     Extracted out of main.py's worker loop body so both callers share the
     exact same send/attachment-resolution/Application-upsert logic rather
     than risking two copies drifting apart.
@@ -396,7 +410,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
     from gmail_send_service import send_application_email_async, decrypt_token
     from models import EmailQueue, Application
     from datetime import datetime, timezone, timedelta
- 
+
     try:
         import re
         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
@@ -405,7 +419,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             item.status_text = f"Invalid to_email '{item.to_email}'"
             await session.commit()
             return
- 
+
         # TESTING GUARD: only send to the internal test domain.
         if not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
             print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
@@ -413,20 +427,20 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             item.status_text = "not test domain for now"
             await session.commit()
             return
- 
+
         from gmail_send_service import get_service_account_access_token, decrypt_token
         from models import User, Consultant, ConsultantEmailToken
         import os
- 
+
         access_token = None
- 
+
         # 1. Try Consultant OAuth Token First
         email_tok = None
- 
+
         # First try looking up by the new email_address column
         tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
         email_tok = tok_res.scalars().first()
- 
+
         # Fallback to the old method (User -> Consultant -> Token)
         if not email_tok:
             user_res = await session.execute(select(User).where(User.email == item.from_email))
@@ -437,7 +451,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 if cons:
                     tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
                     email_tok = tok_res.scalars().first()
- 
+
         # --- TEMPORARY FALLBACK FOR ADMIN TESTING ---
         # If the candidate hasn't authorized their token, the admin's test token won't match the candidate's from_email.
         # We fallback to ANY available token, but we MUST rewrite the from_email so Gmail doesn't throw 403/401.
@@ -448,13 +462,13 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 print(f"[email-queue] TEST FALLBACK: Rewriting from_email from {item.from_email} to {email_tok.email_address}")
                 item.from_email = email_tok.email_address
         # ----------------------------------------------
- 
- 
+
+
         if email_tok and email_tok.access_token_encrypted:
             from datetime import datetime, timezone, timedelta
             import httpx
             from gmail_send_service import encrypt_token
- 
+
             now = datetime.now(timezone.utc)
             # Check if token is expired or about to expire in next 5 mins
             if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
@@ -483,12 +497,12 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                                 await session.commit()
             else:
                 access_token = decrypt_token(email_tok.access_token_encrypted)
- 
+
         # 2. Fallback to Domain Delegation
         if not access_token:
             sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
             access_token = get_service_account_access_token(sa_path, item.from_email)
- 
+
         # BUG FIX: previously built a path under /tmp and
         # handed it straight to send_application_email_async,
         # which builds the MIME message with
@@ -515,7 +529,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             import os
             import tempfile
             from s3_service import download_file_from_s3
- 
+
             for ref in item.attachments:
                 local_candidate = os.path.join("/tmp/email_attachments", ref)
                 if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
@@ -540,7 +554,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     attachment_paths.append(local_candidate)
                 else:
                     missing_attachments.append(ref)
- 
+
         if missing_attachments:
             item.status = "FAILED"
             item.status_text = (
@@ -554,7 +568,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 except OSError:
                     pass
             return
- 
+
         try:
             send_result = await send_application_email_async(
                 access_token=access_token,
@@ -567,7 +581,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             )
             item.status = "SENT"
             item.status_text = "Sent successfully"
- 
+
             # BUG FIX (revised): the Application row and
             # match.status="APPLIED" now get set the moment
             # the consultant queues the email (see
@@ -579,7 +593,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             # creating it from scratch.
             if item.requirement_id:
                 from models import Application
- 
+
                 existing_app_result = await session.execute(
                     select(Application).where(
                         Application.consultant_id == item.consultant_id,
@@ -593,6 +607,13 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     existing_app.gmail_message_id = send_result.get("gmail_message_id")
                     existing_app.sent_at = now
                     existing_app.applied_at = now
+                    existing_app.email_body_preview = (item.content or "")[:500]
+                    # BUG FIX: sender was never recorded on this path.
+                    # Only fill in if not already set, so a real recruiter
+                    # confirm-send attribution from phase7.py is never
+                    # silently overwritten.
+                    if item.sent_by_user_id and not existing_app.recruiter_id:
+                        existing_app.recruiter_id = item.sent_by_user_id
                 else:
                     # Shouldn't normally happen — the row is
                     # created at queue time — but don't lose
@@ -605,10 +626,12 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         cc_email=item.cc_email,
                         gmail_message_id=send_result.get("gmail_message_id"),
                         email_subject=item.subject,
+                        email_body_preview=(item.content or "")[:500],
                         sent_at=now,
                         applied_at=now,
+                        recruiter_id=item.sent_by_user_id,
                     ))
- 
+
             await session.commit()
         finally:
             for p in tmp_cleanup_paths:
@@ -645,8 +668,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             except Exception as inner_e:
                 print(f"[email-queue] completely failed to update item {item_id}: {inner_e}")
                 await session.rollback()
- 
- 
+
+
 @router.post("/api/consultant/email-queue/send-now")
 async def send_email_now(
     body: EmailQueueCreateRequest,
@@ -657,7 +680,7 @@ async def send_email_now(
     Send an application email immediately and record it in `applications`
     on success — used by the Apply-to-Requirement page (admin, recruiter,
     and consultant all share that page) instead of create_email_queue.
- 
+
     BUG FIX: that page previously called create_email_queue for every role
     (admin/recruiter/consultant), which only ever inserts a QUEUED row and
     waits for the background worker's next poll — it never wrote to
@@ -674,9 +697,9 @@ async def send_email_now(
     """
     from models import EmailQueue, Consultant
     from sqlalchemy import select as sa_select
- 
+
     consultant_id = None
- 
+
     if current_user.role == "ADMIN":
         if body.consultant_id:
             cons_result = await db.execute(
@@ -733,14 +756,14 @@ async def send_email_now(
         consultant_id = consultant.id if consultant else body.consultant_id
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
- 
+
     final_cc = body.cc_email.strip() if body.cc_email else ""
     if final_cc:
         if current_user.email not in final_cc:
             final_cc = f"{final_cc},{current_user.email}"
     else:
         final_cc = current_user.email
- 
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
@@ -751,18 +774,30 @@ async def send_email_now(
         content=body.content,
         attachments=body.attachments,
         status="QUEUED",
+        sent_by_user_id=current_user.id,
     )
     db.add(item)
     await db.commit()
     await db.refresh(item)
- 
+
     await process_single_email_queue_item(db, item)
     await db.refresh(item)
- 
+
     if item.status == "SENT":
-        return {"success": True, "id": str(item.id), "status": item.status}
+        # BUG FIX: leaving this row in email_queue meant every
+        # Apply-to-Requirement send also showed up as a duplicate row on
+        # the Email Queue page -- confusing, since it's already tracked
+        # properly in Applications now. Only send-now (this endpoint, the
+        # Apply flow) deletes its row; genuine Compose-page queue items
+        # (create_email_queue, processed later by the background worker)
+        # are untouched and still show in Email Queue as before.
+        result_id = str(item.id)
+        result_status = item.status
+        await db.delete(item)
+        await db.commit()
+        return {"success": True, "id": result_id, "status": result_status}
     raise HTTPException(status_code=502, detail=item.status_text or "Failed to send email.")
- 
+
 @router.post("/api/consultant/email-queue/upload-attachment")
 async def upload_attachment(
     file: UploadFile = File(...),
@@ -770,7 +805,7 @@ async def upload_attachment(
 ):
     """
     Upload attachment file and return a file reference for the email queue.
- 
+
     BUG FIX: this used to save ONLY to /tmp/email_attachments. That
     directory is not durable — it can be (and has been) wiped by a
     server restart or reboot in the window between a consultant
@@ -788,10 +823,10 @@ async def upload_attachment(
     contents = await file.read()
     with open(file_path, "wb") as f:
         f.write(contents)
- 
+
     from s3_service import upload_file_to_s3
     import io
- 
+
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{unique_name}"
     uploaded = upload_file_to_s3(
         io.BytesIO(contents), s3_key, file.content_type or "application/octet-stream"
@@ -800,7 +835,7 @@ async def upload_attachment(
     if not uploaded:
         print(f"[email_queue] WARNING: Spaces upload failed for {unique_name} — "
               f"falling back to /tmp only, which is NOT durable across restarts.")
- 
+
     return {
         "success": True,
         "filename": file.filename,
@@ -809,4 +844,3 @@ async def upload_attachment(
         "size_bytes": len(contents),
         "content_type": file.content_type,
     }
- 

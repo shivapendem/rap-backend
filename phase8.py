@@ -217,6 +217,14 @@ class ApplicationSentRowDTO(BaseModel):
     job_posting_id: Optional[str] = None
     match_score: Optional[float] = None
     applied_at: Optional[str] = None
+    # BUG FIX: client and gmail_message_id were UI table columns with no
+    # backing field at all — always blank regardless of real data.
+    # sent_by_name/role were completely missing too (frontend hardcoded
+    # sentBy: ""). All populated below from real columns/joins.
+    client: Optional[str] = None
+    gmail_message_id: Optional[str] = None
+    sent_by_name: Optional[str] = None
+    sent_by_role: Optional[str] = None
 
 
 class PaginatedApplicationsDTO(BaseModel):
@@ -328,7 +336,7 @@ async def get_audit_log_facets(
 # Applications management
 # ---------------------------------------------------------------------------
 
-from models import Application, Requirement, Consultant
+from models import Application, Requirement, Consultant, User
 
 @router.get("/applications", response_model=PaginatedApplicationsDTO)
 async def list_applications(
@@ -359,9 +367,10 @@ async def list_applications(
 
     total = (await db.execute(select(func.count()).select_from(Application).where(base_filter))).scalar_one()
     
-    q = select(Application, Requirement, Consultant) \
+    q = select(Application, Requirement, Consultant, User) \
         .outerjoin(Requirement, Requirement.id == Application.requirement_id) \
         .outerjoin(Consultant, Consultant.id == Application.consultant_id) \
+        .outerjoin(User, User.id == Application.recruiter_id) \
         .where(base_filter)
 
     order = Application.created_at.desc() if sort_dir == "desc" else Application.created_at.asc()
@@ -388,8 +397,12 @@ async def list_applications(
             job_posting_id=str(app.job_posting_id) if app.job_posting_id else None,
             match_score=float(app.match_score) if app.match_score else None,
             applied_at=app.applied_at.isoformat() if app.applied_at else None,
+            client=req.client if req else None,
+            gmail_message_id=app.gmail_message_id,
+            sent_by_name=(sender.full_name if sender else (cons.full_name if cons else None)),
+            sent_by_role=(sender.role if sender else ("CONSULTANT" if cons else None)),
         )
-        for app, req, cons in results
+        for app, req, cons, sender in results
     ]
     return PaginatedApplicationsDTO(
         data=data,

@@ -78,7 +78,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
               AND NOT EXISTS (
                   SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
               )
-            ORDER BY ge.date ASC
+            ORDER BY (ge.category = 'job_posting') DESC, ge.date DESC
             LIMIT :limit
         """),
         {"limit": batch_size},

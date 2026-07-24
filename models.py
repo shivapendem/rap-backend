@@ -622,6 +622,19 @@ class EmailQueue(Base):
     attachments = JSONBColumn(nullable=True)
     status = Column(Text, nullable=False, default="QUEUED")
     status_text = Column(Text, nullable=True)
+    # BUG FIX: nothing tracked who actually queued/sent an email — the
+    # Applications Tracker's "Sent By" column was permanently blank for
+    # anything routed through this table. Set at creation time
+    # (create_email_queue / send_email_now) from current_user.id, then
+    # propagated onto Application.recruiter_id when
+    # process_single_email_queue_item creates/updates the Application row.
+    #
+    # MIGRATION REQUIRED: run this against the real Postgres database
+    # before deploying this change:
+    #     ALTER TABLE email_queue ADD COLUMN sent_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+    # Until that's applied, any insert/query touching email_queue will
+    # fail with "column email_queue.sent_by_user_id does not exist".
+    sent_by_user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     VALID_STATUSES = {"QUEUED", "SENT", "FAILED"}

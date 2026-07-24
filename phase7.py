@@ -480,15 +480,15 @@ async def confirm_send(
                 )
 
         try:
-           send_result = await send_application_email_async(
-    access_token=access_token,
-    from_email=from_email,
-    to_email=requirement.vendor_email or "",
-    cc_email=cc_email,
-    subject=email_content["subject"],
-    body=email_content["body"],
-    attachment_paths=[attachment_path] if attachment_path else [],
-)
+            send_result = await send_application_email_async(
+                access_token=access_token,
+                from_email=from_email,
+                to_email=requirement.vendor_email or "",
+                cc_email=cc_email,
+                subject=email_content["subject"],
+                body=email_content["body"],
+                attachment_paths=[attachment_path] if attachment_path else [],
+            )
         finally:
             if tmp_resume_path:
                 try:
@@ -501,7 +501,10 @@ async def confirm_send(
         application = Application(
             requirement_id=request.requirement_id,
             consultant_id=consultant.id,
-            recruiter_id=current_user.id if current_user.role == "RECRUITER" else None,
+            # BUG FIX: was restricted to RECRUITER role only — admin-sent
+            # confirm-sends got no sender attribution at all. recruiter_id
+            # is used as a general "who sent this" field now.
+            recruiter_id=current_user.id,
             generated_resume_id=request.generated_resume_id,
             ats_score_at_send=ats_score,
             vendor_email=requirement.vendor_email,
@@ -671,3 +674,76 @@ async def get_application_email_preview(
         "status": app.status,
         "sent_at": app.sent_at,
     }
+
+
+@router.get("/applications/{application_id}/resume-download")
+async def download_application_resume(
+    application_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Stream the resume that was actually attached to a sent application.
+
+    BUG FIX: the Applications Tracker's "Resume" column was a plain
+    `<a href={resumePdfUrl}>` where resumePdfUrl was hardcoded to "" on
+    the frontend (see applications.api.ts) — there was no backend field or
+    endpoint to power it at all. Clicking an empty href triggers a full
+    browser navigation to the current page, which the SPA router then
+    treats like any other unauthenticated-looking navigation and bounces
+    to login — that's the "navigates to login page" symptom, not an actual
+    auth failure. This is a real authenticated download endpoint the
+    frontend now calls via fetch/axios (so the Bearer token goes with the
+    request) instead of a bare anchor tag.
+
+    Access control: admin sees any; recruiter only if the consultant is
+    currently assigned to them; consultant only their own.
+    """
+    from fastapi.responses import Response
+
+    result = await db.execute(select(Application).where(Application.id == application_id))
+    app = result.scalars().first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found.")
+    if not app.generated_resume_id:
+        raise HTTPException(status_code=404, detail="No resume was attached to this application.")
+
+    if current_user.role == "CONSULTANT":
+        cons_result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
+        cons = cons_result.scalars().first()
+        if not cons or cons.id != app.consultant_id:
+            raise HTTPException(status_code=403, detail="Not your application.")
+    elif current_user.role == "RECRUITER":
+        rc_result = await db.execute(
+            select(RecruiterConsultant).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.consultant_id == app.consultant_id,
+                RecruiterConsultant.is_active == True,
+            )
+        )
+        if not rc_result.scalars().first():
+            raise HTTPException(status_code=403, detail="Consultant not assigned to you.")
+    elif current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Insufficient permissions.")
+
+    resume_result = await db.execute(select(GeneratedResume).where(GeneratedResume.id == app.generated_resume_id))
+    resume = resume_result.scalars().first()
+    if not resume or not resume.pdf_path:
+        raise HTTPException(status_code=404, detail="Resume file not found.")
+
+    if Path(resume.pdf_path).exists():
+        with open(resume.pdf_path, "rb") as f:
+            body_bytes = f.read()
+    else:
+        from s3_service import download_file_from_s3
+        body_bytes, _ = download_file_from_s3(resume.pdf_path)
+
+    if not body_bytes:
+        raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
+
+    filename = resume.filename or f"Resume_{resume.id}.pdf"
+    return Response(
+        content=body_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
