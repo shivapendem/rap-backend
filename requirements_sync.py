@@ -75,6 +75,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                    ge.body_html, ge.date
             FROM gmail_emails ge
             WHERE (ge.category IS NULL OR ge.category = 'job_posting' OR ge.category = 'unclassified')
+              AND (ge.status_desc IS NULL OR ge.status_desc = 'Pending')
               AND NOT EXISTS (
                   SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
               )
@@ -109,11 +110,14 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
             # classifier — this IS the "auto-reparse every gmail" behavior:
             # every email gets run through the parser automatically, but
             # only ones it's actually confident are job postings become
-            # Requirement rows. Non-matches are simply skipped (not saved,
-            # not errored) — they'll be re-evaluated next cycle if still
-            # unclassified, which is cheap (regex-only, no DB writes).
+            # Requirement rows. Non-matches are simply skipped and marked 'Parsed - NR'.
             if not parsed.get("is_likely_requirement"):
                 skipped_not_a_requirement += 1
+                await db.execute(
+                    text("UPDATE gmail_emails SET status_desc = 'Parsed - NR' WHERE id = :id"),
+                    {"id": row["id"]}
+                )
+                await db.commit()
                 continue
 
             cleaned_jd = clean_requirement_text(body)
@@ -126,10 +130,18 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 received_date=row["date"],
             )
 
-            # NOTE: we deliberately do NOT touch gmail_emails.processed here —
-            # that column belongs to the Node.js classifier. Completion is
-            # now tracked purely by requirements.raw_email_id existing (the
-            # NOT EXISTS check above), so nothing needs updating on this row.
+            # Update the status_desc based on the result
+            if save_result["status"] == "saved":
+                final_status = "Parsed"
+            elif save_result["status"] == "duplicate":
+                final_status = "Parsed - Dup"
+            else:
+                final_status = "Parsed"
+
+            await db.execute(
+                text("UPDATE gmail_emails SET status_desc = :status WHERE id = :id"),
+                {"status": final_status, "id": row["id"]}
+            )
             await db.commit()
 
             if save_result["status"] == "saved":
@@ -174,6 +186,16 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
             await db.rollback()
             errors += 1
             print(f"[requirements_sync] FAILED gmail_emails.id={row['id']}: {e}")
+            try:
+                await db.execute(
+                    text("UPDATE gmail_emails SET status_desc = 'Failed' WHERE id = :id"),
+                    {"id": row["id"]}
+                )
+                await db.commit()
+            except Exception as update_err:
+                await db.rollback()
+                print(f"Failed to update status_desc to Failed for id {row['id']}: {update_err}")
+
             from error_logger import log_db_error
             await log_db_error(
                 stage="requirements_sync",

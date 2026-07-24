@@ -351,7 +351,7 @@ async def get_raw_email(
                    bcc_addresses, reply_to, body_text, body_html, date,
                    is_read, is_starred, has_attachments, attachments, labels,
                    thread_id, raw_headers, fetched_at, category, priority,
-                   processed, classified_at, classifier_tier, job_posting_id,
+                   processed, classified_at, classifier_tier, job_posting_id, status_desc,
                    EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = gmail_emails.id) AS has_requirement
             FROM gmail_emails WHERE id = :id
         """),
@@ -570,7 +570,7 @@ async def reparse_email(
         # ---- Step 5: mark processed/parsed on whichever raw source we used ----
         if source_gmail_emails_id is not None:
             await db.execute(
-                text("UPDATE gmail_emails SET processed = true WHERE id = :id"),
+                text("UPDATE gmail_emails SET processed = true, status_desc = 'Pending' WHERE id = :id"),
                 {"id": source_gmail_emails_id}
             )
         email.parse_status = "PARSED"
@@ -631,6 +631,7 @@ async def get_gmail_emails(
     account_email: Optional[str] = None,
     category: Optional[str] = None,
     processed: Optional[bool] = None,
+    search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -649,6 +650,9 @@ async def get_gmail_emails(
     if processed is not None:
         where_clauses.append("processed = :processed")
         params["processed"] = processed
+    if search:
+        where_clauses.append("(subject ILIKE :search OR from_address ILIKE :search OR from_name ILIKE :search)")
+        params["search"] = f"%{search}%"
 
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -668,6 +672,7 @@ async def get_gmail_emails(
                    ge.is_read, ge.is_starred, ge.has_attachments, ge.attachments, ge.labels,
                    ge.thread_id, ge.raw_headers, ge.fetched_at, ge.category, ge.priority,
                    ge.processed, ge.classified_at, ge.classifier_tier, ge.job_posting_id,
+                   ge.status_desc,
                    EXISTS (
                        SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
                    ) AS has_requirement
