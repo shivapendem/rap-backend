@@ -159,13 +159,28 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                     await match_requirement(db, save_result["id"])
                     
                     # Also run the JobMatch engine to populate Pending Applications
-                    from models import Requirement
+                    from models import Requirement, Consultant, JobMatch
                     from sqlalchemy.future import select
                     from matching_router import run_matching_for_requirement
                     req_res = await db.execute(select(Requirement).where(Requirement.id == save_result["id"]))
                     req_obj = req_res.scalars().first()
                     if req_obj:
-                        await run_matching_for_requirement(db, req_obj)
+                        # BUG FIX: run_matching_for_requirement now takes the
+                        # active consultant roster and existing-match pairs
+                        # as arguments instead of re-querying them itself
+                        # (that redundant per-call query was fine for this
+                        # single-requirement call site, but was the source
+                        # of a real N+1 timeout on the bulk /matching/run
+                        # endpoint, which loops this over every open
+                        # requirement in one request — fixed there by
+                        # fetching both once per run instead of once per
+                        # requirement). This call site still only handles
+                        # one requirement, so fetching both here is fine.
+                        cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+                        consultants = cons_res.scalars().all()
+                        existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
+                        existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
+                        await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
                         await db.commit()
                         
                 except Exception as match_err:

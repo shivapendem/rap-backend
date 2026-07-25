@@ -16,7 +16,12 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-async def run_matching_for_requirement(db: AsyncSession, req: Requirement) -> int:
+async def run_matching_for_requirement(
+    db: AsyncSession,
+    req: Requirement,
+    consultants: list,
+    existing_pairs: set,
+) -> int:
     if not SKLEARN_AVAILABLE:
         print("[JobMatch] scikit-learn is not available. Skipping matching.")
         return 0
@@ -42,10 +47,16 @@ async def run_matching_for_requirement(db: AsyncSession, req: Requirement) -> in
     if not req_text.strip():
         return 0
 
-    # Fetch active consultants
-    cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
-    consultants = cons_res.scalars().all()
-    
+    # BUG FIX: this used to re-run `SELECT * FROM consultants WHERE status
+    # = 'ACTIVE'` on every single requirement — identical result every
+    # time, since the active roster doesn't change mid-run. With the
+    # status-filter bug above fixed, this function is now actually called
+    # for every open requirement (previously the "OPEN" bug meant it never
+    # ran at all on real data) — so what used to be "1 redundant query
+    # that never actually executed" became "1 redundant query x however
+    # many open requirements exist", which is exactly the kind of thing
+    # that times out a request. Consultants are now fetched once by the
+    # caller and passed in.
     if not consultants:
         return 0
 
@@ -80,34 +91,34 @@ async def run_matching_for_requirement(db: AsyncSession, req: Requirement) -> in
         score = float(cosine_sim[idx]) * 100
         
         if score > 15.0: # 15% similarity threshold for TF-IDF
-            # Check if match already exists
-            existing_res = await db.execute(
-                select(JobMatch).where(
-                    JobMatch.requirement_id == req.id,
-                    JobMatch.consultant_id == cons_id
-                )
+            # BUG FIX: was a separate `SELECT ... WHERE requirement_id = ?
+            # AND consultant_id = ?` per candidate match — another N+1,
+            # this time scaling with (requirements x consultants) instead
+            # of just requirements. existing_pairs is fetched once by the
+            # caller for the whole run and checked here in memory.
+            if (req.id, cons_id) in existing_pairs:
+                continue
+            # Extract top overlapping terms for reasoning
+            req_arr = req_vector.toarray()[0]
+            cons_arr = cons_vectors[idx].toarray()[0]
+            
+            # Element-wise minimum gives the intersection of weights
+            intersection_weights = np.minimum(req_arr, cons_arr)
+            top_indices = intersection_weights.argsort()[-5:][::-1] # Top 5
+            
+            top_terms = [feature_names[i] for i in top_indices if intersection_weights[i] > 0]
+            reasoning = f"Strong semantic match ({score:.1f}%). Key overlapping features: {', '.join(top_terms)}"
+            
+            new_match = JobMatch(
+                requirement_id=req.id,
+                consultant_id=cons_id,
+                match_score=score,
+                match_reasoning=reasoning,
+                status="PENDING"
             )
-            if not existing_res.scalars().first():
-                # Extract top overlapping terms for reasoning
-                req_arr = req_vector.toarray()[0]
-                cons_arr = cons_vectors[idx].toarray()[0]
-                
-                # Element-wise minimum gives the intersection of weights
-                intersection_weights = np.minimum(req_arr, cons_arr)
-                top_indices = intersection_weights.argsort()[-5:][::-1] # Top 5
-                
-                top_terms = [feature_names[i] for i in top_indices if intersection_weights[i] > 0]
-                reasoning = f"Strong semantic match ({score:.1f}%). Key overlapping features: {', '.join(top_terms)}"
-                
-                new_match = JobMatch(
-                    requirement_id=req.id,
-                    consultant_id=cons_id,
-                    match_score=score,
-                    match_reasoning=reasoning,
-                    status="PENDING"
-                )
-                db.add(new_match)
-                new_matches += 1
+            db.add(new_match)
+            existing_pairs.add((req.id, cons_id))
+            new_matches += 1
                 
     return new_matches
 
@@ -135,9 +146,19 @@ async def run_matching_engine(
     )
     requirements = reqs_res.scalars().all()
 
+    # Fetch the active consultant roster once for the whole run (was
+    # re-fetched per requirement — see BUG FIX above run_matching_for_requirement).
+    cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+    consultants = cons_res.scalars().all()
+
+    # Fetch every existing (requirement_id, consultant_id) JobMatch pair
+    # once, instead of one query per candidate match inside the loop.
+    existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
+    existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
+
     new_matches = 0
     for req in requirements:
-        matches_found = await run_matching_for_requirement(db, req)
+        matches_found = await run_matching_for_requirement(db, req, consultants, existing_pairs)
         new_matches += matches_found
 
     await db.commit()
@@ -179,16 +200,39 @@ async def get_pending_matches(
     
     result = await db.execute(query)
     matches = result.scalars().all()
-    
-    # We need to return enriched data
+
+    # BUG FIX: this used to run two separate SELECTs per match (one for
+    # its Requirement, one for its Consultant) — an N+1 query pattern.
+    # With the matching-engine status filter fixed elsewhere in this file,
+    # a single "Run Engine" click can now legitimately produce hundreds of
+    # matches across every open requirement, and the admin view (which
+    # sees every match system-wide, unfiltered) hits the worst case. That
+    # turned into hundreds of sequential round-trips per request, which is
+    # exactly what was timing out / hanging as "Loading matches..." never
+    # resolving. Batch both lookups into two queries total, regardless of
+    # how many matches there are.
+    if not matches:
+        return {"matches": []}
+
+    req_ids = {m.requirement_id for m in matches}
+    cons_ids = {m.consultant_id for m in matches}
+
+    reqs_by_id = {
+        r.id: r for r in (await db.execute(
+            select(Requirement).where(Requirement.id.in_(req_ids))
+        )).scalars().all()
+    }
+    cons_by_id = {
+        c.id: c for c in (await db.execute(
+            select(Consultant).where(Consultant.id.in_(cons_ids))
+        )).scalars().all()
+    }
+
     output = []
     for match in matches:
-        req_res = await db.execute(select(Requirement).where(Requirement.id == match.requirement_id))
-        req = req_res.scalars().first()
-        
-        cons_res = await db.execute(select(Consultant).where(Consultant.id == match.consultant_id))
-        cons = cons_res.scalars().first()
-        
+        req = reqs_by_id.get(match.requirement_id)
+        cons = cons_by_id.get(match.consultant_id)
+
         if req and cons:
             # BUG FIX: was req.job_title (doesn't exist — real field is
             # `role`) and req.client_name or req.vendor_name (real fields
