@@ -608,6 +608,13 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     existing_app.sent_at = now
                     existing_app.applied_at = now
                     existing_app.email_body_preview = (item.content or "")[:500]
+                    # BUG FIX: resume attachment reference was never
+                    # recorded, so the Resume column was always blank for
+                    # every application sent this way. Only overwrite if
+                    # this send actually had an attachment — don't blank
+                    # out a resume recorded by an earlier send.
+                    if item.attachments:
+                        existing_app.resume_attachment_path = item.attachments[0]
                     # BUG FIX: sender was never recorded on this path.
                     # Only fill in if not already set, so a real recruiter
                     # confirm-send attribution from phase7.py is never
@@ -630,6 +637,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         sent_at=now,
                         applied_at=now,
                         recruiter_id=item.sent_by_user_id,
+                        resume_attachment_path=item.attachments[0] if item.attachments else None,
                     ))
 
             await session.commit()

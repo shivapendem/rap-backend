@@ -48,7 +48,7 @@ from typing import List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
-from sqlalchemy import func, select, cast, Text, and_
+from sqlalchemy import func, select, cast, Text, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -490,6 +490,7 @@ class ApplicationHistoryRow(BaseModel):
     # pattern as the admin Applications Tracker) is the field that
     # actually works.
     resume_id: Optional[str] = None
+    resume_available: bool = False
     # BUG FIX: client was never returned (blank UI column); sent_by fields
     # let a consultant see whether they applied themselves or a
     # recruiter/admin sent it on their behalf.
@@ -523,6 +524,7 @@ class RecruiterApplicationRow(BaseModel):
     client: Optional[str] = None
     gmail_message_id: Optional[str] = None
     resume_id: Optional[str] = None
+    resume_available: bool = False
     sent_by_name: Optional[str] = None
     sent_by_role: Optional[str] = None
 
@@ -1364,6 +1366,7 @@ async def get_consultant_applications(
             sent_at=app.sent_at.isoformat() if app.sent_at else None,
             resume_url=resume.pdf_url if resume else None,
             resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
+            resume_available=bool(app.generated_resume_id or app.resume_attachment_path),
             ats_score=float(resume.ats_score) if resume and resume.ats_score else None,
             client=req.client,
             gmail_message_id=app.gmail_message_id,
@@ -1434,13 +1437,13 @@ async def get_recruiter_applications(
         count_q = count_q.where(Application.consultant_id.in_(assigned_ids))
 
     filters = []
-    
+
     if consultant_id:
         try:
             ids = [int(x.strip()) for x in consultant_id.split(",") if x.strip()]
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid consultant_id format")
-            
+
         if ids:
             if current_user.role == "RECRUITER":
                 rcs = (await db.execute(
@@ -1484,6 +1487,7 @@ async def get_recruiter_applications(
             client=req.client,
             gmail_message_id=app.gmail_message_id,
             resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
+            resume_available=bool(app.generated_resume_id or app.resume_attachment_path),
             sent_by_name=sender.full_name if sender else cons.full_name,
             sent_by_role=sender.role if sender else "CONSULTANT",
         )

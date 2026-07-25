@@ -238,6 +238,12 @@ class ApplicationSentRowDTO(BaseModel):
     # when re-applying to an existing match (which is the common case with
     # a large pre-existing match backlog).
     sent_at: Optional[str] = None
+    # BUG FIX: resume_id alone (generated_resume_id) missed every
+    # application sent via the email-queue/Apply flow, which never links
+    # a GeneratedResume — only a raw attachment path. resume_available
+    # reflects either source so the Resume column shows correctly for all
+    # of them, not just the ATS-gated recruiter confirm-send flow.
+    resume_available: bool = False
 
 
 class PaginatedApplicationsDTO(BaseModel):
@@ -417,6 +423,7 @@ async def list_applications(
             sent_by_name=(sender.full_name if sender else (cons.full_name if cons else None)),
             sent_by_role=(sender.role if sender else ("CONSULTANT" if cons else None)),
             sent_at=app.sent_at.isoformat() if app.sent_at else None,
+            resume_available=bool(app.generated_resume_id or app.resume_attachment_path),
         )
         for app, req, cons, sender in results
     ]
@@ -888,5 +895,3 @@ async def list_applications_feed(
         ))
     return PaginatedApplicationsDTO(data=data, total=total, page=page,
         page_size=page_size, total_pages=math.ceil(total / page_size) or 1)
-
-        

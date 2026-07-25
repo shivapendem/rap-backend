@@ -420,6 +420,20 @@ class Application(Base):
     gmail_message_id = Column(Text, nullable=True, index=True)
     email_subject = Column(Text, nullable=True)
     email_body_preview = Column(Text, nullable=True)
+    # BUG FIX: applications sent through the email-queue/Apply-to-Requirement
+    # flow (admin apply, recruiter apply-on-behalf, consultant self-apply,
+    # and Compose) never set generated_resume_id at all — that field only
+    # gets populated by the ATS-gated recruiter Email-Preview confirm-send
+    # flow. Every other application's "Resume" column was permanently
+    # blank even though a real file WAS attached and sent — it just wasn't
+    # linked to the GeneratedResume table, only referenced as a raw
+    # file path/S3 key on the EmailQueue item. Stores that raw reference
+    # so the resume-download endpoint has something to serve.
+    #
+    # MIGRATION REQUIRED: run this against the real Postgres database
+    # before deploying this change:
+    #     ALTER TABLE applications ADD COLUMN resume_attachment_path TEXT;
+    resume_attachment_path = Column(Text, nullable=True)
     ats_score_at_send = Column(Numeric(5, 2), nullable=True)
     sent_at = Column(TIMESTAMP(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)

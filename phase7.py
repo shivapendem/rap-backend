@@ -705,7 +705,7 @@ async def download_application_resume(
     app = result.scalars().first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found.")
-    if not app.generated_resume_id:
+    if not app.generated_resume_id and not app.resume_attachment_path:
         raise HTTPException(status_code=404, detail="No resume was attached to this application.")
 
     if current_user.role == "CONSULTANT":
@@ -726,22 +726,48 @@ async def download_application_resume(
     elif current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Insufficient permissions.")
 
-    resume_result = await db.execute(select(GeneratedResume).where(GeneratedResume.id == app.generated_resume_id))
-    resume = resume_result.scalars().first()
-    if not resume or not resume.pdf_path:
-        raise HTTPException(status_code=404, detail="Resume file not found.")
+    body_bytes = None
+    filename = f"Resume_{application_id}.pdf"
 
-    if Path(resume.pdf_path).exists():
-        with open(resume.pdf_path, "rb") as f:
-            body_bytes = f.read()
-    else:
-        from s3_service import download_file_from_s3
-        body_bytes, _ = download_file_from_s3(resume.pdf_path)
+    if app.generated_resume_id:
+        resume_result = await db.execute(select(GeneratedResume).where(GeneratedResume.id == app.generated_resume_id))
+        resume = resume_result.scalars().first()
+        if resume and resume.pdf_path:
+            if Path(resume.pdf_path).exists():
+                with open(resume.pdf_path, "rb") as f:
+                    body_bytes = f.read()
+            else:
+                from s3_service import download_file_from_s3
+                body_bytes, _ = download_file_from_s3(resume.pdf_path)
+            filename = resume.filename or filename
+
+    # BUG FIX: applications sent via the email-queue/Apply-to-Requirement
+    # flow never have a generated_resume_id — the attached file is only
+    # referenced as a raw path/S3 key on the EmailQueue item, now mirrored
+    # onto Application.resume_attachment_path. Same S3-key-vs-local-path
+    # resolution the send pipeline itself uses (email_queue.py).
+    if body_bytes is None and app.resume_attachment_path:
+        ref = app.resume_attachment_path
+        from email_queue import EMAIL_ATTACHMENT_S3_PREFIX
+        import os as _os
+        local_candidate = _os.path.join("/tmp/email_attachments", ref)
+        if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
+            from s3_service import download_file_from_s3
+            body_bytes, _ = download_file_from_s3(ref)
+            if body_bytes is None and _os.path.exists(local_candidate):
+                with open(local_candidate, "rb") as f:
+                    body_bytes = f.read()
+        elif _os.path.exists(local_candidate):
+            with open(local_candidate, "rb") as f:
+                body_bytes = f.read()
+        elif Path(ref).exists():
+            with open(ref, "rb") as f:
+                body_bytes = f.read()
+        filename = _os.path.basename(ref) or filename
 
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
 
-    filename = resume.filename or f"Resume_{resume.id}.pdf"
     return Response(
         content=body_bytes,
         media_type="application/pdf",
