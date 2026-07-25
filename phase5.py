@@ -48,7 +48,7 @@ from typing import List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
-from sqlalchemy import func, select, cast, Text
+from sqlalchemy import func, select, cast, Text, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
