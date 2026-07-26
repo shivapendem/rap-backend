@@ -8,6 +8,7 @@ with open(file_path, 'r') as f:
 insertion = """
     # Gmail OAuth Token Capture for Consultants
     if user.role == "CONSULTANT":
+        from datetime import datetime, timezone, timedelta
         from models import Consultant, ConsultantEmailToken
         from gmail_send_service import encrypt_token
         
