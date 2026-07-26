@@ -852,3 +852,39 @@ async def upload_attachment(
         "size_bytes": len(contents),
         "content_type": file.content_type,
     }
+
+
+@router.get("/api/consultant/email-queue/download-attachment")
+async def download_queue_attachment(
+    ref: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get a downloadable URL or serve attachment file for email queue item.
+    """
+    from s3_service import generate_presigned_url
+    from fastapi.responses import FileResponse
+
+    clean_ref = ref.strip()
+    if not clean_ref:
+        raise HTTPException(status_code=400, detail="ref is required")
+
+    # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
+    if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
+        url = generate_presigned_url(clean_ref)
+        if url:
+            return {"url": url}
+
+    # 2. Try local file path if present
+    filename = os.path.basename(clean_ref)
+    local_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(local_path):
+        return FileResponse(local_path, filename=filename)
+
+    # 3. Try fallback with S3 prefix
+    s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
+    url = generate_presigned_url(s3_key)
+    if url:
+        return {"url": url}
+
+    raise HTTPException(status_code=404, detail="Attachment file not found.")
