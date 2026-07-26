@@ -367,10 +367,26 @@ def _validate_resume_output(resume_data: dict, consultant: Consultant) -> tuple[
 # ---------------------------------------------------------------------------
 
 def _generate_docx(resume_data: dict, output_path: Path) -> None:
-    """Verbatim from Phase 6 doc Task 4 code example."""
+    """DOCX Generation with markdown bolding support."""
     from docx import Document
+    import re
 
     doc = Document()
+
+    def add_formatted_paragraph(text: str, style: Optional[str] = None):
+        p = doc.add_paragraph(style=style)
+        if not text:
+            return p
+        normalized = re.sub(r'</?(b|strong)>', '**', text)
+        parts = re.split(r'(\*\*.*?\*\*)', normalized)
+        for part in parts:
+            if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                run = p.add_run(part[2:-2])
+                run.bold = True
+            else:
+                p.add_run(part)
+        return p
+
     doc.add_heading(resume_data.get("name", ""), 0)
 
     # Contact
@@ -378,7 +394,7 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     doc.add_paragraph(contact.strip(" |"))
 
     doc.add_heading("Professional Summary", level=1)
-    doc.add_paragraph(resume_data.get("summary", ""))
+    add_formatted_paragraph(resume_data.get("summary", ""))
 
     doc.add_heading("Technical Skills", level=1)
     skills = resume_data.get("skills", [])
@@ -391,7 +407,7 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
         if exp.get("location"):
             doc.add_paragraph(exp["location"])
         for bullet in exp.get("bullets", []):
-            doc.add_paragraph(bullet, style="List Bullet")
+            add_formatted_paragraph(bullet, style="List Bullet")
 
     # Missing skills transparency — per Task 2 truthfulness requirement
     missing = resume_data.get("missing_skills", [])
