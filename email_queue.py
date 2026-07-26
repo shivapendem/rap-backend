@@ -222,13 +222,19 @@ async def create_email_queue(
 async def list_email_queue(
     page: int = 1,
     page_size: int = 20,
+    consultant_id: Optional[str] = Query(None, description="Comma-separated consultant profile ids to filter by"),
+    sent_by_role: Optional[str] = Query(None, description="Comma-separated roles to filter by: ADMIN, RECRUITER, CONSULTANT"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """List all emails in queue."""
     from models import EmailQueue, Consultant, RecruiterConsultant
 
-    query = select(EmailQueue, Consultant).outerjoin(Consultant, Consultant.id == EmailQueue.consultant_id)
+    query = (
+        select(EmailQueue, Consultant, User)
+        .outerjoin(Consultant, Consultant.id == EmailQueue.consultant_id)
+        .outerjoin(User, User.id == EmailQueue.sent_by_user_id)
+    )
     count_query = select(func.count()).select_from(EmailQueue)
 
     if current_user.role == "CONSULTANT":
@@ -253,6 +259,36 @@ async def list_email_queue(
         count_query = count_query.where(EmailQueue.consultant_id.in_(assigned_ids))
     elif current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    # Optional filters — "Filter by Consultant" and "Filter by Sent By Role"
+    # dropdowns on the Global Email Queue screen (admin/recruiter views only;
+    # a single consultant's own view has nothing meaningful to filter by).
+    # For recruiters this narrows further within the assigned_ids scoping
+    # already applied above (the two .where() clauses AND together), so a
+    # recruiter can never widen their view to a consultant outside their
+    # own roster just by passing an arbitrary consultant_id.
+    if consultant_id:
+        try:
+            ids = [int(cid) for cid in consultant_id.split(",") if cid.strip()]
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid consultant_id filter")
+        if ids:
+            query = query.where(EmailQueue.consultant_id.in_(ids))
+            count_query = count_query.where(EmailQueue.consultant_id.in_(ids))
+
+    if sent_by_role:
+        roles = [r.strip().upper() for r in sent_by_role.split(",") if r.strip()]
+        valid_roles = {"ADMIN", "RECRUITER", "CONSULTANT"}
+        invalid = [r for r in roles if r not in valid_roles]
+        if invalid:
+            raise HTTPException(status_code=422, detail=f"Invalid sent_by_role values: {invalid}")
+        if roles:
+            query = query.where(EmailQueue.sent_by_user_id.in_(
+                select(User.id).where(User.role.in_(roles))
+            ))
+            count_query = count_query.where(EmailQueue.sent_by_user_id.in_(
+                select(User.id).where(User.role.in_(roles))
+            ))
 
     # BUG FIX: page/page_size were accepted by the frontend
     # (fetchEmailQueueItems always sent them) but silently ignored here —
@@ -283,10 +319,12 @@ async def list_email_queue(
                 "attachments": item.attachments,
                 "status": item.status,
                 "status_message": item.status_text,
+                "sent_by_name": sender.full_name if sender else None,
+                "sent_by_role": sender.role if sender else None,
                 "created_at": item.created_at.isoformat() if item.created_at else None,
                 "updated_at": item.updated_at.isoformat() if item.updated_at else None,
             }
-            for item, cons in rows
+            for item, cons, sender in rows
         ],
         "total": total,
         "page": page,
@@ -615,6 +653,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     # out a resume recorded by an earlier send.
                     if item.attachments:
                         existing_app.resume_attachment_path = item.attachments[0]
+                        existing_app.attachments_sent = item.attachments
                     # BUG FIX: sender was never recorded on this path.
                     # Only fill in if not already set, so a real recruiter
                     # confirm-send attribution from phase7.py is never
@@ -638,6 +677,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         applied_at=now,
                         recruiter_id=item.sent_by_user_id,
                         resume_attachment_path=item.attachments[0] if item.attachments else None,
+                        attachments_sent=item.attachments if item.attachments else None,
                     ))
 
             await session.commit()

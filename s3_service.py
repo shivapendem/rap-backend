@@ -88,3 +88,18 @@ def download_file_from_s3(s3_key: str):
     except ClientError as e:
         print(f"Failed to download file from DO Spaces: {e}")
         return None, None
+
+def get_s3_file_metadata(s3_key: str):
+    """
+    Returns (size_bytes, content_type) for an object in Spaces via
+    head_object, or (None, None) if it can't be found/read. Used to show
+    real attachment sizes in the Email Preview modal without downloading
+    the whole file.
+    """
+    if not DO_SPACES_BUCKET:
+        return None, None
+    try:
+        head = s3_client.head_object(Bucket=DO_SPACES_BUCKET, Key=s3_key)
+        return head.get("ContentLength"), head.get("ContentType", "application/octet-stream")
+    except ClientError:
+        return None, None

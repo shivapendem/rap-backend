@@ -199,6 +199,12 @@ Generate the tailored resume JSON now.
         # Parse content
         parsed_response = response.parse()
         content = parsed_response.content[0].text
+        
+        # Capture real token usage for cost tracking
+        usage_info = {
+            "input_tokens": parsed_response.usage.input_tokens,
+            "output_tokens": parsed_response.usage.output_tokens,
+        }
         # Sometimes Claude returns wrapped in markdown JSON block
         if content.startswith("```json"):
             content = content[7:]
@@ -208,7 +214,7 @@ Generate the tailored resume JSON now.
             content = content[:-3]
             
         result_json = json.loads(content.strip())
-        return result_json, rate_limits
+        return result_json, rate_limits, usage_info
     except Exception as e:
         logger.warning(f"Error calling Claude API: {e}. Falling back to mock data.")
-        return mock_fallback, {}
+        return mock_fallback, {}, None

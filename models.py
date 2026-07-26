@@ -434,6 +434,17 @@ class Application(Base):
     # before deploying this change:
     #     ALTER TABLE applications ADD COLUMN resume_attachment_path TEXT;
     resume_attachment_path = Column(Text, nullable=True)
+    # Full list of attachment refs actually sent with this application
+    # (resume + any extras like a cover letter). resume_attachment_path
+    # above only ever kept item.attachments[0] for the existing
+    # resume-download endpoint's sake — this preserves everything so the
+    # Email Preview modal can list and download every attachment sent,
+    # not just the first one.
+    #
+    # MIGRATION REQUIRED: run this against the real Postgres database
+    # before deploying this change:
+    #     ALTER TABLE applications ADD COLUMN attachments_sent JSONB;
+    attachments_sent = JSONBColumn(nullable=True)
     ats_score_at_send = Column(Numeric(5, 2), nullable=True)
     sent_at = Column(TIMESTAMP(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)

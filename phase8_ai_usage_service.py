@@ -16,6 +16,7 @@ MODEL_PRICING = {
     "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
     "gpt-4": {"input": 0.03, "output": 0.06},
     "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
+    "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
 }
 DEFAULT_PRICING = {"input": 0.005, "output": 0.015}
 
@@ -54,11 +55,43 @@ async def set_budget_threshold(db: AsyncSession, budget_usd: float, updated_by: 
     await db.commit()
     return budget_usd
 
+
+
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate USD cost for an AI call based on model + token counts."""
     pricing = MODEL_PRICING.get(model, DEFAULT_PRICING)
     cost = (input_tokens / 1000.0) * pricing["input"] + (output_tokens / 1000.0) * pricing["output"]
     return round(cost, 6)
+
+async def log_ai_usage(
+    db: AsyncSession,
+    purpose: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    consultant_id: str | None = None,
+    consultant_name: str | None = None,
+    requirement_id: str | None = None,
+):
+    """Insert a real AI usage log row for tracking/cost reporting."""
+    from models import AIUsageLog
+    cost = estimate_cost(model, input_tokens, output_tokens)
+    db.add(AIUsageLog(
+        purpose=purpose,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        estimated_cost=cost,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        consultant_id=consultant_id,
+        consultant_name=consultant_name,
+        requirement_id=requirement_id,
+    ))
+    await db.commit()
+    return cost
 
 async def save_claude_rate_limits(db: AsyncSession, limits: dict):
     """Save Claude rate limit headers to AppSettings."""

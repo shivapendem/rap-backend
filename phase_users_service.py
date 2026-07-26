@@ -179,6 +179,7 @@ class UserService:
             role=req.role,
             password_hash=get_password_hash(req.password),
             is_active=True,
+            experience_years=req.experience_years,
             resume_info=req.resume_info,
         )
         user = await UserRepository.create(db, user)

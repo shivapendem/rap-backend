@@ -659,11 +659,65 @@ async def get_application_email_preview(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get stored email preview for a sent application."""
+    """
+    Get stored email preview for a sent application.
+
+    BUG FIX: this never returned an `attachments` field at all, so the
+    Email Preview modal (consultant, recruiter, and admin all share the
+    same modal code) always rendered zero attachments no matter what was
+    actually sent — the resume link and any extra files (cover letter,
+    etc.) were completely invisible here even though they were sent.
+    Also, only the first attachment was ever persisted anywhere
+    (Application.resume_attachment_path) — now reads the full list from
+    Application.attachments_sent, falling back to the single legacy
+    field for older rows sent before that column existed.
+
+    Access control: admin sees any; recruiter only if the consultant is
+    currently assigned to them; consultant only their own — same rule
+    already enforced on the sibling resume-download endpoint below.
+    """
+    import mimetypes
+    from s3_service import get_s3_file_metadata
+    from email_queue import EMAIL_ATTACHMENT_S3_PREFIX
+
     result = await db.execute(select(Application).where(Application.id == application_id))
     app = result.scalars().first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found.")
+
+    if current_user.role == "CONSULTANT":
+        cons_result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
+        cons = cons_result.scalars().first()
+        if not cons or cons.id != app.consultant_id:
+            raise HTTPException(status_code=403, detail="Not your application.")
+    elif current_user.role == "RECRUITER":
+        rc_result = await db.execute(
+            select(RecruiterConsultant).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.consultant_id == app.consultant_id,
+            )
+        )
+        if not rc_result.scalars().first():
+            raise HTTPException(status_code=403, detail="Not your consultant's application.")
+
+    refs = app.attachments_sent or ([app.resume_attachment_path] if app.resume_attachment_path else [])
+
+    attachments = []
+    for ref in refs:
+        if not ref:
+            continue
+        size_bytes, content_type = None, None
+        local_path = os.path.join("/tmp/email_attachments", ref)
+        if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
+            size_bytes, content_type = get_s3_file_metadata(ref)
+        elif os.path.exists(local_path):
+            size_bytes = os.path.getsize(local_path)
+            content_type = mimetypes.guess_type(local_path)[0]
+        attachments.append({
+            "filename": ref,
+            "mimeType": content_type or mimetypes.guess_type(ref)[0] or "application/octet-stream",
+            "sizeBytes": size_bytes or 0,
+        })
 
     return {
         "application_id": str(application_id),
@@ -673,6 +727,7 @@ async def get_application_email_preview(
         "cc_email": app.cc_email,
         "status": app.status,
         "sent_at": app.sent_at,
+        "attachments": attachments,
     }
 
 

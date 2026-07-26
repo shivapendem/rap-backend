@@ -175,9 +175,19 @@ async def generate_resume(
     resume_info["experience"] = manual_exp_entries + resume_info["experience"]
 
     try:
-        generated_data, rate_limits = generate_tailored_resume(resume_info, request.job_description or "General Role")
+        generated_data, rate_limits, usage_info = generate_tailored_resume(resume_info, request.job_description or "General Role")
         if rate_limits:
             await save_claude_rate_limits(db, rate_limits)
+        if usage_info:
+            from phase8_ai_usage_service import log_ai_usage
+            await log_ai_usage(
+                db,
+                purpose="resume_generation",
+                model="claude-sonnet-4-6",
+                input_tokens=usage_info["input_tokens"],
+                output_tokens=usage_info["output_tokens"],
+                consultant_id=str(target_user_id),
+            )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Generation failed: {e}")
     # Compute a real ATS score from the generated resume vs. the job description.

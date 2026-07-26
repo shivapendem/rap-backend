@@ -58,6 +58,7 @@ class CreateUserRequestDTO(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8)
     role: str
+    experience_years: Optional[float] = Field(None, ge=0, le=60)
     resume_info: Optional[Any] = None
 
     @field_validator("role")
@@ -182,9 +183,6 @@ class ConsultantAdminRowDTO(BaseModel):
     ats_score: Optional[float] = None
     updated_at: str = ""
     has_resume: bool = False  # base_resume_file_path/base_resume_text can be large — expose presence, not raw content
-    last_login_at: Optional[str] = None
-    total_applications_sent: int = 0
-    total_resumes_generated: int = 0
     last_login_at: Optional[str] = None
     total_applications_sent: int = 0
     total_resumes_generated: int = 0

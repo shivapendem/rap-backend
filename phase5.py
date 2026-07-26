@@ -661,6 +661,10 @@ class RecruiterRequirementResponse(BaseModel):
     jobDescription: str
     parsedFields: RecruiterParsedFieldsDTO
     vendorContact: VendorContactDTO
+    # Consultants (from this recruiter's own roster) matched to this
+    # requirement — batch-loaded per page, not per row, to avoid N+1
+    # queries. Empty list if none matched yet.
+    matchedConsultants: List[str] = []
 
 
 class ConsultantFilteredRequirementResponse(RecruiterRequirementResponse):
@@ -1000,6 +1004,30 @@ async def get_all_requirements_for_recruiter(
         await db.execute(base_q.offset((page - 1) * pageSize).limit(pageSize))
     ).scalars().all()
 
+    # Batch-load matched consultant names for every requirement on this
+    # page in one query, scoped to the recruiter's own active roster (ADMIN
+    # sees matches from any consultant). Avoids an N+1 query per row.
+    req_ids = [r.id for r in results]
+    matches_by_req: dict[int, list[str]] = {}
+    if req_ids:
+        matches_q = (
+            select(RequirementConsultantMatch.requirement_id, Consultant.full_name)
+            .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
+            .where(RequirementConsultantMatch.requirement_id.in_(req_ids))
+        )
+        if current_user.role == "RECRUITER":
+            assigned_result = await db.execute(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )
+            assigned_ids = [row[0] for row in assigned_result.all()]
+            matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
+
+        for req_id, name in (await db.execute(matches_q)).all():
+            matches_by_req.setdefault(req_id, []).append(name)
+
     data = [
         RecruiterRequirementResponse(
             id=str(r.id),
@@ -1019,6 +1047,7 @@ async def get_all_requirements_for_recruiter(
                 budget=r.rate or "",
             ),
             vendorContact=VendorContactDTO(**_parse_vendor_contact(r.vendor_contact)),
+            matchedConsultants=matches_by_req.get(r.id, []),
         )
         for r in results
     ]
@@ -1392,6 +1421,7 @@ async def get_recruiter_applications(
     page_size: int = Query(20, ge=1, le=100),
     consultant_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -1413,7 +1443,19 @@ async def get_recruiter_applications(
         .join(Requirement, Requirement.id == Application.requirement_id) \
         .join(Consultant, Consultant.id == Application.consultant_id) \
         .outerjoin(User, User.id == Application.recruiter_id)
-    count_q = select(func.count(Application.id))
+    # NOTE: joined to Requirement/Consultant the same way as q above —
+    # required so the `search` filter below (which references
+    # Consultant.full_name / Requirement.role / vendor / client) can be
+    # applied to count_q too, not just q. Application-only filters
+    # (consultant_id, status) would have worked fine against a bare
+    # func.count(Application.id), but count_q needs the same FROM-clause
+    # as q for any filter that touches a joined table.
+    count_q = (
+        select(func.count(Application.id))
+        .select_from(Application)
+        .join(Requirement, Requirement.id == Application.requirement_id)
+        .join(Consultant, Consultant.id == Application.consultant_id)
+    )
 
     # BUG FIX: this only ever restricted by RecruiterConsultant assignment
     # when a specific consultant_id filter was passed. The frontend's
@@ -1459,6 +1501,20 @@ async def get_recruiter_applications(
 
     if status:
         filters.append(Application.status == status)
+
+    # Search across the fields actually visible in the table — consultant
+    # name, role, vendor, and client — so a recruiter can find an
+    # application without knowing which specific field it's in.
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        filters.append(
+            or_(
+                Consultant.full_name.ilike(term),
+                Requirement.role.ilike(term),
+                Requirement.vendor.ilike(term),
+                Requirement.client.ilike(term),
+            )
+        )
 
     if filters:
         base_filter = and_(*filters)
