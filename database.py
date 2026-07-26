@@ -32,10 +32,11 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=os.getenv("DB_ECHO", "false").lower() == "true",  # Don't echo in production by default
     pool_pre_ping=True,  # Detect stale connections
+    pool_recycle=1800,   # Recycle connections after 30 mins to prevent stale accumulation
     # pool_size / max_overflow only supported for non-SQLite
     **({
-        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
-        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "2")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "3")),
     } if not DATABASE_URL.startswith("sqlite") else {})
 )
 
