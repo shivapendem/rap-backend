@@ -124,9 +124,9 @@ class RecruiterConsultant(Base):
     __tablename__ = "recruiter_consultants"
 
     id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
-    recruiter_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False)
-    is_active = Column(Boolean, nullable=False, default=True)
+    recruiter_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -468,7 +468,7 @@ class JobMatch(Base):
     consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False, index=True)
     match_score = Column(Numeric(5, 2), nullable=True)
     match_reasoning = Column(Text, nullable=True)
-    status = Column(Text, nullable=False, default="PENDING") # PENDING, APPLIED, REJECTED
+    status = Column(Text, nullable=False, default="PENDING", index=True) # PENDING, APPLIED, REJECTED
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

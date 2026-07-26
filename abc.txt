@@ -550,3 +550,16 @@ CREATE TABLE IF NOT EXISTS job_matches (
 CREATE INDEX IF NOT EXISTS ix_job_matches_id ON job_matches (id);
 CREATE INDEX IF NOT EXISTS ix_job_matches_requirement_id ON job_matches (requirement_id);
 CREATE INDEX IF NOT EXISTS ix_job_matches_consultant_id ON job_matches (consultant_id);
+
+-- Indexes to speed up /api/matching/pending and recruiter filtering
+
+-- 1. Index on JobMatch status
+CREATE INDEX IF NOT EXISTS ix_job_matches_status ON job_matches (status);
+
+-- 2. Indexes on RecruiterConsultant to speed up fetching assigned consultants
+CREATE INDEX IF NOT EXISTS ix_recruiter_consultants_recruiter_id ON recruiter_consultants (recruiter_id);
+CREATE INDEX IF NOT EXISTS ix_recruiter_consultants_consultant_id ON recruiter_consultants (consultant_id);
+CREATE INDEX IF NOT EXISTS ix_recruiter_consultants_is_active ON recruiter_consultants (is_active);
+
+-- 3. (Optional but recommended) Composite index for RecruiterConsultant active filtering
+CREATE INDEX IF NOT EXISTS ix_rc_recruiter_active ON recruiter_consultants (recruiter_id, is_active);
