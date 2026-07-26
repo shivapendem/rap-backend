@@ -1,5 +1,6 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from models import User, Consultant, Requirement, JobMatch
@@ -113,98 +114,67 @@ async def get_pending_matches(
 ):
     """
     Get all pending job matches for the current user's view, with optional filters.
+    Optimized to perform a single high-performance SQL JOIN query across JobMatch,
+    Requirement, and Consultant tables.
     """
-    query = select(JobMatch)
-    
-    if status:
-        query = query.where(JobMatch.status == status.upper())
-    else:
-        query = query.where(JobMatch.status == "PENDING")
+    target_status = status.upper() if status else "PENDING"
+
+    stmt = (
+        select(
+            JobMatch.id,
+            JobMatch.requirement_id,
+            Requirement.role.label("requirement_title"),
+            func.coalesce(Requirement.client, Requirement.vendor).label("requirement_company"),
+            JobMatch.consultant_id,
+            Consultant.full_name.label("consultant_name"),
+            Consultant.email.label("consultant_email"),
+            JobMatch.match_score,
+            JobMatch.match_reasoning,
+            JobMatch.status,
+            JobMatch.created_at
+        )
+        .join(Requirement, JobMatch.requirement_id == Requirement.id)
+        .join(Consultant, JobMatch.consultant_id == Consultant.id)
+        .where(JobMatch.status == target_status)
+    )
 
     if consultant_id:
         c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()]
         if c_ids:
-            query = query.where(JobMatch.consultant_id.in_(c_ids))
+            stmt = stmt.where(JobMatch.consultant_id.in_(c_ids))
 
     if current_user.role == "CONSULTANT":
-        cons_res = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
-        cons = cons_res.scalars().first()
-        if not cons:
-            return {"matches": []}
-        query = query.where(JobMatch.consultant_id == cons.id)
+        cons_subq = select(Consultant.id).where(Consultant.user_id == current_user.id).scalar_subquery()
+        stmt = stmt.where(JobMatch.consultant_id == cons_subq)
     elif current_user.role == "RECRUITER":
-        # BUG FIX: this branch didn't exist — recruiters fell through with
-        # no filter at all and saw every consultant's pending matches
-        # system-wide, not just their own assigned ones (this file's own
-        # comment already flagged it as an MVP gap). Same scoping already
-        # applied to the Applications tracker for recruiters — apply it
-        # here too so "Pending Applications" only shows what's actually
-        # theirs to act on.
         from models import RecruiterConsultant
-        assigned_res = await db.execute(
-            select(RecruiterConsultant.consultant_id).where(
-                RecruiterConsultant.recruiter_id == current_user.id,
-                RecruiterConsultant.is_active == True,
-            )
-        )
-        assigned_ids = [row[0] for row in assigned_res.all()]
-        query = query.where(JobMatch.consultant_id.in_(assigned_ids))
-    
-    # Limit to top 200 most recent pending matches to prevent memory bloat/slow rendering
-    query = query.order_by(JobMatch.created_at.desc()).limit(200)
-    result = await db.execute(query)
-    matches = result.scalars().all()
+        assigned_subq = select(RecruiterConsultant.consultant_id).where(
+            RecruiterConsultant.recruiter_id == current_user.id,
+            RecruiterConsultant.is_active == True,
+        ).scalar_subquery()
+        stmt = stmt.where(JobMatch.consultant_id.in_(assigned_subq))
 
-    # BUG FIX: this used to run two separate SELECTs per match (one for
-    # its Requirement, one for its Consultant) — an N+1 query pattern.
-    # With the matching-engine status filter fixed elsewhere in this file,
-    # a single "Run Engine" click can now legitimately produce hundreds of
-    # matches across every open requirement, and the admin view (which
-    # sees every match system-wide, unfiltered) hits the worst case. That
-    # turned into hundreds of sequential round-trips per request, which is
-    # exactly what was timing out / hanging as "Loading matches..." never
-    # resolving. Batch both lookups into two queries total, regardless of
-    # how many matches there are.
-    if not matches:
-        return {"matches": []}
+    stmt = stmt.order_by(JobMatch.created_at.desc()).limit(200)
 
-    req_ids = {m.requirement_id for m in matches}
-    cons_ids = {m.consultant_id for m in matches}
+    result = await db.execute(stmt)
+    rows = result.mappings().all()
 
-    reqs_by_id = {
-        r.id: r for r in (await db.execute(
-            select(Requirement).where(Requirement.id.in_(req_ids))
-        )).scalars().all()
-    }
-    cons_by_id = {
-        c.id: c for c in (await db.execute(
-            select(Consultant).where(Consultant.id.in_(cons_ids))
-        )).scalars().all()
-    }
-
-    output = []
-    for match in matches:
-        req = reqs_by_id.get(match.requirement_id)
-        cons = cons_by_id.get(match.consultant_id)
-
-        if req and cons:
-            # BUG FIX: was req.job_title (doesn't exist — real field is
-            # `role`) and req.client_name or req.vendor_name (real fields
-            # are `client` and `vendor`). Would have crashed this endpoint
-            # with AttributeError the moment any real JobMatch row existed.
-            output.append({
-                "id": match.id,
-                "requirement_id": req.id,
-                "requirement_title": req.role,
-                "requirement_company": req.client or req.vendor,
-                "consultant_id": cons.id,
-                "consultant_name": cons.full_name,
-                "consultant_email": cons.email,
-                "match_score": match.match_score,
-                "match_reasoning": match.match_reasoning,
-                "status": match.status,
-                "created_at": match.created_at
-            })
+    output = [
+        {
+            "id": row["id"],
+            "requirement_id": row["requirement_id"],
+            "requirement_title": row["requirement_title"],
+            "requirement_company": row["requirement_company"],
+            "consultant_id": row["consultant_id"],
+            "consultant_name": row["consultant_name"],
+            "consultant_email": row["consultant_email"],
+            "match_score": float(row["match_score"]) if row["match_score"] is not None else None,
+            "match_reasoning": row["match_reasoning"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
     return {"matches": output}
 

@@ -563,3 +563,26 @@ CREATE INDEX IF NOT EXISTS ix_recruiter_consultants_is_active ON recruiter_consu
 
 -- 3. (Optional but recommended) Composite index for RecruiterConsultant active filtering
 CREATE INDEX IF NOT EXISTS ix_rc_recruiter_active ON recruiter_consultants (recruiter_id, is_active);
+
+-- 4. High-performance composite indexes for /api/matching/pending (filtering + sorting)
+CREATE INDEX IF NOT EXISTS ix_job_matches_status_created_desc ON job_matches (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_job_matches_status_consultant_created_desc ON job_matches (status, consultant_id, created_at DESC);
+
+-- 5. Database View for pre-joined Pending Job Matches
+CREATE OR REPLACE VIEW v_pending_job_matches AS
+SELECT 
+    jm.id AS id,
+    jm.requirement_id AS requirement_id,
+    r.role AS requirement_title,
+    COALESCE(r.client, r.vendor) AS requirement_company,
+    jm.consultant_id AS consultant_id,
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    jm.match_score AS match_score,
+    jm.match_reasoning AS match_reasoning,
+    jm.status AS status,
+    jm.created_at AS created_at
+FROM job_matches jm
+JOIN requirements r ON jm.requirement_id = r.id
+JOIN consultants c ON jm.consultant_id = c.id;
+
