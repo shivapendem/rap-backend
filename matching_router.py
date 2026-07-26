@@ -225,3 +225,26 @@ async def mark_match_applied(
     match.status = "APPLIED"
     await db.commit()
     return {"success": True}
+@router.patch("/{match_id}/reject")
+async def reject_match(
+    match_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Reject a pending match, hiding it from the pending view.
+    """
+    query = select(JobMatch).where(JobMatch.id == match_id)
+    result = await db.execute(query)
+    match = result.scalars().first()
+
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    if match.status != "PENDING":
+        raise HTTPException(status_code=400, detail="Only pending matches can be rejected")
+
+    match.status = "REJECTED"
+    await db.commit()
+
+    return {"success": True, "message": "Match rejected successfully"}
