@@ -106,13 +106,25 @@ async def run_matching_engine(
 @router.get("/pending")
 async def get_pending_matches(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    status: Optional[str] = Query(None),
+    consultant_id: Optional[str] = Query(None)
 ):
     """
-    Get all pending job matches for the current user's view.
+    Get all pending job matches for the current user's view, with optional filters.
     """
-    query = select(JobMatch).where(JobMatch.status == "PENDING")
+    query = select(JobMatch)
     
+    if status:
+        query = query.where(JobMatch.status == status.upper())
+    else:
+        query = query.where(JobMatch.status == "PENDING")
+
+    if consultant_id:
+        c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()]
+        if c_ids:
+            query = query.where(JobMatch.consultant_id.in_(c_ids))
+
     if current_user.role == "CONSULTANT":
         cons_res = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
         cons = cons_res.scalars().first()
