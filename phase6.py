@@ -367,17 +367,39 @@ def _validate_resume_output(resume_data: dict, consultant: Consultant) -> tuple[
 # ---------------------------------------------------------------------------
 
 def _generate_docx(resume_data: dict, output_path: Path) -> None:
-    """DOCX Generation with markdown bolding support."""
+    """Master Resume DOCX Builder modeled after shivashankar.docx.pdf template."""
     from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
     import re
 
     doc = Document()
 
-    def add_formatted_paragraph(text: str, style: Optional[str] = None):
+    # Set 0.75-inch page margins
+    for section in doc.sections:
+        section.top_margin = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+        section.left_margin = Inches(0.75)
+        section.right_margin = Inches(0.75)
+
+    def add_section_header(title: str):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(12)
+        p.paragraph_format.space_after = Pt(4)
+        run = p.add_run(title.upper())
+        run.bold = True
+        run.font.size = Pt(11)
+        run.font.underline = True
+        run.font.color.rgb = RGBColor(0, 0, 0)
+        return p
+
+    def add_formatted_paragraph(text: str, style: Optional[str] = None, space_after: int = 4):
         p = doc.add_paragraph(style=style)
+        p.paragraph_format.space_after = Pt(space_after)
         if not text:
             return p
-        normalized = re.sub(r'</?(b|strong)>', '**', text)
+        normalized = re.sub(r'</?(b|strong)>', '**', str(text))
         parts = re.split(r'(\*\*.*?\*\*)', normalized)
         for part in parts:
             if part.startswith("**") and part.endswith("**") and len(part) > 4:
@@ -387,35 +409,263 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
                 p.add_run(part)
         return p
 
-    doc.add_heading(resume_data.get("name", ""), 0)
+    # 1. HEADER & CONTACT
+    name = resume_data.get("name", "").strip() or "FULL NAME"
+    p_name = doc.add_paragraph()
+    p_name.paragraph_format.space_after = Pt(2)
+    run_name = p_name.add_run(name)
+    run_name.bold = True
+    run_name.font.size = Pt(15)
 
-    # Contact
-    contact = f"{resume_data.get('email', '')} | {resume_data.get('phone', '')}"
-    doc.add_paragraph(contact.strip(" |"))
+    contact_parts = []
+    if resume_data.get("email"):
+        contact_parts.append(resume_data["email"])
+    if resume_data.get("phone"):
+        contact_parts.append(f"Mobile. No: {resume_data['phone']}")
+    if resume_data.get("location"):
+        contact_parts.append(resume_data["location"])
+    if resume_data.get("linkedin"):
+        contact_parts.append(resume_data["linkedin"])
+    if resume_data.get("github"):
+        contact_parts.append(resume_data["github"])
 
-    doc.add_heading("Professional Summary", level=1)
-    add_formatted_paragraph(resume_data.get("summary", ""))
+    if contact_parts:
+        p_contact = doc.add_paragraph()
+        p_contact.paragraph_format.space_after = Pt(6)
+        p_contact.add_run(" | ".join(contact_parts))
 
-    doc.add_heading("Technical Skills", level=1)
-    skills = resume_data.get("skills", [])
-    doc.add_paragraph(", ".join(skills) if skills else "")
+    # Add thin horizontal rule under header
+    p_hr = doc.add_paragraph()
+    p_hr.paragraph_format.space_after = Pt(8)
+    p_hr_border = OxmlElement('w:pBdr')
+    bottom_border = OxmlElement('w:bottom')
+    bottom_border.set(qn('w:val'), 'single')
+    bottom_border.set(qn('w:sz'), '6')
+    bottom_border.set(qn('w:space'), '1')
+    bottom_border.set(qn('w:color'), '000000')
+    p_hr_border.append(bottom_border)
+    p_hr._p.get_or_add_pPr().append(p_hr_border)
 
-    doc.add_heading("Professional Experience", level=1)
-    for exp in resume_data.get("experience", []):
-        title = f"{exp.get('role', '')} | {exp.get('client', '')} | {exp.get('start', '')} – {exp.get('end', '')}"
-        doc.add_heading(title, level=2)
-        if exp.get("location"):
-            doc.add_paragraph(exp["location"])
-        for bullet in exp.get("bullets", []):
-            add_formatted_paragraph(bullet, style="List Bullet")
+    # 2. CAREER OBJECTIVE / SUMMARY
+    career_obj = resume_data.get("career_objective") or resume_data.get("summary")
+    if career_obj:
+        add_section_header("CAREER OBJECTIVE:")
+        add_formatted_paragraph(career_obj, space_after=6)
 
-    # Missing skills transparency — per Task 2 truthfulness requirement
+    # 3. EXPERIENCE
+    experience = resume_data.get("experience", [])
+    if experience:
+        add_section_header("EXPERIENCE:")
+        for exp in experience:
+            company = exp.get("client") or exp.get("company") or ""
+            role = exp.get("role") or exp.get("title") or ""
+            start = exp.get("start") or exp.get("start_date") or ""
+            end = exp.get("end") or exp.get("end_date") or ""
+            date_str = f"{start} – {end}".strip(" –")
+
+            exp_line = f"Associated with {company}" if company else ""
+            if date_str:
+                exp_line += f" ({date_str})"
+            if exp_line:
+                p_exp = add_formatted_paragraph(exp_line)
+                p_exp.runs[0].bold = True
+
+            if role:
+                add_formatted_paragraph(f"Designation: {role}")
+            if exp.get("location"):
+                add_formatted_paragraph(f"Location: {exp['location']}")
+            if exp.get("description"):
+                add_formatted_paragraph(f"Job Description: {exp['description']}")
+
+            for bullet in exp.get("bullets", []):
+                add_formatted_paragraph(bullet, style="List Bullet")
+
+    # 4. TECHNICAL PROFICIENCIES
+    tech_profs = resume_data.get("technical_proficiencies", [])
+    skills_list = resume_data.get("skills", [])
+    if tech_profs or skills_list:
+        add_section_header("TECHNICAL PROFICIENCIES:")
+        if tech_profs and isinstance(tech_profs, list):
+            for tp in tech_profs:
+                cat = tp.get("category", "Skills")
+                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
+                p_tp = doc.add_paragraph(style="List Bullet")
+                p_tp.paragraph_format.space_after = Pt(2)
+                r_cat = p_tp.add_run(f"{cat:<25} : ")
+                r_cat.bold = True
+                p_tp.add_run(skills_val)
+        elif skills_list:
+            p_sk = doc.add_paragraph(style="List Bullet")
+            r_cat = p_sk.add_run(f"{'Core Skills':<25} : ")
+            r_cat.bold = True
+            p_sk.add_run(", ".join(skills_list))
+
+    # 5. KEY PROJECTS
+    key_projects = resume_data.get("key_projects", [])
+    if key_projects:
+        add_section_header("KEY PROJECTS:")
+        for idx, proj in enumerate(key_projects, 1):
+            title = proj.get("title") or proj.get("game_name") or f"Project {idx}"
+            p_proj = doc.add_paragraph()
+            p_proj.paragraph_format.space_after = Pt(2)
+            r_t = p_proj.add_run(f"{idx}) Project Title: {title}")
+            r_t.bold = True
+
+            if proj.get("description"):
+                add_formatted_paragraph(f"Description: {proj['description']}")
+            if proj.get("role"):
+                add_formatted_paragraph(f"Role: {proj['role']}")
+
+            resps = proj.get("responsibilities", [])
+            if resps:
+                add_formatted_paragraph("Responsibilities:")
+                for resp in resps:
+                    add_formatted_paragraph(resp, style="List Bullet")
+
+            if proj.get("team_size"):
+                add_formatted_paragraph(f"Team Size: {proj['team_size']}")
+            if proj.get("duration"):
+                add_formatted_paragraph(f"Duration: {proj['duration']}")
+            if proj.get("technical_tools") or proj.get("tools"):
+                tools = proj.get("technical_tools") or proj.get("tools")
+                tools_str = ", ".join(tools) if isinstance(tools, list) else str(tools)
+                add_formatted_paragraph(f"Technical Tools: {tools_str}")
+
+    # 6. OTHER PROJECTS
+    other_projects = resume_data.get("other_projects")
+    if other_projects:
+        add_section_header("OTHER PROJECTS:")
+        if isinstance(other_projects, str):
+            add_formatted_paragraph(other_projects)
+        elif isinstance(other_projects, list):
+            for op in other_projects:
+                if isinstance(op, str):
+                    add_formatted_paragraph(op, style="List Bullet")
+                elif isinstance(op, dict):
+                    add_formatted_paragraph(f"{op.get('title', '')}: {op.get('description', '')}")
+
+    # 7. ACADEMIC PROJECTS
+    academic_projects = resume_data.get("academic_projects", [])
+    if academic_projects:
+        add_section_header("ACADEMIC PROJECTS:")
+        for idx, proj in enumerate(academic_projects, 1):
+            title = proj.get("title") or f"Project {idx}"
+            p_proj = doc.add_paragraph()
+            p_proj.paragraph_format.space_after = Pt(2)
+            r_t = p_proj.add_run(f"{idx}) Project Title: {title}")
+            r_t.bold = True
+
+            if proj.get("platform"):
+                add_formatted_paragraph(f"Platform: {proj['platform']}")
+            if proj.get("description"):
+                add_formatted_paragraph(f"Description: {proj['description']}")
+            if proj.get("role"):
+                add_formatted_paragraph(f"Role: {proj['role']}")
+
+            resps = proj.get("responsibilities", [])
+            if resps:
+                for resp in resps:
+                    add_formatted_paragraph(resp, style="List Bullet")
+
+            if proj.get("team_size"):
+                add_formatted_paragraph(f"Team Size: {proj['team_size']}")
+            if proj.get("duration"):
+                add_formatted_paragraph(f"Duration: {proj['duration']}")
+            if proj.get("technical_tools"):
+                tools_str = ", ".join(proj["technical_tools"]) if isinstance(proj["technical_tools"], list) else str(proj["technical_tools"])
+                add_formatted_paragraph(f"Technical Tools: {tools_str}")
+
+    # 8. EDUCATIONAL BACKGROUND
+    education = resume_data.get("education") or resume_data.get("educational_background")
+    if education:
+        add_section_header("EDUCATIONAL BACKGROUND:")
+        if isinstance(education, list):
+            for edu in education:
+                if isinstance(edu, dict):
+                    deg = edu.get("degree", "")
+                    inst = edu.get("institution") or edu.get("college", "")
+                    yr = edu.get("year", "")
+                    det = edu.get("details") or edu.get("percentage", "")
+                    line = f"{deg} - {inst} ({yr})" if inst else deg
+                    if det:
+                        line += f" | {det}"
+                    add_formatted_paragraph(line, style="List Bullet")
+                else:
+                    add_formatted_paragraph(str(edu), style="List Bullet")
+        elif isinstance(education, str):
+            add_formatted_paragraph(education)
+
+    # 9. NON-TECHNICAL PROFICIENCIES
+    non_tech = resume_data.get("non_technical_proficiencies")
+    if non_tech:
+        add_section_header("NON-TECHNICAL PROFICIENCIES:")
+        if isinstance(non_tech, list):
+            for nt in non_tech:
+                add_formatted_paragraph(str(nt), style="List Bullet")
+        else:
+            add_formatted_paragraph(str(non_tech))
+
+    # 10. ACHIEVEMENTS
+    achievements = resume_data.get("achievements")
+    if achievements:
+        add_section_header("ACHIEVEMENTS:")
+        if isinstance(achievements, list):
+            for ach in achievements:
+                add_formatted_paragraph(str(ach), style="List Bullet")
+        else:
+            add_formatted_paragraph(str(achievements))
+
+    # 11. HOBBIES & INTEREST
+    hobbies = resume_data.get("hobbies_and_interests") or resume_data.get("hobbies")
+    if hobbies:
+        add_section_header("HOBBIES & INTEREST:")
+        if isinstance(hobbies, list):
+            for h in hobbies:
+                add_formatted_paragraph(str(h), style="List Bullet")
+        else:
+            add_formatted_paragraph(str(hobbies))
+
+    # 12. PERSONAL DETAILS
+    personal = resume_data.get("personal_details")
+    if personal and isinstance(personal, dict):
+        add_section_header("PERSONAL DETAILS:")
+        labels = [
+            ("Name", personal.get("name") or name),
+            ("Father's Name", personal.get("father_name")),
+            ("Date of Birth", personal.get("dob")),
+            ("Marital Status", personal.get("marital_status")),
+            ("Languages Known", personal.get("languages_known")),
+            ("Permanent Address", personal.get("permanent_address")),
+            ("Desired Work Location", personal.get("desired_work_location")),
+            ("Contact No", personal.get("contact_no") or resume_data.get("phone")),
+            ("Alternate E-mail", personal.get("alternate_email")),
+        ]
+        for k, v in labels:
+            if v:
+                p_p = doc.add_paragraph()
+                p_p.paragraph_format.space_after = Pt(2)
+                r_lbl = p_p.add_run(f"{k:<25} : ")
+                r_lbl.bold = True
+                p_p.add_run(str(v))
+
+    # 13. DECLARATION
+    decl = resume_data.get("declaration")
+    if decl or name:
+        add_section_header("DECLARATION:")
+        decl_text = decl.get("text") if isinstance(decl, dict) else (decl if isinstance(decl, str) else "I hereby declare that the above facts given by me are true to the best of my knowledge and belief.")
+        add_formatted_paragraph(decl_text, space_after=10)
+
+        place = decl.get("place", "Hyderabad") if isinstance(decl, dict) else "Hyderabad"
+        p_sig = doc.add_paragraph()
+        p_sig.paragraph_format.space_before = Pt(10)
+        r_pl = p_sig.add_run(f"Place: {place}")
+        r_pl.bold = True
+
+    # Missing skills transparency
     missing = resume_data.get("missing_skills", [])
     if missing:
-        doc.add_heading("Skills Gap", level=1)
-        doc.add_paragraph(
-            f"Skills from job description not in profile (not added): {', '.join(missing)}"
-        )
+        add_section_header("SKILLS GAP (NOT IN PROFILE):")
+        add_formatted_paragraph(f"Skills requested in job description: {', '.join(missing)}")
 
     doc.save(str(output_path))
 
