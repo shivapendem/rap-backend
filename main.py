@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator, model_validator, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import or_
 from passlib.context import CryptContext
 import jwt
 import os
@@ -13,7 +14,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
 from database import engine, Base, get_db, AsyncSessionLocal, DATABASE_URL
-from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch
+from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch, RecruiterConsultant
 import asyncio
 from requirements_sync import sync_pending_emails
 from auth import (
@@ -104,6 +105,11 @@ class RequirementResponse(BaseModel):
     ats_match_count: Optional[int] = None
     parse_confidence: Optional[float] = None
     raw_email_id: Optional[int] = None
+    # Names of consultants matched to this requirement — scoped to the
+    # caller's own roster for RECRUITER, all consultants for ADMIN, and
+    # left empty for CONSULTANT (not relevant/exposed on this shared
+    # admin-style endpoint for that role).
+    matched_consultants: List[str] = []
 
 class PaginatedRequirements(BaseModel):
     data: List[RequirementResponse]
@@ -569,12 +575,29 @@ async def get_requirements(
         query = query.where(Requirement.status == status)
     if matched_only:
         since = datetime.now(timezone.utc) - timedelta(days=matched_days)
-        query = query.where(
-            Requirement.id.in_(
-                select(RequirementConsultantMatch.requirement_id)
-                .where(RequirementConsultantMatch.created_at >= since)
-            )
+        matched_subq = select(RequirementConsultantMatch.requirement_id).where(
+            RequirementConsultantMatch.created_at >= since
         )
+        # BUG FIX: matched_only previously checked whether ANY consultant
+        # was matched to a requirement, not specifically the caller. A
+        # consultant using this filter could see (and click Apply on)
+        # requirements matched to someone else entirely, then hit a 403
+        # from get_requirement_detail's real per-consultant ownership
+        # check — "matched" and "matched to you" silently disagreed.
+        # Scope to the caller's own matches when they're a consultant.
+        if current_user.role == "CONSULTANT":
+            cons_result = await db.execute(
+                select(Consultant).where(Consultant.user_id == current_user.id)
+            )
+            consultant = cons_result.scalars().first()
+            if consultant:
+                matched_subq = matched_subq.where(
+                    RequirementConsultantMatch.consultant_id == consultant.id
+                )
+            else:
+                # No consultant profile at all — no matches are possible.
+                matched_subq = matched_subq.where(False)
+        query = query.where(Requirement.id.in_(matched_subq))
 
     # BUG FIX: the FilterBar (admin Requirements page) has always sent
     # confidence_filter and employment_type as real query params, but this
@@ -638,6 +661,34 @@ async def get_requirements(
 
     reqs = (await db.execute(query)).scalars().all()
     total_pages = math.ceil(total / page_size) if page_size > 0 else 0
+
+    # Batch-load matched consultant names for this page in one query
+    # (not per-row), scoped the same way as every other recruiter-facing
+    # endpoint: RECRUITER sees only their active roster, ADMIN sees
+    # everyone, CONSULTANT gets nothing here (not this endpoint's concern).
+    if current_user.role in ("RECRUITER", "ADMIN") and reqs:
+        req_ids = [r.id for r in reqs]
+        matches_q = (
+            select(RequirementConsultantMatch.requirement_id, Consultant.full_name)
+            .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
+            .where(RequirementConsultantMatch.requirement_id.in_(req_ids))
+        )
+        if current_user.role == "RECRUITER":
+            assigned_result = await db.execute(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )
+            assigned_ids = [row[0] for row in assigned_result.all()]
+            matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
+
+        matches_by_req: dict[int, list[str]] = {}
+        for req_id, name in (await db.execute(matches_q)).all():
+            matches_by_req.setdefault(req_id, []).append(name)
+
+        for r in reqs:
+            r.matched_consultants = matches_by_req.get(r.id, [])
 
     return PaginatedRequirements(
         data=reqs,
