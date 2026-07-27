@@ -11,7 +11,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from database import get_db
 from auth import get_current_user
@@ -224,6 +224,7 @@ async def list_email_queue(
     page_size: int = 20,
     consultant_id: Optional[str] = Query(None, description="Comma-separated consultant profile ids to filter by"),
     sent_by_role: Optional[str] = Query(None, description="Comma-separated roles to filter by: ADMIN, RECRUITER, CONSULTANT"),
+    search: Optional[str] = Query(None, description="Free-text match against subject, to/from email, and consultant name"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -290,6 +291,19 @@ async def list_email_queue(
                 select(User.id).where(User.role.in_(roles))
             ))
 
+    if search:
+        term = f"%{search.strip()}%"
+        search_clause = or_(
+            EmailQueue.subject.ilike(term),
+            EmailQueue.to_email.ilike(term),
+            EmailQueue.from_email.ilike(term),
+            EmailQueue.consultant_id.in_(
+                select(Consultant.id).where(Consultant.full_name.ilike(term))
+            ),
+        )
+        query = query.where(search_clause)
+        count_query = count_query.where(search_clause)
+
     # BUG FIX: page/page_size were accepted by the frontend
     # (fetchEmailQueueItems always sent them) but silently ignored here —
     # every request returned the entire table regardless of page, and the
@@ -333,7 +347,240 @@ async def list_email_queue(
     }
 
 
-@router.get("/api/consultant/email-queue/{item_id}")
+@router.post("/api/consultant/email-queue/send-now")
+async def send_email_now(
+    body: EmailQueueCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Send an application email immediately and record it in `applications`
+    on success — used by the Apply-to-Requirement page (admin, recruiter,
+    and consultant all share that page) instead of create_email_queue.
+
+    BUG FIX: that page previously called create_email_queue for every role
+    (admin/recruiter/consultant), which only ever inserts a QUEUED row and
+    waits for the background worker's next poll — it never wrote to
+    `applications` at all, on success or failure. Every "Apply" from that
+    page silently only ever showed up in the Email Queue, never in the
+    Applications tracker, no matter who sent it. This endpoint reuses the
+    exact same consultant-resolution logic as create_email_queue (copied
+    below, not refactored into a shared helper, to avoid risking a change
+    in create_email_queue's still-used queue-and-wait behavior for the
+    actual Compose pages), then sends immediately via the same
+    process_single_email_queue_item used by the background worker, so the
+    caller gets a real success/failure result and, on success, a real
+    `applications` row — not just "queued".
+    """
+    from models import EmailQueue, Consultant
+    from sqlalchemy import select as sa_select
+
+    consultant_id = None
+
+    if current_user.role == "ADMIN":
+        if body.consultant_id:
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+            )
+            consultant = cons_result.scalars().first()
+            if not consultant:
+                raise HTTPException(status_code=404, detail="Consultant not found.")
+            consultant_id = consultant.id
+        else:
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.email == current_user.email)
+            )
+            consultant = cons_result.scalars().first()
+            if consultant:
+                consultant_id = consultant.id
+            else:
+                cons_result = await db.execute(
+                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                )
+                consultant = cons_result.scalars().first()
+                if not consultant:
+                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
+                consultant_id = consultant.id
+    elif current_user.role == "RECRUITER":
+        if body.consultant_id:
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+            )
+            consultant = cons_result.scalars().first()
+            if not consultant:
+                raise HTTPException(status_code=404, detail="Consultant not found.")
+            consultant_id = consultant.id
+        else:
+            cons_result = await db.execute(
+                sa_select(Consultant).where(Consultant.email == current_user.email)
+            )
+            consultant = cons_result.scalars().first()
+            if consultant:
+                consultant_id = consultant.id
+            else:
+                cons_result = await db.execute(
+                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                )
+                consultant = cons_result.scalars().first()
+                if not consultant:
+                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
+                consultant_id = consultant.id
+    else:
+        cons_result = await db.execute(
+            sa_select(Consultant).where(Consultant.user_id == current_user.id)
+        )
+        consultant = cons_result.scalars().first()
+        consultant_id = consultant.id if consultant else body.consultant_id
+        if not consultant_id:
+            raise HTTPException(status_code=400, detail="Consultant profile not found.")
+
+    final_cc = body.cc_email.strip() if body.cc_email else ""
+    if final_cc:
+        if current_user.email not in final_cc:
+            final_cc = f"{final_cc},{current_user.email}"
+    else:
+        final_cc = current_user.email
+
+    item = EmailQueue(
+        consultant_id=consultant_id,
+        requirement_id=body.requirement_id,
+        from_email=body.from_email,
+        to_email=body.to_email,
+        cc_email=final_cc,
+        subject=body.subject,
+        content=body.content,
+        attachments=body.attachments,
+        status="QUEUED",
+        sent_by_user_id=current_user.id,
+    )
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+
+    await process_single_email_queue_item(db, item)
+    await db.refresh(item)
+
+    if item.status == "SENT":
+        # BUG FIX: leaving this row in email_queue meant every
+        # Apply-to-Requirement send also showed up as a duplicate row on
+        # the Email Queue page -- confusing, since it's already tracked
+        # properly in Applications now. Only send-now (this endpoint, the
+        # Apply flow) deletes its row; genuine Compose-page queue items
+        # (create_email_queue, processed later by the background worker)
+        # are untouched and still show in Email Queue as before.
+        result_id = str(item.id)
+        result_status = item.status
+        await db.delete(item)
+        await db.commit()
+        return {"success": True, "id": result_id, "status": result_status}
+    raise HTTPException(status_code=502, detail=item.status_text or "Failed to send email.")
+
+@router.post("/api/consultant/email-queue/upload-attachment")
+async def upload_attachment(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Upload attachment file and return a file reference for the email queue.
+
+    BUG FIX: this used to save ONLY to /tmp/email_attachments. That
+    directory is not durable — it can be (and has been) wiped by a
+    server restart or reboot in the window between a consultant
+    attaching a resume and the background worker actually sending the
+    queued email (up to 60s later, longer if the queue backs up). When
+    the file was gone by send time, the app silently sent the email
+    with no attachment and marked it "Sent successfully" with no error
+    anywhere. Now the file is also uploaded to Spaces (durable,
+    survives restarts) and the returned reference points there; the
+    /tmp copy is kept only as a same-process fast path.
+    """
+    ext = os.path.splitext(file.filename)[1]
+    unique_name = f"{uuid.uuid4()}{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    from s3_service import upload_file_to_s3
+    import io
+    import asyncio
+
+    s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{unique_name}"
+    # PERFORMANCE: upload_file_to_s3 is a blocking/synchronous call; running
+    # it directly inside this async endpoint blocks the whole event loop
+    # for the duration of the upload. Offload to a worker thread instead.
+    uploaded = await asyncio.to_thread(
+        upload_file_to_s3, io.BytesIO(contents), s3_key, file.content_type or "application/octet-stream"
+    )
+    stored_reference = s3_key if uploaded else unique_name
+    if not uploaded:
+        print(f"[email_queue] WARNING: Spaces upload failed for {unique_name} — "
+              f"falling back to /tmp only, which is NOT durable across restarts.")
+
+    return {
+        "success": True,
+        "filename": file.filename,
+        "stored_name": stored_reference,
+        "path": file_path,
+        "size_bytes": len(contents),
+        "content_type": file.content_type,
+    }
+
+
+@router.get("/api/consultant/email-queue/download-attachment")
+async def download_queue_attachment(
+    ref: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get a downloadable URL or serve attachment file for email queue item.
+    """
+    from s3_service import generate_presigned_url
+    from fastapi.responses import FileResponse
+
+    clean_ref = ref.strip()
+    if not clean_ref:
+        raise HTTPException(status_code=400, detail="ref is required")
+
+    # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
+    if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
+        url = generate_presigned_url(clean_ref)
+        if url:
+            return {"url": url}
+
+    # 2. Try local file path if present
+    filename = os.path.basename(clean_ref)
+    local_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(local_path):
+        return FileResponse(local_path, filename=filename)
+
+    # 3. Try fallback with S3 prefix
+    s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
+    url = generate_presigned_url(s3_key)
+    if url:
+        return {"url": url}
+
+    raise HTTPException(status_code=404, detail="Attachment file not found.")
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX (routing): these three routes take a bare numeric id
+# (/{item_id}), but were previously registered ahead of literal-path
+# routes like /upload-attachment, /download-attachment, and /send-now.
+# Starlette matches routes by path *shape* in registration order before
+# FastAPI validates each path parameter's type — with no type converter,
+# "/{item_id}" matches ANY single path segment string, including
+# "download-attachment". That meant GET
+# /api/consultant/email-queue/download-attachment was being captured by
+# get_email_queue_item first, and failed with a 422 (int conversion
+# failure on "download-attachment") before ever reaching the real
+# endpoint below. Fixed two ways together: the literal-path routes above
+# are now registered first, and `{item_id:int}` makes the path itself
+# only match numeric segments, so non-numeric literal paths never route
+# here regardless of declaration order.
+# ---------------------------------------------------------------------------
+
+@router.get("/api/consultant/email-queue/{item_id:int}")
 async def get_email_queue_item(
     item_id: int,
     db: AsyncSession = Depends(get_db),
@@ -364,7 +611,7 @@ async def get_email_queue_item(
     }
 
 
-@router.patch("/api/consultant/email-queue/{item_id}/status")
+@router.patch("/api/consultant/email-queue/{item_id:int}/status")
 async def update_email_queue_status(
     item_id: int,
     body: EmailQueueStatusUpdate,
@@ -393,7 +640,7 @@ async def update_email_queue_status(
     return {"success": True, "id": str(item.id), "status": item.status}
 
 
-@router.delete("/api/consultant/email-queue/{item_id}")
+@router.delete("/api/consultant/email-queue/{item_id:int}")
 async def delete_email_queue_item(
     item_id: int,
     db: AsyncSession = Depends(get_db),
@@ -566,12 +813,16 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         if item.attachments:
             import os
             import tempfile
+            import asyncio
             from s3_service import download_file_from_s3
 
             for ref in item.attachments:
                 local_candidate = os.path.join("/tmp/email_attachments", ref)
                 if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
-                    body_bytes, _ = download_file_from_s3(ref)
+                    # PERFORMANCE: download_file_from_s3 is a blocking call;
+                    # offload to a worker thread so it doesn't stall the
+                    # event loop while other requests are in flight.
+                    body_bytes, _ = await asyncio.to_thread(download_file_from_s3, ref)
                     if body_bytes:
                         fd, tmp_path = tempfile.mkstemp(
                             suffix=os.path.splitext(ref)[1] or ".pdf",
@@ -630,7 +881,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             # row to reflect the real outcome, rather than
             # creating it from scratch.
             if item.requirement_id:
-                from models import Application
+                from models import Application, Requirement
 
                 existing_app_result = await session.execute(
                     select(Application).where(
@@ -680,6 +931,19 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         attachments_sent=item.attachments if item.attachments else None,
                     ))
 
+                # Move the requirement itself into the Submitted list on a
+                # successful application send. Only advances NEW -> SUBMITTED
+                # — never overwrites a requirement that's already further
+                # along (REVIEWING/INTERVIEWING/CLOSED/REJECTED), so a second
+                # consultant applying to an already-submitted requirement
+                # doesn't silently regress its status.
+                req_result = await session.execute(
+                    select(Requirement).where(Requirement.id == item.requirement_id)
+                )
+                requirement = req_result.scalars().first()
+                if requirement and requirement.status == "NEW":
+                    requirement.status = "SUBMITTED"
+
             await session.commit()
         finally:
             for p in tmp_cleanup_paths:
@@ -716,215 +980,3 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             except Exception as inner_e:
                 print(f"[email-queue] completely failed to update item {item_id}: {inner_e}")
                 await session.rollback()
-
-
-@router.post("/api/consultant/email-queue/send-now")
-async def send_email_now(
-    body: EmailQueueCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Send an application email immediately and record it in `applications`
-    on success — used by the Apply-to-Requirement page (admin, recruiter,
-    and consultant all share that page) instead of create_email_queue.
-
-    BUG FIX: that page previously called create_email_queue for every role
-    (admin/recruiter/consultant), which only ever inserts a QUEUED row and
-    waits for the background worker's next poll — it never wrote to
-    `applications` at all, on success or failure. Every "Apply" from that
-    page silently only ever showed up in the Email Queue, never in the
-    Applications tracker, no matter who sent it. This endpoint reuses the
-    exact same consultant-resolution logic as create_email_queue (copied
-    below, not refactored into a shared helper, to avoid risking a change
-    in create_email_queue's still-used queue-and-wait behavior for the
-    actual Compose pages), then sends immediately via the same
-    process_single_email_queue_item used by the background worker, so the
-    caller gets a real success/failure result and, on success, a real
-    `applications` row — not just "queued".
-    """
-    from models import EmailQueue, Consultant
-    from sqlalchemy import select as sa_select
-
-    consultant_id = None
-
-    if current_user.role == "ADMIN":
-        if body.consultant_id:
-            cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.id == body.consultant_id)
-            )
-            consultant = cons_result.scalars().first()
-            if not consultant:
-                raise HTTPException(status_code=404, detail="Consultant not found.")
-            consultant_id = consultant.id
-        else:
-            cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.email == current_user.email)
-            )
-            consultant = cons_result.scalars().first()
-            if consultant:
-                consultant_id = consultant.id
-            else:
-                cons_result = await db.execute(
-                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
-                )
-                consultant = cons_result.scalars().first()
-                if not consultant:
-                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
-                consultant_id = consultant.id
-    elif current_user.role == "RECRUITER":
-        if body.consultant_id:
-            cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.id == body.consultant_id)
-            )
-            consultant = cons_result.scalars().first()
-            if not consultant:
-                raise HTTPException(status_code=404, detail="Consultant not found.")
-            consultant_id = consultant.id
-        else:
-            cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.email == current_user.email)
-            )
-            consultant = cons_result.scalars().first()
-            if consultant:
-                consultant_id = consultant.id
-            else:
-                cons_result = await db.execute(
-                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
-                )
-                consultant = cons_result.scalars().first()
-                if not consultant:
-                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
-                consultant_id = consultant.id
-    else:
-        cons_result = await db.execute(
-            sa_select(Consultant).where(Consultant.user_id == current_user.id)
-        )
-        consultant = cons_result.scalars().first()
-        consultant_id = consultant.id if consultant else body.consultant_id
-        if not consultant_id:
-            raise HTTPException(status_code=400, detail="Consultant profile not found.")
-
-    final_cc = body.cc_email.strip() if body.cc_email else ""
-    if final_cc:
-        if current_user.email not in final_cc:
-            final_cc = f"{final_cc},{current_user.email}"
-    else:
-        final_cc = current_user.email
-
-    item = EmailQueue(
-        consultant_id=consultant_id,
-        requirement_id=body.requirement_id,
-        from_email=body.from_email,
-        to_email=body.to_email,
-        cc_email=final_cc,
-        subject=body.subject,
-        content=body.content,
-        attachments=body.attachments,
-        status="QUEUED",
-        sent_by_user_id=current_user.id,
-    )
-    db.add(item)
-    await db.commit()
-    await db.refresh(item)
-
-    await process_single_email_queue_item(db, item)
-    await db.refresh(item)
-
-    if item.status == "SENT":
-        # BUG FIX: leaving this row in email_queue meant every
-        # Apply-to-Requirement send also showed up as a duplicate row on
-        # the Email Queue page -- confusing, since it's already tracked
-        # properly in Applications now. Only send-now (this endpoint, the
-        # Apply flow) deletes its row; genuine Compose-page queue items
-        # (create_email_queue, processed later by the background worker)
-        # are untouched and still show in Email Queue as before.
-        result_id = str(item.id)
-        result_status = item.status
-        await db.delete(item)
-        await db.commit()
-        return {"success": True, "id": result_id, "status": result_status}
-    raise HTTPException(status_code=502, detail=item.status_text or "Failed to send email.")
-
-@router.post("/api/consultant/email-queue/upload-attachment")
-async def upload_attachment(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Upload attachment file and return a file reference for the email queue.
-
-    BUG FIX: this used to save ONLY to /tmp/email_attachments. That
-    directory is not durable — it can be (and has been) wiped by a
-    server restart or reboot in the window between a consultant
-    attaching a resume and the background worker actually sending the
-    queued email (up to 60s later, longer if the queue backs up). When
-    the file was gone by send time, the app silently sent the email
-    with no attachment and marked it "Sent successfully" with no error
-    anywhere. Now the file is also uploaded to Spaces (durable,
-    survives restarts) and the returned reference points there; the
-    /tmp copy is kept only as a same-process fast path.
-    """
-    ext = os.path.splitext(file.filename)[1]
-    unique_name = f"{uuid.uuid4()}{ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_name)
-    contents = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(contents)
-
-    from s3_service import upload_file_to_s3
-    import io
-
-    s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{unique_name}"
-    uploaded = upload_file_to_s3(
-        io.BytesIO(contents), s3_key, file.content_type or "application/octet-stream"
-    )
-    stored_reference = s3_key if uploaded else unique_name
-    if not uploaded:
-        print(f"[email_queue] WARNING: Spaces upload failed for {unique_name} — "
-              f"falling back to /tmp only, which is NOT durable across restarts.")
-
-    return {
-        "success": True,
-        "filename": file.filename,
-        "stored_name": stored_reference,
-        "path": file_path,
-        "size_bytes": len(contents),
-        "content_type": file.content_type,
-    }
-
-
-@router.get("/api/consultant/email-queue/download-attachment")
-async def download_queue_attachment(
-    ref: str = Query(...),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Get a downloadable URL or serve attachment file for email queue item.
-    """
-    from s3_service import generate_presigned_url
-    from fastapi.responses import FileResponse
-
-    clean_ref = ref.strip()
-    if not clean_ref:
-        raise HTTPException(status_code=400, detail="ref is required")
-
-    # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
-    if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
-        url = generate_presigned_url(clean_ref)
-        if url:
-            return {"url": url}
-
-    # 2. Try local file path if present
-    filename = os.path.basename(clean_ref)
-    local_path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(local_path):
-        return FileResponse(local_path, filename=filename)
-
-    # 3. Try fallback with S3 prefix
-    s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
-    url = generate_presigned_url(s3_key)
-    if url:
-        return {"url": url}
-
-    raise HTTPException(status_code=404, detail="Attachment file not found.")

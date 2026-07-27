@@ -14,7 +14,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
 from database import engine, Base, get_db, AsyncSessionLocal, DATABASE_URL
-from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch, RecruiterConsultant
+from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch, RecruiterConsultant, Application
 import asyncio
 from requirements_sync import sync_pending_emails
 from auth import (
@@ -110,6 +110,11 @@ class RequirementResponse(BaseModel):
     # left empty for CONSULTANT (not relevant/exposed on this shared
     # admin-style endpoint for that role).
     matched_consultants: List[str] = []
+    # Whether THIS caller (when a CONSULTANT) already has a SENT
+    # application for this requirement. Always False for RECRUITER/ADMIN
+    # on this shared endpoint — "did I personally apply" only makes sense
+    # for the consultant viewing their own Requirements page.
+    already_applied: bool = False
 
 class PaginatedRequirements(BaseModel):
     data: List[RequirementResponse]
@@ -617,11 +622,20 @@ async def get_requirements(
             query = query.where(Requirement.employment_types.any(employment_type))
 
     if search:
+        # BUG FIX: only matched role/vendor_email — searching by client,
+        # vendor name, location, or rate (all shown as columns in the same
+        # table) silently returned nothing. Broadened to every free-text
+        # column an admin would plausibly search by.
         search_term = f"%{search}%"
         query = query.where(
             or_(
                 Requirement.role.ilike(search_term),
-                Requirement.vendor_email.ilike(search_term)
+                Requirement.vendor_email.ilike(search_term),
+                Requirement.vendor.ilike(search_term),
+                Requirement.client.ilike(search_term),
+                Requirement.location.ilike(search_term),
+                Requirement.rate.ilike(search_term),
+                Requirement.work_mode.ilike(search_term),
             )
         )
 
@@ -689,6 +703,29 @@ async def get_requirements(
 
         for r in reqs:
             r.matched_consultants = matches_by_req.get(r.id, [])
+
+    # For a CONSULTANT viewing their own Requirements page, tell them
+    # which of these requirements they've already sent an application
+    # for — this is what the frontend's Apply link needs to switch to an
+    # "Applied" badge instead of always showing "Apply", regardless of
+    # whether it was actually sent.
+    if current_user.role == "CONSULTANT" and reqs:
+        cons_result = await db.execute(
+            select(Consultant).where(Consultant.user_id == current_user.id)
+        )
+        consultant = cons_result.scalars().first()
+        if consultant:
+            req_ids = [r.id for r in reqs]
+            applied_result = await db.execute(
+                select(Application.requirement_id).where(
+                    Application.consultant_id == consultant.id,
+                    Application.requirement_id.in_(req_ids),
+                    Application.status == "SENT",
+                )
+            )
+            applied_ids = {row[0] for row in applied_result.all()}
+            for r in reqs:
+                r.already_applied = r.id in applied_ids
 
     return PaginatedRequirements(
         data=reqs,

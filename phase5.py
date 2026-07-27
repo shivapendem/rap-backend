@@ -60,6 +60,7 @@ from models import (
     RequirementConsultantMatch,
     GeneratedResume,
     Application,
+    JobMatch,
 )
 from auth import get_current_user
 
@@ -1232,7 +1233,14 @@ async def get_requirement_detail(
     """Returns full requirement including job_description for the detail modal."""
     req = await _validate_requirement_id_exists(db, requirement_id)
 
-    # Consultants can only view requirements assigned to them
+    # Consultants can only view requirements assigned to them. Two
+    # separate matching systems exist in this codebase —
+    # RequirementConsultantMatch (the dashboard/requirements matched
+    # view) and JobMatch (the matching engine, used by "Pending
+    # Applications") — and they don't share rows. A consultant applying
+    # from Pending Applications was always rejected here because only
+    # RequirementConsultantMatch was checked; accept either as valid
+    # proof of assignment.
     if current_user.role == "CONSULTANT":
         consultant = await _get_consultant_for_user(db, current_user)
         match = (await db.execute(
@@ -1242,7 +1250,14 @@ async def get_requirement_detail(
             )
         )).scalars().first()
         if not match:
-            raise HTTPException(status_code=403, detail="Requirement not assigned to you")
+            job_match = (await db.execute(
+                select(JobMatch).where(
+                    JobMatch.requirement_id == requirement_id,
+                    JobMatch.consultant_id == consultant.id,
+                )
+            )).scalars().first()
+            if not job_match:
+                raise HTTPException(status_code=403, detail="Requirement not assigned to you")
 
     return RequirementDetailResponse(
         id=str(req.id),

@@ -113,6 +113,15 @@ async def save_requirement(
             "experience": parsed.get("experience"),
             "skills": parsed.get("skills"),
         },
+        # BUG FIX: parser.py's parse_requirement() always computes a real
+        # parse_confidence (see calculate_confidence()), but this
+        # constructor never read it out of `parsed` — every auto-synced
+        # requirement (the only path that creates new rows on an ongoing
+        # basis) silently fell back to the parse_confidence column's
+        # default of 0, showing 0% for every row regardless of actual
+        # parse quality. Only a manual Reparse (phase2.py) ever set the
+        # real value, since that path writes it explicitly.
+        parse_confidence=parsed.get("parse_confidence", 0.0),
         received_date=received_date,
         status="NEW",
     )
