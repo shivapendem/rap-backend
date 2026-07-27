@@ -823,8 +823,16 @@ async def download_application_resume(
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
 
+    # BUG FIX: media_type was hardcoded to application/pdf regardless of
+    # the actual file — a .docx attachment would download with a
+    # Content-Type claiming it's a PDF, causing "Failed to load PDF
+    # document" when a viewer tried to open it based on that header.
+    import mimetypes
+    guessed_type, _ = mimetypes.guess_type(filename)
+    media_type = guessed_type or "application/octet-stream"
+
     return Response(
         content=body_bytes,
-        media_type="application/pdf",
+        media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
