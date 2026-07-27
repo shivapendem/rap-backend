@@ -343,7 +343,32 @@ async def get_raw_email(
     points; falls back to the emails table only for any legacy rows that
     predate this pipeline (there shouldn't be any going forward).
     """
-    _require_role(current_user, "ADMIN", "RECRUITER")
+    _require_role(current_user, "ADMIN", "RECRUITER", "CONSULTANT")
+    # BUG FIX: this endpoint used to block CONSULTANT entirely, so the
+    # "View Raw" button on the consultant's own Requirements page always
+    # 403'd. Consultants can view raw email content, but ONLY for a
+    # requirement they're actually matched to (checking both match
+    # tables, same dual-check used for the Apply eligibility fix) — not
+    # arbitrary emails by ID.
+    if current_user.role == "CONSULTANT":
+        from models import Consultant, RequirementConsultantMatch, JobMatch
+        cons_result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
+        consultant = cons_result.scalars().first()
+        if not consultant:
+            raise HTTPException(status_code=403, detail="No consultant profile found.")
+        owns_req = await db.execute(
+            select(Requirement.id)
+            .join(RequirementConsultantMatch, RequirementConsultantMatch.requirement_id == Requirement.id)
+            .where(Requirement.raw_email_id == email_id, RequirementConsultantMatch.consultant_id == consultant.id)
+        )
+        if not owns_req.scalars().first():
+            owns_req_job = await db.execute(
+                select(Requirement.id)
+                .join(JobMatch, JobMatch.requirement_id == Requirement.id)
+                .where(Requirement.raw_email_id == email_id, JobMatch.consultant_id == consultant.id)
+            )
+            if not owns_req_job.scalars().first():
+                raise HTTPException(status_code=403, detail="This email isn't linked to a requirement matched to you.")
 
     result = await db.execute(
         text("""

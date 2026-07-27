@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from anthropic import Anthropic
 import logging
 from dotenv import load_dotenv
@@ -7,6 +8,109 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# Category buckets for turning a flat skill list into the categorized
+# "TECHNICAL PROFICIENCIES" table format, for use when resume_info doesn't
+# already have technical_proficiencies pre-categorized (it usually only has
+# a flat tech_stack.{expert,exposure,familiar}). Order here is the order
+# categories appear in the table; a skill is matched case-insensitively
+# against these keyword lists, first match wins.
+SKILL_CATEGORIES: list[tuple[str, list[str]]] = [
+    ("Programming Languages", [
+        "python", "sql", "c++", "c", "java", "javascript", "typescript",
+        "bash", "shell scripting", "go", "golang", "rust", "scala",
+    ]),
+    ("AI / ML & GenAI", [
+        "gpt", "openai", "langchain", "llamaindex", "rag", "agentic", "prompt engineering",
+        "fine-tuning", "lora", "peft", "huggingface", "transformers", "guardrails",
+        "bert", "bart", "t5", "ner", "topic modeling", "ragas", "trulens",
+        "scikit-learn", "xgboost", "lightgbm", "nltk", "spacy", "tensorflow", "pytorch",
+        "keras", "llama", "nemo",
+    ]),
+    ("Vector Databases & Search", [
+        "pinecone", "faiss", "chromadb", "weaviate", "pgvector", "elasticsearch", "opensearch",
+    ]),
+    ("Backend Frameworks & APIs", [
+        "fastapi", "flask", "django", "graphql", "restful", "soap api", "swagger", "openapi",
+        "spring boot", "microservices",
+    ]),
+    ("Cloud Platforms", [
+        "aws", "azure", "gcp", "google cloud", "ec2", "s3", "lambda", "sagemaker",
+    ]),
+    ("Big Data & Streaming", [
+        "apache kafka", "kafka", "pyspark", "apache spark", "spark", "apache airflow", "airflow",
+        "rabbitmq", "celery",
+    ]),
+    ("Databases & Data Stores", [
+        "postgresql", "mongodb", "redis", "mysql", "oracle", "sql server", "teradata",
+        "cassandra", "dynamodb",
+    ]),
+    ("DevOps & CI/CD", [
+        "docker", "kubernetes", "terraform", "ci/cd", "github actions", "jenkins",
+        "ansible", "puppet", "chef",
+    ]),
+    ("Data Processing & Visualization", [
+        "pandas", "numpy", "scipy", "matplotlib", "seaborn", "plotly", "jupyter", "mlflow",
+    ]),
+    ("Testing & Monitoring", [
+        "pytest", "unittest", "prometheus", "cloudwatch", "dynatrace", "nagios",
+        "loadrunner", "soapui",
+    ]),
+    ("Version Control & Collaboration", [
+        "git", "github", "gitlab", "svn", "mercurial", "jira", "confluence", "postman",
+    ]),
+    ("Web Technologies", [
+        "html5", "html", "css3", "css", "jquery", "ajax", "json", "xml",
+    ]),
+]
+
+
+def categorize_skills(skills: list[str]) -> list[dict]:
+    """Groups a flat skill list into {category, skills} buckets for the
+    TECHNICAL PROFICIENCIES table, using keyword matching. Anything that
+    doesn't match a known category lands in "Other Tools & Technologies"
+    rather than being dropped."""
+    seen = set()
+    ordered_skills = []
+    for s in skills:
+        key = s.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            ordered_skills.append(s.strip())
+
+    # BUG FIX: naive substring matching (`kw in skill_lower`) produced
+    # false positives — "go" matched inside "MongoDB", "sql" matched
+    # inside "PostgreSQL", both landing in Programming Languages instead
+    # of Databases. Word-boundary regex matching fixes this: \bgo\b
+    # doesn't match the "go" inside "MongoDB" because there's no boundary
+    # between "n" and "g".
+    compiled_categories = [
+        (category, [re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE) for kw in keywords])
+        for category, keywords in SKILL_CATEGORIES
+    ]
+
+    buckets: dict[str, list[str]] = {}
+    unmatched: list[str] = []
+    for skill in ordered_skills:
+        matched_category = None
+        for category, patterns in compiled_categories:
+            if any(p.search(skill) for p in patterns):
+                matched_category = category
+                break
+        if matched_category:
+            buckets.setdefault(matched_category, []).append(skill)
+        else:
+            unmatched.append(skill)
+
+    result = [
+        {"category": category, "skills": buckets[category]}
+        for category, _ in SKILL_CATEGORIES
+        if category in buckets
+    ]
+    if unmatched:
+        result.append({"category": "Other Tools & Technologies", "skills": unmatched})
+    return result
 
 
 SYSTEM_PROMPT = """You are an elite Fortune 500 Resume Architect and Principal Technical Recruiter.
@@ -24,6 +128,7 @@ CRITICAL STANDARDS & INSTRUCTIONS:
    - ACADEMIC PROJECTS (Academic/university projects with platform, description, role, responsibilities, team_size, duration, technical_tools)
    - OTHER PROJECTS (Additional work, bug fixes, R&D, porting work)
    - EDUCATIONAL BACKGROUND (Degree, institution, year, details/percentage)
+   - CERTIFICATIONS (Professional certifications with issuing body and year, kept separate from ACHIEVEMENTS)
    - NON-TECHNICAL PROFICIENCIES (Soft skills, leadership, administration bullets)
    - ACHIEVEMENTS (Certifications, paper presentations, awards)
    - HOBBIES & INTEREST (Interests bullets)
@@ -105,6 +210,7 @@ Return EXACTLY this JSON structure with no markdown code fences:
       "details": "string"
     }
   ],
+  "certifications": ["string (e.g. AWS Certified Solutions Architect – Associate, 2023)"],
   "non_technical_proficiencies": ["bullet1", "bullet2"],
   "achievements": ["achievement1", "achievement2"],
   "hobbies_and_interests": ["hobby1", "hobby2"],
@@ -130,39 +236,82 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
     
+    # BUG FIX: this used to fabricate generic placeholder content (a canned
+    # "Highly motivated professional..." summary, a fake "FinCorp Global"
+    # employer, invented bullet points) whenever the AI call was
+    # unavailable or failed — so admins/consultants would see what looked
+    # like a real tailored resume but was actually fiction, with no
+    # indication anything had gone wrong. This now builds the fallback
+    # entirely from the candidate's own stored resume_info (their real
+    # profile JSON), leaving a field blank rather than inventing content
+    # when resume_info doesn't have it. It's a straight passthrough of
+    # real data, not an AI-tailored resume — generation_notes says so
+    # explicitly so this is distinguishable from a real generation.
+    real_summary = (
+        resume_info.get("summary")
+        or resume_info.get("career_objective")
+        or resume_info.get("professional_summary")
+        or resume_info.get("objective")
+        or ""
+    )
+    real_skills = (
+        resume_info.get("skills")
+        or resume_info.get("tech_stack", {}).get("expert", [])
+        or resume_info.get("tech_stack", {}).get("intermediate", [])
+        or []
+    )
+    # TECHNICAL PROFICIENCIES table: prefer resume_info's own categorized
+    # list if it has one, otherwise build one from the full tech_stack
+    # (expert + exposure/intermediate + familiar tiers merged) so the
+    # table isn't limited to just the "expert" tier used for `skills`
+    # above. Most stored profiles (like this one) only have a flat
+    # tech_stack, not pre-categorized technical_proficiencies.
+    tech_stack = resume_info.get("tech_stack") or {}
+    all_tech_skills = [
+        *tech_stack.get("expert", []),
+        *tech_stack.get("exposure", []),
+        *tech_stack.get("intermediate", []),
+        *tech_stack.get("familiar", []),
+    ]
+    real_tech_proficiencies = (
+        resume_info.get("technical_proficiencies")
+        or (categorize_skills(all_tech_skills) if all_tech_skills else None)
+        or (categorize_skills(real_skills) if real_skills else None)
+    )
+    real_education = resume_info.get("education") or resume_info.get("educational_background") or []
+    real_certifications = resume_info.get("certifications") or []
+
     mock_fallback = {
         "name": resume_info.get("full_name", "Unknown"),
         "email": resume_info.get("email", ""),
         "phone": resume_info.get("phone", ""),
-        "summary": "Highly motivated professional tailored for this role.",
-        "skills": resume_info.get("tech_stack", {}).get("expert", []) or ["React", "TypeScript", "Node.js"],
+        "location": resume_info.get("location", ""),
+        "linkedin": resume_info.get("linkedin", ""),
+        "github": resume_info.get("github", ""),
+        "summary": real_summary,
+        "technical_proficiencies": real_tech_proficiencies,
+        "skills": real_skills,
         "missing_skills": [],
         "experience": [
             {
-                "client": exp.get("company", "FinCorp Global"),
-                "role": exp.get("role", "Software Engineer"),
-                "start": exp.get("start_date", "2022-01"),
-                "end": exp.get("end_date", "Present"),
-                "location": "Remote",
-                "bullets": exp.get("bullets", ["Developed responsive web applications", "Integrated REST APIs", "Improved test coverage"])
+                "client": exp.get("company", ""),
+                "role": exp.get("role", exp.get("title", "")),
+                "start": exp.get("start_date", exp.get("start", "")),
+                "end": exp.get("end_date", exp.get("end", "Present")),
+                "location": exp.get("location", ""),
+                "bullets": exp.get("bullets", [])
             }
             for exp in resume_info.get("experience", [])
-        ] or [
-            {
-                "client": "FinCorp Global",
-                "role": "Senior Engineer",
-                "start": "2022-01",
-                "end": "Present",
-                "location": "Remote",
-                "bullets": ["Developed responsive web applications", "Integrated REST APIs", "Improved test coverage"]
-            }
         ],
-        "generation_notes": "Mock generated due to missing or invalid Anthropic API key."
+        "education": real_education,
+        "certifications": real_certifications,
+        "personal_details": resume_info.get("personal_details") or {},
+        "generation_notes": "AI generation was unavailable — this is the candidate's stored profile data as-is, not an AI-tailored resume."
     }
 
     if not api_key or api_key.startswith("your_"):
-        logger.warning("ANTHROPIC_API_KEY not found or is a placeholder, returning mock data for testing.")
-        return mock_fallback, {}
+        logger.warning("ANTHROPIC_API_KEY not found or is a placeholder, returning real profile data (untailored) for testing.")
+        return mock_fallback, {}, None
 
     try:
         client = Anthropic(api_key=api_key)
