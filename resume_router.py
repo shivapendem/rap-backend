@@ -667,6 +667,39 @@ async def update_resume(
     await db.commit()
     await db.refresh(resume)
 
+    # BUG FIX: this endpoint only ever updated the `data` JSON column —
+    # the actual downloadable PDF sitting in S3 was generated once at
+    # creation time and never touched again. Editing a resume (adding a
+    # LinkedIn URL, fixing a typo, or picking up a template fix like the
+    # Declaration section removal) had zero effect on what "Download PDF"
+    # actually served — it kept returning the exact same stale file
+    # forever. Regenerate and re-upload whenever the content changed, so
+    # Save Changes and Download PDF never drift apart again.
+    if request.data is not None:
+        from phase6 import _generate_docx, _convert_to_pdf
+        from pathlib import Path
+
+        resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+        resume_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = resume_dir / "resume.docx"
+        pdf_path = resume_dir / "resume.pdf"
+
+        try:
+            _generate_docx(resume.data, docx_path)
+            if _convert_to_pdf(docx_path, pdf_path):
+                s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
+                with open(pdf_path, "rb") as f:
+                    if upload_file_to_s3(f, s3_key, "application/pdf"):
+                        resume.s3_key = s3_key
+                        resume.status = 'completed'
+                        await db.commit()
+                        await db.refresh(resume)
+        except Exception as e:
+            # Don't fail the save over a PDF regen hiccup — the data edit
+            # itself already succeeded and committed above. The next save
+            # (or the lazy self-heal in download_resume) will retry.
+            print(f"PDF regeneration on save failed for resume {resume.id}: {e}")
+
     return resume
 
 @router.delete("/{id}")

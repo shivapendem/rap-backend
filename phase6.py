@@ -452,7 +452,44 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
         add_section_header("CAREER OBJECTIVE:")
         add_formatted_paragraph(career_obj, space_after=6)
 
-    # 3. EXPERIENCE
+    # 3. TECHNICAL PROFICIENCIES — moved here, right after Career
+    # Objective and before Experience, to match the web preview/editor's
+    # section order. Rendered as a real bordered table (was a
+    # colon-padded bullet list before, which is why it looked nothing
+    # like the bordered category/skills table shown in the preview).
+    tech_profs = resume_data.get("technical_proficiencies", [])
+    skills_list = resume_data.get("skills", [])
+    if tech_profs or skills_list:
+        add_section_header("TECHNICAL PROFICIENCIES:")
+        if tech_profs and isinstance(tech_profs, list):
+            table = doc.add_table(rows=0, cols=2)
+            table.style = "Table Grid"
+            table.autofit = False
+            table.columns[0].width = Inches(1.9)
+            table.columns[1].width = Inches(4.6)
+            for tp in tech_profs:
+                cat = tp.get("category", "Skills")
+                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
+                row = table.add_row()
+                cell_cat, cell_skills = row.cells
+                cell_cat.width = Inches(1.9)
+                cell_skills.width = Inches(4.6)
+                r_cat = cell_cat.paragraphs[0].add_run(cat)
+                r_cat.bold = True
+                r_cat.font.size = Pt(9)
+                r_sk = cell_skills.paragraphs[0].add_run(skills_val)
+                r_sk.font.size = Pt(9)
+            # Spacer after the table so the next section header isn't
+            # crammed against it.
+            spacer = doc.add_paragraph()
+            spacer.paragraph_format.space_after = Pt(4)
+        elif skills_list:
+            p_sk = doc.add_paragraph(style="List Bullet")
+            r_cat = p_sk.add_run(f"{'Core Skills':<25} : ")
+            r_cat.bold = True
+            p_sk.add_run(", ".join(skills_list))
+
+    # 4. EXPERIENCE
     experience = resume_data.get("experience", [])
     if experience:
         add_section_header("EXPERIENCE:")
@@ -479,26 +516,6 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
 
             for bullet in exp.get("bullets", []):
                 add_formatted_paragraph(bullet, style="List Bullet")
-
-    # 4. TECHNICAL PROFICIENCIES
-    tech_profs = resume_data.get("technical_proficiencies", [])
-    skills_list = resume_data.get("skills", [])
-    if tech_profs or skills_list:
-        add_section_header("TECHNICAL PROFICIENCIES:")
-        if tech_profs and isinstance(tech_profs, list):
-            for tp in tech_profs:
-                cat = tp.get("category", "Skills")
-                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
-                p_tp = doc.add_paragraph(style="List Bullet")
-                p_tp.paragraph_format.space_after = Pt(2)
-                r_cat = p_tp.add_run(f"{cat:<25} : ")
-                r_cat.bold = True
-                p_tp.add_run(skills_val)
-        elif skills_list:
-            p_sk = doc.add_paragraph(style="List Bullet")
-            r_cat = p_sk.add_run(f"{'Core Skills':<25} : ")
-            r_cat.bold = True
-            p_sk.add_run(", ".join(skills_list))
 
     # 5. KEY PROJECTS
     key_projects = resume_data.get("key_projects", [])
