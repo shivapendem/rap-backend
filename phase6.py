@@ -443,19 +443,51 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
         return p
 
     def add_formatted_paragraph(text: str, style: Optional[str] = None, space_after: int = 4):
-        p = doc.add_paragraph(style=style)
-        p.paragraph_format.space_after = Pt(space_after)
+        # BUG FIX: this only ever converted <b>/<strong> to a bold
+        # marker — every OTHER tag ReactQuill's toolbar can emit (<p>,
+        # </p>, <em>/<i>, <u>, <br>, <ul>/<ol>/<li>) passed straight
+        # through untouched and showed up as literal, visible text in
+        # the generated DOCX/PDF — e.g. "<p>Managed a team</p>" instead
+        # of just "Managed a team". Now normalizes the full set of tags
+        # Quill can actually produce in this app: splits multi-paragraph
+        # content into separate DOCX paragraphs, converts list items to
+        # bullet-prefixed lines, supports italics alongside the existing
+        # bold support, and strips anything else that slips through as
+        # a final safety net.
         if not text:
+            p = doc.add_paragraph(style=style)
+            p.paragraph_format.space_after = Pt(space_after)
             return p
-        normalized = re.sub(r'</?(b|strong)>', '**', str(text))
-        parts = re.split(r'(\*\*.*?\*\*)', normalized)
-        for part in parts:
-            if part.startswith("**") and part.endswith("**") and len(part) > 4:
-                run = p.add_run(part[2:-2])
-                run.bold = True
-            else:
-                p.add_run(part)
-        return p
+        normalized = str(text)
+        normalized = re.sub(r'</?(strong|b)>', '**', normalized)
+        normalized = re.sub(r'</?(em|i)>', '*', normalized)
+        normalized = re.sub(r'<br\s*/?>', '\n', normalized)
+        normalized = re.sub(r'</p>\s*<p[^>]*>', '\n\n', normalized)
+        normalized = re.sub(r'</?p[^>]*>', '', normalized)
+        normalized = re.sub(r'<li[^>]*>', '• ', normalized)
+        normalized = re.sub(r'</li>', '\n', normalized)
+        normalized = re.sub(r'</?(ul|ol|u)[^>]*>', '', normalized)
+        # Final safety net — strips any remaining tag this editor
+        # doesn't currently produce but could add in the future.
+        normalized = re.sub(r'<[^>]+>', '', normalized)
+        para_lines = [ln for ln in normalized.split('\n') if ln.strip()] or [""]
+        first_p = None
+        for para_text in para_lines:
+            p = doc.add_paragraph(style=style)
+            p.paragraph_format.space_after = Pt(space_after)
+            if first_p is None:
+                first_p = p
+            parts = re.split(r'(\*\*.*?\*\*|\*.*?\*)', para_text)
+            for part in parts:
+                if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                    run = p.add_run(part[2:-2])
+                    run.bold = True
+                elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+                    run = p.add_run(part[1:-1])
+                    run.italic = True
+                else:
+                    p.add_run(part)
+        return first_p
 
     # 1. HEADER & CONTACT
     name = resume_data.get("name", "").strip() or "FULL NAME"

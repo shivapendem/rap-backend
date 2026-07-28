@@ -230,6 +230,122 @@ Return EXACTLY this JSON structure with no markdown code fences:
   "generation_notes": "Brief notes on how you tailored the resume."
 }"""
 
+def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
+    """
+    Coerces AI output (or the offline fallback) into the exact master-resume
+    schema every consumer (ResumeRichPreview, ResumePrintView, _generate_docx)
+    expects — same section set, same order, same field names/types — so every
+    resume looks identical regardless of how the AI phrased that particular
+    response.
+
+    Claude generally follows SYSTEM_PROMPT's schema, but LLM JSON output is
+    never contractually guaranteed: a field can come back missing, empty, or
+    under a slightly different key from one generation to the next. Rather
+    than let each individual downstream consumer guess defensively (and
+    inevitably miss a spot — see the frontend crash this was pulled from),
+    this is the single place that guarantees the contract once, right after
+    generation, before the result is ever saved or rendered.
+    """
+    if not isinstance(resume_data, dict):
+        resume_data = {}
+
+    def _clean_str(val) -> str:
+        return val.strip() if isinstance(val, str) else ""
+
+    def _as_list(val) -> list:
+        if isinstance(val, list):
+            return val
+        if isinstance(val, str) and val.strip():
+            return [val.strip()]
+        return []
+
+    normalized: dict = {}
+
+    # 1. Header & contact — always present, falling back to the source
+    # profile so a header field the AI dropped doesn't just disappear.
+    normalized["name"] = _clean_str(resume_data.get("name")) or _clean_str(resume_info.get("full_name")) or "Unknown"
+    normalized["email"] = _clean_str(resume_data.get("email")) or _clean_str(resume_info.get("email"))
+    normalized["phone"] = _clean_str(resume_data.get("phone")) or _clean_str(resume_info.get("phone"))
+    normalized["location"] = _clean_str(resume_data.get("location")) or _clean_str(resume_info.get("location") or resume_info.get("current_location"))
+    normalized["linkedin"] = _clean_str(resume_data.get("linkedin")) or _clean_str(resume_info.get("linkedin"))
+    normalized["github"] = _clean_str(resume_data.get("github")) or _clean_str(resume_info.get("github"))
+
+    # 2. Career Objective / Summary — the schema wants both populated with
+    # the same content when only one came back, so every consumer that
+    # reads either field sees it.
+    career_obj = _clean_str(resume_data.get("career_objective")) or _clean_str(resume_data.get("summary"))
+    normalized["career_objective"] = career_obj
+    normalized["summary"] = career_obj
+
+    # 3. Technical Proficiencies — always a categorized table. If the AI
+    # returned skills but skipped (or malformed) the category breakdown,
+    # rebuild the table from the flat list so the section still renders as
+    # a table instead of silently vanishing.
+    skills = _as_list(resume_data.get("skills"))
+    tech_profs = resume_data.get("technical_proficiencies")
+    if not (isinstance(tech_profs, list) and tech_profs):
+        tech_profs = categorize_skills(skills) if skills else []
+    else:
+        # Normalize each row's `skills` to a list even if the AI emitted a
+        # comma-joined string for one category.
+        cleaned_profs = []
+        for tp in tech_profs:
+            if not isinstance(tp, dict):
+                continue
+            cat = _clean_str(tp.get("category")) or "Skills"
+            tp_skills = tp.get("skills")
+            if isinstance(tp_skills, str):
+                tp_skills = [s.strip() for s in tp_skills.split(",") if s.strip()]
+            cleaned_profs.append({"category": cat, "skills": _as_list(tp_skills)})
+        tech_profs = cleaned_profs
+    normalized["technical_proficiencies"] = tech_profs
+    normalized["skills"] = skills
+    normalized["missing_skills"] = _as_list(resume_data.get("missing_skills"))
+
+    # 4. Experience — every entry always has every field the template
+    # needs, `bullets` always a list. This is the field whose absence
+    # crashed the resume editor (exp.bullets.map on undefined) before the
+    # frontend was hardened — normalizing here means it can never happen
+    # again regardless of what any client does with the data.
+    normalized_experience = []
+    for exp in _as_list(resume_data.get("experience")):
+        if not isinstance(exp, dict):
+            continue
+        bullets = _as_list(exp.get("bullets"))
+        normalized_experience.append({
+            "client": _clean_str(exp.get("client") or exp.get("company")),
+            "role": _clean_str(exp.get("role") or exp.get("title")),
+            "start": _clean_str(exp.get("start") or exp.get("start_date")),
+            "end": _clean_str(exp.get("end") or exp.get("end_date")) or "Present",
+            "location": _clean_str(exp.get("location")),
+            "description": _clean_str(exp.get("description")),
+            "bullets": bullets,
+        })
+    normalized["experience"] = normalized_experience
+
+    # 5. Everything else — pass through as-is. These sections are all
+    # optional in the template (rendered only `if present`), so there's
+    # nothing to coerce; just make sure list-typed sections are actually
+    # lists so a stray string from the AI doesn't break a `.map`/`for`
+    # loop downstream.
+    for key in ("key_projects", "academic_projects", "education", "certifications",
+                "non_technical_proficiencies", "achievements", "hobbies_and_interests"):
+        if key in resume_data and resume_data[key] not in (None, "", []):
+            val = resume_data[key]
+            normalized[key] = val if isinstance(val, (list, dict)) else val
+    if "education" not in normalized and resume_info.get("education"):
+        normalized["education"] = resume_info["education"]
+    if "other_projects" in resume_data and resume_data["other_projects"]:
+        normalized["other_projects"] = resume_data["other_projects"]
+    if isinstance(resume_data.get("personal_details"), dict) and resume_data["personal_details"]:
+        normalized["personal_details"] = resume_data["personal_details"]
+    if resume_data.get("declaration"):
+        normalized["declaration"] = resume_data["declaration"]
+
+    normalized["generation_notes"] = _clean_str(resume_data.get("generation_notes"))
+    return normalized
+
+
 def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
     """
     Calls Anthropic API to generate a structured JSON resume based on resume_info and job_description.
@@ -312,7 +428,7 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
 
     if not api_key or api_key.startswith("your_"):
         logger.warning("ANTHROPIC_API_KEY not found or is a placeholder, returning real profile data (untailored) for testing.")
-        return mock_fallback, {}, None
+        return _normalize_resume_data(mock_fallback, resume_info), {}, None
 
     try:
         client = Anthropic(api_key=api_key)
@@ -364,7 +480,7 @@ Generate the tailored resume JSON now.
             content = content[:-3]
             
         result_json = json.loads(content.strip())
-        return result_json, rate_limits, usage_info
+        return _normalize_resume_data(result_json, resume_info), rate_limits, usage_info
     except Exception as e:
         logger.warning(f"Error calling Claude API: {e}. Falling back to mock data.")
-        return mock_fallback, {}, None
+        return _normalize_resume_data(mock_fallback, resume_info), {}, None
