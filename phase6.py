@@ -260,18 +260,58 @@ async def _call_ai_tailoring(
     primary = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()]
     secondary = [s.strip() for s in (consultant.secondary_skills or "").split(",") if s.strip()]
 
+    # BUG FIX: this resume_info was built ONLY from primary_skills/
+    # secondary_skills (comma-separated text columns) and ConsultantExperience
+    # table rows — completely separate from consultant.resume_info, the JSON
+    # blob the "My Resumes" flow (resume_router.py) reads from. A consultant
+    # whose real profile data was entered/imported into that JSON blob (e.g.
+    # via the resume JSON import feature) but never duplicated into these
+    # separate structured fields would get an almost entirely empty
+    # resume_info here — no skills, no experience, no education, no
+    # certifications at all (education/certifications weren't sourced from
+    # anywhere in this function, structured or JSON) — which is exactly the
+    # shape of failure that produces a "resume is basically empty" result.
+    # Fall back to the JSON blob for anything the structured fields didn't
+    # provide, so both data sources actually work.
+    profile_json = consultant.resume_info or {}
+    tech_stack_json = profile_json.get("tech_stack") or {}
+
+    if not primary and not secondary:
+        primary = tech_stack_json.get("expert") or profile_json.get("skills") or []
+        secondary = (
+            (tech_stack_json.get("exposure") or [])
+            + (tech_stack_json.get("familiar") or [])
+        )
+
+    if not experience_payload:
+        experience_payload = [
+            {
+                "company": exp.get("company", ""),
+                "role": exp.get("role", ""),
+                "start_date": exp.get("start_date", ""),
+                "end_date": exp.get("end_date", "Present"),
+                "technologies": exp.get("tech_used", []),
+                "bullets": exp.get("bullets", []),
+            }
+            for exp in profile_json.get("experience", [])
+        ]
+
     resume_info: Dict[str, Any] = {
-        "full_name": consultant.full_name or "",
-        "email": consultant.email or "",
-        "phone": consultant.phone or "",
+        "full_name": consultant.full_name or profile_json.get("full_name", ""),
+        "email": consultant.email or profile_json.get("email", ""),
+        "phone": consultant.phone or profile_json.get("phone", ""),
         "total_experience_years": float(consultant.total_experience_years)
         if consultant.total_experience_years is not None
-        else None,
-        "work_authorization": consultant.work_authorization or "",
-        "current_location": consultant.current_location or "",
+        else profile_json.get("years_experience"),
+        "work_authorization": consultant.work_authorization or profile_json.get("visa_type", ""),
+        "current_location": consultant.current_location or profile_json.get("location", ""),
+        "linkedin": profile_json.get("linkedin", ""),
+        "github": profile_json.get("github", ""),
         "tech_stack": {"expert": primary, "familiar": secondary},
         "base_resume_text": consultant.base_resume_text or "",
         "experience": experience_payload,
+        "education": profile_json.get("education") or profile_json.get("educational_background") or [],
+        "certifications": profile_json.get("certifications") or [],
     }
 
     # ── Requirement context (preserves everything the old prompt carried) ──
@@ -291,8 +331,16 @@ MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
     # generate_tailored_resume() is synchronous and blocks for the duration of
     # the HTTP call. Running it inline would freeze this uvicorn worker for
     # every other request, so it goes to a thread.
+    #
+    # BUG FIX: generate_tailored_resume() returns a 3-tuple
+    # (result_json, rate_limits, usage_info) on every code path — success,
+    # no-API-key, and the exception fallback all return three values. This
+    # was only unpacking two, so EVERY call raised
+    # "ValueError: too many values to unpack (expected 2)", caught by the
+    # except block below and surfaced as a generic "AI service error"
+    # regardless of whether generation would have actually succeeded.
     try:
-        resume_data, rate_limits = await asyncio.to_thread(
+        resume_data, rate_limits, usage_info = await asyncio.to_thread(
             generate_tailored_resume, resume_info, jd_context
         )
     except Exception as exc:  # noqa: BLE001 - surface any client/transport error
@@ -641,42 +689,6 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
                 add_formatted_paragraph(str(h), style="List Bullet")
         else:
             add_formatted_paragraph(str(hobbies))
-
-    # 12. PERSONAL DETAILS
-    personal = resume_data.get("personal_details")
-    if personal and isinstance(personal, dict):
-        add_section_header("PERSONAL DETAILS:")
-        labels = [
-            ("Name", personal.get("name") or name),
-            ("Father's Name", personal.get("father_name")),
-            ("Date of Birth", personal.get("dob")),
-            ("Marital Status", personal.get("marital_status")),
-            ("Languages Known", personal.get("languages_known")),
-            ("Permanent Address", personal.get("permanent_address")),
-            ("Desired Work Location", personal.get("desired_work_location")),
-            ("Contact No", personal.get("contact_no") or resume_data.get("phone")),
-            ("Alternate E-mail", personal.get("alternate_email")),
-        ]
-        for k, v in labels:
-            if v:
-                p_p = doc.add_paragraph()
-                p_p.paragraph_format.space_after = Pt(2)
-                r_lbl = p_p.add_run(f"{k:<25} : ")
-                r_lbl.bold = True
-                p_p.add_run(str(v))
-
-    # 13. DECLARATION
-    decl = resume_data.get("declaration")
-    if decl or name:
-        add_section_header("DECLARATION:")
-        decl_text = decl.get("text") if isinstance(decl, dict) else (decl if isinstance(decl, str) else "I hereby declare that the above facts given by me are true to the best of my knowledge and belief.")
-        add_formatted_paragraph(decl_text, space_after=10)
-
-        place = decl.get("place", "Hyderabad") if isinstance(decl, dict) else "Hyderabad"
-        p_sig = doc.add_paragraph()
-        p_sig.paragraph_format.space_before = Pt(10)
-        r_pl = p_sig.add_run(f"Place: {place}")
-        r_pl.bold = True
 
     # Missing skills transparency
     missing = resume_data.get("missing_skills", [])
@@ -1352,9 +1364,19 @@ async def download_resume(
 
     file_path = generated.pdf_path if file_type == "pdf" else generated.docx_path
 
-    # pdf_path may hold a Spaces object KEY rather than a local path (see
-    # _run_generation_pipeline — the local file is deleted after upload).
-    # Path(key).exists() is always False, so stream it back from Spaces.
+    # BUG FIX: generated.filename is always stored ending in ".pdf"
+    # (see _build_resume_filename — it hardcodes the suffix), and that one
+    # stored name gets reused for BOTH the pdf_path and docx_path files.
+    # Downloading "pdf" happened to look right by coincidence, but
+    # downloading "docx" served real DOCX bytes under a filename ending in
+    # ".pdf" — both downloads then land in the Downloads folder with the
+    # same base name, making it easy to open the wrong one and see Word
+    # content where a PDF was expected. Force the extension to match what
+    # was actually requested, regardless of what's stored.
+    stored_name = generated.filename or Path(file_path).name
+    stem = stored_name.rsplit(".", 1)[0] if "." in stored_name else stored_name
+    correct_filename = f"{stem}.{file_type}"
+
     if file_path and not Path(file_path).exists():
         from s3_service import download_file_from_s3
         body, content_type = download_file_from_s3(file_path)
@@ -1365,7 +1387,7 @@ async def download_resume(
                 media_type=content_type or "application/pdf",
                 headers={
                     "Content-Disposition":
-                        f'attachment; filename="{generated.filename or Path(file_path).name}"'
+                        f'attachment; filename="{correct_filename}"'
                 },
             )
 
@@ -1380,12 +1402,11 @@ async def download_resume(
         "application/pdf" if file_type == "pdf"
         else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
-    filename = generated.filename or Path(file_path).name
 
     return FileResponse(
         path=file_path,
         media_type=media_type,
-        filename=filename,
+        filename=correct_filename,
     )
 
 

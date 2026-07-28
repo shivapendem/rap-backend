@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from typing import Optional
 from anthropic import Anthropic
 import logging
 from dotenv import load_dotenv
@@ -229,10 +230,10 @@ Return EXACTLY this JSON structure with no markdown code fences:
   "generation_notes": "Brief notes on how you tailored the resume."
 }"""
 
-def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict]:
+def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
     """
     Calls Anthropic API to generate a structured JSON resume based on resume_info and job_description.
-    Returns (resume_json, rate_limit_headers).
+    Returns (resume_json, rate_limit_headers, usage_info).
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
     

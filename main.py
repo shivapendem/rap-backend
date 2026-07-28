@@ -35,7 +35,16 @@ from auth import (
 # Security helpers
 # ---------------------------------------------------------------------------
 
-ALLOWED_SORT_COLUMNS = {"received_date", "received_at", "role", "vendor", "client", "status", "created_at", "ats_match_count"}
+# BUG FIX: this whitelist was never updated when the frontend table
+# added sorting to more columns (Vendor Email, Work Mode, Location,
+# Parse Confidence) — clicking those columns' sort arrows always 422'd
+# here, surfaced by the frontend as a generic "Failed to load
+# requirements" error with no indication of which column caused it.
+ALLOWED_SORT_COLUMNS = {
+    "received_date", "received_at", "role", "vendor", "client", "status",
+    "created_at", "ats_match_count", "vendor_email", "work_mode", "location",
+    "parse_confidence",
+}
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
