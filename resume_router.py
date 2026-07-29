@@ -16,6 +16,7 @@ from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3
 from claude_service import generate_tailored_resume
 from phase8_ai_usage_service import save_claude_rate_limits
+from resume_validation import get_missing_resume_fields, missing_fields_message
 
 # You can import openai and use it if an API key is provided
 # import openai
@@ -96,16 +97,18 @@ class PaginatedResumes(BaseModel):
     page_size: int
     total_pages: int
 
-@router.post("/generate", response_model=ResumeResponse)
-async def generate_resume(
-    request: ResumeCreateRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+async def _resolve_target_user(
+    request_user_id: Optional[int],
+    current_user: User,
+    db: AsyncSession,
 ):
+    """Resolve which consultant we're generating for, honoring the
+    ADMIN/RECRUITER "generate on behalf of" path. Shared by the /generate
+    endpoint and the /completeness pre-check so they never drift apart."""
     target_user_id = current_user.id
     target_user = current_user
-    if request.user_id and current_user.role in ("ADMIN", "RECRUITER"):
-        target_user_id = request.user_id
+    if request_user_id and current_user.role in ("ADMIN", "RECRUITER"):
+        target_user_id = request_user_id
         target_user_result = await db.execute(select(User).where(User.id == target_user_id))
         target_user = target_user_result.scalar_one_or_none()
         if not target_user:
@@ -114,11 +117,18 @@ async def generate_resume(
     if target_user.role != "CONSULTANT":
         raise HTTPException(status_code=403, detail="Resumes can only be generated for consultants.")
 
-    # Fetch consultant to get profile experiences
-    consultant = None
-    if target_user.role == "CONSULTANT":
-        consultant_res = await db.execute(select(Consultant).where(Consultant.user_id == target_user.id))
-        consultant = consultant_res.scalar_one_or_none()
+    return target_user_id, target_user
+
+
+async def _build_resume_info(
+    target_user: User,
+    db: AsyncSession,
+    experience_ids: Optional[List[int]] = None,
+):
+    """Assemble the resume_info payload (skills/experience/education/etc.)
+    used both to actually call the AI and to check profile completeness."""
+    consultant_res = await db.execute(select(Consultant).where(Consultant.user_id == target_user.id))
+    consultant = consultant_res.scalar_one_or_none()
 
     profile_experiences = []
     if consultant:
@@ -126,8 +136,8 @@ async def generate_resume(
         profile_experiences = exp_results.scalars().all()
 
     explicit_experiences = []
-    if request.experience_ids:
-        exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.id.in_(request.experience_ids)))
+    if experience_ids:
+        exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.id.in_(experience_ids)))
         explicit_experiences = exp_results.scalars().all()
 
     # Merge avoiding duplicates
@@ -173,6 +183,55 @@ async def generate_resume(
 
     # Prepend profile experiences so they are processed as most relevant/recent
     resume_info["experience"] = manual_exp_entries + resume_info["experience"]
+
+    return resume_info
+
+
+@router.get("/completeness")
+async def get_resume_completeness(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pre-check the frontend calls before letting someone hit "Generate Resume".
+    Returns which of skills/experience/education are still missing so the UI
+    can show a checklist and disable the button, instead of the person
+    finding out only after burning an AI call on a useless resume.
+    """
+    target_user_id, target_user = await _resolve_target_user(user_id, current_user, db)
+    resume_info = await _build_resume_info(target_user, db)
+    missing_fields = get_missing_resume_fields(resume_info)
+    return {
+        "user_id": target_user_id,
+        "complete": len(missing_fields) == 0,
+        "missing_fields": missing_fields,
+        "message": missing_fields_message(missing_fields) if missing_fields else None,
+    }
+
+
+@router.post("/generate", response_model=ResumeResponse)
+async def generate_resume(
+    request: ResumeCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    target_user_id, target_user = await _resolve_target_user(request.user_id, current_user, db)
+    resume_info = await _build_resume_info(target_user, db, request.experience_ids)
+
+    # Guard rail: don't waste an AI call generating a resume from a profile
+    # that's missing skills/experience/education — that just produces a
+    # resume nobody can use. Fail fast with exactly what's missing so the
+    # frontend (or the caller) can tell the consultant what to go fill in.
+    missing_fields = get_missing_resume_fields(resume_info)
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": missing_fields_message(missing_fields),
+                "missing_fields": missing_fields,
+            },
+        )
 
     try:
         generated_data, rate_limits, usage_info = generate_tailored_resume(resume_info, request.job_description or "General Role")

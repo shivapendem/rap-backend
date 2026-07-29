@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth import get_current_user
 from database import get_db
 from claude_service import generate_tailored_resume
+from resume_validation import get_missing_resume_fields, missing_fields_message
 from models import (
     Consultant,
     ConsultantExperience,
@@ -213,6 +214,96 @@ Return exactly this JSON structure with no markdown, no code fences, no extra te
 }"""
 
 
+def _build_profile_resume_info(
+    consultant: Consultant,
+    experiences: List[ConsultantExperience],
+) -> Dict[str, Any]:
+    """
+    Assemble the resume_info payload for a consultant from BOTH data
+    sources: the structured Consultant columns/ConsultantExperience rows,
+    and the consultant.resume_info JSON blob ("My Resumes" flow). Used to
+    actually call the AI, and to check profile completeness before we do.
+
+    BUG FIX: this used to be built ONLY from primary_skills/secondary_skills
+    (comma-separated text columns) and ConsultantExperience table rows —
+    completely separate from consultant.resume_info, the JSON blob the "My
+    Resumes" flow (resume_router.py) reads from. A consultant whose real
+    profile data was entered/imported into that JSON blob (e.g. via the
+    resume JSON import feature) but never duplicated into these separate
+    structured fields would get an almost entirely empty resume_info here —
+    no skills, no experience, no education, no certifications at all
+    (education/certifications weren't sourced from anywhere in this
+    function, structured or JSON) — which is exactly the shape of failure
+    that produces a "resume is basically empty" result. Fall back to the
+    JSON blob for anything the structured fields didn't provide, so both
+    data sources actually work.
+    """
+    # ── Structured profile ────────────────────────────────────────────────
+    # Key names mirror claude_service's internal mock_fallback shape so its
+    # offline fallback still yields sensible data instead of placeholders.
+    experience_payload: List[Dict[str, Any]] = []
+    for exp in sorted(experiences, key=lambda e: e.sort_order):
+        raw = f"{exp.responsibilities or ''}\n{exp.achievements or ''}"
+        bullets = [ln.strip(" -*\u2022\t") for ln in re.split(r"[\r\n]+", raw) if ln.strip(" -*\u2022\t")]
+        experience_payload.append(
+            {
+                "company": exp.client_name or "",
+                "role": exp.role_title or "",
+                "start_date": exp.start_date.strftime("%b %Y") if exp.start_date else "",
+                "end_date": "Present"
+                if exp.is_present
+                else (exp.end_date.strftime("%b %Y") if exp.end_date else ""),
+                "technologies": exp.technologies or [],
+                "bullets": bullets,
+            }
+        )
+
+    primary = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()]
+    secondary = [s.strip() for s in (consultant.secondary_skills or "").split(",") if s.strip()]
+
+    profile_json = consultant.resume_info or {}
+    tech_stack_json = profile_json.get("tech_stack") or {}
+
+    if not primary and not secondary:
+        primary = tech_stack_json.get("expert") or profile_json.get("skills") or []
+        secondary = (
+            (tech_stack_json.get("exposure") or [])
+            + (tech_stack_json.get("familiar") or [])
+        )
+
+    if not experience_payload:
+        experience_payload = [
+            {
+                "company": exp.get("company", ""),
+                "role": exp.get("role", ""),
+                "start_date": exp.get("start_date", ""),
+                "end_date": exp.get("end_date", "Present"),
+                "technologies": exp.get("tech_used", []),
+                "bullets": exp.get("bullets", []),
+            }
+            for exp in profile_json.get("experience", [])
+        ]
+
+    return {
+        "full_name": consultant.full_name or profile_json.get("full_name", ""),
+        "email": consultant.email or profile_json.get("email", ""),
+        "phone": consultant.phone or profile_json.get("phone", ""),
+        "total_experience_years": float(consultant.total_experience_years)
+        if consultant.total_experience_years is not None
+        else profile_json.get("years_experience"),
+        "work_authorization": consultant.work_authorization or profile_json.get("visa_type", ""),
+        "current_location": consultant.current_location or profile_json.get("location", ""),
+        "linkedin": profile_json.get("linkedin", ""),
+        "github": profile_json.get("github", ""),
+        "tech_stack": {"expert": primary, "familiar": secondary},
+        "skills": primary + secondary,
+        "base_resume_text": consultant.base_resume_text or "",
+        "experience": experience_payload,
+        "education": profile_json.get("education") or profile_json.get("educational_background") or [],
+        "certifications": profile_json.get("certifications") or [],
+    }
+
+
 async def _call_ai_tailoring(
     consultant: Consultant,
     experiences: List[ConsultantExperience],
@@ -237,82 +328,7 @@ async def _call_ai_tailoring(
             detail="ANTHROPIC_API_KEY is not configured. Set it in .env to enable resume generation.",
         )
 
-    # ── Structured profile ────────────────────────────────────────────────
-    # Key names mirror claude_service's internal mock_fallback shape so its
-    # offline fallback still yields sensible data instead of placeholders.
-    experience_payload: List[Dict[str, Any]] = []
-    for exp in sorted(experiences, key=lambda e: e.sort_order):
-        raw = f"{exp.responsibilities or ''}\n{exp.achievements or ''}"
-        bullets = [ln.strip(" -*\u2022\t") for ln in re.split(r"[\r\n]+", raw) if ln.strip(" -*\u2022\t")]
-        experience_payload.append(
-            {
-                "company": exp.client_name or "",
-                "role": exp.role_title or "",
-                "start_date": exp.start_date.strftime("%b %Y") if exp.start_date else "",
-                "end_date": "Present"
-                if exp.is_present
-                else (exp.end_date.strftime("%b %Y") if exp.end_date else ""),
-                "technologies": exp.technologies or [],
-                "bullets": bullets,
-            }
-        )
-
-    primary = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()]
-    secondary = [s.strip() for s in (consultant.secondary_skills or "").split(",") if s.strip()]
-
-    # BUG FIX: this resume_info was built ONLY from primary_skills/
-    # secondary_skills (comma-separated text columns) and ConsultantExperience
-    # table rows — completely separate from consultant.resume_info, the JSON
-    # blob the "My Resumes" flow (resume_router.py) reads from. A consultant
-    # whose real profile data was entered/imported into that JSON blob (e.g.
-    # via the resume JSON import feature) but never duplicated into these
-    # separate structured fields would get an almost entirely empty
-    # resume_info here — no skills, no experience, no education, no
-    # certifications at all (education/certifications weren't sourced from
-    # anywhere in this function, structured or JSON) — which is exactly the
-    # shape of failure that produces a "resume is basically empty" result.
-    # Fall back to the JSON blob for anything the structured fields didn't
-    # provide, so both data sources actually work.
-    profile_json = consultant.resume_info or {}
-    tech_stack_json = profile_json.get("tech_stack") or {}
-
-    if not primary and not secondary:
-        primary = tech_stack_json.get("expert") or profile_json.get("skills") or []
-        secondary = (
-            (tech_stack_json.get("exposure") or [])
-            + (tech_stack_json.get("familiar") or [])
-        )
-
-    if not experience_payload:
-        experience_payload = [
-            {
-                "company": exp.get("company", ""),
-                "role": exp.get("role", ""),
-                "start_date": exp.get("start_date", ""),
-                "end_date": exp.get("end_date", "Present"),
-                "technologies": exp.get("tech_used", []),
-                "bullets": exp.get("bullets", []),
-            }
-            for exp in profile_json.get("experience", [])
-        ]
-
-    resume_info: Dict[str, Any] = {
-        "full_name": consultant.full_name or profile_json.get("full_name", ""),
-        "email": consultant.email or profile_json.get("email", ""),
-        "phone": consultant.phone or profile_json.get("phone", ""),
-        "total_experience_years": float(consultant.total_experience_years)
-        if consultant.total_experience_years is not None
-        else profile_json.get("years_experience"),
-        "work_authorization": consultant.work_authorization or profile_json.get("visa_type", ""),
-        "current_location": consultant.current_location or profile_json.get("location", ""),
-        "linkedin": profile_json.get("linkedin", ""),
-        "github": profile_json.get("github", ""),
-        "tech_stack": {"expert": primary, "familiar": secondary},
-        "base_resume_text": consultant.base_resume_text or "",
-        "experience": experience_payload,
-        "education": profile_json.get("education") or profile_json.get("educational_background") or [],
-        "certifications": profile_json.get("certifications") or [],
-    }
+    resume_info = _build_profile_resume_info(consultant, experiences)
 
     # ── Requirement context (preserves everything the old prompt carried) ──
     jd_context = f"""Role: {requirement.role}
@@ -691,6 +707,22 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
                     add_formatted_paragraph(str(edu), style="List Bullet")
         elif isinstance(education, str):
             add_formatted_paragraph(education)
+
+    # 8.5 CERTIFICATIONS
+    # BUG FIX: resume_data["certifications"] was already being populated
+    # earlier in this pipeline (see the profile_json merge above) and
+    # rendered correctly in the frontend's live preview — but there was
+    # never a section here to actually write it into the generated
+    # DOCX/PDF, so it silently disappeared from the downloaded file even
+    # though it showed up while editing.
+    certifications = resume_data.get("certifications")
+    if certifications:
+        add_section_header("CERTIFICATIONS:")
+        if isinstance(certifications, list):
+            for cert in certifications:
+                add_formatted_paragraph(str(cert), style="List Bullet")
+        else:
+            add_formatted_paragraph(str(certifications))
 
     # 9. NON-TECHNICAL PROFICIENCIES
     non_tech = resume_data.get("non_technical_proficiencies")
@@ -1082,10 +1114,27 @@ async def generate_resume(
         )
 
     # Validate prerequisites
-    if not consultant.base_resume_text and not consultant.primary_skills:
+    # BUG FIX: this only checked base_resume_text/primary_skills — it never
+    # looked at experience or education at all, so a consultant with a
+    # skills list but no experience/education entries sailed through this
+    # check and got an AI call that produced a mostly-empty resume. Build
+    # the same resume_info the AI call itself will use and check all three
+    # required sections (skills, experience, education) up front.
+    exp_result = await db.execute(
+        select(ConsultantExperience)
+        .where(ConsultantExperience.consultant_id == consultant.id)
+        .order_by(ConsultantExperience.sort_order.asc())
+    )
+    experiences_for_check = exp_result.scalars().all()
+    profile_resume_info = _build_profile_resume_info(consultant, experiences_for_check)
+    missing_fields = get_missing_resume_fields(profile_resume_info)
+    if missing_fields:
         raise HTTPException(
             status_code=422,
-            detail="Upload a base resume or add skills before generating a tailored resume.",
+            detail={
+                "message": missing_fields_message(missing_fields),
+                "missing_fields": missing_fields,
+            },
         )
     if not requirement.job_description:
         raise HTTPException(
