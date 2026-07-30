@@ -104,7 +104,21 @@ async def _resolve_target_user(
 ):
     """Resolve which consultant we're generating for, honoring the
     ADMIN/RECRUITER "generate on behalf of" path. Shared by the /generate
-    endpoint and the /completeness pre-check so they never drift apart."""
+    endpoint and the /completeness pre-check so they never drift apart.
+
+    BUG FIX: this never checked that a RECRUITER was actually assigned to
+    the target consultant — any recruiter could pass any user_id in the
+    request/URL and this would happily resolve it. That's how a recruiter
+    could reach the "Generate Resume" page and even get as far as the
+    completeness check for a consultant who then failed to load on the
+    Consultant Detail page ("may not be assigned to you") — two different
+    endpoints enforcing two different rules for the same relationship.
+    _get_resume_for_user() above already has the correct check (a
+    consultant counts as assigned via EITHER the legacy single
+    sales_recruiter_user_id FK OR the RecruiterConsultant join table) —
+    reuse that same rule here so every recruiter-facing endpoint in this
+    file agrees on who's assigned to whom.
+    """
     target_user_id = current_user.id
     target_user = current_user
     if request_user_id and current_user.role in ("ADMIN", "RECRUITER"):
@@ -113,6 +127,23 @@ async def _resolve_target_user(
         target_user = target_user_result.scalar_one_or_none()
         if not target_user:
             raise HTTPException(status_code=404, detail="Target user not found")
+
+        if current_user.role == "RECRUITER":
+            assigned_consultant = await db.execute(
+                select(Consultant.id).where(
+                    Consultant.user_id == target_user_id,
+                    or_(
+                        Consultant.sales_recruiter_user_id == current_user.id,
+                        Consultant.id.in_(
+                            select(RecruiterConsultant.consultant_id).where(
+                                RecruiterConsultant.recruiter_id == current_user.id
+                            )
+                        ),
+                    ),
+                )
+            )
+            if not assigned_consultant.scalar_one_or_none():
+                raise HTTPException(status_code=403, detail="This consultant is not assigned to you.")
 
     if target_user.role != "CONSULTANT":
         raise HTTPException(status_code=403, detail="Resumes can only be generated for consultants.")
