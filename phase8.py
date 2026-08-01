@@ -107,7 +107,6 @@ class ProcessingErrorRowDTO(BaseModel):
     source_id: Optional[str] = None
     error_stage: str
     error_message: str
-    status: str
     occurred_at: str
     resolved_at: Optional[str] = None
 
@@ -493,16 +492,21 @@ async def export_audit_logs_csv(
 async def list_errors(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
-    status: Optional[str] = None,
-    error_stage: Optional[str] = None,
+    date_filter: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
     filters = []
-    if status:
-        filters.append(ProcessingError.status == status)
-    if error_stage:
-        filters.append(ProcessingError.error_stage == error_stage)
+    if date_filter:
+        try:
+            d = date.fromisoformat(date_filter)
+            start_dt = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+            end_dt = start_dt + timedelta(days=1)
+            filters.append(ProcessingError.occurred_at >= start_dt)
+            filters.append(ProcessingError.occurred_at < end_dt)
+        except ValueError:
+            pass
+            
     base_filter = and_(*filters) if filters else True
 
     total = (await db.execute(select(func.count()).select_from(ProcessingError).where(base_filter))).scalar_one()
@@ -514,7 +518,7 @@ async def list_errors(
     data = [
         ProcessingErrorRowDTO(
             id=str(r.id), source_type=r.source_type, source_id=r.source_id,
-            error_stage=r.error_stage, error_message=r.error_message, status=r.status,
+            error_stage=r.error_stage, error_message=r.error_message,
             occurred_at=r.occurred_at.isoformat() if r.occurred_at else "",
             resolved_at=r.resolved_at.isoformat() if r.resolved_at else None,
         )
@@ -525,21 +529,6 @@ async def list_errors(
 
 
 
-
-@router.post("/errors/{error_id}/close")
-async def close_error(
-    error_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(require_admin),
-):
-    result = await db.execute(select(ProcessingError).where(ProcessingError.id == error_id))
-    error = result.scalars().first()
-    if not error:
-        raise HTTPException(status_code=404, detail="Error not found")
-    error.status = "CLOSED"
-    error.resolved_at = datetime.now(timezone.utc)
-    await db.commit()
-    return {"success": True, "message": "Error closed."}
 
 
 # ---------------------------------------------------------------------------
