@@ -196,7 +196,7 @@ async def _email_queue_worker_loop():
     from models import EmailQueue
     from email_queue import process_single_email_queue_item
     from datetime import datetime, timezone
-    from sqlalchemy import or_
+    from sqlalchemy import or_, func
 
     while True:
         try:
