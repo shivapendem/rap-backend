@@ -105,6 +105,8 @@ def clean_requirement_text(text: str) -> str:
     if not text:
         return ""
 
+    text = text.replace("\x00", "").replace("\u0000", "")
+
     # Convert HTML to plain text if needed
     if "<html" in text.lower() or "<body" in text.lower():
         text = html_to_text(text)
@@ -118,4 +120,4 @@ def clean_requirement_text(text: str) -> str:
     text = re.sub(r' {2,}', ' ', text)       # max 1 space
     text = text.strip()
 
-    return text
+    return text.replace("\x00", "").replace("\u0000", "")

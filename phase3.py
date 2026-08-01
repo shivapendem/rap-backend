@@ -482,7 +482,8 @@ def _extract_text_from_docx(file_bytes: bytes) -> str:
                 for cell in row.cells:
                     if cell.text.strip():
                         parts.append(cell.text.strip())
-        return "\n".join(parts)
+        text = "\n".join(parts)
+        return text.replace("\x00", "").replace("\u0000", "")
     except Exception as exc:
         logger.warning("DOCX text extraction failed: %s", exc)
         return ""
@@ -497,18 +498,20 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
                 text = page.extract_text()
                 if text:
                     parts.append(text.strip())
-        return "\n".join(parts)
+        extracted = "\n".join(parts)
+        return extracted.replace("\x00", "").replace("\u0000", "")
     except Exception as exc:
         logger.warning("PDF text extraction failed: %s", exc)
         return ""
 
 
 def _extract_resume_text(file_bytes: bytes, content_type: str) -> str:
+    text = ""
     if "wordprocessingml" in content_type or content_type == "application/docx":
-        return _extract_text_from_docx(file_bytes)
-    if content_type == "application/pdf":
-        return _extract_text_from_pdf(file_bytes)
-    return ""
+        text = _extract_text_from_docx(file_bytes)
+    elif content_type == "application/pdf":
+        text = _extract_text_from_pdf(file_bytes)
+    return text.replace("\x00", "").replace("\u0000", "")
 
 
 def _generate_temp_password(length: int = 12) -> str:

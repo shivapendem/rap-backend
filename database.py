@@ -41,13 +41,43 @@ if use_null_pool:
     engine_kwargs["poolclass"] = NullPool
 elif not DATABASE_URL.startswith("sqlite"):
     engine_kwargs.update({
-        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),        # Reduced from 10 to 5 for lean connection footprint
-        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "5")),   # Reduced from 20 to 5
-        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")), # Recycle idle connections after 5 mins (was 30 mins)
-        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "15")),  # Fail fast if connection queue is full
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "2")),        # Strictly cap connection pool size to 2 per worker process
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "0")),   # 0 overflow allowed — prevents connection limit exhaustion
+        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "60")),  # Recycle idle connections after 60s
+        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "10")),  # Fail fast after 10s if connection queue is full
     })
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
+
+from sqlalchemy import event
+
+def _clean_sql_param(val):
+    if isinstance(val, str):
+        if "\x00" in val or "\u0000" in val:
+            return val.replace("\x00", "").replace("\u0000", "")
+        return val
+    if isinstance(val, dict):
+        return {k: _clean_sql_param(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_clean_sql_param(v) for v in val]
+    return val
+
+@event.listens_for(engine.sync_engine, "before_cursor_execute", retval=True)
+def _sanitize_nul_bytes(conn, cursor, statement, parameters, context, executemany):
+    """
+    Global Engine Safeguard:
+    PostgreSQL UTF-8 strictly forbids NUL (0x00) bytes in VARCHAR/TEXT columns,
+    raising CharacterNotInRepertoireError. This intercepts and strips 0x00 bytes
+    from all parameter strings before they reach asyncpg/PostgreSQL.
+    """
+    if parameters:
+        if isinstance(parameters, tuple):
+            parameters = tuple(_clean_sql_param(p) for p in parameters)
+        elif isinstance(parameters, list):
+            parameters = [_clean_sql_param(p) for p in parameters]
+        elif isinstance(parameters, dict):
+            parameters = {k: _clean_sql_param(v) for k, v in parameters.items()}
+    return statement, parameters
 
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
