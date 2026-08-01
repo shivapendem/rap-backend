@@ -1142,4 +1142,11 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 await session.commit()
             except Exception as inner_e:
                 print(f"[email-queue] completely failed to update item {item_id}: {inner_e}")
+                from error_logger import log_db_error
+                await log_db_error(
+                    stage="email_queue_item_status_commit",
+                    error=inner_e,
+                    source_type="email_queue",
+                    source_id=str(item_id),
+                )
                 await session.rollback()

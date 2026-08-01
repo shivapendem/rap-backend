@@ -1026,6 +1026,13 @@ async def _run_generation_pipeline(
                 s3_pdf_key = None
         except Exception as e:
             logger.error(f"S3 upload failed for generated PDF: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="generated_resume_s3_upload",
+                error=e,
+                source_type="requirement",
+                source_id=str(requirement.id) if requirement else None,
+            )
             s3_pdf_key = None
 
     # ── Step 9: Mark previous versions non-final ─────────────────────────

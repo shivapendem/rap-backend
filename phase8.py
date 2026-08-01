@@ -36,7 +36,6 @@ from models import (
 )
 from phase8_audit_service import log_action, build_metadata_preview
 from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost, get_claude_rate_limits
-from phase8_retry_service import attempt_retry
 from phase8_cache import cache_get, cache_set, check_redis_health
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
@@ -109,7 +108,6 @@ class ProcessingErrorRowDTO(BaseModel):
     error_stage: str
     error_message: str
     status: str
-    retry_count: int
     occurred_at: str
     resolved_at: Optional[str] = None
 
@@ -517,7 +515,6 @@ async def list_errors(
         ProcessingErrorRowDTO(
             id=str(r.id), source_type=r.source_type, source_id=r.source_id,
             error_stage=r.error_stage, error_message=r.error_message, status=r.status,
-            retry_count=r.retry_count or 0,
             occurred_at=r.occurred_at.isoformat() if r.occurred_at else "",
             resolved_at=r.resolved_at.isoformat() if r.resolved_at else None,
         )
@@ -527,25 +524,6 @@ async def list_errors(
                                total_pages=math.ceil(total / page_size) or 1)
 
 
-@router.post("/errors/{error_id}/retry")
-async def retry_error(
-    error_id: int,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(require_admin),
-):
-    result = await db.execute(select(ProcessingError).where(ProcessingError.id == error_id))
-    error = result.scalars().first()
-    if not error:
-        raise HTTPException(status_code=404, detail="Error not found")
-
-    outcome = await attempt_retry(db, error)
-    await log_action(db, "ERROR_RETRY",
-        actor_user_id=current_user.get("sub"), actor_name=current_user.get("sub", ""),
-        actor_role=current_user.get("role", ""), entity_type="ProcessingError", entity_id=str(error_id),
-        metadata=outcome)
-    await db.commit()
-    return outcome
 
 
 @router.post("/errors/{error_id}/close")

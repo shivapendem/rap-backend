@@ -305,6 +305,8 @@ async def generate_resume(
             ats_value = int(round(ats_total))
     except Exception as e:
         print(f"ATS scoring failed, leaving score empty: {e}")
+        from error_logger import log_db_error
+        await log_db_error(stage="ats_scoring", error=e)
         ats_value = None
     new_resume = Resume(
         user_id=target_user_id,
@@ -365,9 +367,18 @@ async def generate_resume(
                 )
         except Exception as docx_exc:
             print(f"DOCX upload failed (PDF result unaffected): {docx_exc}")
+            from error_logger import log_db_error
+            await log_db_error(stage="resume_docx_s3_upload", error=docx_exc)
     except Exception as e:
         new_resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="resume_generate_docx_pdf",
+            error=e,
+            source_type="resume",
+            source_id=str(new_resume.id),
+        )
 
     await db.commit()
     await db.refresh(new_resume)
@@ -428,9 +439,18 @@ async def finalize_resume(
                 )
         except Exception as docx_exc:
             print(f"DOCX upload failed (PDF result unaffected): {docx_exc}")
+            from error_logger import log_db_error
+            await log_db_error(stage="resume_finalize_docx_s3_upload", error=docx_exc)
     except Exception as e:
         resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="resume_finalize_docx_pdf",
+            error=e,
+            source_type="resume",
+            source_id=str(resume.id),
+        )
 
     await db.commit()
     await db.refresh(resume)
@@ -789,6 +809,13 @@ async def update_resume(
             # itself already succeeded and committed above. The next save
             # (or the lazy self-heal in download_resume) will retry.
             print(f"PDF regeneration on save failed for resume {resume.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_pdf_regen_on_save",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
 
     return resume
 
@@ -867,6 +894,13 @@ async def download_resume(
                             await db.refresh(resume)
             except Exception as e:
                 print(f"Lazy PDF regeneration failed for resume {resume.id}: {e}")
+                from error_logger import log_db_error
+                await log_db_error(
+                    stage="resume_lazy_pdf_regen",
+                    error=e,
+                    source_type="resume",
+                    source_id=str(resume.id),
+                )
 
         if not resume.s3_key:
             raise HTTPException(

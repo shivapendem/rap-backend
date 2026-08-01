@@ -698,6 +698,13 @@ async def update_own_profile(
                 await match_consultant(bg_session, cid)
         except Exception as e:
             logger.error("Background auto-match failed for consultant_id=%s: %s", cid, e)
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="background_auto_match",
+                error=e,
+                source_type="consultant",
+                source_id=str(cid),
+            )
     asyncio.create_task(_rematch_in_background(consultant_id))
 
     count_result = await db.execute(

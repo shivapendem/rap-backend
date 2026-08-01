@@ -775,6 +775,8 @@ async def sync_gmail_to_requirements_endpoint(
     try:
         summary = await sync_pending_emails(db)
     except Exception as e:
+        from error_logger import log_db_error
+        await log_db_error(stage="gmail_sync_manual_trigger", error=e)
         raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
 
     return {

@@ -93,6 +93,13 @@ async def run_matching_for_requirement(
         cosine_sim = cosine_similarity(req_vector, cons_matrix)[0]
     except Exception as e:
         print(f"[JobMatch] TF-IDF matching failed for requirement_id={requirement.id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="matching_tfidf_per_requirement",
+            error=e,
+            source_type="requirement",
+            source_id=str(requirement.id),
+        )
         return 0
 
     new_matches = 0
@@ -180,6 +187,11 @@ async def run_matching_engine(
 
         except Exception as e:
             print(f"[JobMatch] TF-IDF batch vectorization failed: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="matching_tfidf_batch",
+                error=e,
+            )
 
     await db.commit()
     return {"success": True, "new_matches": new_matches}
