@@ -586,3 +586,92 @@ FROM job_matches jm
 JOIN requirements r ON jm.requirement_id = r.id
 JOIN consultants c ON jm.consultant_id = c.id;
 
+-- ---------------------------------------------------------------------------
+-- Performance Optimization Views & Indexes
+-- Added for reporting, email queue, application tracking, and fast query execution
+-- ---------------------------------------------------------------------------
+
+-- 1. Database View for System & User Reporting Stats
+CREATE OR REPLACE VIEW v_user_reporting_stats AS
+SELECT 
+    u.id AS user_id,
+    u.full_name AS user_name,
+    u.role AS user_role,
+    COALESCE(app_counts.applications_sent, 0) AS applications_sent,
+    COALESCE(eq_counts.emails_sent, 0) AS emails_sent
+FROM users u
+LEFT JOIN (
+    SELECT recruiter_id, COUNT(*) AS applications_sent
+    FROM applications
+    WHERE status = 'SENT' AND recruiter_id IS NOT NULL
+    GROUP BY recruiter_id
+) app_counts ON u.id = app_counts.recruiter_id
+LEFT JOIN (
+    SELECT sent_by_user_id, COUNT(*) AS emails_sent
+    FROM email_queue
+    WHERE status = 'SENT' AND sent_by_user_id IS NOT NULL
+    GROUP BY sent_by_user_id
+) eq_counts ON u.id = eq_counts.sent_by_user_id;
+
+-- 2. Database View for Pre-Joined Outgoing Email Queue
+CREATE OR REPLACE VIEW v_email_queue_details AS
+SELECT 
+    eq.id AS id,
+    eq.consultant_id AS consultant_id,
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    eq.requirement_id AS requirement_id,
+    r.role AS requirement_title,
+    r.client AS requirement_client,
+    r.vendor AS requirement_vendor,
+    eq.from_email AS from_email,
+    eq.to_email AS to_email,
+    eq.cc_email AS cc_email,
+    eq.subject AS subject,
+    eq.content AS content,
+    eq.attachments AS attachments,
+    eq.status AS status,
+    eq.status_text AS status_text,
+    eq.sent_by_user_id AS sent_by_user_id,
+    eq.created_at AS created_at,
+    eq.updated_at AS updated_at
+FROM email_queue eq
+LEFT JOIN consultants c ON eq.consultant_id = c.id
+LEFT JOIN requirements r ON eq.requirement_id = r.id;
+
+-- 3. Database View for Pre-Joined Application Tracker
+CREATE OR REPLACE VIEW v_application_tracker_details AS
+SELECT 
+    a.id AS id,
+    a.consultant_id AS consultant_id,
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    a.requirement_id AS requirement_id,
+    r.role AS requirement_title,
+    COALESCE(r.client, r.vendor) AS company_name,
+    a.recruiter_id AS recruiter_id,
+    u.full_name AS recruiter_name,
+    a.status AS status,
+    a.vendor_email AS vendor_email,
+    a.cc_email AS cc_email,
+    a.email_subject AS email_subject,
+    a.sent_at AS sent_at,
+    a.created_at AS created_at
+FROM applications a
+JOIN consultants c ON a.consultant_id = c.id
+JOIN requirements r ON a.requirement_id = r.id
+LEFT JOIN users u ON a.recruiter_id = u.id;
+
+-- 4. Composite Performance Indexes
+CREATE INDEX IF NOT EXISTS ix_applications_status_sent_at ON applications (status, sent_at DESC);
+CREATE INDEX IF NOT EXISTS ix_applications_recruiter_status ON applications (recruiter_id, status);
+CREATE INDEX IF NOT EXISTS ix_applications_consultant_status ON applications (consultant_id, status);
+CREATE INDEX IF NOT EXISTS ix_email_queue_status_created ON email_queue (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_email_queue_sent_by_user ON email_queue (sent_by_user_id, status);
+CREATE INDEX IF NOT EXISTS ix_email_queue_consultant_status ON email_queue (consultant_id, status);
+CREATE INDEX IF NOT EXISTS ix_emails_parse_status_received ON emails (parse_status, received_at DESC);
+CREATE INDEX IF NOT EXISTS ix_requirements_status_received ON requirements (status, received_date DESC);
+CREATE INDEX IF NOT EXISTS ix_consultants_status_updated ON consultants (status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS ix_users_role_active ON users (role, is_active);
+
+

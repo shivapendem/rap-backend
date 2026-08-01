@@ -196,7 +196,8 @@ async def get_pending_matches(
     Optimized to perform a single high-performance SQL JOIN query across JobMatch,
     Requirement, and Consultant tables.
     """
-    target_status = status.upper() if status else "PENDING"
+    valid_statuses = {"PENDING", "APPLIED", "REJECTED"}
+    target_status = status.upper().strip() if status and status.upper().strip() in valid_statuses else "PENDING"
 
     stmt = (
         select(
@@ -218,7 +219,7 @@ async def get_pending_matches(
     )
 
     if consultant_id:
-        c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()]
+        c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
         if c_ids:
             stmt = stmt.where(JobMatch.consultant_id.in_(c_ids))
 
@@ -238,6 +239,16 @@ async def get_pending_matches(
     result = await db.execute(stmt)
     rows = result.mappings().all()
 
+    import math
+    def _safe_float(val):
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            return f if not (math.isnan(f) or math.isinf(f)) else None
+        except (ValueError, TypeError):
+            return None
+
     output = [
         {
             "id": row["id"],
@@ -247,7 +258,7 @@ async def get_pending_matches(
             "consultant_id": row["consultant_id"],
             "consultant_name": row["consultant_name"],
             "consultant_email": row["consultant_email"],
-            "match_score": float(row["match_score"]) if row["match_score"] is not None else None,
+            "match_score": _safe_float(row["match_score"]),
             "match_reasoning": row["match_reasoning"],
             "status": row["status"],
             "created_at": row["created_at"],

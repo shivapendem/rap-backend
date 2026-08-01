@@ -42,6 +42,24 @@ class EmailQueueCreateRequest(BaseModel):
             return None
         return v
 
+    @field_validator('from_email', 'to_email', mode='before')
+    @classmethod
+    def validate_email_format(cls, v: str, info) -> str:
+        import re
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{info.field_name} is required and cannot be empty.")
+        clean_v = v.strip().lower()
+        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", clean_v):
+            raise ValueError(f"Invalid email address for {info.field_name}: '{v}'")
+        return clean_v
+
+    @field_validator('subject', mode='before')
+    @classmethod
+    def validate_subject(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("Subject cannot be empty.")
+        return v.strip()
+
 
 class EmailQueueStatusUpdate(BaseModel):
     status: str
