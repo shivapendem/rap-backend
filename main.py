@@ -254,6 +254,13 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Dispose database engine and close all connection pool sockets on shutdown
+    try:
+        await engine.dispose()
+        print("[db] Connection pool engine disposed cleanly.")
+    except Exception as dispose_err:
+        print(f"[db] Engine dispose error: {dispose_err}")
+
 
 # ---------------------------------------------------------------------------
 # App setup
