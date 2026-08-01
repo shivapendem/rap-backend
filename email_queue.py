@@ -69,6 +69,94 @@ class EmailQueueStatusUpdate(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+ANTI_SPAM_DELAY_MINUTES = 5
+
+
+async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> datetime:
+    """
+    Calculates the next available scheduled_at timestamp for a given from_email.
+    Enforces a mandatory 5-minute anti-spam delay between consecutive emails sent from the same sender email.
+    Checks both EmailQueue and Application tables for any recent sends/schedules.
+    If no prior email was scheduled/sent for this from_email in the last 5 minutes, returns current UTC time.
+    Otherwise, returns max_previous_time + 5 minutes.
+    """
+    from datetime import datetime, timezone, timedelta
+    from models import EmailQueue, Application, Consultant
+
+    now_utc = datetime.now(timezone.utc)
+    norm_from = from_email.strip().lower()
+
+    # 1. Check max scheduled_at or created_at in EmailQueue for this sender
+    stmt_eq = (
+        select(func.max(func.coalesce(EmailQueue.scheduled_at, EmailQueue.created_at)))
+        .where(
+            func.lower(EmailQueue.from_email) == norm_from,
+            EmailQueue.status.in_(["QUEUED", "SENT"])
+        )
+    )
+    res_eq = await db.execute(stmt_eq)
+    last_eq_time = res_eq.scalar()
+
+    # 2. Check max sent_at or created_at in Application table for this sender
+    stmt_app = (
+        select(func.max(func.coalesce(Application.sent_at, Application.created_at)))
+        .join(Consultant, Consultant.id == Application.consultant_id)
+        .where(
+            func.lower(Consultant.email) == norm_from,
+            Application.status == "SENT"
+        )
+    )
+    res_app = await db.execute(stmt_app)
+    last_app_time = res_app.scalar()
+
+    times = [t for t in (last_eq_time, last_app_time) if t is not None]
+    if times:
+        last_time = max(times)
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=timezone.utc)
+        min_next_time = last_time + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+        if min_next_time > now_utc:
+            return min_next_time
+    return now_utc
+
+
+async def reschedule_remaining_queued_emails(db: AsyncSession, from_email: str, actual_sent_at: datetime) -> None:
+    """
+    Defense-in-depth: Called after an email for from_email is sent.
+    Pushes any remaining QUEUED emails for the same from_email to ensure they are at least
+    5 minutes after actual_sent_at and spaced 5 minutes apart.
+    """
+    from datetime import datetime, timezone, timedelta
+    from models import EmailQueue
+
+    norm_from = from_email.strip().lower()
+    if actual_sent_at.tzinfo is None:
+        actual_sent_at = actual_sent_at.replace(tzinfo=timezone.utc)
+
+    stmt = (
+        select(EmailQueue)
+        .where(
+            func.lower(EmailQueue.from_email) == norm_from,
+            EmailQueue.status == "QUEUED"
+        )
+        .order_by(func.coalesce(EmailQueue.scheduled_at, EmailQueue.created_at).asc(), EmailQueue.id.asc())
+    )
+    res = await db.execute(stmt)
+    remaining_items = res.scalars().all()
+
+    current_slot = actual_sent_at + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+    for item in remaining_items:
+        item_sched = item.scheduled_at or item.created_at
+        if item_sched and item_sched.tzinfo is None:
+            item_sched = item_sched.replace(tzinfo=timezone.utc)
+
+        if not item_sched or item_sched < current_slot:
+            item.scheduled_at = current_slot
+            current_slot += timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+        else:
+            current_slot = item_sched + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+
+
 async def _assert_email_queue_access(db: AsyncSession, current_user: User, item) -> None:
     """
     BUG FIX: get/update-status/delete on a single email-queue item had NO
@@ -175,6 +263,8 @@ async def create_email_queue(
     else:
         final_cc = current_user.email
 
+    scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
@@ -186,6 +276,7 @@ async def create_email_queue(
         attachments=body.attachments,
         status="QUEUED",
         sent_by_user_id=current_user.id,
+        scheduled_at=scheduled_at,
     )
     db.add(item)
     # BUG FIX: the Apply button on the dashboard and "My Applications" both
@@ -233,6 +324,7 @@ async def create_email_queue(
         "success": True,
         "id": str(item.id),
         "status": item.status,
+        "scheduled_at": item.scheduled_at.isoformat() if item.scheduled_at else None,
     }
 
 
@@ -346,6 +438,7 @@ async def list_email_queue(
                 "requirement_id": str(item.requirement_id) if item.requirement_id else None,
                 "from_email": item.from_email,
                 "to_email": item.to_email,
+                "cc_email": item.cc_email,
                 "subject": item.subject,
                 "content": item.content,
                 "attachments": item.attachments,
@@ -353,6 +446,7 @@ async def list_email_queue(
                 "status_message": item.status_text,
                 "sent_by_name": sender.full_name if sender else None,
                 "sent_by_role": sender.role if sender else None,
+                "scheduled_at": item.scheduled_at.isoformat() if item.scheduled_at else None,
                 "created_at": item.created_at.isoformat() if item.created_at else None,
                 "updated_at": item.updated_at.isoformat() if item.updated_at else None,
             }
@@ -459,6 +553,10 @@ async def send_email_now(
     else:
         final_cc = current_user.email
 
+    from datetime import datetime, timezone
+    scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
+    now_utc = datetime.now(timezone.utc)
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
@@ -470,28 +568,63 @@ async def send_email_now(
         attachments=body.attachments,
         status="QUEUED",
         sent_by_user_id=current_user.id,
+        scheduled_at=scheduled_at,
     )
     db.add(item)
+
+    if body.requirement_id:
+        from models import Application, RequirementConsultantMatch
+        existing_app_result = await db.execute(
+            select(Application).where(
+                Application.consultant_id == consultant_id,
+                Application.requirement_id == body.requirement_id,
+            )
+        )
+        existing_app = existing_app_result.scalars().first()
+        if existing_app:
+            existing_app.status = "PENDING"
+            existing_app.vendor_email = body.to_email
+            existing_app.cc_email = final_cc
+            existing_app.email_subject = body.subject
+        else:
+            db.add(Application(
+                consultant_id=consultant_id,
+                requirement_id=body.requirement_id,
+                status="PENDING",
+                vendor_email=body.to_email,
+                cc_email=final_cc,
+                email_subject=body.subject,
+            ))
+        match_result = await db.execute(
+            select(RequirementConsultantMatch).where(
+                RequirementConsultantMatch.requirement_id == body.requirement_id,
+                RequirementConsultantMatch.consultant_id == consultant_id,
+            )
+        )
+        match = match_result.scalars().first()
+        if match:
+            match.status = "APPLIED"
+
     await db.commit()
     await db.refresh(item)
 
-    await process_single_email_queue_item(db, item)
-    await db.refresh(item)
+    if scheduled_at <= now_utc:
+        await process_single_email_queue_item(db, item)
+        await db.refresh(item)
 
-    if item.status == "SENT":
-        # BUG FIX: leaving this row in email_queue meant every
-        # Apply-to-Requirement send also showed up as a duplicate row on
-        # the Email Queue page -- confusing, since it's already tracked
-        # properly in Applications now. Only send-now (this endpoint, the
-        # Apply flow) deletes its row; genuine Compose-page queue items
-        # (create_email_queue, processed later by the background worker)
-        # are untouched and still show in Email Queue as before.
-        result_id = str(item.id)
-        result_status = item.status
-        await db.delete(item)
-        await db.commit()
-        return {"success": True, "id": result_id, "status": result_status}
-    raise HTTPException(status_code=502, detail=item.status_text or "Failed to send email.")
+        if item.status == "SENT":
+            result_id = str(item.id)
+            result_status = item.status
+            return {"success": True, "id": result_id, "status": result_status}
+        raise HTTPException(status_code=502, detail=item.status_text or "Failed to send email.")
+    else:
+        return {
+            "success": True,
+            "id": str(item.id),
+            "status": "QUEUED",
+            "scheduled_at": item.scheduled_at.isoformat(),
+            "message": "Email queued with 5-minute anti-spam delay."
+        }
 
 @router.post("/api/consultant/email-queue/upload-attachment")
 async def upload_attachment(
@@ -715,6 +848,16 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
     from datetime import datetime, timezone, timedelta
 
     try:
+        # SCHEDULE TIME GUARD: ensure email is only triggered when scheduled_at <= now()
+        now_check = datetime.now(timezone.utc)
+        item_sched = item.scheduled_at
+        if item_sched:
+            if item_sched.tzinfo is None:
+                item_sched = item_sched.replace(tzinfo=timezone.utc)
+            if item_sched > now_check:
+                print(f"[email-queue] item {item.id} skipped: scheduled_at ({item_sched.isoformat()}) is in the future")
+                return
+
         import re
         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
             print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
@@ -962,6 +1105,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 if requirement and requirement.status == "NEW":
                     requirement.status = "SUBMITTED"
 
+            await reschedule_remaining_queued_emails(session, item.from_email, now)
             await session.commit()
         finally:
             for p in tmp_cleanup_paths:

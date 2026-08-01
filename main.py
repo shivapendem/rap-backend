@@ -181,12 +181,12 @@ async def _gmail_to_requirements_loop():
         await asyncio.sleep(GMAIL_SYNC_INTERVAL_SECONDS)
 
 
-EMAIL_QUEUE_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_QUEUE_SYNC_INTERVAL_SECONDS", "60"))
+EMAIL_QUEUE_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_QUEUE_SYNC_INTERVAL_SECONDS", "15"))
 
 async def _email_queue_worker_loop():
     """
-    Background loop: periodically checks EmailQueue for QUEUED items and sends them
-    via consultant's Gmail API token.
+    Background loop: periodically checks EmailQueue for QUEUED items whose scheduled_at <= now()
+    and sends them via consultant's Gmail API token.
 
     Per-item send/attachment/Application-upsert logic lives in
     email_queue.process_single_email_queue_item — shared with the
@@ -195,15 +195,27 @@ async def _email_queue_worker_loop():
     """
     from models import EmailQueue
     from email_queue import process_single_email_queue_item
+    from datetime import datetime, timezone
+    from sqlalchemy import or_
+
     while True:
         try:
             async with AsyncSessionLocal() as session:
+                now_utc = datetime.now(timezone.utc)
                 result = await session.execute(
-                    select(EmailQueue).where(EmailQueue.status == "QUEUED")
+                    select(EmailQueue)
+                    .where(
+                        EmailQueue.status == "QUEUED",
+                        or_(EmailQueue.scheduled_at == None, EmailQueue.scheduled_at <= now_utc)
+                    )
+                    .order_by(
+                        func.coalesce(EmailQueue.scheduled_at, EmailQueue.created_at).asc(),
+                        EmailQueue.id.asc()
+                    )
                 )
                 queued_items = result.scalars().all()
                 if queued_items:
-                    print(f"[email-queue] processing {len(queued_items)} items")
+                    print(f"[email-queue] processing {len(queued_items)} eligible items")
                 for item in queued_items:
                     await process_single_email_queue_item(session, item)
         except Exception as e:

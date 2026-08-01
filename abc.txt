@@ -674,4 +674,6 @@ CREATE INDEX IF NOT EXISTS ix_requirements_status_received ON requirements (stat
 CREATE INDEX IF NOT EXISTS ix_consultants_status_updated ON consultants (status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS ix_users_role_active ON users (role, is_active);
 
-
+-- 5. Anti-Spam Email Queue Scheduled Dispatch Column & Index
+ALTER TABLE public.email_queue ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+CREATE INDEX IF NOT EXISTS ix_email_queue_from_email_scheduled ON public.email_queue (from_email, scheduled_at DESC);

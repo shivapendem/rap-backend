@@ -660,6 +660,7 @@ class EmailQueue(Base):
     # Until that's applied, any insert/query touching email_queue will
     # fail with "column email_queue.sent_by_user_id does not exist".
     sent_by_user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    scheduled_at = Column(TIMESTAMP(timezone=True), nullable=True, server_default=func.now(), index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     VALID_STATUSES = {"QUEUED", "SENT", "FAILED"}
