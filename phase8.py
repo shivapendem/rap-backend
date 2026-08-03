@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, text
+from sqlalchemy import select, func, and_, or_, text
 from sqlalchemy.future import select as fselect
 
 from database import get_db
@@ -361,11 +361,22 @@ async def list_applications(
     consultant_id: Optional[str] = None,
     requirement_id: Optional[str] = None,
     status: Optional[str] = None,
+    search: Optional[str] = None,
     sort_dir: str = Query("desc"),
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ) -> PaginatedApplicationsDTO:
     """Return paginated applications with optional filters."""
+    # BUG FIX: `search` was accepted by nothing here — the frontend's
+    # "Search by name, role, vendor, client…" box on the Applications
+    # Tracker silently did nothing for admins (it was never even forwarded
+    # by the frontend, and this endpoint had no such param to begin with).
+    # The sibling /api/recruiter/applications endpoint already implements
+    # this search correctly (see phase5.py get_recruiter_applications) —
+    # mirrored that same ilike-across-joined-fields approach here so both
+    # views behave the same way.
+    needs_search_join = bool(search and search.strip())
+
     filters = []
     if consultant_id:
         try:
@@ -381,15 +392,42 @@ async def list_applications(
             pass
     if status:
         filters.append(Application.status == status)
+    if needs_search_join:
+        term = f"%{search.strip()}%"
+        filters.append(
+            or_(
+                Consultant.full_name.ilike(term),
+                Requirement.role.ilike(term),
+                Requirement.vendor.ilike(term),
+                Requirement.client.ilike(term),
+            )
+        )
     base_filter = and_(*filters) if filters else True
 
-    total = (await db.execute(select(func.count()).select_from(Application).where(base_filter))).scalar_one()
+    count_q = select(func.count()).select_from(Application).where(base_filter)
+    if needs_search_join:
+        # The search filter above references Consultant/Requirement columns,
+        # so the count query needs the same joins as the main query below —
+        # otherwise this raises (or silently miscounts) once `search` is set.
+        count_q = (
+            select(func.count(Application.id))
+            .select_from(Application)
+            .join(Requirement, Requirement.id == Application.requirement_id)
+            .join(Consultant, Consultant.id == Application.consultant_id)
+            .where(base_filter)
+        )
+    total = (await db.execute(count_q)).scalar_one()
 
-    q = select(Application, Requirement, Consultant, User) \
-        .outerjoin(Requirement, Requirement.id == Application.requirement_id) \
-        .outerjoin(Consultant, Consultant.id == Application.consultant_id) \
-        .outerjoin(User, User.id == Application.recruiter_id) \
-        .where(base_filter)
+    q = select(Application, Requirement, Consultant, User)
+    if needs_search_join:
+        q = q.join(Requirement, Requirement.id == Application.requirement_id) \
+             .join(Consultant, Consultant.id == Application.consultant_id) \
+             .outerjoin(User, User.id == Application.recruiter_id)
+    else:
+        q = q.outerjoin(Requirement, Requirement.id == Application.requirement_id) \
+             .outerjoin(Consultant, Consultant.id == Application.consultant_id) \
+             .outerjoin(User, User.id == Application.recruiter_id)
+    q = q.where(base_filter)
 
     order = Application.created_at.desc() if sort_dir == "desc" else Application.created_at.asc()
 

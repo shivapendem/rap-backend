@@ -465,12 +465,20 @@ async def upload_resume(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    # FEATURE CHANGE: only .docx is accepted now, no PDF or anything
+    # else — client-side dropzone restrictions can be bypassed by
+    # anyone crafting the request directly, so this server-side check
+    # is what actually enforces it.
+    if not file.filename.lower().endswith('.docx'):
+        raise HTTPException(status_code=400, detail="Only .docx (Word) files are supported.")
 
-    s3_key = f"users/{current_user.id}/resumes/{uuid.uuid4()}/final.pdf"
+    s3_key = f"users/{current_user.id}/resumes/{uuid.uuid4()}/final.docx"
 
-    success = upload_file_to_s3(file.file, s3_key, content_type="application/pdf")
+    success = upload_file_to_s3(
+        file.file,
+        s3_key,
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
 

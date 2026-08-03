@@ -428,9 +428,12 @@ async def confirm_send(
         else:
             from gmail_send_service import get_service_account_access_token
             import os
+            import asyncio
             sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
             from_email = consultant.email
-            access_token = get_service_account_access_token(sa_path, from_email)
+            # Run the blocking JWT-signing/HTTP call off the event loop so
+            # this async route doesn't stall other requests while it waits.
+            access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, from_email)
 
         # BUG FIX: was querying the `Resume` table (self-service consultant
         # resume builder) by generated_resume_id — but Application.generated_resume_id's
@@ -678,7 +681,7 @@ async def get_application_email_preview(
     """
     import mimetypes
     from s3_service import get_s3_file_metadata
-    from email_queue import EMAIL_ATTACHMENT_S3_PREFIX
+    from email_queue import EMAIL_ATTACHMENT_S3_PREFIX, original_filename_from_ref
 
     result = await db.execute(select(Application).where(Application.id == application_id))
     app = result.scalars().first()
@@ -714,7 +717,8 @@ async def get_application_email_preview(
             size_bytes = os.path.getsize(local_path)
             content_type = mimetypes.guess_type(local_path)[0]
         attachments.append({
-            "filename": ref,
+            "filename": original_filename_from_ref(ref),
+            "ref": ref,
             "mimeType": content_type or mimetypes.guess_type(ref)[0] or "application/octet-stream",
             "sizeBytes": size_bytes or 0,
         })
@@ -781,19 +785,18 @@ async def download_application_resume(
     elif current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Insufficient permissions.")
 
-    body_bytes = None
     filename = f"Resume_{application_id}.pdf"
+    local_path = None
+    s3_key = None
 
     if app.generated_resume_id:
         resume_result = await db.execute(select(GeneratedResume).where(GeneratedResume.id == app.generated_resume_id))
         resume = resume_result.scalars().first()
         if resume and resume.pdf_path:
             if Path(resume.pdf_path).exists():
-                with open(resume.pdf_path, "rb") as f:
-                    body_bytes = f.read()
+                local_path = resume.pdf_path
             else:
-                from s3_service import download_file_from_s3
-                body_bytes, _ = download_file_from_s3(resume.pdf_path)
+                s3_key = resume.pdf_path
             filename = resume.filename or filename
 
     # BUG FIX: applications sent via the email-queue/Apply-to-Requirement
@@ -801,26 +804,21 @@ async def download_application_resume(
     # referenced as a raw path/S3 key on the EmailQueue item, now mirrored
     # onto Application.resume_attachment_path. Same S3-key-vs-local-path
     # resolution the send pipeline itself uses (email_queue.py).
-    if body_bytes is None and app.resume_attachment_path:
+    if local_path is None and s3_key is None and app.resume_attachment_path:
         ref = app.resume_attachment_path
         from email_queue import EMAIL_ATTACHMENT_S3_PREFIX
         import os as _os
         local_candidate = _os.path.join("/tmp/email_attachments", ref)
         if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
-            from s3_service import download_file_from_s3
-            body_bytes, _ = download_file_from_s3(ref)
-            if body_bytes is None and _os.path.exists(local_candidate):
-                with open(local_candidate, "rb") as f:
-                    body_bytes = f.read()
+            s3_key = ref
         elif _os.path.exists(local_candidate):
-            with open(local_candidate, "rb") as f:
-                body_bytes = f.read()
+            local_path = local_candidate
         elif Path(ref).exists():
-            with open(ref, "rb") as f:
-                body_bytes = f.read()
-        filename = _os.path.basename(ref) or filename
+            local_path = ref
+        from email_queue import original_filename_from_ref
+        filename = original_filename_from_ref(ref) or filename
 
-    if not body_bytes:
+    if local_path is None and s3_key is None:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
 
     # BUG FIX: media_type was hardcoded to application/pdf regardless of
@@ -831,8 +829,41 @@ async def download_application_resume(
     guessed_type, _ = mimetypes.guess_type(filename)
     media_type = guessed_type or "application/octet-stream"
 
+    # BUG FIX ("view keeps downloading"): a browser can only render a PDF
+    # or image inline on its own — for a .docx (or any other Office
+    # format), there is no in-browser renderer, so simply avoiding the
+    # `attachment` Content-Disposition (see below) is NOT enough; the
+    # browser still has nothing to show and falls back to a download
+    # prompt regardless of headers. The actual fix for those formats is
+    # routing them through an external document viewer (Google Docs
+    # Viewer / Office Online), which needs a real reachable URL, not
+    # proxied bytes — so when the file lives in Spaces, prefer returning
+    # a presigned URL (JSON) instead of streaming bytes, and let the
+    # frontend decide (open the URL directly for pdf/image, or wrap it
+    # in a viewer for everything else — see toViewableUrl in
+    # applications.api.ts). Local (non-S3) files have no public URL to
+    # hand a viewer service, so those still fall back to proxied bytes
+    # below — a real, unavoidable limitation for that case, not a bug.
+    if s3_key:
+        from s3_service import generate_presigned_url
+        presigned = generate_presigned_url(s3_key)
+        if presigned:
+            return {"url": presigned, "filename": filename, "mimeType": media_type}
+        from s3_service import download_file_from_s3
+        body_bytes, _ = download_file_from_s3(s3_key)
+    else:
+        with open(local_path, "rb") as f:
+            body_bytes = f.read()
+
+    if not body_bytes:
+        raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
+
     return Response(
         content=body_bytes,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # BUG FIX: was "attachment", which forces a browser save-dialog no
+        # matter what the frontend does with the response. "inline" at
+        # least lets natively-renderable types (pdf/image) open as a
+        # plain viewer tab instead of always triggering a download.
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )

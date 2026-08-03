@@ -646,8 +646,8 @@ async def upload_attachment(
     survives restarts) and the returned reference points there; the
     /tmp copy is kept only as a same-process fast path.
     """
-    ext = os.path.splitext(file.filename)[1]
-    unique_name = f"{uuid.uuid4()}{ext}"
+    safe_original = sanitize_attachment_filename(file.filename)
+    unique_name = f"{uuid.uuid4()}__{safe_original}"
     file_path = os.path.join(UPLOAD_DIR, unique_name)
     contents = await file.read()
     with open(file_path, "wb") as f:
@@ -818,6 +818,39 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # Spaces key" apart from a bare local filename (legacy queue rows saved
 # before this fix still have a plain filename with no prefix).
 EMAIL_ATTACHMENT_S3_PREFIX = "email-queue-attachments/"
+
+# BUG FIX: attachment refs were stored as bare "<uuid><ext>" with the
+# person's original filename discarded entirely at upload time (see
+# upload_attachment below) — nothing anywhere recorded it, so every screen
+# that later displays or downloads the attachment (Email Preview modal,
+# resume-download endpoint) had no choice but to show the meaningless
+# UUID/S3-key as the "filename". New uploads now embed the sanitized
+# original name in the stored key itself ("<uuid>__<original-name>"), and
+# original_filename_from_ref() strips the UUID prefix back off for display.
+# Refs uploaded before this change has no original name recorded anywhere
+# and will still show as their raw basename — that's unrecoverable without
+# re-uploading, but everything sent from here on will show correctly.
+import re as _re
+
+_ATTACHMENT_UUID_PREFIX_RE = _re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}__'
+)
+
+
+def sanitize_attachment_filename(name: str) -> str:
+    """Strip path components and characters unsafe in an S3 key / HTTP
+    Content-Disposition header, while keeping the name human-readable."""
+    name = os.path.basename(name or "").strip()
+    name = _re.sub(r'[\\/:*?"<>|\r\n]', "_", name)
+    return name[:150] or "attachment"
+
+
+def original_filename_from_ref(ref: str) -> str:
+    """Recover the human-readable filename from a stored attachment
+    reference. See note above — only works for refs uploaded after this
+    fix; older ones fall back to their raw basename, same as before."""
+    base = os.path.basename(ref or "")
+    return _ATTACHMENT_UUID_PREFIX_RE.sub("", base) or base
 
 # TESTING GUARD: while we validate the email queue pipeline, only allow sends
 # to this domain. Remove/relax this check once testing is complete and real

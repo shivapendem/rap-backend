@@ -20,6 +20,8 @@ def build_mime_message(
     subject: str,
     body: str,
     attachment_paths: Optional[List[str]] = None,
+    attachment_names: Optional[dict] = None,  # maps       	path -> original display filename
+
 ) -> str:
     """
     Build MIME email message with optional attachments (one or many).
@@ -43,6 +45,7 @@ def build_mime_message(
 
     msg.attach(MIMEText(body, "plain"))
 
+    attachment_names = attachment_names or {}
     for attachment_path in paths:
         if not os.path.exists(attachment_path):
             continue
@@ -50,7 +53,7 @@ def build_mime_message(
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
             encoders.encode_base64(part)
-            filename = os.path.basename(attachment_path)
+            filename = attachment_names.get(attachment_path) or os.path.basename(attachment_path)
             part.add_header(
                 "Content-Disposition",
                 f"attachment; filename={filename}",
@@ -69,6 +72,7 @@ def send_via_gmail_api(
     subject: str,
     body: str,
     attachment_paths: Optional[List[str]] = None,
+    attachment_names: Optional[dict] = None,
 ) -> dict:
     """
     Send email via Gmail API using consultant's OAuth access token.
@@ -86,6 +90,7 @@ def send_via_gmail_api(
             subject=subject,
             body=body,
             attachment_paths=attachment_paths,
+            attachment_names=attachment_names,
         )
 
         response = httpx.post(

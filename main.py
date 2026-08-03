@@ -119,6 +119,12 @@ class RequirementResponse(BaseModel):
     # left empty for CONSULTANT (not relevant/exposed on this shared
     # admin-style endpoint for that role).
     matched_consultants: List[str] = []
+    # Names of matched consultants who ALSO have a real SENT application
+    # for this requirement — the frontend highlights these within
+    # matched_consultants. Previously never populated by this endpoint at
+    # all (the frontend read row.submitted_consultants, but nothing here
+    # ever set it), so the highlighting never actually triggered.
+    submitted_consultants: List[str] = []
     # Whether THIS caller (when a CONSULTANT) already has a SENT
     # application for this requirement. Always False for RECRUITER/ADMIN
     # on this shared endpoint — "did I personally apply" only makes sense
@@ -576,6 +582,10 @@ async def get_requirements(
     matched_days: int = 7,
     confidence_filter: Optional[str] = None,
     employment_type: Optional[str] = None,
+    # BUG FIX: Requirements page had no way to filter by matched
+    # consultant at all — mirrors the same comma-separated-ids pattern
+    # already used by /api/matching/pending and the Applications Tracker.
+    consultant_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -631,6 +641,18 @@ async def get_requirements(
                 # No consultant profile at all — no matches are possible.
                 matched_subq = matched_subq.where(False)
         query = query.where(Requirement.id.in_(matched_subq))
+
+    filter_consultant_ids: list[int] = []
+    if consultant_id:
+        try:
+            filter_consultant_ids = [int(x.strip()) for x in consultant_id.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid consultant_id format")
+        if filter_consultant_ids:
+            matched_consultant_subq = select(RequirementConsultantMatch.requirement_id).where(
+                RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids)
+            )
+            query = query.where(Requirement.id.in_(matched_consultant_subq))
 
     # BUG FIX: the FilterBar (admin Requirements page) has always sent
     # confidence_filter and employment_type as real query params, but this
@@ -725,12 +747,45 @@ async def get_requirements(
             assigned_ids = [row[0] for row in assigned_result.all()]
             matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
 
+        # BUG FIX: when the caller filtered by specific consultant(s) via
+        # ?consultant_id=, the Matched Consultants column still showed
+        # EVERY consultant matched to the requirement, not just the
+        # one(s) actually selected in the filter — confusing when you
+        # picked one name and the row still listed a dozen others. Scope
+        # the displayed names to the filter too, same as the requirements
+        # list itself already is.
+        if filter_consultant_ids:
+            matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids))
+
         matches_by_req: dict[int, list[str]] = {}
         for req_id, name in (await db.execute(matches_q)).all():
             matches_by_req.setdefault(req_id, []).append(name)
 
         for r in reqs:
             r.matched_consultants = matches_by_req.get(r.id, [])
+
+        # Which of those matched consultants already have a real SENT
+        # application for this requirement — powers the "highlight
+        # applied consultants" treatment in the Matched Consultants column.
+        submitted_q = (
+            select(Application.requirement_id, Consultant.full_name)
+            .join(Consultant, Consultant.id == Application.consultant_id)
+            .where(
+                Application.requirement_id.in_(req_ids),
+                Application.status == "SENT",
+            )
+        )
+        if current_user.role == "RECRUITER":
+            submitted_q = submitted_q.where(Application.consultant_id.in_(assigned_ids))
+        if filter_consultant_ids:
+            submitted_q = submitted_q.where(Application.consultant_id.in_(filter_consultant_ids))
+
+        submitted_by_req: dict[int, list[str]] = {}
+        for req_id, name in (await db.execute(submitted_q)).all():
+            submitted_by_req.setdefault(req_id, []).append(name)
+
+        for r in reqs:
+            r.submitted_consultants = submitted_by_req.get(r.id, [])
 
     # For a CONSULTANT viewing their own Requirements page, tell them
     # which of these requirements they've already sent an application
