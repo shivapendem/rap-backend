@@ -1023,7 +1023,19 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         # 2. Fallback to Domain Delegation
         if not access_token:
             sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
-            access_token = get_service_account_access_token(sa_path, item.from_email)
+            # PERFORMANCE/STABILITY: get_service_account_access_token does a
+            # synchronous httpx.post with a 10s timeout — calling it
+            # directly here freezes this entire process's event loop for
+            # up to 10 seconds every time this fallback fires (which the
+            # TEST FALLBACK logging shows happens often). While frozen,
+            # every other coroutine on this worker stalls too, including
+            # unrelated requests waiting on a DB connection pool checkout —
+            # a plausible contributor to the intermittent
+            # "greenlet_spawn has not been called" errors seen elsewhere
+            # in this app under load. Offload to a worker thread, same
+            # fix already applied to this same call in phase7.py.
+            import asyncio as _asyncio
+            access_token = await _asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
 
         # BUG FIX: previously built a path under /tmp and
         # handed it straight to send_application_email_async,
