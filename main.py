@@ -286,6 +286,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Serves static/email_assets/company_banner.png at
+# /static/email_assets/company_banner.png — used by the Email Preview
+# modal (get_email_preview in phase7.py) to actually render the company
+# banner in-browser, since a browser can't resolve the cid: reference the
+# real sent email uses instead (see gmail_send_service.build_mime_message).
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # app.add_middleware(
@@ -869,6 +877,14 @@ async def get_me(
         "is_active": current_user.is_active,
         "skills": current_user.skills if isinstance(current_user.skills, list) else [],
         "experience_years": float(current_user.experience_years) if current_user.experience_years is not None else None,
+        # Needed by the Apply-to-Requirement page's signature preview (see
+        # ApplyToRequirementPage.tsx) — these were already stored on the
+        # user but never returned by this endpoint, so the frontend had no
+        # way to show what the auto-appended signature will actually say.
+        "mobile_number": current_user.mobile_number,
+        "extension": current_user.extension,
+        "linkedin_url": current_user.linkedin_url,
+        "designation": current_user.designation,
     }
 
 

@@ -42,6 +42,10 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
         needsto_fetch_mail=bool(u.needsto_fetch_mail),
         experience_years=float(u.experience_years) if u.experience_years is not None else None,
         resume_info=u.resume_info,
+        mobile_number=u.mobile_number,
+        extension=u.extension,
+        linkedin_url=u.linkedin_url,
+        designation=u.designation,
     )
 
 
@@ -127,6 +131,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         secondary_skills=c.secondary_skills,
         preferred_roles=c.preferred_roles,
         ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
+        linkedin_url=c.linkedin_url,
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
         has_resume=bool(c.base_resume_file_path or c.base_resume_text),
         last_login_at=last_login_at.isoformat() if last_login_at else None,
@@ -181,6 +186,10 @@ class UserService:
             is_active=True,
             experience_years=req.experience_years,
             resume_info=req.resume_info,
+            mobile_number=req.mobile_number,
+            extension=req.extension,
+            linkedin_url=req.linkedin_url,
+            designation=req.designation,
         )
         user = await UserRepository.create(db, user)
 
@@ -235,6 +244,14 @@ class UserService:
             user.experience_years = req.experience_years
         if req.resume_info is not None:
             user.resume_info = req.resume_info
+        if req.mobile_number is not None:
+            user.mobile_number = req.mobile_number
+        if req.extension is not None:
+            user.extension = req.extension
+        if req.linkedin_url is not None:
+            user.linkedin_url = req.linkedin_url
+        if req.designation is not None:
+            user.designation = req.designation
         user = await UserRepository.update(db, user)
 
         # Apply consultant-only fields if this user has a linked consultant profile
@@ -347,6 +364,7 @@ class ConsultantAssignmentService:
         total_experience_years: Optional[float] = None,
         secondary_skills: Optional[str] = None,
         preferred_roles: Optional[str] = None,
+        linkedin_url: Optional[str] = None,
     ) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -374,6 +392,8 @@ class ConsultantAssignmentService:
             consultant.secondary_skills = secondary_skills
         if preferred_roles is not None:
             consultant.preferred_roles = preferred_roles
+        if linkedin_url is not None:
+            consultant.linkedin_url = linkedin_url
 
         consultant = await ConsultantRepository.update(db, consultant)
 

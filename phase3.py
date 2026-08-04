@@ -52,7 +52,7 @@ import string
 import uuid
 from datetime import datetime, date
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -88,9 +88,10 @@ router = APIRouter()
 # Constants
 # ---------------------------------------------------------------------------
 
+# FEATURE CHANGE: only .docx is accepted now, no PDF — matches the same
+# restriction applied to the "My Resumes" upload flow (resume_router.py).
 ALLOWED_RESUME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/pdf",
 }
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
@@ -101,6 +102,13 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
 # ---------------------------------------------------------------------------
 
 # ── Profile ─────────────────────────────────────────────────────────────────
+
+class EducationEntryRequest(BaseModel):
+    degree: Optional[str] = None
+    institution: Optional[str] = None
+    year: Optional[str] = None
+    details: Optional[str] = None
+
 
 class ProfileUpdateRequest(BaseModel):
     fullName: str = Field(..., min_length=1, max_length=200)
@@ -114,6 +122,15 @@ class ProfileUpdateRequest(BaseModel):
     preferredRoles: Optional[str] = None
     preferredLocations: Optional[str] = None
     totalExperienceYears: Optional[float] = Field(None, ge=0, le=60)
+    # BUG FIX: these three were never collectable anywhere — the
+    # "Profile incomplete" check (resume_validation.py) has always
+    # required them, but there was no form field, no request field, and
+    # (for title/summary/education) no storage column at all. Stored in
+    # User.resume_info (see update_own_profile below) rather than new
+    # Consultant columns, to avoid a migration.
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    education: List[EducationEntryRequest] = []
 
     @field_validator("workAuth")
     @classmethod
@@ -161,6 +178,10 @@ class ProfileResponse(BaseModel):
     # real in _consultant_to_profile_response below.
     profileCompleteness: int = 0
     activeApplicationsCount: int = 0
+    # BUG FIX: read back from User.resume_info — see ProfileUpdateRequest.
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    education: List[EducationEntryRequest] = []
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +217,7 @@ class AdminConsultantCreateRequest(BaseModel):
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     resume_info: Optional[dict] = None
+    linkedin_url: Optional[str] = None
 
     @field_validator("email")
     @classmethod
@@ -341,6 +363,13 @@ async def _get_consultant_for_user(db: AsyncSession, user: User) -> Consultant:
 async def _consultant_to_profile_response(
     db: AsyncSession, c: Consultant, experience_count: int = 0
 ) -> ProfileResponse:
+    # BUG FIX: title/summary/education/linkedin have no Consultant
+    # column — read them from the linked User.resume_info JSON instead,
+    # the same blob update_own_profile now writes them into.
+    resume_info: Dict[str, Any] = {}
+    if c.user_id:
+        user_result = await db.execute(select(User.resume_info).where(User.id == c.user_id))
+        resume_info = user_result.scalar_one_or_none() or {}
     """Map ORM Consultant → ProfileResponse matching frontend ConsultantProfileDTO."""
     primary = [s.strip() for s in (c.primary_skills or "").split(",") if s.strip()]
     secondary = [s.strip() for s in (c.secondary_skills or "").split(",") if s.strip()]
@@ -404,7 +433,7 @@ async def _consultant_to_profile_response(
         email=c.email,
         location=c.current_location,
         phone=c.phone,
-        linkedInUrl=None,  # not in model yet — Phase 8 extension
+        linkedInUrl=resume_info.get("linkedin"),
         primarySkills=primary,
         secondarySkills=secondary,
         workAuth=c.work_authorization,
@@ -417,6 +446,9 @@ async def _consultant_to_profile_response(
         status=c.status,
         preferredRoles=c.preferred_roles,
         preferredLocations=c.preferred_locations,
+        title=resume_info.get("title"),
+        summary=resume_info.get("summary"),
+        education=resume_info.get("education") or [],
         totalExperienceYears=float(c.total_experience_years) if c.total_experience_years is not None else None,
         availabilityStatus=c.availability_status,
         createdAt=c.created_at.isoformat() if c.created_at else None,
@@ -683,6 +715,28 @@ async def update_own_profile(
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
 
+    # BUG FIX: this consultant self-service endpoint never wrote to
+    # User.resume_info at all — the AI generation eligibility check
+    # (resume_validation.py) only ever reads from there, so no amount of
+    # filling in this form could ever clear the "Profile incomplete"
+    # warning. Sync every field it checks for, using the exact keys
+    # FIELD_CHECKS expects. linkedInUrl was ALSO previously accepted by
+    # this endpoint's request body but never assigned anywhere — genuinely
+    # discarded on every save until now.
+    existing_info = dict(current_user.resume_info or {})
+    existing_info.update({
+        "full_name": payload.fullName,
+        "email": current_user.email,
+        "phone": payload.phone,
+        "linkedin": payload.linkedInUrl,
+        "title": payload.title,
+        "summary": payload.summary,
+        "years_experience": payload.totalExperienceYears,
+        "skills": payload.primarySkills + payload.secondarySkills,
+        "education": [e.model_dump() for e in payload.education],
+    })
+    current_user.resume_info = existing_info
+
     await db.commit()
     await db.refresh(consultant)
 
@@ -885,6 +939,7 @@ async def admin_create_consultant(
         preferred_locations=payload.preferred_locations,
         current_location=payload.current_location,
         total_experience_years=payload.total_experience_years,
+        linkedin_url=payload.linkedin_url,
     )
     # availability_status isn't referenced elsewhere in this file, so only
     # set it if the model actually defines that column.
@@ -959,7 +1014,7 @@ async def activate_consultant(
 @router.post(
     "/api/consultant/resume/upload",
     response_model=ResumeUploadResponse,
-    summary="Upload base resume — DOCX or PDF, max 10 MB",
+    summary="Upload base resume — DOCX only, max 10 MB",
 )
 async def upload_resume(
     file: UploadFile = File(...),
@@ -976,7 +1031,7 @@ async def upload_resume(
 
     content_type = file.content_type or ""
     if content_type not in ALLOWED_RESUME_TYPES:
-        raise HTTPException(400, f"Only DOCX and PDF accepted. Got: '{content_type}'")
+        raise HTTPException(400, f"Only DOCX (Word) files are accepted. Got: '{content_type}'")
 
     file_bytes = await file.read()
     if not file_bytes:

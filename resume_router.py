@@ -461,18 +461,48 @@ async def finalize_resume(
 async def upload_resume(
     title: str = Form(...),
     target_role: str = Form(None),
+    # BUG FIX: this endpoint always saved the resume under the UPLOADER's
+    # own account (current_user.id) — so when an admin/recruiter selected
+    # a candidate on the My Resumes page and uploaded a PDF "for" them, it
+    # actually got attached to the admin/recruiter's own account instead.
+    # The upload itself succeeded (hence the success toast), but the
+    # candidate's resume list is filtered by user_id, so it could never
+    # show up there — looked exactly like "upload succeeds, nothing
+    # appears". Now accepts an optional target_user_id so the frontend can
+    # say who it's actually for.
+    target_user_id: int = Form(None),
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # FEATURE CHANGE: only .docx is accepted now, no PDF or anything
-    # else — client-side dropzone restrictions can be bypassed by
-    # anyone crafting the request directly, so this server-side check
-    # is what actually enforces it.
+    # CHANGE: was PDF-only ("Only PDF files are supported."). Now DOCX-only
+    # instead — content-type and storage key updated to match.
     if not file.filename.lower().endswith('.docx'):
-        raise HTTPException(status_code=400, detail="Only .docx (Word) files are supported.")
+        raise HTTPException(status_code=400, detail="Only .docx files are supported.")
 
-    s3_key = f"users/{current_user.id}/resumes/{uuid.uuid4()}/final.docx"
+    owner_id = current_user.id
+    if target_user_id and target_user_id != current_user.id:
+        if current_user.role not in ("ADMIN", "RECRUITER"):
+            raise HTTPException(status_code=403, detail="Only admins/recruiters can upload a resume for someone else.")
+        if current_user.role == "RECRUITER":
+            allowed = await db.execute(
+                select(Consultant.user_id).where(
+                    Consultant.user_id == target_user_id,
+                    or_(
+                        Consultant.sales_recruiter_user_id == current_user.id,
+                        Consultant.id.in_(
+                            select(RecruiterConsultant.consultant_id).where(
+                                RecruiterConsultant.recruiter_id == current_user.id
+                            )
+                        ),
+                    ),
+                )
+            )
+            if not allowed.scalars().first():
+                raise HTTPException(status_code=403, detail="That consultant isn't assigned to you.")
+        owner_id = target_user_id
+
+    s3_key = f"users/{owner_id}/resumes/{uuid.uuid4()}/final.docx"
 
     success = upload_file_to_s3(
         file.file,
@@ -483,7 +513,7 @@ async def upload_resume(
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
 
     new_resume = Resume(
-        user_id=current_user.id,
+        user_id=owner_id,
         title=title,
         target_role=target_role,
         s3_key=s3_key,
@@ -956,7 +986,13 @@ async def download_resume_file(
         raise HTTPException(status_code=502, detail="Could not retrieve the resume file from storage.")
 
     safe_title = "".join(c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_").strip()
-    filename = f"{safe_title or f'Resume_{id}'}.pdf"
+    # BUG FIX: filename extension was hardcoded to ".pdf" regardless of the
+    # actual stored file — now that uploads are DOCX-only (see /upload
+    # above), this was saving downloaded files as "Title.pdf" while the
+    # bytes inside were actually a .docx, which most apps then fail to open.
+    # Derive it from the real stored key instead.
+    ext = os.path.splitext(resume.s3_key)[1] or ".docx"
+    filename = f"{safe_title or f'Resume_{id}'}{ext}"
 
     resume.download_count += 1
     resume.last_downloaded = datetime.now(timezone.utc)
@@ -964,7 +1000,7 @@ async def download_resume_file(
 
     return Response(
         content=body,
-        media_type=content_type or "application/pdf",
+        media_type=content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

@@ -37,6 +37,12 @@ class UserAdminRowDTO(BaseModel):
     needsto_fetch_mail: bool = False
     experience_years: Optional[float] = None
     resume_info: Optional[Any] = None
+    # Admin/Recruiter contact fields — see MIGRATION REQUIRED note on
+    # models.py's User.mobile_number/extension/linkedin_url.
+    mobile_number: Optional[str] = None
+    extension: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    designation: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -60,6 +66,13 @@ class CreateUserRequestDTO(BaseModel):
     role: str
     experience_years: Optional[float] = Field(None, ge=0, le=60)
     resume_info: Optional[Any] = None
+    # Admin/Recruiter only — Consultant profiles carry their own
+    # linkedin_url on ConsultantAdminRowDTO/UpdateConsultantRequestDTO
+    # instead (see AdminConsultantCreateRequest in phase3.py).
+    mobile_number: Optional[str] = Field(None, max_length=30)
+    extension: Optional[str] = Field(None, max_length=10)
+    linkedin_url: Optional[str] = None
+    designation: Optional[str] = Field(None, max_length=100)
 
     @field_validator("role")
     @classmethod
@@ -111,6 +124,13 @@ class EditUserRequestDTO(BaseModel):
     needsto_fetch_mail: Optional[bool] = None
     experience_years: Optional[float] = Field(None, ge=0, le=60)
     resume_info: Optional[Any] = None
+    # Admin/Recruiter contact fields — meaningless for CONSULTANT (they use
+    # the separate consultant-profile PUT /admin/consultants/{id} instead,
+    # via UpdateConsultantRequestDTO.linkedin_url).
+    mobile_number: Optional[str] = Field(None, max_length=30)
+    extension: Optional[str] = Field(None, max_length=10)
+    linkedin_url: Optional[str] = None
+    designation: Optional[str] = Field(None, max_length=100)
 
     @field_validator("role")
     @classmethod
@@ -181,6 +201,7 @@ class ConsultantAdminRowDTO(BaseModel):
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     ats_score: Optional[float] = None
+    linkedin_url: Optional[str] = None
     updated_at: str = ""
     has_resume: bool = False  # base_resume_file_path/base_resume_text can be large — expose presence, not raw content
     last_login_at: Optional[str] = None
@@ -225,6 +246,7 @@ class UpdateConsultantRequestDTO(BaseModel):
     total_experience_years: Optional[float] = None
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
+    linkedin_url: Optional[str] = None
 
     @field_validator("status")
     @classmethod

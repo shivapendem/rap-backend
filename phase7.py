@@ -40,6 +40,18 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
+# Signature sender resolution
+# ---------------------------------------------------------------------------
+# Delegates to email_template.resolve_sender_fields, which email_queue.py's
+# send_email_now (the ACTUAL live endpoint the Apply buttons on Pending
+# Applications/Requirements hit) also uses — see the comment there. Kept
+# as a thin wrapper here so nothing else in this file has to change.
+def _sender_fields(current_user: User, consultant: Consultant) -> dict:
+    from email_template import resolve_sender_fields
+    return resolve_sender_fields(current_user, consultant)
+
+
+# ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
@@ -63,6 +75,11 @@ class EmailPreviewRequest(BaseModel):
 class EmailPreviewResponse(BaseModel):
     subject: str
     body: str
+    # Rich HTML version of `body` with the sender's full signature card
+    # (name, title, LinkedIn, contact block, company footer) — this is
+    # what actually gets sent; `body` remains the plain-text fallback and
+    # what the preview UI shows/lets you edit.
+    html_body: Optional[str] = None
     to_email: Optional[str] = None
     cc_email: Optional[str] = None
     consultant_name: str
@@ -342,6 +359,8 @@ async def get_email_preview(
         consultant_email=consultant.email or "",
         consultant_phone=consultant.phone,
         primary_skills=consultant.primary_skills,
+        **_sender_fields(current_user, consultant),
+        for_preview=True,
     )
 
     # BUG FIX: preview previously returned nothing about the generated
@@ -360,6 +379,7 @@ async def get_email_preview(
     return EmailPreviewResponse(
         subject=email_content["subject"],
         body=email_content["body"],
+        html_body=email_content["html_body"],
         to_email=requirement.vendor_email,
         cc_email=cc_email or None,
         consultant_name=consultant.full_name or "",
@@ -420,6 +440,7 @@ async def confirm_send(
             consultant_email=consultant.email or "",
             consultant_phone=consultant.phone,
             primary_skills=consultant.primary_skills,
+            **_sender_fields(current_user, consultant),
         )
 
         if token and token.access_token_encrypted:
@@ -491,6 +512,8 @@ async def confirm_send(
                 subject=email_content["subject"],
                 body=email_content["body"],
                 attachment_paths=[attachment_path] if attachment_path else [],
+                html_body=email_content["html_body"],
+                inline_images=email_content.get("inline_images"),
             )
         finally:
             if tmp_resume_path:

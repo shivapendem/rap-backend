@@ -241,6 +241,7 @@ async def update_consultant(
         total_experience_years=body.total_experience_years,
         secondary_skills=body.secondary_skills,
         preferred_roles=body.preferred_roles,
+        linkedin_url=body.linkedin_url,
         admin_id=current_user.get("sub"),
     )
     return UpdateConsultantResponseDTO(

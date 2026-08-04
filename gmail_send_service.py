@@ -9,8 +9,21 @@ import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email import encoders
 from typing import Optional, List
+
+# BUG FIX: the rich HTML signature (name/title/LinkedIn/contact card +
+# company banner — see email_template.py build_signature_html) was being
+# BUILT but never actually SENT: build_mime_message only ever attached a
+# MIMEText(body, "plain") part, so every real outgoing application email
+# was plain text only, regardless of how much work went into the HTML
+# version. It was only ever shown in the in-app Email Preview modal. Now
+# accepts an optional html_body (+ inline_images, for the company banner
+# via Content-ID) and sends a proper multipart/related(alternative(text,
+# html), inline images) message when one is provided — falls back to the
+# old plain-text-only behavior when it's not, so nothing else breaks.
+BANNER_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "static", "email_assets", "company_banner.png")
 
 
 def build_mime_message(
@@ -20,22 +33,65 @@ def build_mime_message(
     subject: str,
     body: str,
     attachment_paths: Optional[List[str]] = None,
-    attachment_names: Optional[dict] = None,  # maps       	path -> original display filename
-
+    attachment_names: Optional[dict] = None,  # maps path -> original display filename
+    html_body: Optional[str] = None,
+    inline_images: Optional[List[dict]] = None,
 ) -> str:
     """
-    Build MIME email message with optional attachments (one or many).
-    Returns base64url encoded string for Gmail API.
+    Build MIME email message with optional attachments (one or many) and
+    an optional rich HTML body (with inline images, e.g. the company
+    banner) alongside the required plain-text fallback.
+
     FIX: previously took a single attachment_path, so only ever one file
     could ever be sent even when a consultant/recruiter attached several.
     Now loops over every path given and attaches each one that actually
     exists on disk at build time.
+
+    BUG FIX: attachment filenames previously always fell back to
+    os.path.basename(attachment_path) — for a Spaces-backed attachment
+    downloaded to a tempfile.mkstemp() path (e.g.
+    "/tmp/email_queue_attach_8rjcse9l.pdf"), that's a meaningless random
+    name, not the consultant's actual resume filename. attachment_names
+    (path -> real display name) is now used when present, matching what
+    email_queue.py's process_single_email_queue_item already builds.
     """
     paths = [p for p in (attachment_paths or []) if p]
-    if paths:
-        msg = MIMEMultipart()
+    attachment_names = attachment_names or {}
+
+    # The text+html alternative is its own sub-part regardless of whether
+    # there are file attachments or an inline image — a top-level
+    # multipart/mixed (for attachments) or multipart/related (for inline
+    # images) each need an alternative part inside them, not a bare
+    # MIMEText, or the html_body would end up shown as raw markup by
+    # clients that don't understand a stray text/html top-level part.
+    if html_body:
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain"))
+        alt.attach(MIMEText(html_body, "html"))
+        core = alt
     else:
-        msg = MIMEMultipart("alternative")
+        core = MIMEText(body, "plain")
+
+    if inline_images:
+        related = MIMEMultipart("related")
+        related.attach(core)
+        for img in inline_images:
+            img_path = img.get("path") or BANNER_IMAGE_PATH
+            cid = img.get("cid")
+            if not cid or not os.path.exists(img_path):
+                continue
+            with open(img_path, "rb") as f:
+                mime_img = MIMEImage(f.read())
+            mime_img.add_header("Content-ID", f"<{cid}>")
+            mime_img.add_header("Content-Disposition", "inline", filename=os.path.basename(img_path))
+            related.attach(mime_img)
+        core = related
+
+    if paths:
+        msg = MIMEMultipart("mixed")
+        msg.attach(core)
+    else:
+        msg = core
 
     msg["From"] = sender
     msg["To"] = to
@@ -43,9 +99,6 @@ def build_mime_message(
         msg["Cc"] = cc
     msg["Subject"] = subject
 
-    msg.attach(MIMEText(body, "plain"))
-
-    attachment_names = attachment_names or {}
     for attachment_path in paths:
         if not os.path.exists(attachment_path):
             continue
@@ -73,6 +126,8 @@ def send_via_gmail_api(
     body: str,
     attachment_paths: Optional[List[str]] = None,
     attachment_names: Optional[dict] = None,
+    html_body: Optional[str] = None,
+    inline_images: Optional[List[dict]] = None,
 ) -> dict:
     """
     Send email via Gmail API using consultant's OAuth access token.
@@ -91,6 +146,8 @@ def send_via_gmail_api(
             body=body,
             attachment_paths=attachment_paths,
             attachment_names=attachment_names,
+            html_body=html_body,
+            inline_images=inline_images,
         )
 
         response = httpx.post(
@@ -127,6 +184,9 @@ async def send_application_email_async(
     subject: str,
     body: str,
     attachment_paths: Optional[List[str]] = None,
+    attachment_names: Optional[dict] = None,
+    html_body: Optional[str] = None,
+    inline_images: Optional[List[dict]] = None,
 ) -> dict:
     """
     Async wrapper for Gmail send. Used by FastAPI endpoints.
@@ -134,6 +194,22 @@ async def send_application_email_async(
     from a single attachment_path to attachment_paths — this wrapper is
     what callers (e.g. the email queue worker) actually call, so it has
     to accept/forward the same param or every call downstream breaks.
+
+    BUG FIX: this wrapper accepted attachment_paths but silently dropped
+    attachment_names on the floor — it was never in the signature, so
+    even a caller that built a path->original-filename map (like the
+    email queue worker downloading a Spaces object to a randomly-named
+    /tmp file) had no way to get that name to build_mime_message. The
+    MIME builder then fell back to os.path.basename(attachment_path),
+    which for a tempfile.mkstemp() path is a meaningless random name
+    (e.g. "email_queue_attach_8rjcse9l.pdf") — that's what recipients
+    saw in Gmail instead of the consultant's actual resume filename.
+    Now forwarded straight through to send_via_gmail_api.
+
+    Also forwards html_body/inline_images so the rich HTML signature +
+    company banner built at queue-creation time actually reaches the
+    real outgoing message instead of only ever appearing in the in-app
+    Email Preview modal.
     """
     import asyncio
 
@@ -148,6 +224,9 @@ async def send_application_email_async(
             subject=subject,
             body=body,
             attachment_paths=attachment_paths,
+            attachment_names=attachment_names,
+            html_body=html_body,
+            inline_images=inline_images,
         ),
     )
     return result

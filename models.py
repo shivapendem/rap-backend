@@ -69,6 +69,20 @@ class User(Base):
     # Postgres database — see note at top of phase_users_schema.py.
     experience_years = Column(Numeric, nullable=True)
     resume_info = JSONBColumn(nullable=True)
+    # Admin/Recruiter contact fields — MIGRATION REQUIRED (same as
+    # experience_years above): run against the real Postgres database
+    # before deploying this change:
+    #     ALTER TABLE users ADD COLUMN mobile_number TEXT;
+    #     ALTER TABLE users ADD COLUMN extension TEXT;
+    #     ALTER TABLE users ADD COLUMN linkedin_url TEXT;
+    mobile_number = Column(Text, nullable=True)
+    extension = Column(Text, nullable=True)
+    linkedin_url = Column(Text, nullable=True)
+    # Real job title (e.g. "Lead Bench Sales Recruiter"), shown in the
+    # application-email signature instead of the generic role label —
+    # MIGRATION REQUIRED, same as the three columns above:
+    #     ALTER TABLE users ADD COLUMN designation TEXT;
+    designation = Column(Text, nullable=True)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 
@@ -102,6 +116,9 @@ class Consultant(Base):
     primary_skills = Column(Text, nullable=True)
     secondary_skills = Column(Text, nullable=True)
     preferred_roles = Column(Text, nullable=True)
+    # MIGRATION REQUIRED — same as User.mobile_number/extension/linkedin_url
+    # above: ALTER TABLE consultants ADD COLUMN linkedin_url TEXT;
+    linkedin_url = Column(Text, nullable=True)
     preferred_employment_types = ArrayTextColumn(nullable=False, default=lambda: ["C2C"])
     base_resume_file_path = Column(Text, nullable=True)
     base_resume_text = Column(Text, nullable=True)
@@ -639,6 +656,15 @@ class EmailQueue(Base):
     cc_email = Column(Text, nullable=True)
     subject = Column(Text, nullable=False)
     content = Column(Text, nullable=True)
+    # Rich HTML version of `content` (signature card + company banner
+    # image) — built once at queue-creation time (send_email_now /
+    # create_email_queue) and stored here so process_single_email_queue_item
+    # can send it later exactly as composed, without needing to re-look-up
+    # or re-derive the sender's identity at actual send time. NULL for
+    # anything queued before this existed — those just send as plain text,
+    # same as always. MIGRATION REQUIRED, same pattern as the User columns:
+    #     ALTER TABLE email_queue ADD COLUMN html_content TEXT;
+    html_content = Column(Text, nullable=True)
     # FIX: was `Column(JSONB, nullable=True)` — JSONB is only imported
     # inside the `if _is_postgres:` branch above, so on SQLite (dev
     # fallback) this name is undefined and importing this module raises

@@ -554,6 +554,47 @@ async def send_email_now(
     else:
         final_cc = current_user.email
 
+    # Auto-append the sender's contact-card signature (name, title/
+    # designation, LinkedIn, email/mobile/office-extension, address) after
+    # whatever the admin/recruiter/consultant typed — same sender identity
+    # logic phase7.py's older preview/confirm-send endpoints use, shared
+    # via email_template.resolve_sender_fields. This is the ACTUAL signature
+    # that goes out on every real Apply-button send, since this endpoint
+    # (not phase7.py's) is what those buttons hit.
+    #
+    # Also builds the matching HTML version (signature card + real company
+    # banner image, embedded inline via Content-ID at send time — see
+    # gmail_send_service.build_mime_message) and stores it in the new
+    # html_content column, so process_single_email_queue_item can send a
+    # proper multipart/alternative message later exactly as composed here,
+    # without re-deriving the sender's identity at actual send time.
+    from email_template import build_signature_text, build_signature_html, resolve_sender_fields
+    sender = resolve_sender_fields(current_user, consultant)
+    signature = build_signature_text(
+        sender["sender_name"],
+        sender["sender_title"],
+        sender["sender_email"],
+        sender["sender_direct_number"],
+        sender["sender_extension"],
+        sender["sender_linkedin_url"],
+    )
+    final_content = f"{body.content.rstrip()}\n\n{signature}" if (body.content or "").strip() else signature
+
+    import html as _html
+    intro_html = _html.escape(body.content or "").replace("\n", "<br>")
+    signature_html = build_signature_html(
+        sender["sender_name"],
+        sender["sender_title"],
+        sender["sender_email"],
+        sender["sender_direct_number"],
+        sender["sender_extension"],
+        sender["sender_linkedin_url"],
+    )
+    final_html_content = (
+        f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1e293b;">{intro_html}</div>'
+        + signature_html
+    )
+
     from datetime import datetime, timezone
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
     now_utc = datetime.now(timezone.utc)
@@ -565,7 +606,8 @@ async def send_email_now(
         to_email=body.to_email,
         cc_email=final_cc,
         subject=body.subject,
-        content=body.content,
+        content=final_content,
+        html_content=final_html_content,
         attachments=body.attachments,
         status="QUEUED",
         sent_by_user_id=current_user.id,
@@ -1002,7 +1044,22 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         # attachment-less — a failed send with a clear
         # reason is recoverable; a silently incomplete
         # "success" is not.
+        #
+        # BUG FIX (filename): a Spaces attachment is downloaded to a
+        # tempfile.mkstemp() path (e.g. "/tmp/email_queue_attach_8rjcse9l.pdf")
+        # so it can be handed to send_application_email_async as a real
+        # path on disk. That randomly-generated basename was never mapped
+        # back to the person's actual filename anywhere, so recipients saw
+        # "email_queue_attach_8rjcse9l.pdf" in Gmail instead of, e.g.,
+        # "Anusha_Resume.pdf". attachment_names now records, for every
+        # resolved path, the human-readable name recovered via
+        # original_filename_from_ref(ref) — the same helper the Email
+        # Preview modal already uses to display attachment names — and
+        # that map is passed through to send_application_email_async so
+        # build_mime_message uses it for the Content-Disposition filename
+        # instead of falling back to os.path.basename(attachment_path).
         attachment_paths = []
+        attachment_names = {}
         missing_attachments = []
         tmp_cleanup_paths = []
         if item.attachments:
@@ -1012,6 +1069,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             from s3_service import download_file_from_s3
 
             for ref in item.attachments:
+                display_name = original_filename_from_ref(ref)
                 local_candidate = os.path.join("/tmp/email_attachments", ref)
                 if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
                     # PERFORMANCE: download_file_from_s3 is a blocking call;
@@ -1026,16 +1084,19 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         with os.fdopen(fd, "wb") as f:
                             f.write(body_bytes)
                         attachment_paths.append(tmp_path)
+                        attachment_names[tmp_path] = display_name
                         tmp_cleanup_paths.append(tmp_path)
                     elif os.path.exists(local_candidate):
                         # Spaces fetch failed but the /tmp copy
                         # from this same server session is
                         # still there — use it rather than fail.
                         attachment_paths.append(local_candidate)
+                        attachment_names[local_candidate] = display_name
                     else:
                         missing_attachments.append(ref)
                 elif os.path.exists(local_candidate):
                     attachment_paths.append(local_candidate)
+                    attachment_names[local_candidate] = display_name
                 else:
                     missing_attachments.append(ref)
 
@@ -1054,6 +1115,14 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             return
 
         try:
+            # BUG FIX: this only ever sent item.content (plain text) — the
+            # rich HTML signature + company banner built at queue-creation
+            # time (send_email_now above) and stored in item.html_content
+            # was never actually passed through to the real send. Now
+            # attaches the banner inline via Content-ID when an HTML body
+            # is present; rows queued before html_content existed (NULL)
+            # still send as plain text only, same as before.
+            from email_template import COMPANY_BANNER_CID
             send_result = await send_application_email_async(
                 access_token=access_token,
                 from_email=item.from_email,
@@ -1061,7 +1130,10 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 cc_email=item.cc_email or "",
                 subject=item.subject,
                 body=item.content or "",
-                attachment_paths=attachment_paths
+                attachment_paths=attachment_paths,
+                attachment_names=attachment_names,
+                html_body=item.html_content or None,
+                inline_images=[{"cid": COMPANY_BANNER_CID}] if item.html_content else None,
             )
             item.status = "SENT"
             item.status_text = "Sent successfully"
