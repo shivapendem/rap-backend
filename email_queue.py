@@ -6,7 +6,6 @@ import os
 import uuid
 import math
 import asyncio
-import tempfile
 from fastapi import UploadFile, File
 
 from typing import Optional, List
@@ -21,6 +20,15 @@ from auth import get_current_user
 from models import User
 
 router = APIRouter()
+
+# How long send_email_now waits for the actual send (token refresh +
+# attachment download + Gmail API call) before giving up and returning
+# "queued" instead — see the BUG FIX comment at its call site below for
+# why this exists. Kept comfortably under common reverse-proxy/Cloudflare
+# timeout windows (usually 30-100s) so THIS server is always the one that
+# gives up first and returns a clean response, rather than an intermediary
+# silently killing the connection with none at all.
+SEND_NOW_TIMEOUT_SECONDS = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +678,41 @@ async def send_email_now(
     await db.refresh(item)
 
     if scheduled_at <= now_utc:
-        await process_single_email_queue_item(db, item)
+        # BUG FIX ("Network Error" on send): this used to await the full
+        # send inline with no bound — token refresh + attachment download
+        # from Spaces + the actual Gmail API call, all sequential, can
+        # legitimately take longer than the timeout on whatever sits in
+        # front of this server (reverse proxy / Cloudflare / gunicorn
+        # worker timeout). When it does, the connection gets killed before
+        # any response is sent; the browser never receives one at all, and
+        # axios reports a bare "Network Error" — masking what actually
+        # happened (confirmed via a 502 in the Network tab, with no CORS
+        # headers on Cloudflare's own error page, which is why axios saw
+        # no response rather than a real error body).
+        #
+        # Now bounded with a timeout: if the send genuinely finishes
+        # quickly (the common case), the caller still gets an immediate
+        # SENT/FAILED result exactly as before. If it's still running past
+        # SEND_NOW_TIMEOUT_SECONDS, asyncio.wait_for cancels this attempt
+        # and we respond "queued" instead — the item is already committed
+        # as QUEUED in the DB (see db.commit() above), so the independent
+        # background worker (_email_queue_worker_loop in main.py) picks it
+        # up fresh on its next poll and completes the send itself.
+        # Slightly less immediate feedback in the slow case, but no more
+        # failed requests that actually succeeded moments later on the
+        # server.
+        try:
+            await asyncio.wait_for(
+                process_single_email_queue_item(db, item),
+                timeout=SEND_NOW_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "success": True,
+                "id": str(item.id),
+                "status": "QUEUED",
+                "message": "Taking longer than usual — this will finish sending in the background within a minute.",
+            }
         await db.refresh(item)
 
         if item.status == "SENT":
@@ -1047,7 +1089,12 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         # token, which is exactly why this was intermittent/role-
         # correlated rather than affecting every send: whoever already
         # had a token connected skipped this branch entirely and never
-        # hit the block.
+        # hit the block. While frozen, every other coroutine on this
+        # worker stalls too, including unrelated requests waiting on a DB
+        # connection pool checkout — a plausible contributor to the
+        # intermittent "greenlet_spawn has not been called" errors seen
+        # elsewhere in this app under load. Offload to a worker thread,
+        # same fix already applied to this same call in phase7.py.
         #
         # NOTE: uses the module-level `import asyncio` (top of this
         # file), not a local import — this function also does
@@ -1100,14 +1147,17 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         missing_attachments = []
         tmp_cleanup_paths = []
         if item.attachments:
-            # NOTE: os/tempfile/asyncio are all imported at module level
-            # (top of this file) — deliberately NOT re-imported locally
-            # here. A local import of any of these names anywhere in this
-            # function's body makes Python treat that name as local for
-            # the function's ENTIRE execution, which would break the
-            # earlier os.path.join(...)/asyncio.to_thread(...) calls in
-            # the "Fallback to Domain Delegation" block above with
-            # UnboundLocalError — see the note on that block.
+            # NOTE: os/asyncio are imported at module level (top of this
+            # file) — deliberately NOT re-imported locally here. A local
+            # import of either name anywhere in this function's body
+            # makes Python treat that name as local for the function's
+            # ENTIRE execution, which would break the earlier
+            # os.path.join(...)/asyncio.to_thread(...) calls in the
+            # "Fallback to Domain Delegation" block above with
+            # UnboundLocalError — see the note on that block. `tempfile`
+            # is not used elsewhere in this function, so it's safe to
+            # import locally right here.
+            import tempfile
             from s3_service import download_file_from_s3
 
             for ref in item.attachments:
