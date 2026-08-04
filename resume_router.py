@@ -194,10 +194,21 @@ async def _build_resume_info(
         end_str = "Present" if exp.is_present else (exp.end_date.strftime("%b %Y") if exp.end_date else "")
         date_str = f"{start_str} - {end_str}".strip(" -")
 
+        # BUG FIX: this used to send ONLY a combined "dates" string (e.g.
+        # "Jan 2020 - Present"), but the AI is asked to RETURN separate
+        # "start"/"end" fields — forcing it to re-parse and split a
+        # combined string on its own instead of just carrying forward
+        # values it was already given cleanly. Sending both the combined
+        # string (kept for any code that still reads it) AND explicit
+        # start/end/is_present makes it far more likely a past role's
+        # real end date survives the AI round-trip correctly.
         manual_exp_entries.append({
             "title": exp.role_title,
             "company": exp.client_name,
             "dates": date_str,
+            "start": start_str,
+            "end": end_str,
+            "is_present": bool(exp.is_present),
             "bullets": bullets
         })
 
@@ -732,6 +743,15 @@ async def download_base_resume(
 
 @router.get("/consultants")
 async def get_consultants_for_resumes(
+    # BUG FIX: the Requirements page's "Apply" link (unlike Pending
+    # Applications, which already carries a specific consultantId) opens
+    # ApplyToRequirementPage with no consultant context at all, so its
+    # dropdown showed EVERY consultant in the system — including ones with
+    # no relevance to that requirement. Optional requirement_id restricts
+    # the list to consultants actually matched to that specific
+    # requirement (RequirementConsultantMatch), same source the
+    # Requirements table's own "Matched Consultants" column already uses.
+    requirement_id: int = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -746,8 +766,22 @@ async def get_consultants_for_resumes(
             "experience_years": u.experience_years or (c.total_experience_years if c else 0)
         }
 
+    matched_consultant_ids = None
+    if requirement_id:
+        from models import RequirementConsultantMatch
+        matched_result = await db.execute(
+            select(RequirementConsultantMatch.consultant_id).where(
+                RequirementConsultantMatch.requirement_id == requirement_id
+            )
+        )
+        matched_consultant_ids = [row[0] for row in matched_result.all()]
+        if not matched_consultant_ids:
+            return []
+
     if current_user.role == "ADMIN":
         query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.role == "CONSULTANT")
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
         return [map_user_consultant(u, c) for u, c in results]
     elif current_user.role == "RECRUITER":
@@ -765,10 +799,14 @@ async def get_consultants_for_resumes(
             User.id.in_(consultant_users_query),
             User.role == "CONSULTANT"
         )
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
         return [map_user_consultant(u, c) for u, c in results]
     else:
         query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id == current_user.id)
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
         return [map_user_consultant(u, c) for u, c in results]
 

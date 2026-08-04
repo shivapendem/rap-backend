@@ -5,6 +5,8 @@
 import os
 import uuid
 import math
+import asyncio
+import tempfile
 from fastapi import UploadFile, File
 
 from typing import Optional, List
@@ -275,7 +277,7 @@ async def create_email_queue(
         subject=body.subject,
         content=body.content,
         attachments=body.attachments,
-        status="QUEUED",
+        status="PROCESSING",  # RACE FIX: claim immediately, matches worker loop's claim
         sent_by_user_id=current_user.id,
         scheduled_at=scheduled_at,
     )
@@ -968,7 +970,6 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
 
         from gmail_send_service import get_service_account_access_token, decrypt_token
         from models import User, Consultant, ConsultantEmailToken
-        import os
 
         access_token = None
 
@@ -1037,21 +1038,29 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 access_token = decrypt_token(email_tok.access_token_encrypted)
 
         # 2. Fallback to Domain Delegation
+        # BUG FIX: get_service_account_access_token makes a real,
+        # SYNCHRONOUS network call to Google's OAuth endpoint
+        # (gmail_send_service.py uses plain httpx.post, not an async
+        # client) — calling it directly here blocked the entire event
+        # loop for the full round-trip to Google. This fallback is what
+        # runs whenever the sender has no personally-connected Gmail
+        # token, which is exactly why this was intermittent/role-
+        # correlated rather than affecting every send: whoever already
+        # had a token connected skipped this branch entirely and never
+        # hit the block.
+        #
+        # NOTE: uses the module-level `import asyncio` (top of this
+        # file), not a local import — this function also does
+        # asyncio.to_thread(...) further down for the S3 attachment
+        # download, and a local `import asyncio` anywhere in a function
+        # body makes Python treat that name as local for the ENTIRE
+        # function. A bare `asyncio.to_thread(...)` here with a local
+        # import later in the same function would raise
+        # UnboundLocalError at runtime on every single send, since this
+        # reference executes before that later import statement does.
         if not access_token:
             sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
-            # PERFORMANCE/STABILITY: get_service_account_access_token does a
-            # synchronous httpx.post with a 10s timeout — calling it
-            # directly here freezes this entire process's event loop for
-            # up to 10 seconds every time this fallback fires (which the
-            # TEST FALLBACK logging shows happens often). While frozen,
-            # every other coroutine on this worker stalls too, including
-            # unrelated requests waiting on a DB connection pool checkout —
-            # a plausible contributor to the intermittent
-            # "greenlet_spawn has not been called" errors seen elsewhere
-            # in this app under load. Offload to a worker thread, same
-            # fix already applied to this same call in phase7.py.
-            import asyncio as _asyncio
-            access_token = await _asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
+            access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
 
         # BUG FIX: previously built a path under /tmp and
         # handed it straight to send_application_email_async,
@@ -1091,9 +1100,14 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         missing_attachments = []
         tmp_cleanup_paths = []
         if item.attachments:
-            import os
-            import tempfile
-            import asyncio
+            # NOTE: os/tempfile/asyncio are all imported at module level
+            # (top of this file) — deliberately NOT re-imported locally
+            # here. A local import of any of these names anywhere in this
+            # function's body makes Python treat that name as local for
+            # the function's ENTIRE execution, which would break the
+            # earlier os.path.join(...)/asyncio.to_thread(...) calls in
+            # the "Fallback to Domain Delegation" block above with
+            # UnboundLocalError — see the note on that block.
             from s3_service import download_file_from_s3
 
             for ref in item.attachments:

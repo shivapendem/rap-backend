@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import or_, func, update
 from pydantic import BaseModel, EmailStr, field_validator, model_validator, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -220,6 +221,26 @@ async def _email_queue_worker_loop():
                     )
                 )
                 queued_items = result.scalars().all()
+                # RACE FIX: send_email_now() (email_queue.py) can process the
+                # same item this loop just selected, in the window between
+                # this query and the loop's own send attempt below — both
+                # paths would then call the Gmail API for the same item,
+                # causing duplicate sends and slower total processing time
+                # (which can push send_email_now's caller past its own
+                # timeout). Atomically claim each item by flipping its status
+                # to PROCESSING right here; if 0 rows are affected, another
+                # caller already claimed it, so skip it in this cycle.
+                claimed_items = []
+                for qi in queued_items:
+                    claim_result = await session.execute(
+                        update(EmailQueue)
+                        .where(EmailQueue.id == qi.id, EmailQueue.status == "QUEUED")
+                        .values(status="PROCESSING")
+                    )
+                    if claim_result.rowcount > 0:
+                        claimed_items.append(qi)
+                await session.commit()
+                queued_items = claimed_items
                 if queued_items:
                     print(f"[email-queue] processing {len(queued_items)} eligible items")
                 for item in queued_items:

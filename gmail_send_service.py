@@ -9,9 +9,18 @@ import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.mime.image import MIMEImage
 from email import encoders
 from typing import Optional, List
+
+# BUG FIX (severity: this could break EVERY send, not just ones with an
+# inline image): MIMEImage (email.mime.image) depends on the stdlib
+# `imghdr` module, which was removed in Python 3.13. If this server runs
+# 3.13+, `from email.mime.image import MIMEImage` at module level would
+# raise ModuleNotFoundError the instant this file is imported — taking
+# down every single email send (plain text included), not just the new
+# banner-embedding feature. Imported lazily inside build_mime_message
+# instead, guarded by try/except, so a missing/broken MIMEImage only
+# disables the inline image — it can never block sending the email itself.
 
 # BUG FIX: the rich HTML signature (name/title/LinkedIn/contact card +
 # company banner — see email_template.py build_signature_html) was being
@@ -80,11 +89,19 @@ def build_mime_message(
             cid = img.get("cid")
             if not cid or not os.path.exists(img_path):
                 continue
-            with open(img_path, "rb") as f:
-                mime_img = MIMEImage(f.read())
-            mime_img.add_header("Content-ID", f"<{cid}>")
-            mime_img.add_header("Content-Disposition", "inline", filename=os.path.basename(img_path))
-            related.attach(mime_img)
+            try:
+                from email.mime.image import MIMEImage
+                with open(img_path, "rb") as f:
+                    mime_img = MIMEImage(f.read())
+                mime_img.add_header("Content-ID", f"<{cid}>")
+                mime_img.add_header("Content-Disposition", "inline", filename=os.path.basename(img_path))
+                related.attach(mime_img)
+            except Exception as img_err:
+                # Never let a broken inline image take the whole send down
+                # with it — see the module-level comment on why this is
+                # imported lazily/guarded in the first place.
+                print(f"[gmail_send_service] skipping inline image {cid}: {img_err}")
+                continue
         core = related
 
     if paths:
