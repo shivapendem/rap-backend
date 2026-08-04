@@ -568,32 +568,48 @@ async def send_email_now(
     # html_content column, so process_single_email_queue_item can send a
     # proper multipart/alternative message later exactly as composed here,
     # without re-deriving the sender's identity at actual send time.
-    from email_template import build_signature_text, build_signature_html, resolve_sender_fields
-    sender = resolve_sender_fields(current_user, consultant)
-    signature = build_signature_text(
-        sender["sender_name"],
-        sender["sender_title"],
-        sender["sender_email"],
-        sender["sender_direct_number"],
-        sender["sender_extension"],
-        sender["sender_linkedin_url"],
-    )
-    final_content = f"{body.content.rstrip()}\n\n{signature}" if (body.content or "").strip() else signature
+    #
+    # BUG FIX: wrapped in try/except — any failure while building the
+    # signature/HTML (e.g. models.py's new columns not migrated on this
+    # database yet, or a bad field on the current_user row) used to take
+    # the whole send down with it, surfacing as this endpoint's generic
+    # 502 with no clue that "signature building" was the actual failure
+    # point. Now falls back to plain content with no signature at all
+    # rather than blocking the send — sending the application is more
+    # important than the signature being present.
+    final_content = body.content or ""
+    final_html_content = None
+    try:
+        from email_template import build_signature_text, build_signature_html, resolve_sender_fields
+        sender = resolve_sender_fields(current_user, consultant)
+        signature = build_signature_text(
+            sender["sender_name"],
+            sender["sender_title"],
+            sender["sender_email"],
+            sender["sender_direct_number"],
+            sender["sender_extension"],
+            sender["sender_linkedin_url"],
+        )
+        final_content = f"{body.content.rstrip()}\n\n{signature}" if (body.content or "").strip() else signature
 
-    import html as _html
-    intro_html = _html.escape(body.content or "").replace("\n", "<br>")
-    signature_html = build_signature_html(
-        sender["sender_name"],
-        sender["sender_title"],
-        sender["sender_email"],
-        sender["sender_direct_number"],
-        sender["sender_extension"],
-        sender["sender_linkedin_url"],
-    )
-    final_html_content = (
-        f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1e293b;">{intro_html}</div>'
-        + signature_html
-    )
+        import html as _html
+        intro_html = _html.escape(body.content or "").replace("\n", "<br>")
+        signature_html = build_signature_html(
+            sender["sender_name"],
+            sender["sender_title"],
+            sender["sender_email"],
+            sender["sender_direct_number"],
+            sender["sender_extension"],
+            sender["sender_linkedin_url"],
+        )
+        final_html_content = (
+            f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1e293b;">{intro_html}</div>'
+            + signature_html
+        )
+    except Exception as sig_err:
+        print(f"[email_queue] signature build failed, sending without one: {sig_err}")
+        final_content = body.content or ""
+        final_html_content = None
 
     from datetime import datetime, timezone
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
