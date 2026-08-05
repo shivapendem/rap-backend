@@ -1180,12 +1180,21 @@ async def create_experience(
     _require_role(current_user, "CONSULTANT")
     consultant = await _get_consultant_for_user(db, current_user)
 
-    # Next sort order = current max + 1
-    max_result = await db.execute(
-        select(func.max(ConsultantExperience.sort_order))
+    # BUG FIX: new experiences are meant to always land at the TOP
+    # (sort_order 0) — but simply setting sort_order=0 collides with
+    # whatever entry already holds that position (e.g. right after a
+    # manual drag-reorder reassigns sort_order 0..N to match the new
+    # visual order). Two rows tied at sort_order=0 then depend on the
+    # database's tie-breaking (typically insertion order/id), which
+    # favored the OLDER entry over the genuinely new one — showing the
+    # new entry second instead of first. Shift every existing entry down
+    # by one first, so sort_order=0 is actually free before the new row
+    # claims it — no tie possible.
+    await db.execute(
+        update(ConsultantExperience)
         .where(ConsultantExperience.consultant_id == consultant.id)
+        .values(sort_order=ConsultantExperience.sort_order + 1)
     )
-    next_order = (max_result.scalar_one() or 0) + 1
 
     exp = ConsultantExperience(
         consultant_id=consultant.id,
@@ -1201,7 +1210,7 @@ async def create_experience(
         technologies=payload.technologies,
         responsibilities=payload.responsibilities,
         achievements=payload.achievements,
-        sort_order=payload.sortOrder,
+        sort_order=0,
     )
     db.add(exp)
     await db.commit()
