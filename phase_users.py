@@ -242,6 +242,8 @@ async def update_consultant(
         secondary_skills=body.secondary_skills,
         preferred_roles=body.preferred_roles,
         linkedin_url=body.linkedin_url,
+        education=[e.model_dump() for e in body.education] if body.education is not None else None,
+        resume_info=body.resume_info,
         admin_id=current_user.get("sub"),
     )
     return UpdateConsultantResponseDTO(

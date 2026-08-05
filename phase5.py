@@ -499,6 +499,12 @@ class ApplicationHistoryRow(BaseModel):
     gmail_message_id: Optional[str] = None
     sent_by_name: Optional[str] = None
     sent_by_role: Optional[str] = None
+    # Real filename, so the frontend can show "John_Doe_Resume.docx"
+    # instead of a generic "PDF" label that's wrong for non-PDF uploads.
+    # Falls back to the raw attachment path's basename for applications
+    # sent via the email-queue/Apply-to-Requirement flow, which never
+    # get a GeneratedResume row at all.
+    resume_filename: Optional[str] = None
 
 
 class PaginatedApplicationHistory(BaseModel):
@@ -1499,13 +1505,27 @@ async def get_consultant_applications(
         .outerjoin(GeneratedResume, GeneratedResume.id == Application.generated_resume_id)
         .outerjoin(User, User.id == Application.recruiter_id)
         .where(Application.consultant_id == consultant.id)
-        .order_by(Application.sent_at.desc().nullslast())
+        .order_by(Application.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )).all()
 
     rows = []
     for app, req, resume, sender in results:
+        if resume and resume.filename:
+            resume_filename = resume.filename
+        elif app.resume_attachment_path:
+            # BUG FIX: raw os.path.basename() returned the stored
+            # reference unchanged (e.g. "f32a0912-...__agfgr.pdf") — the
+            # UUID prefix was never stripped off here, so the table
+            # showed the meaningless internal storage key instead of the
+            # real filename someone actually uploaded. Same recovery
+            # function the download endpoint (phase7.py) already uses.
+            from email_queue import original_filename_from_ref
+            resume_filename = original_filename_from_ref(app.resume_attachment_path)
+        else:
+            resume_filename = None
+
         rows.append(ApplicationHistoryRow(
             application_id=str(app.id),
             requirement_id=str(req.id),
@@ -1513,7 +1533,7 @@ async def get_consultant_applications(
             vendor=req.vendor,
             vendor_email=app.vendor_email,
             application_status=app.status,
-            sent_at=app.sent_at.isoformat() if app.sent_at else None,
+            sent_at=(app.sent_at or app.created_at).isoformat() if (app.sent_at or app.created_at) else None,
             resume_url=resume.pdf_url if resume else None,
             resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
             resume_available=bool(app.generated_resume_id or app.resume_attachment_path),
@@ -1522,6 +1542,7 @@ async def get_consultant_applications(
             gmail_message_id=app.gmail_message_id,
             sent_by_name=sender.full_name if sender else consultant.full_name,
             sent_by_role=sender.role if sender else "CONSULTANT",
+            resume_filename=resume_filename,
         ))
 
     return PaginatedApplicationHistory(

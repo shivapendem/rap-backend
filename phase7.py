@@ -350,7 +350,7 @@ async def get_email_preview(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found.")
 
-    cc_email = await get_sales_recruiter_email(db, consultant)
+    cc_email = current_user.email
 
     email_content = build_application_email(
         vendor_contact_name=requirement.vendor_contact,
@@ -431,7 +431,7 @@ async def confirm_send(
         if not requirement:
             raise HTTPException(status_code=404, detail="Requirement not found.")
 
-        cc_email = await get_sales_recruiter_email(db, consultant)
+        cc_email = current_user.email
 
         email_content = build_application_email(
             vendor_contact_name=requirement.vendor_contact,
@@ -761,6 +761,16 @@ async def get_application_email_preview(
 @router.get("/applications/{application_id}/resume-download")
 async def download_application_resume(
     application_id: int,
+    # BUG FIX: this endpoint is used by TWO different frontend features —
+    # admin/recruiter's "view" (which hands a presigned URL to Google's
+    # Docs Viewer; Google's own servers fetch it, so browser CORS never
+    # applies there) and the consultant's "download" button (which needs
+    # real bytes in the browser, and DOES hit CORS against a presigned
+    # URL, since this bucket has no CORS policy allowing direct browser
+    # access). Rather than pick one behavior for both, force_stream lets
+    # the download button explicitly ask for real bytes every time,
+    # while the default (view) behavior is untouched.
+    force_stream: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -857,21 +867,31 @@ async def download_application_resume(
     # format), there is no in-browser renderer, so simply avoiding the
     # `attachment` Content-Disposition (see below) is NOT enough; the
     # browser still has nothing to show and falls back to a download
-    # prompt regardless of headers. The actual fix for those formats is
-    # routing them through an external document viewer (Google Docs
-    # Viewer / Office Online), which needs a real reachable URL, not
-    # proxied bytes — so when the file lives in Spaces, prefer returning
-    # a presigned URL (JSON) instead of streaming bytes, and let the
-    # frontend decide (open the URL directly for pdf/image, or wrap it
-    # in a viewer for everything else — see toViewableUrl in
-    # applications.api.ts). Local (non-S3) files have no public URL to
-    # hand a viewer service, so those still fall back to proxied bytes
-    # below — a real, unavoidable limitation for that case, not a bug.
+    # prompt regardless of headers. A prior version of this endpoint
+    # always returned a presigned Spaces URL (JSON) for the frontend to
+    # hand to an external viewer (Google Docs Viewer/Office Online)
+    # instead of proxying bytes.
+    #
+    # BUG FIX (refined, not fully reverted): that approach broke the
+    # consultant's plain "download" button — this bucket
+    # (nyc3.digitaloceanspaces.com) has no CORS configuration allowing
+    # browser access at all, so a presigned URL fetched directly by the
+    # browser (as a real download needs to) failed outright with "blocked
+    # by CORS policy: No 'Access-Control-Allow-Origin' header". Admin/
+    # recruiter's "view" feature was unaffected by that, because it hands
+    # the presigned URL to Google's Docs Viewer, whose own servers fetch
+    # it server-side — browser CORS never applies there. So both behaviors
+    # are correct for their respective caller: force_stream=True (used by
+    # the download button) always streams real bytes through this
+    # same-origin endpoint; the default (view) keeps using a presigned URL
+    # when one is available, falling back to streaming only if presigning
+    # itself fails.
     if s3_key:
-        from s3_service import generate_presigned_url
-        presigned = generate_presigned_url(s3_key)
-        if presigned:
-            return {"url": presigned, "filename": filename, "mimeType": media_type}
+        if not force_stream:
+            from s3_service import generate_presigned_url
+            presigned = generate_presigned_url(s3_key)
+            if presigned:
+                return {"url": presigned, "filename": filename, "mimeType": media_type}
         from s3_service import download_file_from_s3
         body_bytes, _ = download_file_from_s3(s3_key)
     else:

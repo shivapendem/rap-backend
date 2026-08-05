@@ -119,6 +119,14 @@ class Consultant(Base):
     # MIGRATION REQUIRED — same as User.mobile_number/extension/linkedin_url
     # above: ALTER TABLE consultants ADD COLUMN linkedin_url TEXT;
     linkedin_url = Column(Text, nullable=True)
+    # MIGRATION REQUIRED — ALTER TABLE consultants ADD COLUMN education JSONB;
+    # (or ADD COLUMN education TEXT on the SQLite dev path — see JSONBColumn).
+    # Was previously ONLY stored in User.resume_info["education"], written/
+    # read solely by the consultant's own PUT/GET /api/consultant/profile —
+    # the admin screens (this table) had no column for it at all, so admin
+    # couldn't see or edit it and a consultant's own edits never showed up
+    # there. Same class of bug as linkedin_url above; same fix shape.
+    education = JSONBColumn(nullable=True)
     preferred_employment_types = ArrayTextColumn(nullable=False, default=lambda: ["C2C"])
     base_resume_file_path = Column(Text, nullable=True)
     base_resume_text = Column(Text, nullable=True)

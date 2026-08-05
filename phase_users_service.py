@@ -75,10 +75,18 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
     last_login_at = None
     total_applications_sent = 0
     total_resumes_generated = 0
+    # Feeds the admin "Resume Info (JSON)" editor — same underlying field
+    # AddEditUserDrawer.tsx already edits from the Users page, now also
+    # editable directly from the consultant-specific admin screens.
+    resume_info = None
 
     if c.user_id:
-        user_result = await db.execute(select(User.last_login_at).where(User.id == c.user_id))
-        last_login_at = user_result.scalar_one_or_none()
+        user_result = await db.execute(
+            select(User.last_login_at, User.resume_info).where(User.id == c.user_id)
+        )
+        user_row = user_result.first()
+        if user_row:
+            last_login_at, resume_info = user_row
 
         resumes_result = await db.execute(
             select(func.count()).select_from(Resume).where(Resume.user_id == c.user_id)  # pylint: disable=not-callable  # pyright: ignore[reportOptionalCall, reportCallIssue]
@@ -132,6 +140,8 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         preferred_roles=c.preferred_roles,
         ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
         linkedin_url=c.linkedin_url,
+        education=c.education or [],
+        resume_info=resume_info,
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
         has_resume=bool(c.base_resume_file_path or c.base_resume_text),
         last_login_at=last_login_at.isoformat() if last_login_at else None,
@@ -293,6 +303,15 @@ class UserService:
                 if not already:
                     await RecruiterConsultantRepository.assign(db, rid, consultant.id)
 
+        # If role changed to CONSULTANT from ADMIN or RECRUITER, add a notification for the user
+        if before.get("role") in ("ADMIN", "RECRUITER") and user.role == "CONSULTANT":
+            from models import Notification
+            db.add(Notification(
+                user_id=user.id,
+                title="Account Role Updated to Consultant",
+                body="Your account role has been updated to Consultant. Please complete your profile (skills, experience, and target role) to enable matched requirements."
+            ))
+
         await log_action(
             db, "USER_UPDATED",
             actor_user_id=admin_id, actor_name=admin_id, actor_role="ADMIN",
@@ -384,6 +403,8 @@ class ConsultantAssignmentService:
         secondary_skills: Optional[str] = None,
         preferred_roles: Optional[str] = None,
         linkedin_url: Optional[str] = None,
+        education: Optional[list] = None,
+        resume_info: Optional[dict] = None,
     ) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -413,6 +434,18 @@ class ConsultantAssignmentService:
             consultant.preferred_roles = preferred_roles
         if linkedin_url is not None:
             consultant.linkedin_url = linkedin_url
+        if education is not None:
+            consultant.education = education
+
+        # resume_info lives on User, not Consultant (see admin_create_consultant
+        # and generate_resume() in resume_router.py, which both read/write it
+        # there) — same field AddEditUserDrawer.tsx already edits from the
+        # Users page, now also editable directly from this screen.
+        if resume_info is not None and consultant.user_id:
+            user_result = await db.execute(select(User).where(User.id == consultant.user_id))
+            linked_user = user_result.scalars().first()
+            if linked_user:
+                linked_user.resume_info = resume_info
 
         consultant = await ConsultantRepository.update(db, consultant)
 

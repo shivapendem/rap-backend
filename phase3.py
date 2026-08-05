@@ -218,6 +218,7 @@ class AdminConsultantCreateRequest(BaseModel):
     preferred_roles: Optional[str] = None
     resume_info: Optional[dict] = None
     linkedin_url: Optional[str] = None
+    education: List[EducationEntryRequest] = []
 
     @field_validator("email")
     @classmethod
@@ -436,7 +437,15 @@ async def _consultant_to_profile_response(
         # Prefer the real Consultant.linkedin_url column (what admin edits
         # write to) — fall back to the legacy resume_info blob only for
         # rows saved before this endpoint wrote the column directly.
-        linkedInUrl=c.linkedin_url or resume_info.get("linkedin"),
+        # BUG FIX: `c.linkedin_url or resume_info.get(...)` treated an
+        # explicitly-cleared LinkedIn URL (admin/consultant blanked the
+        # field, leaving "") the same as "never set" — Python's `or` falls
+        # through on any falsy value, not just None — so clearing the field
+        # would silently resurrect old, stale data from the legacy blob
+        # instead of showing empty. Only fall back when the column is
+        # genuinely unset (None), which only happens for rows saved before
+        # this column existed.
+        linkedInUrl=c.linkedin_url if c.linkedin_url is not None else resume_info.get("linkedin"),
         primarySkills=primary,
         secondarySkills=secondary,
         workAuth=c.work_authorization,
@@ -451,7 +460,10 @@ async def _consultant_to_profile_response(
         preferredLocations=c.preferred_locations,
         title=resume_info.get("title"),
         summary=resume_info.get("summary"),
-        education=resume_info.get("education") or [],
+        # Prefer the real Consultant.education column (what admin now
+        # edits) — fall back to the legacy resume_info blob only for rows
+        # saved before update_own_profile started writing the column too.
+        education=c.education or resume_info.get("education") or [],
         totalExperienceYears=float(c.total_experience_years) if c.total_experience_years is not None else None,
         availabilityStatus=c.availability_status,
         createdAt=c.created_at.isoformat() if c.created_at else None,
@@ -724,6 +736,10 @@ async def update_own_profile(
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
+    # Same fix as linkedin_url above: write the real Consultant.education
+    # column (what admin now reads/edits) in addition to resume_info below
+    # (kept for resume_validation.py's FIELD_CHECKS / resume generation).
+    consultant.education = [e.model_dump() for e in payload.education]
 
     # BUG FIX: this consultant self-service endpoint never wrote to
     # User.resume_info at all — the AI generation eligibility check
@@ -950,6 +966,7 @@ async def admin_create_consultant(
         current_location=payload.current_location,
         total_experience_years=payload.total_experience_years,
         linkedin_url=payload.linkedin_url,
+        education=[e.model_dump() for e in payload.education],
     )
     # availability_status isn't referenced elsewhere in this file, so only
     # set it if the model actually defines that column.

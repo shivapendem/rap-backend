@@ -20,6 +20,12 @@ VALID_STATUSES = {"Active", "Inactive"}
 VALID_CONSULTANT_STATUSES = {"ACTIVE", "INACTIVE", "BENCH", "ON_PROJECT"}  # matches your Consultant.VALID_STATUSES
 
 
+class EducationEntryDTO(BaseModel):
+    degree: Optional[str] = None
+    institution: Optional[str] = None
+    year: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # GET /admin/users — row shape
 # ---------------------------------------------------------------------------
@@ -202,6 +208,11 @@ class ConsultantAdminRowDTO(BaseModel):
     preferred_roles: Optional[str] = None
     ats_score: Optional[float] = None
     linkedin_url: Optional[str] = None
+    # Same fix shape as linkedin_url: previously only stored in
+    # User.resume_info["education"] (consultant's own profile), invisible
+    # to and un-editable from admin. Now backed by Consultant.education.
+    education: List["EducationEntryDTO"] = []
+    resume_info: Optional[Any] = None
     updated_at: str = ""
     has_resume: bool = False  # base_resume_file_path/base_resume_text can be large — expose presence, not raw content
     last_login_at: Optional[str] = None
@@ -247,6 +258,8 @@ class UpdateConsultantRequestDTO(BaseModel):
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     linkedin_url: Optional[str] = None
+    education: Optional[List[EducationEntryDTO]] = None
+    resume_info: Optional[Any] = None
 
     @field_validator("status")
     @classmethod
