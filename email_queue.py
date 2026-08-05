@@ -971,99 +971,73 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
 
         access_token = None
 
-        # 1. Try Consultant OAuth Token First
-        email_tok = None
-
-        # First try looking up by the new email_address column
-        tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
-        email_tok = tok_res.scalars().first()
-
-        # Fallback to the old method (User -> Consultant -> Token)
-        if not email_tok:
-            user_res = await session.execute(select(User).where(User.email == item.from_email))
-            from_user = user_res.scalars().first()
-            if from_user and from_user.role == "CONSULTANT":
-                cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
-                cons = cons_res.scalars().first()
-                if cons:
-                    tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
-                    email_tok = tok_res.scalars().first()
-
-        # --- TEMPORARY FALLBACK FOR ADMIN TESTING ---
-        # If the candidate hasn't authorized their token, the admin's test token won't match the candidate's from_email.
-        # We fallback to ANY available token, but we MUST rewrite the from_email so Gmail doesn't throw 403/401.
-        if not email_tok:
-            tok_res = await session.execute(select(ConsultantEmailToken))
-            email_tok = tok_res.scalars().first()
-            if email_tok and email_tok.email_address:
-                print(f"[email-queue] TEST FALLBACK: Rewriting from_email from {item.from_email} to {email_tok.email_address}")
-                item.from_email = email_tok.email_address
-        # ----------------------------------------------
-
-
-        if email_tok and email_tok.access_token_encrypted:
-            from datetime import datetime, timezone, timedelta
-            import httpx
-            from gmail_send_service import encrypt_token
-
-            now = datetime.now(timezone.utc)
-            # Check if token is expired or about to expire in next 5 mins
-            if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
-                if email_tok.refresh_token_encrypted:
-                    ref_token = decrypt_token(email_tok.refresh_token_encrypted)
-                    client_id = os.getenv("GOOGLE_CLIENT_ID")
-                    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-                    if client_id and client_secret:
-                        async with httpx.AsyncClient() as client:
-                            res = await client.post(
-                                "https://oauth2.googleapis.com/token",
-                                data={
-                                    "client_id": client_id,
-                                    "client_secret": client_secret,
-                                    "refresh_token": ref_token,
-                                    "grant_type": "refresh_token"
-                                }
-                            )
-                            if res.status_code == 200:
-                                new_data = res.json()
-                                access_token = new_data["access_token"]
-                                email_tok.access_token_encrypted = encrypt_token(access_token)
-                                if "refresh_token" in new_data:
-                                    email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
-                                email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
-                                await session.commit()
-            else:
-                access_token = decrypt_token(email_tok.access_token_encrypted)
-
-        # 2. Fallback to Domain Delegation
-        # BUG FIX: get_service_account_access_token makes a real,
-        # SYNCHRONOUS network call to Google's OAuth endpoint
-        # (gmail_send_service.py uses plain httpx.post, not an async
-        # client) — calling it directly here blocked the entire event
-        # loop for the full round-trip to Google. This fallback is what
-        # runs whenever the sender has no personally-connected Gmail
-        # token, which is exactly why this was intermittent/role-
-        # correlated rather than affecting every send: whoever already
-        # had a token connected skipped this branch entirely and never
-        # hit the block. While frozen, every other coroutine on this
-        # worker stalls too, including unrelated requests waiting on a DB
-        # connection pool checkout — a plausible contributor to the
-        # intermittent "greenlet_spawn has not been called" errors seen
-        # elsewhere in this app under load. Offload to a worker thread,
-        # same fix already applied to this same call in phase7.py.
-        #
-        # NOTE: uses the module-level `import asyncio` (top of this
-        # file), not a local import — this function also does
-        # asyncio.to_thread(...) further down for the S3 attachment
-        # download, and a local `import asyncio` anywhere in a function
-        # body makes Python treat that name as local for the ENTIRE
-        # function. A bare `asyncio.to_thread(...)` here with a local
-        # import later in the same function would raise
-        # UnboundLocalError at runtime on every single send, since this
-        # reference executes before that later import statement does.
-        if not access_token:
+        if "savantis" in item.from_email.lower():
+            # Send using JSON (Service Account Domain Delegation)
             sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
             access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
+        else:
+            # Check with OAuth credentials from consultants
+            email_tok = None
+
+            # First try looking up by the new email_address column
+            tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
+            email_tok = tok_res.scalars().first()
+
+            # Fallback to the old method (User -> Consultant -> Token)
+            if not email_tok:
+                user_res = await session.execute(select(User).where(User.email == item.from_email))
+                from_user = user_res.scalars().first()
+                if from_user and from_user.role == "CONSULTANT":
+                    cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
+                    cons = cons_res.scalars().first()
+                    if cons:
+                        tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
+                        email_tok = tok_res.scalars().first()
+
+            # --- TEMPORARY FALLBACK FOR ADMIN TESTING ---
+            if not email_tok:
+                tok_res = await session.execute(select(ConsultantEmailToken))
+                email_tok = tok_res.scalars().first()
+                if email_tok and email_tok.email_address:
+                    print(f"[email-queue] TEST FALLBACK: Rewriting from_email from {item.from_email} to {email_tok.email_address}")
+                    item.from_email = email_tok.email_address
+
+            if email_tok and email_tok.access_token_encrypted:
+                from datetime import datetime, timezone, timedelta
+                import httpx
+                from gmail_send_service import encrypt_token
+
+                now = datetime.now(timezone.utc)
+                # Check if token is expired or about to expire in next 5 mins
+                if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
+                    if email_tok.refresh_token_encrypted:
+                        ref_token = decrypt_token(email_tok.refresh_token_encrypted)
+                        client_id = os.getenv("GOOGLE_CLIENT_ID")
+                        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+                        if client_id and client_secret:
+                            async with httpx.AsyncClient() as client:
+                                res = await client.post(
+                                    "https://oauth2.googleapis.com/token",
+                                    data={
+                                        "client_id": client_id,
+                                        "client_secret": client_secret,
+                                        "refresh_token": ref_token,
+                                        "grant_type": "refresh_token"
+                                    }
+                                )
+                                if res.status_code == 200:
+                                    new_data = res.json()
+                                    access_token = new_data["access_token"]
+                                    email_tok.access_token_encrypted = encrypt_token(access_token)
+                                    if "refresh_token" in new_data:
+                                        email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
+                                    email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
+                                    await session.commit()
+                else:
+                    access_token = decrypt_token(email_tok.access_token_encrypted)
+
+            if not access_token:
+                raise ValueError("No OAuth token found for candidate/consultant and not a Savantis sender")
 
         # BUG FIX: previously built a path under /tmp and
         # handed it straight to send_application_email_async,
