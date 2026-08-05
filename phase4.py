@@ -458,33 +458,56 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
 
         existing = existing_matches_by_consultant.get(consultant.id)
 
-        if existing:
-            existing.match_score = result["total"]
-            existing.skill_score = result["skill_score"]
-            existing.role_score = result["role_score"]
-            existing.experience_score = result["experience_score"]
-            existing.employment_score = result["employment_score"]
-            existing.location_score = result["location_score"]
-            existing.auth_score = result["auth_score"]
-            existing.matched_skills = result["matched_skills"]
-            existing.missing_skills = result["missing_skills"]
-            existing.match_reason = result["match_reason"]
-        else:
-            db.add(RequirementConsultantMatch(
-                requirement_id=requirement_id,
-                consultant_id=consultant.id,
-                match_score=result["total"],
-                skill_score=result["skill_score"],
-                role_score=result["role_score"],
-                experience_score=result["experience_score"],
-                employment_score=result["employment_score"],
-                location_score=result["location_score"],
-                auth_score=result["auth_score"],
-                matched_skills=result["matched_skills"],
-                missing_skills=result["missing_skills"],
-                match_reason=result["match_reason"],
-                status="ASSIGNED",
-            ))
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with db.begin_nested():
+                if existing:
+                    existing.match_score = result["total"]
+                    existing.skill_score = result["skill_score"]
+                    existing.role_score = result["role_score"]
+                    existing.experience_score = result["experience_score"]
+                    existing.employment_score = result["employment_score"]
+                    existing.location_score = result["location_score"]
+                    existing.auth_score = result["auth_score"]
+                    existing.matched_skills = result["matched_skills"]
+                    existing.missing_skills = result["missing_skills"]
+                    existing.match_reason = result["match_reason"]
+                else:
+                    db.add(RequirementConsultantMatch(
+                        requirement_id=requirement_id,
+                        consultant_id=consultant.id,
+                        match_score=result["total"],
+                        skill_score=result["skill_score"],
+                        role_score=result["role_score"],
+                        experience_score=result["experience_score"],
+                        employment_score=result["employment_score"],
+                        location_score=result["location_score"],
+                        auth_score=result["auth_score"],
+                        matched_skills=result["matched_skills"],
+                        missing_skills=result["missing_skills"],
+                        match_reason=result["match_reason"],
+                        status="ASSIGNED",
+                    ))
+                await db.flush()
+        except IntegrityError:
+            stmt = select(RequirementConsultantMatch).where(
+                RequirementConsultantMatch.requirement_id == requirement_id,
+                RequirementConsultantMatch.consultant_id == consultant.id
+            )
+            res = await db.execute(stmt)
+            existing = res.scalars().first()
+            if existing:
+                existing.match_score = result["total"]
+                existing.skill_score = result["skill_score"]
+                existing.role_score = result["role_score"]
+                existing.experience_score = result["experience_score"]
+                existing.employment_score = result["employment_score"]
+                existing.location_score = result["location_score"]
+                existing.auth_score = result["auth_score"]
+                existing.matched_skills = result["matched_skills"]
+                existing.missing_skills = result["missing_skills"]
+                existing.match_reason = result["match_reason"]
+                await db.flush()
 
         assignment_count += 1
 
@@ -550,33 +573,56 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
 
         existing = existing_by_req.get(requirement.id)
 
-        if existing:
-            existing.match_score = result["total"]
-            existing.skill_score = result["skill_score"]
-            existing.role_score = result["role_score"]
-            existing.experience_score = result["experience_score"]
-            existing.employment_score = result["employment_score"]
-            existing.location_score = result["location_score"]
-            existing.auth_score = result["auth_score"]
-            existing.matched_skills = result["matched_skills"]
-            existing.missing_skills = result["missing_skills"]
-            existing.match_reason = result["match_reason"]
-        else:
-            db.add(RequirementConsultantMatch(
-                requirement_id=requirement.id,
-                consultant_id=consultant_id,
-                match_score=result["total"],
-                skill_score=result["skill_score"],
-                role_score=result["role_score"],
-                experience_score=result["experience_score"],
-                employment_score=result["employment_score"],
-                location_score=result["location_score"],
-                auth_score=result["auth_score"],
-                matched_skills=result["matched_skills"],
-                missing_skills=result["missing_skills"],
-                match_reason=result["match_reason"],
-                status="ASSIGNED",
-            ))
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with db.begin_nested():
+                if existing:
+                    existing.match_score = result["total"]
+                    existing.skill_score = result["skill_score"]
+                    existing.role_score = result["role_score"]
+                    existing.experience_score = result["experience_score"]
+                    existing.employment_score = result["employment_score"]
+                    existing.location_score = result["location_score"]
+                    existing.auth_score = result["auth_score"]
+                    existing.matched_skills = result["matched_skills"]
+                    existing.missing_skills = result["missing_skills"]
+                    existing.match_reason = result["match_reason"]
+                else:
+                    db.add(RequirementConsultantMatch(
+                        requirement_id=requirement.id,
+                        consultant_id=consultant_id,
+                        match_score=result["total"],
+                        skill_score=result["skill_score"],
+                        role_score=result["role_score"],
+                        experience_score=result["experience_score"],
+                        employment_score=result["employment_score"],
+                        location_score=result["location_score"],
+                        auth_score=result["auth_score"],
+                        matched_skills=result["matched_skills"],
+                        missing_skills=result["missing_skills"],
+                        match_reason=result["match_reason"],
+                        status="ASSIGNED",
+                    ))
+                await db.flush()
+        except IntegrityError:
+            stmt = select(RequirementConsultantMatch).where(
+                RequirementConsultantMatch.requirement_id == requirement.id,
+                RequirementConsultantMatch.consultant_id == consultant_id
+            )
+            res = await db.execute(stmt)
+            existing = res.scalars().first()
+            if existing:
+                existing.match_score = result["total"]
+                existing.skill_score = result["skill_score"]
+                existing.role_score = result["role_score"]
+                existing.experience_score = result["experience_score"]
+                existing.employment_score = result["employment_score"]
+                existing.location_score = result["location_score"]
+                existing.auth_score = result["auth_score"]
+                existing.matched_skills = result["matched_skills"]
+                existing.missing_skills = result["missing_skills"]
+                existing.match_reason = result["match_reason"]
+                await db.flush()
 
         match_count += 1
 
