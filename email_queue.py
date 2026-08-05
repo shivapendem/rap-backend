@@ -93,16 +93,25 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
     """
     from datetime import datetime, timezone, timedelta
     from models import EmailQueue, Application, Consultant
+    from sqlalchemy import text
+    import hashlib
 
-    now_utc = datetime.now(timezone.utc)
     norm_from = from_email.strip().lower()
 
-    # 1. Check max scheduled_at or created_at in EmailQueue for this sender
+    # Acquire transaction-level advisory lock to serialize concurrent enqueues for the same sender
+    email_hash = int(hashlib.sha256(norm_from.encode('utf-8')).hexdigest()[:16], 16)
+    if email_hash > 9223372036854775807:
+        email_hash = email_hash - 18446744073709551616
+    await db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": email_hash})
+
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Check max scheduled_at or created_at in EmailQueue for this sender (including PROCESSING)
     stmt_eq = (
         select(func.max(func.coalesce(EmailQueue.scheduled_at, EmailQueue.created_at)))
         .where(
             func.lower(EmailQueue.from_email) == norm_from,
-            EmailQueue.status.in_(["QUEUED", "SENT"])
+            EmailQueue.status.in_(["QUEUED", "SENT", "PROCESSING"])
         )
     )
     res_eq = await db.execute(stmt_eq)
@@ -121,14 +130,17 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
     last_app_time = res_app.scalar()
 
     times = [t for t in (last_eq_time, last_app_time) if t is not None]
+    
+    # Base reference floor is (now - 5 minutes)
+    reference_time = now_utc - timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+    
     if times:
         last_time = max(times)
         if last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=timezone.utc)
-        min_next_time = last_time + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
-        if min_next_time > now_utc:
-            return min_next_time
-    return now_utc
+        reference_time = max(reference_time, last_time)
+        
+    return reference_time + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
 
 
 async def reschedule_remaining_queued_emails(db: AsyncSession, from_email: str, actual_sent_at: datetime) -> None:
