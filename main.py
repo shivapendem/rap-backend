@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie
+from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, func, update
 from pydantic import BaseModel, EmailStr, field_validator, model_validator, Field
@@ -386,6 +386,29 @@ app.include_router(phase8_router)
 
 from phase_users import router as phase_users_router  # noqa: E402
 app.include_router(phase_users_router)
+
+# BUG FIX: phase8.py mounts under "/api/v1/admin" (see its own
+# APIRouter(prefix=...) declaration), but the frontend's AI Usage screen
+# calls "/api/admin/ai-usage/claude" instead, missing the "/v1" segment,
+# and 404s.
+#
+# IMPORTANT: this is intentionally a single, exact-path redirect, NOT a
+# blanket "/api/admin/*" catch-all. "/api/admin/" is also the real,
+# legitimate prefix for many OTHER unrelated routes already in this
+# codebase (see phase2.py's raw-emails/gmail-emails/gmail-accounts routes,
+# phase3.py's consultants routes, phase4.py's requirements/rematch routes,
+# phase5.py's resumes/generate route) — a wildcard redirect here would
+# have silently broken every one of those by sending them to a
+# nonexistent "/api/v1/admin/..." path instead. Add more specific lines
+# below (one per confirmed-broken path) if other phase8/phase_users
+# screens turn out to have the same missing-"/v1" frontend bug — do not
+# widen this into a wildcard.
+from fastapi.responses import RedirectResponse
+
+@app.get("/api/admin/ai-usage/claude", include_in_schema=False)
+async def _ai_usage_claude_prefix_compat_redirect(request: Request):
+    query = f"?{request.url.query}" if request.url.query else ""
+    return RedirectResponse(url=f"/api/v1/admin/ai-usage/claude{query}", status_code=307)
 
 from resume_router import router as resume_router  # noqa: E402
 app.include_router(resume_router)
@@ -930,6 +953,71 @@ async def update_me(
             "role": current_user.role,
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# Dynamic company banner — Spaces-backed, replaces the old static-file
+# banner (static/email_assets/company_banner.png). See the comment on
+# COMPANY_BANNER_S3_KEY in email_template.py and _resolve_banner_bytes in
+# gmail_send_service.py for the full rationale: updating the banner here
+# is immediately live everywhere (local + production, real sends +
+# preview) with no file copying or redeploy — replace it once, done.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/settings/company-banner")
+async def get_company_banner():
+    """
+    Streams the current company banner image. Used by the Email Preview
+    modal's <img> tag (get_email_preview in phase7.py sets banner_src to
+    this URL) — proxied through the API rather than a direct Spaces URL
+    so the browser never needs a bucket CORS policy, same pattern
+    download_file_from_s3 is already used for elsewhere in this app.
+    Any authenticated user can view it (it's not sensitive — the same
+    image is about to be emailed to external vendors anyway); only
+    uploading a replacement is admin-restricted, below.
+    """
+    from gmail_send_service import _resolve_banner_bytes
+    import mimetypes
+
+    body, filename = _resolve_banner_bytes()
+    if body is None:
+        raise HTTPException(status_code=404, detail="No company banner is set.")
+
+    media_type = mimetypes.guess_type(filename or "banner.png")[0] or "image/png"
+    return Response(content=body, media_type=media_type)
+
+
+@app.post("/api/v1/admin/settings/company-banner")
+async def upload_company_banner(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Admin-only: replace the company banner shown in application-email
+    signatures (both the real sent email and the Email Preview modal).
+    Always uploaded to the SAME fixed Spaces key (COMPANY_BANNER_S3_KEY)
+    so this simply overwrites the previous banner in place — no version
+    tracking/cleanup needed, and every server/environment sharing the
+    same Spaces bucket picks up the new one immediately on the very next
+    send or preview, with no restart or redeploy.
+    """
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only admins can change the company banner.")
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file (PNG, JPG, etc.).")
+
+    from email_template import COMPANY_BANNER_S3_KEY
+    from s3_service import upload_file_to_s3
+
+    success = upload_file_to_s3(file.file, COMPANY_BANNER_S3_KEY, content_type=file.content_type)
+    if not success:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to upload banner to storage. Check Spaces/S3 credentials are configured.",
+        )
+
+    return {"success": True, "message": "Company banner updated — live on every send and preview immediately."}
 
 
 @app.get("/health")

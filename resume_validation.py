@@ -8,7 +8,7 @@
 # Manager ask: we were never checking that the profile actually had real
 # data in it before calling the AI, so a thin profile silently produced a
 # useless resume. This checks every section that shows up in a real
-# resume_info blob (header fields, summary, skills, experience, education),
+# resume_info blob (header fields, skills, experience, education),
 # not just a subset -- and returns *which* fields are missing so the caller
 # (API error, or the frontend pre-check) can tell the user exactly what to
 # go fill in.
@@ -58,10 +58,8 @@ def _non_empty_experience(resume_info: Dict[str, Any]) -> bool:
     return bool(resume_info.get("experience"))
 
 
-def _non_empty_summary(resume_info: Dict[str, Any]) -> bool:
-    return _non_empty_str(
-        resume_info, "summary", "career_objective", "professional_summary", "objective"
-    )
+def _non_empty_education(resume_info: Dict[str, Any]) -> bool:
+    return bool(resume_info.get("education") or resume_info.get("educational_background"))
 
 
 def _non_empty_title(resume_info: Dict[str, Any]) -> bool:
@@ -78,22 +76,16 @@ def _non_empty_years_experience(resume_info: Dict[str, Any]) -> bool:
 
 # Every field we require, in the order they should be reported.
 # (field_key, human label, checker function)
-# BUG FIX: Education (and any certifications) is no longer a hard
-# requirement here — plenty of legitimate consultant profiles have real,
-# usable experience/skills but no education entries filled in yet, and the
-# generate-resume screen was blocking them entirely over it. Removed from
-# this list rather than left in with an always-true checker, so it's clear
-# at a glance which fields are actually enforced.
 FIELD_CHECKS = [
     ("full_name", "Full Name", lambda ri: _non_empty_str(ri, "full_name")),
     ("email", "Email", lambda ri: _non_empty_str(ri, "email")),
     ("phone", "Phone", lambda ri: _non_empty_str(ri, "phone")),
     ("title", "Target Title / Role", _non_empty_title),
-    ("summary", "Summary", _non_empty_summary),
     ("linkedin", "LinkedIn", lambda ri: _non_empty_str(ri, "linkedin")),
     ("years_experience", "Years of Experience", _non_empty_years_experience),
     ("skills", "Skills", _non_empty_skills),
     ("experience", "Experience", _non_empty_experience),
+    ("education", "Education", _non_empty_education),
 ]
 
 FIELD_LABELS = {key: label for key, label, _ in FIELD_CHECKS}
@@ -103,9 +95,8 @@ def get_missing_resume_fields(resume_info: Optional[Dict[str, Any]]) -> List[str
     """
     Returns the list of field keys that are missing/empty in resume_info,
     checked against every field that shows up in a real profile (header
-    info, summary, skills, experience -- see FIELD_CHECKS above). Education
-    is intentionally not enforced (see note above FIELD_CHECKS). Empty list
-    = profile is complete enough to generate a real resume.
+    info, skills, experience, education -- see FIELD_CHECKS above).
+    Empty list = profile is complete enough to generate a real resume.
     """
     resume_info = resume_info or {}
     missing: List[str] = []

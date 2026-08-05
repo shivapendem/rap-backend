@@ -273,7 +273,12 @@ async def list_audit_logs(
     if entity_type:
         filters.append(AuditLog.entity_type == entity_type)
     if date_from:
-        filters.append(AuditLog.created_at >= datetime.fromisoformat(date_from))
+        # BUG FIX: date_to below appends "T23:59:59+00:00" so the compared
+        # value is tz-aware, matching AuditLog.created_at's tz-aware
+        # TIMESTAMP column — date_from was parsed bare, giving a naive
+        # datetime compared against a tz-aware column. Match date_to's
+        # handling so both ends of the range are interpreted the same way.
+        filters.append(AuditLog.created_at >= datetime.fromisoformat(date_from + "T00:00:00+00:00"))
     if date_to:
         filters.append(AuditLog.created_at <= datetime.fromisoformat(date_to + "T23:59:59+00:00"))
     if search:
@@ -866,7 +871,8 @@ async def list_applications_feed(
     db: AsyncSession = Depends(get_db), _: dict = Depends(require_admin),
 ):
     filters = [AuditLog.action.in_(["SEND", "APPLICATION_SENT"])]
-    if date_from: filters.append(AuditLog.created_at >= datetime.fromisoformat(date_from))
+    # Same date_from tz-consistency fix as list_audit_logs above.
+    if date_from: filters.append(AuditLog.created_at >= datetime.fromisoformat(date_from + "T00:00:00+00:00"))
     if date_to: filters.append(AuditLog.created_at <= datetime.fromisoformat(date_to + "T23:59:59+00:00"))
     # BUG FIX: consultant_id was being filtered in Python AFTER the DB
     # already paginated (.offset()/.limit()) on the unfiltered set — total

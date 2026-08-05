@@ -257,22 +257,41 @@ class UserService:
         # Apply consultant-only fields if this user has a linked consultant profile
         if req.role == "CONSULTANT":
             consultant = await ConsultantRepository.get_by_user_id(db, user.id)
-            if consultant:
-                if req.work_authorization is not None:
-                    consultant.work_authorization = req.work_authorization
-                if req.preferred_employment_types is not None:
-                    consultant.preferred_employment_types = req.preferred_employment_types
-                if req.primary_skills is not None:
-                    consultant.primary_skills = req.primary_skills
-                consultant.full_name = user.full_name
-                consultant.email = user.email
-                await ConsultantRepository.update(db, consultant)
-
-                if req.recruiter_id:
-                    rid = int(req.recruiter_id)
-                    already = await RecruiterConsultantRepository.exists(db, rid, consultant.id)
-                    if not already:
-                        await RecruiterConsultantRepository.assign(db, rid, consultant.id)
+            # BUG FIX: this only ever UPDATED an existing Consultant row —
+            # if someone's role was CHANGED to CONSULTANT (as opposed to
+            # being created as one from the start, which already
+            # auto-creates this row above in create_user), no Consultant
+            # row exists yet, so this whole block silently did nothing.
+            # Their next visit to "My Profile" hit a 404 with no
+            # explanation. Mirrors create_user's own auto-create logic
+            # exactly, so both paths behave consistently.
+            if not consultant:
+                from models import Consultant
+                consultant = Consultant(
+                    user_id=user.id,
+                    full_name=user.full_name,
+                    email=user.email,
+                    status="ACTIVE",
+                    gmail_connected=False,
+                    ats_score=0,
+                    preferred_employment_types=[],
+                )
+                db.add(consultant)
+                await db.flush()
+            if req.work_authorization is not None:
+                consultant.work_authorization = req.work_authorization
+            if req.preferred_employment_types is not None:
+                consultant.preferred_employment_types = req.preferred_employment_types
+            if req.primary_skills is not None:
+                consultant.primary_skills = req.primary_skills
+            consultant.full_name = user.full_name
+            consultant.email = user.email
+            await ConsultantRepository.update(db, consultant)
+            if req.recruiter_id:
+                rid = int(req.recruiter_id)
+                already = await RecruiterConsultantRepository.exists(db, rid, consultant.id)
+                if not already:
+                    await RecruiterConsultantRepository.assign(db, rid, consultant.id)
 
         await log_action(
             db, "USER_UPDATED",

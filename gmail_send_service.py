@@ -35,6 +35,37 @@ from typing import Optional, List
 BANNER_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "static", "email_assets", "company_banner.png")
 
 
+# BUG FIX: the banner was previously ALWAYS read from the static file
+# above — updating it meant manually copying a new file onto every
+# server (local + production separately), invisible until someone
+# actually sent/previewed an email and it still showed the old one, or a
+# mismatch between environments. Now resolved dynamically from Spaces
+# (same bucket resumes/attachments already use — see s3_service.py) under
+# one fixed, always-overwritten key, so replacing it once (via the admin
+# upload endpoint in main.py) is immediately live everywhere. Falls back
+# to the local static file only if Spaces isn't configured/reachable —
+# e.g. a fresh local dev checkout with no .env S3 credentials yet — so
+# sending never breaks outright just because the dynamic banner isn't
+# set up.
+def _resolve_banner_bytes():
+    """Returns (bytes, display_filename) for the current company banner,
+    or (None, None) if it can't be found anywhere."""
+    try:
+        from email_template import COMPANY_BANNER_S3_KEY
+        from s3_service import download_file_from_s3
+        body, _content_type = download_file_from_s3(COMPANY_BANNER_S3_KEY)
+        if body:
+            return body, os.path.basename(COMPANY_BANNER_S3_KEY)
+    except Exception as s3_err:
+        print(f"[gmail_send_service] dynamic banner fetch failed, falling back to static file: {s3_err}")
+
+    if os.path.exists(BANNER_IMAGE_PATH):
+        with open(BANNER_IMAGE_PATH, "rb") as f:
+            return f.read(), os.path.basename(BANNER_IMAGE_PATH)
+
+    return None, None
+
+
 def build_mime_message(
     sender: str,
     to: str,
@@ -85,16 +116,25 @@ def build_mime_message(
         related = MIMEMultipart("related")
         related.attach(core)
         for img in inline_images:
-            img_path = img.get("path") or BANNER_IMAGE_PATH
             cid = img.get("cid")
-            if not cid or not os.path.exists(img_path):
+            if not cid:
                 continue
             try:
                 from email.mime.image import MIMEImage
-                with open(img_path, "rb") as f:
-                    mime_img = MIMEImage(f.read())
+                explicit_path = img.get("path")
+                if explicit_path:
+                    if not os.path.exists(explicit_path):
+                        continue
+                    with open(explicit_path, "rb") as f:
+                        img_bytes = f.read()
+                    display_name = os.path.basename(explicit_path)
+                else:
+                    img_bytes, display_name = _resolve_banner_bytes()
+                    if img_bytes is None:
+                        continue
+                mime_img = MIMEImage(img_bytes)
                 mime_img.add_header("Content-ID", f"<{cid}>")
-                mime_img.add_header("Content-Disposition", "inline", filename=os.path.basename(img_path))
+                mime_img.add_header("Content-Disposition", "inline", filename=display_name)
                 related.attach(mime_img)
             except Exception as img_err:
                 # Never let a broken inline image take the whole send down

@@ -433,7 +433,10 @@ async def _consultant_to_profile_response(
         email=c.email,
         location=c.current_location,
         phone=c.phone,
-        linkedInUrl=resume_info.get("linkedin"),
+        # Prefer the real Consultant.linkedin_url column (what admin edits
+        # write to) — fall back to the legacy resume_info blob only for
+        # rows saved before this endpoint wrote the column directly.
+        linkedInUrl=c.linkedin_url or resume_info.get("linkedin"),
         primarySkills=primary,
         secondarySkills=secondary,
         workAuth=c.work_authorization,
@@ -710,6 +713,13 @@ async def update_own_profile(
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
     consultant.secondary_skills = ", ".join(payload.secondarySkills)
+    # BUG FIX: this used to only stash linkedInUrl inside User.resume_info
+    # (see below) — the admin screens (phase_users_service.py, phase3.py's
+    # admin update_consultant) read/write the real Consultant.linkedin_url
+    # column instead, so a consultant editing their own LinkedIn URL here
+    # never showed up on the admin side. Write the real column too so both
+    # directions stay in sync.
+    consultant.linkedin_url = payload.linkedInUrl
     consultant.preferred_employment_types = payload.employmentTypes
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
@@ -1437,7 +1447,7 @@ async def set_recruiters_for_consultant(
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "ADMIN")
-    await _get_consultant_or_404(db, consultant_id)
+    consultant = await _get_consultant_or_404(db, consultant_id)
 
     for rid in recruiter_ids:
         r = await db.execute(
@@ -1472,4 +1482,25 @@ async def set_recruiters_for_consultant(
             ))
 
     await db.commit()
-    return {"message": f"Updated recruiter assignments for consultant {consultant_id}"}
+
+    # Return the fresh assignment list along with the message so the
+    # frontend can update immediately instead of waiting on a refetch
+    # (and doesn't need to guess at names from raw ids).
+    result = await db.execute(
+        select(RecruiterConsultant, User)
+        .join(User, User.id == RecruiterConsultant.recruiter_id)
+        .where(
+            RecruiterConsultant.consultant_id == consultant_id,
+            RecruiterConsultant.is_active == True,
+        )
+        .order_by(User.full_name.asc())
+    )
+    assigned_recruiters = [
+        {"id": str(u.id), "name": u.full_name, "email": u.email} for _, u in result.all()
+    ]
+
+    consultant_label = consultant.full_name or consultant.email or f"consultant {consultant_id}"
+    return {
+        "message": f"Updated recruiter assignments for {consultant_label}.",
+        "assigned_recruiters": assigned_recruiters,
+    }

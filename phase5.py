@@ -1330,16 +1330,122 @@ async def apply_to_requirement(
         )
     )).scalars().first()
 
-    # Create application record
-    app = Application(
+    # BUG FIX: this endpoint previously only ever created an Application
+    # row with status="SENT" and a WebSocket broadcast — it never sent an
+    # actual email through Gmail at all. Every consultant clicking Apply
+    # through THIS endpoint got a confident "Application submitted to
+    # ..." success message while the vendor received nothing, with no
+    # error anywhere to show anything had gone wrong (because nothing
+    # technically errored — the code just never tried to send in the
+    # first place). Now builds and sends a real email through the same
+    # infrastructure email_queue.py's send-now endpoint uses (signature,
+    # HTML body with company banner, resume attachment, Gmail token
+    # resolution, real filename), instead of maintaining a second,
+    # diverging "apply" implementation that only pretends to send.
+    from models import EmailQueue
+    from email_queue import process_single_email_queue_item, UPLOAD_DIR
+    from email_template import build_application_email, resolve_sender_fields
+    from pathlib import Path
+    import uuid as _uuid
+
+    sender = resolve_sender_fields(current_user, consultant)
+    email_content = build_application_email(
+        vendor_contact_name=None,
+        role=req.role,
+        consultant_name=consultant.full_name or "",
+        consultant_email=consultant.email or "",
+        consultant_phone=consultant.phone,
+        primary_skills=consultant.primary_skills,
+        **sender,
+    )
+
+    # Resolve the generated resume's actual bytes and place them where
+    # process_single_email_queue_item's existing attachment resolution
+    # logic already looks (a bare filename under UPLOAD_DIR, i.e.
+    # /tmp/email_attachments/ — see original_filename_from_ref/
+    # EMAIL_ATTACHMENT_S3_PREFIX in email_queue.py). GeneratedResume.pdf_path
+    # is NOT in that ref format itself — it's whatever local temp path
+    # (or, once that's cleaned up, S3 key) the generation pipeline used —
+    # so it can't be passed through as-is; same local-then-S3 fallback
+    # phase7.py already uses for this identical scenario.
+    attachment_refs = None
+    if resume and resume.pdf_path:
+        body_bytes = None
+        if Path(resume.pdf_path).exists():
+            with open(resume.pdf_path, "rb") as f:
+                body_bytes = f.read()
+        else:
+            from s3_service import download_file_from_s3
+            body_bytes, _ = download_file_from_s3(resume.pdf_path)
+
+        if body_bytes:
+            safe_name = "".join(
+                c for c in (resume.filename or f"Resume_{resume.id}.pdf")
+                if c.isalnum() or c in " -_."
+            ).strip() or f"Resume_{resume.id}.pdf"
+            unique_name = f"{_uuid.uuid4()}__{safe_name}"
+            with open(Path(UPLOAD_DIR) / unique_name, "wb") as f:
+                f.write(body_bytes)
+            attachment_refs = [unique_name]
+        else:
+            # Resume exists but its bytes can't be found anywhere —
+            # fail loudly instead of silently sending without it.
+            raise HTTPException(
+                status_code=502,
+                detail="Could not retrieve the generated resume file to attach. Please regenerate the resume and try again.",
+            )
+
+    queue_item = EmailQueue(
         consultant_id=consultant.id,
         requirement_id=requirement_id,
-        generated_resume_id=resume.id if resume else None,
-        status="SENT",
-        vendor_email=req.vendor_email,
-        sent_at=datetime.now(timezone.utc),
+        from_email=consultant.email or "",
+        to_email=req.vendor_email or "",
+        cc_email=None,
+        subject=email_content["subject"],
+        content=email_content["body"],
+        html_content=email_content["html_body"],
+        attachments=attachment_refs,
+        status="QUEUED",
+        sent_by_user_id=current_user.id,
+        scheduled_at=datetime.now(timezone.utc),
     )
-    db.add(app)
+    db.add(queue_item)
+    await db.commit()
+    await db.refresh(queue_item)
+
+    await process_single_email_queue_item(db, queue_item)
+    await db.refresh(queue_item)
+
+    if queue_item.status != "SENT":
+        raise HTTPException(
+            status_code=502,
+            detail=queue_item.status_text or "Failed to send application email.",
+        )
+
+    # NOTE: process_single_email_queue_item above already creates/updates
+    # the Application row itself (it upserts on consultant_id +
+    # requirement_id whenever item.requirement_id is set — see the
+    # "revised" BUG FIX block in that function). Do NOT create a second
+    # Application row here — Application has a unique constraint on
+    # (consultant_id, requirement_id), so doing so would raise an
+    # IntegrityError on every successful send. Just fetch what it already
+    # wrote (with the real gmail_message_id, resume attachment, sent_at,
+    # etc. — all more accurate than anything this endpoint could set
+    # itself) to build the response below.
+    app = (await db.execute(
+        select(Application).where(
+            Application.consultant_id == consultant.id,
+            Application.requirement_id == requirement_id,
+        )
+    )).scalars().first()
+    if not app:
+        # Shouldn't happen given queue_item.status == "SENT" above, but
+        # don't silently 500 with an AttributeError on app.id below if it
+        # somehow does.
+        raise HTTPException(
+            status_code=500,
+            detail="Email sent, but the application record could not be found afterward. Please check the Applications tab.",
+        )
 
     # Update match status — reuses the match object already fetched above,
     # no second lookup needed.

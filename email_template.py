@@ -45,6 +45,20 @@ COMPANY_LINE_NUMBER = "+1 469-392-4030"
 # by gmail_send_service.build_mime_message — see BANNER_IMAGE_PATH there.
 COMPANY_BANNER_CID = "company_banner_img"
 
+# BUG FIX: previously a static file at static/email_assets/company_banner.png
+# — updating the banner meant manually copying a new file onto every
+# server (local + production separately), and a mismatch between them
+# was invisible until someone actually sent/previewed an email. Now
+# stored in Spaces (same bucket resumes/attachments already use) under
+# this one fixed key, always overwritten in place on update (see the
+# admin upload endpoint in main.py) — so replacing it once is
+# immediately live everywhere, no file copying or redeploy needed.
+# gmail_send_service.py fetches this fresh at send time (falling back to
+# the old static file only if Spaces isn't configured/reachable), and
+# the preview banner_src below now points at a backend endpoint that
+# proxies the same S3 object, instead of the old static file.
+COMPANY_BANNER_S3_KEY = "company-assets/banner.png"
+
 
 def build_signature_text(
     name: str,
@@ -91,12 +105,13 @@ def build_signature_html(
     clients fall back to build_signature_text() above.
 
     banner_src defaults to the cid: reference used for the actual sent
-    email (see BANNER_IMAGE_PATH in gmail_send_service.py, which attaches
-    the real file inline under that Content-ID). A browser can't resolve
-    cid: URLs on its own, so the Email Preview modal instead passes a real
-    servable URL (/static/email_assets/company_banner.png — see
-    get_email_preview in phase7.py) so the banner actually shows up there
-    too, not just in the real sent email.
+    email (see BANNER_IMAGE_PATH/COMPANY_BANNER_S3_KEY in
+    gmail_send_service.py, which attaches the real file inline under that
+    Content-ID). A browser can't resolve cid: URLs on its own, so the
+    Email Preview modal instead passes a real servable URL
+    (/api/settings/company-banner — see get_email_preview in phase7.py)
+    so the banner actually shows up there too, not just in the real sent
+    email.
     """
     import html as _html
 
@@ -283,7 +298,7 @@ def build_application_email(
     text_signature = build_signature_text(
         sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
     )
-    banner_kwargs = {"banner_src": "/static/email_assets/company_banner.png"} if for_preview else {}
+    banner_kwargs = {"banner_src": "/api/settings/company-banner"} if for_preview else {}
     html_signature = build_signature_html(
         sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
         **banner_kwargs,
