@@ -222,18 +222,7 @@ async def _email_queue_worker_loop():
         print(f"[email-queue] self-healing failed: {sh_err}")
     while True:
         try:
-            # Heartbeat check
-            print(f"[email-queue] checking queue at {datetime.now(timezone.utc).isoformat()}")
             async with AsyncSessionLocal() as session:
-                # Temporary debug log
-                try:
-                    debug_res = await session.execute(select(EmailQueue).order_by(EmailQueue.id.desc()).limit(3))
-                    debug_items = debug_res.scalars().all()
-                    for d in debug_items:
-                        print(f"[email-queue debug] id={d.id} status={d.status} scheduled_at={d.scheduled_at.isoformat() if d.scheduled_at else None} to_email={d.to_email}")
-                except Exception as dbg_err:
-                    print(f"[email-queue debug] failed to query: {dbg_err}")
-
                 now_utc = datetime.now(timezone.utc)
                 result = await session.execute(
                     select(EmailQueue)
