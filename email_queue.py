@@ -994,6 +994,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 print(f"[email-queue] item {item.id} skipped: scheduled_at ({item_sched.isoformat()}) is in the future")
                 return
 
+        print(f"[email-queue debug {item.id}] Starting send processing for from_email={item.from_email} to_email={item.to_email}")
+
         async def mark_app_failed(err_msg: str):
             if item.requirement_id:
                 app_res = await session.execute(
@@ -1024,6 +1026,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             await mark_app_failed(item.status_text)
             await session.commit()
             return
+
+        print(f"[email-queue debug {item.id}] Passed testing guards. Resolving token...")
 
         from gmail_send_service import get_service_account_access_token, decrypt_token
         from models import User, Consultant, ConsultantEmailToken
@@ -1097,6 +1101,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
 
             if not access_token:
                 raise ValueError("No OAuth token found for candidate/consultant and not a Savantis sender")
+
+        print(f"[email-queue debug {item.id}] Token resolved successfully. Resolving attachments...")
 
         # BUG FIX: previously built a path under /tmp and
         # handed it straight to send_application_email_async,
@@ -1196,6 +1202,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             return
 
         try:
+            print(f"[email-queue debug {item.id}] Attachments resolved successfully. Sending via Gmail API...")
             # BUG FIX: this only ever sent item.content (plain text) — the
             # rich HTML signature + company banner built at queue-creation
             # time (send_email_now above) and stored in item.html_content
@@ -1216,6 +1223,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 html_body=item.html_content or None,
                 inline_images=[{"cid": COMPANY_BANNER_CID}] if item.html_content else None,
             )
+            print(f"[email-queue debug {item.id}] Gmail API returned successfully. Marking status as SENT...")
             item.status = "SENT"
             item.status_text = "Sent successfully"
 
@@ -1302,7 +1310,9 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     pass
     except Exception as e:
         item_id = item.id
-        print(f"[email-queue] failed to send item {item_id}: {e}")
+        import traceback
+        tb_str = traceback.format_exc()
+        print(f"[email-queue debug {item_id}] Failed to send item: {e}\nTraceback:\n{tb_str}")
         from error_logger import log_db_error
         await log_db_error(stage="email_queue_worker_item", error=e, source_type="email_queue", source_id=item_id)
         await session.rollback()
