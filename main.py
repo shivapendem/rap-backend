@@ -205,8 +205,11 @@ async def _email_queue_worker_loop():
     from datetime import datetime, timezone
     from sqlalchemy import or_, func
 
+    print("[email-queue] worker loop task initialized and started")
     while True:
         try:
+            # Heartbeat check
+            print(f"[email-queue] checking queue at {datetime.now(timezone.utc).isoformat()}")
             async with AsyncSessionLocal() as session:
                 now_utc = datetime.now(timezone.utc)
                 result = await session.execute(
