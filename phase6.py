@@ -699,7 +699,16 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
                     inst = edu.get("institution") or edu.get("college", "")
                     yr = edu.get("year", "")
                     det = edu.get("details") or edu.get("percentage", "")
-                    line = f"{deg} - {inst} ({yr})" if inst else deg
+                    # BUG FIX: this only ever showed the year when
+                    # institution was ALSO present — an entry with just
+                    # Degree + Year (no institution filled in) silently
+                    # lost the year entirely. Build from whichever pieces
+                    # actually exist, independently of each other.
+                    line = deg
+                    if inst:
+                        line += f" - {inst}"
+                    if yr:
+                        line += f" ({yr})"
                     if det:
                         line += f" | {det}"
                     add_formatted_paragraph(line, style="List Bullet")

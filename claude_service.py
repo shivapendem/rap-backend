@@ -333,8 +333,29 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
         if key in resume_data and resume_data[key] not in (None, "", []):
             val = resume_data[key]
             normalized[key] = val if isinstance(val, (list, dict)) else val
-    if "education" not in normalized and resume_info.get("education"):
+    # BUG FIX: the AI can return an `education` array that's PRESENT but
+    # has empty/missing fields per-entry (e.g. year dropped even though
+    # it was given a real value) — the old check only fell back to the
+    # reliable source data when the WHOLE section was missing, so a
+    # partially-empty AI response was trusted as-is. Backfill any blank
+    # field on each entry from the matching real profile entry (matched
+    # by position — education entries aren't reordered by the AI in
+    # practice), rather than an all-or-nothing fallback.
+    if not normalized.get("education") and resume_info.get("education"):
         normalized["education"] = resume_info["education"]
+    elif isinstance(normalized.get("education"), list) and resume_info.get("education"):
+        real_edu = resume_info["education"]
+        backfilled = []
+        for i, entry in enumerate(normalized["education"]):
+            if isinstance(entry, dict) and i < len(real_edu) and isinstance(real_edu[i], dict):
+                merged = dict(entry)
+                for field in ("degree", "institution", "year", "details"):
+                    if not merged.get(field) and real_edu[i].get(field):
+                        merged[field] = real_edu[i][field]
+                backfilled.append(merged)
+            else:
+                backfilled.append(entry)
+        normalized["education"] = backfilled
     if "other_projects" in resume_data and resume_data["other_projects"]:
         normalized["other_projects"] = resume_data["other_projects"]
     if isinstance(resume_data.get("personal_details"), dict) and resume_data["personal_details"]:
