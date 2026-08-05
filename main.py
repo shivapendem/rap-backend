@@ -206,6 +206,20 @@ async def _email_queue_worker_loop():
     from sqlalchemy import or_, func
 
     print("[email-queue] worker loop task initialized and started")
+    # Self-healing: reset any stuck PROCESSING items back to QUEUED on startup
+    try:
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import update
+            claim_reset = await session.execute(
+                update(EmailQueue)
+                .where(EmailQueue.status == "PROCESSING")
+                .values(status="QUEUED")
+            )
+            await session.commit()
+            if claim_reset.rowcount > 0:
+                print(f"[email-queue] self-healing: reset {claim_reset.rowcount} stuck PROCESSING items back to QUEUED")
+    except Exception as sh_err:
+        print(f"[email-queue] self-healing failed: {sh_err}")
     while True:
         try:
             # Heartbeat check
