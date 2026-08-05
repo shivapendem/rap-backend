@@ -274,6 +274,26 @@ async def create_email_queue(
     else:
         final_cc = current_user.email
 
+    if final_cc.strip() == body.from_email.strip() and consultant_id:
+        from models import RecruiterConsultant, User, Consultant
+        r_res = await db.execute(
+            sa_select(User.email)
+            .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
+            .where(RecruiterConsultant.consultant_id == consultant_id, RecruiterConsultant.is_active == True)
+            .limit(1)
+        )
+        recruiter_email = r_res.scalar()
+        if not recruiter_email:
+            c_res = await db.execute(
+                sa_select(User.email)
+                .join(Consultant, Consultant.sales_recruiter_user_id == User.id)
+                .where(Consultant.id == consultant_id)
+                .limit(1)
+            )
+            recruiter_email = c_res.scalar()
+        if recruiter_email:
+            final_cc = recruiter_email
+
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
 
     item = EmailQueue(
@@ -563,6 +583,26 @@ async def send_email_now(
             final_cc = f"{final_cc},{current_user.email}"
     else:
         final_cc = current_user.email
+
+    if final_cc.strip() == body.from_email.strip() and consultant_id:
+        from models import RecruiterConsultant, User, Consultant
+        r_res = await db.execute(
+            sa_select(User.email)
+            .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
+            .where(RecruiterConsultant.consultant_id == consultant_id, RecruiterConsultant.is_active == True)
+            .limit(1)
+        )
+        recruiter_email = r_res.scalar()
+        if not recruiter_email:
+            c_res = await db.execute(
+                sa_select(User.email)
+                .join(Consultant, Consultant.sales_recruiter_user_id == User.id)
+                .where(Consultant.id == consultant_id)
+                .limit(1)
+            )
+            recruiter_email = c_res.scalar()
+        if recruiter_email:
+            final_cc = recruiter_email
 
     # Auto-append the sender's contact-card signature (name, title/
     # designation, LinkedIn, email/mobile/office-extension, address) after
@@ -950,11 +990,25 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 print(f"[email-queue] item {item.id} skipped: scheduled_at ({item_sched.isoformat()}) is in the future")
                 return
 
+        async def mark_app_failed(err_msg: str):
+            if item.requirement_id:
+                app_res = await session.execute(
+                    select(Application).where(
+                        Application.consultant_id == item.consultant_id,
+                        Application.requirement_id == item.requirement_id,
+                    )
+                )
+                app = app_res.scalars().first()
+                if app:
+                    app.status = "FAILED"
+                    app.error_message = err_msg
+
         import re
         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
             print(f"[email-queue] item {item.id} failed: Invalid to_email '{item.to_email}'")
             item.status = "FAILED"
             item.status_text = f"Invalid to_email '{item.to_email}'"
+            await mark_app_failed(item.status_text)
             await session.commit()
             return
 
@@ -963,6 +1017,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
             item.status = "FAILED"
             item.status_text = "not test domain for now"
+            await mark_app_failed(item.status_text)
             await session.commit()
             return
 

@@ -350,7 +350,11 @@ async def get_email_preview(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found.")
 
-    cc_email = await get_sales_recruiter_email(db, consultant)
+    cc_email = current_user.email
+    if current_user.role == "CONSULTANT":
+        recruiter_email = await get_sales_recruiter_email(db, consultant)
+        if recruiter_email:
+            cc_email = recruiter_email
 
     email_content = build_application_email(
         vendor_contact_name=requirement.vendor_contact,
@@ -444,7 +448,11 @@ async def confirm_send(
         if not requirement:
             raise HTTPException(status_code=404, detail="Requirement not found.")
 
-        cc_email = await get_sales_recruiter_email(db, consultant)
+        cc_email = current_user.email
+        if current_user.role == "CONSULTANT":
+            recruiter_email = await get_sales_recruiter_email(db, consultant)
+            if recruiter_email:
+                cc_email = recruiter_email
 
         email_content = build_application_email(
             vendor_contact_name=requirement.vendor_contact,

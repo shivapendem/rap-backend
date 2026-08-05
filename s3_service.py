@@ -86,7 +86,11 @@ def download_file_from_s3(s3_key: str):
         obj = s3_client.get_object(Bucket=DO_SPACES_BUCKET, Key=s3_key)
         return obj["Body"].read(), obj.get("ContentType", "application/pdf")
     except ClientError as e:
-        print(f"Failed to download file from DO Spaces: {e}")
+        error_code = e.response.get("Error", {}).get("Code", "Unknown")
+        if error_code == "NoSuchKey":
+            print(f"[s3_service] File not found in DO Spaces (NoSuchKey): {s3_key}")
+        else:
+            print(f"Failed to download file from DO Spaces: {e}")
         return None, None
 
 def get_s3_file_metadata(s3_key: str):
