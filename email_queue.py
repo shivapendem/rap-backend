@@ -677,57 +677,13 @@ async def send_email_now(
     await db.commit()
     await db.refresh(item)
 
-    if scheduled_at <= now_utc:
-        # BUG FIX ("Network Error" on send): this used to await the full
-        # send inline with no bound — token refresh + attachment download
-        # from Spaces + the actual Gmail API call, all sequential, can
-        # legitimately take longer than the timeout on whatever sits in
-        # front of this server (reverse proxy / Cloudflare / gunicorn
-        # worker timeout). When it does, the connection gets killed before
-        # any response is sent; the browser never receives one at all, and
-        # axios reports a bare "Network Error" — masking what actually
-        # happened (confirmed via a 502 in the Network tab, with no CORS
-        # headers on Cloudflare's own error page, which is why axios saw
-        # no response rather than a real error body).
-        #
-        # Now bounded with a timeout: if the send genuinely finishes
-        # quickly (the common case), the caller still gets an immediate
-        # SENT/FAILED result exactly as before. If it's still running past
-        # SEND_NOW_TIMEOUT_SECONDS, asyncio.wait_for cancels this attempt
-        # and we respond "queued" instead — the item is already committed
-        # as QUEUED in the DB (see db.commit() above), so the independent
-        # background worker (_email_queue_worker_loop in main.py) picks it
-        # up fresh on its next poll and completes the send itself.
-        # Slightly less immediate feedback in the slow case, but no more
-        # failed requests that actually succeeded moments later on the
-        # server.
-        try:
-            await asyncio.wait_for(
-                process_single_email_queue_item(db, item),
-                timeout=SEND_NOW_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            return {
-                "success": True,
-                "id": str(item.id),
-                "status": "QUEUED",
-                "message": "Taking longer than usual — this will finish sending in the background within a minute.",
-            }
-        await db.refresh(item)
-
-        if item.status == "SENT":
-            result_id = str(item.id)
-            result_status = item.status
-            return {"success": True, "id": result_id, "status": result_status}
-        raise HTTPException(status_code=502, detail=item.status_text or "Failed to send email.")
-    else:
-        return {
-            "success": True,
-            "id": str(item.id),
-            "status": "QUEUED",
-            "scheduled_at": item.scheduled_at.isoformat(),
-            "message": "Email queued with 5-minute anti-spam delay."
-        }
+    return {
+        "success": True,
+        "id": str(item.id),
+        "status": "QUEUED",
+        "scheduled_at": (item.scheduled_at or scheduled_at or now_utc).isoformat(),
+        "message": "Email added to queue successfully."
+    }
 
 @router.post("/api/consultant/email-queue/upload-attachment")
 async def upload_attachment(
