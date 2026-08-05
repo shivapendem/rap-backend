@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 
 import math
-from typing import Optional, List
+from typing import Optional, List, Any
 
 from fastapi import HTTPException
 from sqlalchemy import select, func
@@ -139,8 +139,20 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         secondary_skills=c.secondary_skills,
         preferred_roles=c.preferred_roles,
         ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
-        linkedin_url=c.linkedin_url,
-        education=c.education or [],
+        # BUG FIX ("admin shows no education / different LinkedIn than the
+        # consultant's own profile"): this used to read ONLY the Consultant
+        # columns, with no fallback — but consultants who saved their
+        # LinkedIn/education before those columns existed (or whose data
+        # otherwise never got backfilled onto them) still have their real
+        # data sitting in User.resume_info, which is exactly what the
+        # consultant-facing profile endpoint (phase3.py
+        # _consultant_to_profile_response) already falls back to. Admin
+        # was missing that same fallback, so the two screens disagreed for
+        # any consultant whose data predates the column. Both screens now
+        # use identical fallback logic; both write paths still write the
+        # real column going forward, so this only matters for old rows.
+        linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
+        education=c.education or (resume_info or {}).get("education") or [],
         resume_info=resume_info,
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
         has_resume=bool(c.base_resume_file_path or c.base_resume_text),
@@ -366,6 +378,12 @@ class UserService:
 # Consultant assignment
 # ---------------------------------------------------------------------------
 
+# Sentinel distinguishing "resume_info wasn't in the request body at all"
+# from "resume_info was explicitly sent as null to clear it" — see the
+# BUG FIX note in update_consultant() below. Plain `None` can't carry that
+# distinction because it's also the value being cleared TO.
+RESUME_INFO_NOT_PROVIDED = object()
+
 class ConsultantAssignmentService:
 
     @staticmethod
@@ -395,7 +413,7 @@ class ConsultantAssignmentService:
         preferred_roles: Optional[str] = None,
         linkedin_url: Optional[str] = None,
         education: Optional[list] = None,
-        resume_info: Optional[dict] = None,
+        resume_info: Any = RESUME_INFO_NOT_PROVIDED,
     ) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -432,7 +450,12 @@ class ConsultantAssignmentService:
         # and generate_resume() in resume_router.py, which both read/write it
         # there) — same field AddEditUserDrawer.tsx already edits from the
         # Users page, now also editable directly from this screen.
-        if resume_info is not None and consultant.user_id:
+        # BUG FIX ("removing JSON doesn't save"): was `if resume_info is not
+        # None` — indistinguishable from "field omitted from this request",
+        # since None is also the value an explicit clear sends. Compare
+        # against the sentinel instead, so an explicit null actually clears
+        # it while a truly-omitted field still leaves it alone.
+        if resume_info is not RESUME_INFO_NOT_PROVIDED and consultant.user_id:
             user_result = await db.execute(select(User).where(User.id == consultant.user_id))
             linked_user = user_result.scalars().first()
             if linked_user:

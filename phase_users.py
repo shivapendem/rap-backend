@@ -24,7 +24,7 @@ from phase_users_schema import (
     UpdateRecruiterConsultantsRequestDTO, UpdateRecruiterConsultantsResponseDTO,
     UpdateConsultantRequestDTO, UpdateConsultantResponseDTO,
 )
-from phase_users_service import UserService, ConsultantAssignmentService
+from phase_users_service import UserService, ConsultantAssignmentService, RESUME_INFO_NOT_PROVIDED
 
 # Reuse the exact same require_admin dependency defined in phase8.py
 from phase8 import require_admin
@@ -243,7 +243,19 @@ async def update_consultant(
         preferred_roles=body.preferred_roles,
         linkedin_url=body.linkedin_url,
         education=[e.model_dump() for e in body.education] if body.education is not None else None,
-        resume_info=body.resume_info,
+        # BUG FIX ("removing JSON doesn't save"): every other field here
+        # uses "None = not provided, skip" — fine for them, since the UI
+        # never intentionally sends e.g. primary_skills: null to mean
+        # "clear it". But the Resume Info (JSON) editor DOES send
+        # resume_info: null on purpose when you clear the textarea and
+        # save — and that got treated identically to "field omitted",
+        # so the service's `if resume_info is not None` skipped the
+        # update and the old JSON silently stuck around. Use
+        # model_fields_set to tell "the field was in the request body"
+        # (clear it, even to null) apart from "the field wasn't sent at
+        # all" (leave it alone) — same distinction Pydantic's own
+        # exclude_unset is built for.
+        resume_info=body.resume_info if "resume_info" in body.model_fields_set else RESUME_INFO_NOT_PROVIDED,
         admin_id=current_user.get("sub"),
     )
     return UpdateConsultantResponseDTO(
