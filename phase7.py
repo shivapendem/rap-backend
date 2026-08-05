@@ -350,7 +350,7 @@ async def get_email_preview(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found.")
 
-    cc_email = current_user.email
+    cc_email = await get_sales_recruiter_email(db, consultant)
 
     email_content = build_application_email(
         vendor_contact_name=requirement.vendor_contact,
@@ -414,6 +414,19 @@ async def confirm_send(
     try:
         consultant = await resolve_apply_consultant(db, current_user, request.consultant_id)
 
+        # BUG FIX ("inactive user — restrict application send"): nothing
+        # stopped an application from being sent for a consultant marked
+        # Inactive — from either the Pending Applications (match-based
+        # apply) or Requirements (direct apply) flow, since both route
+        # through this same endpoint. Block it here so it's enforced
+        # regardless of which frontend entry point was used.
+        if consultant.status == "INACTIVE":
+            raise HTTPException(
+                status_code=400,
+                detail=f"{consultant.full_name or 'This consultant'} is marked Inactive — "
+                       f"applications can't be sent on their behalf until they're reactivated.",
+            )
+
         ats_score = request.ats_score or 0
         if ats_score < 80:
             raise HTTPException(
@@ -431,7 +444,7 @@ async def confirm_send(
         if not requirement:
             raise HTTPException(status_code=404, detail="Requirement not found.")
 
-        cc_email = current_user.email
+        cc_email = await get_sales_recruiter_email(db, consultant)
 
         email_content = build_application_email(
             vendor_contact_name=requirement.vendor_contact,

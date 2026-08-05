@@ -303,15 +303,6 @@ class UserService:
                 if not already:
                     await RecruiterConsultantRepository.assign(db, rid, consultant.id)
 
-        # If role changed to CONSULTANT from ADMIN or RECRUITER, add a notification for the user
-        if before.get("role") in ("ADMIN", "RECRUITER") and user.role == "CONSULTANT":
-            from models import Notification
-            db.add(Notification(
-                user_id=user.id,
-                title="Account Role Updated to Consultant",
-                body="Your account role has been updated to Consultant. Please complete your profile (skills, experience, and target role) to enable matched requirements."
-            ))
-
         await log_action(
             db, "USER_UPDATED",
             actor_user_id=admin_id, actor_name=admin_id, actor_role="ADMIN",

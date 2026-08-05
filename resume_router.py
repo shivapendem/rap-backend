@@ -244,11 +244,22 @@ async def get_resume_completeness(
     target_user_id, target_user = await _resolve_target_user(user_id, current_user, db)
     resume_info = await _build_resume_info(target_user, db)
     missing_fields = get_missing_resume_fields(resume_info)
+
+    # Surface the target consultant's status so the "Generate/Regenerate
+    # Resume" page (shared across admin/recruiter/consultant) can show a
+    # clear "this consultant is inactive" indicator instead of the admin/
+    # recruiter only finding out something's off after generating anyway.
+    consultant_status = None
+    consultant_res = await db.execute(select(Consultant.status).where(Consultant.user_id == target_user_id))
+    consultant_status = consultant_res.scalar_one_or_none()
+
     return {
         "user_id": target_user_id,
         "complete": len(missing_fields) == 0,
         "missing_fields": missing_fields,
         "message": missing_fields_message(missing_fields) if missing_fields else None,
+        "consultant_status": consultant_status,
+        "is_active": bool(target_user.is_active),
     }
 
 
