@@ -332,6 +332,7 @@ async def create_email_queue(
             existing_app.cc_email = final_cc
             existing_app.email_subject = body.subject
         else:
+            from datetime import datetime, timezone
             db.add(Application(
                 consultant_id=consultant_id,
                 requirement_id=body.requirement_id,
@@ -339,6 +340,7 @@ async def create_email_queue(
                 vendor_email=body.to_email,
                 cc_email=final_cc,
                 email_subject=body.subject,
+                applied_at=datetime.now(timezone.utc),
             ))
         match_result = await db.execute(
             select(RequirementConsultantMatch).where(
@@ -696,6 +698,7 @@ async def send_email_now(
             existing_app.cc_email = final_cc
             existing_app.email_subject = body.subject
         else:
+            from datetime import datetime, timezone
             db.add(Application(
                 consultant_id=consultant_id,
                 requirement_id=body.requirement_id,
@@ -703,6 +706,7 @@ async def send_email_now(
                 vendor_email=body.to_email,
                 cc_email=final_cc,
                 email_subject=body.subject,
+                applied_at=datetime.now(timezone.utc),
             ))
         match_result = await db.execute(
             select(RequirementConsultantMatch).where(

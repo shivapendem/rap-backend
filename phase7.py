@@ -561,6 +561,7 @@ async def confirm_send(
             email_body_preview=email_content["preview"],
             status="SENT",
             sent_at=datetime.now(timezone.utc),
+            applied_at=datetime.now(timezone.utc),
         )
         db.add(application)
         await db.commit()

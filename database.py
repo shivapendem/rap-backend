@@ -47,6 +47,13 @@ elif not DATABASE_URL.startswith("sqlite"):
         "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "10")),  # Fail fast after 10s if connection queue is full
     })
 
+if not DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {
+        "server_settings": {
+            "timezone": "UTC"
+        }
+    }
+
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
 from sqlalchemy import event
