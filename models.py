@@ -689,7 +689,7 @@ class EmailQueue(Base):
     scheduled_at = Column(TIMESTAMP(timezone=True), nullable=True, server_default=func.now(), index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-    VALID_STATUSES = {"QUEUED", "SENT", "FAILED"}
+    VALID_STATUSES = {"QUEUED", "SENT", "FAILED", "PROCESSING"}
 
     @validates("status")
     def validate_status(self, key, value):
