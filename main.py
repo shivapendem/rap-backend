@@ -274,46 +274,7 @@ async def _email_queue_worker_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # CREATE TABLE IF NOT EXISTS — always safe to call on every startup
-    # Ensure v_applications_detail view exists before SQLAlchemy create_all runs
-    from sqlalchemy import text
     async with engine.begin() as conn:
-        await conn.execute(text("""
-            DROP VIEW IF EXISTS v_applications_detail CASCADE;
-            CREATE OR REPLACE VIEW v_applications_detail AS
-            SELECT 
-                a.id AS application_id,
-                a.consultant_id,
-                a.requirement_id,
-                a.recruiter_id,
-                a.generated_resume_id,
-                a.status,
-                a.gmail_message_id,
-                a.email_subject,
-                a.email_body_preview,
-                a.sent_at,
-                a.applied_at,
-                a.created_at,
-                a.updated_at,
-                a.vendor_email,
-                a.ats_score_at_send,
-                a.error_message,
-                
-                r.client AS requirement_client,
-                r.role AS requirement_role,
-                r.job_description AS requirement_job_description,
-                r.vendor_email AS requirement_vendor_email,
-                
-                c.full_name AS consultant_name,
-                c.email AS consultant_email,
-                
-                u.full_name AS recruiter_name,
-                u.email AS recruiter_email
-            FROM applications a
-            LEFT OUTER JOIN requirements r ON r.id = a.requirement_id
-            LEFT OUTER JOIN consultants c ON c.id = a.consultant_id
-            LEFT OUTER JOIN users u ON u.id = a.recruiter_id;
-        """))
         await conn.run_sync(Base.metadata.create_all)
 
     # Insert-if-not-exists keyed by email — never touches rows that already exist
