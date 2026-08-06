@@ -750,3 +750,38 @@ class MessageTemplate(Base):
     content = Column(Text, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+class ApplicationsDetailView(Base):
+    __tablename__ = "v_applications_detail"
+    
+    application_id = Column(PK_TYPE, primary_key=True)
+    consultant_id = Column(FK_TYPE)
+    requirement_id = Column(FK_TYPE)
+    recruiter_id = Column(FK_TYPE)
+    generated_resume_id = Column(FK_TYPE)
+    status = Column(Text)
+    status_text = Column(Text)
+    gmail_message_id = Column(Text)
+    email_subject = Column(Text)
+    email_body_preview = Column(Text)
+    sent_at = Column(TIMESTAMP(timezone=True))
+    applied_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP(timezone=True))
+    updated_at = Column(TIMESTAMP(timezone=True))
+    vendor_email = Column(Text)
+    ats_score_at_send = Column(Numeric)
+    error_message = Column(Text)
+    scheduled_at = Column(TIMESTAMP(timezone=True))
+    send_permission_granted = Column(Boolean)
+    gmail_thread_id = Column(Text)
+    
+    requirement_client = Column(Text)
+    requirement_role = Column(Text)
+    requirement_job_description = Column(Text)
+    requirement_vendor_email = Column(Text)
+    
+    consultant_name = Column(Text)
+    consultant_email = Column(Text)
+    
+    recruiter_name = Column(Text)
+    recruiter_email = Column(Text)

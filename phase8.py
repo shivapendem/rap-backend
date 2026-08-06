@@ -357,7 +357,7 @@ async def get_audit_log_facets(
 # Applications management
 # ---------------------------------------------------------------------------
 
-from models import Application, Requirement, Consultant, User
+from models import ApplicationsDetailView
 
 @router.get("/applications", response_model=PaginatedApplicationsDTO)
 async def list_applications(
@@ -372,100 +372,69 @@ async def list_applications(
     _: dict = Depends(require_admin),
 ) -> PaginatedApplicationsDTO:
     """Return paginated applications with optional filters."""
-    # BUG FIX: `search` was accepted by nothing here — the frontend's
-    # "Search by name, role, vendor, client…" box on the Applications
-    # Tracker silently did nothing for admins (it was never even forwarded
-    # by the frontend, and this endpoint had no such param to begin with).
-    # The sibling /api/recruiter/applications endpoint already implements
-    # this search correctly (see phase5.py get_recruiter_applications) —
-    # mirrored that same ilike-across-joined-fields approach here so both
-    # views behave the same way.
-    needs_search_join = bool(search and search.strip())
-
     filters = []
     if consultant_id:
         try:
             ids = [int(x.strip()) for x in consultant_id.split(",") if x.strip()]
             if ids:
-                filters.append(Application.consultant_id.in_(ids))
+                filters.append(ApplicationsDetailView.consultant_id.in_(ids))
         except ValueError:
             pass
     if requirement_id:
         try:
-            filters.append(Application.requirement_id == int(requirement_id))
+            filters.append(ApplicationsDetailView.requirement_id == int(requirement_id))
         except ValueError:
             pass
     if status:
-        filters.append(Application.status == status)
-    if needs_search_join:
+        filters.append(ApplicationsDetailView.status == status)
+    if search and search.strip():
         term = f"%{search.strip()}%"
         filters.append(
             or_(
-                Consultant.full_name.ilike(term),
-                Requirement.role.ilike(term),
-                Requirement.vendor.ilike(term),
-                Requirement.client.ilike(term),
+                ApplicationsDetailView.consultant_name.ilike(term),
+                ApplicationsDetailView.requirement_role.ilike(term),
+                ApplicationsDetailView.requirement_vendor_email.ilike(term),
+                ApplicationsDetailView.requirement_client.ilike(term),
             )
         )
     base_filter = and_(*filters) if filters else True
 
-    count_q = select(func.count()).select_from(Application).where(base_filter)
-    if needs_search_join:
-        # The search filter above references Consultant/Requirement columns,
-        # so the count query needs the same joins as the main query below —
-        # otherwise this raises (or silently miscounts) once `search` is set.
-        count_q = (
-            select(func.count(Application.id))
-            .select_from(Application)
-            .join(Requirement, Requirement.id == Application.requirement_id)
-            .join(Consultant, Consultant.id == Application.consultant_id)
-            .where(base_filter)
-        )
+    count_q = select(func.count(ApplicationsDetailView.application_id)).select_from(ApplicationsDetailView).where(base_filter)
     total = (await db.execute(count_q)).scalar_one()
 
-    q = select(Application, Requirement, Consultant, User)
-    if needs_search_join:
-        q = q.join(Requirement, Requirement.id == Application.requirement_id) \
-             .join(Consultant, Consultant.id == Application.consultant_id) \
-             .outerjoin(User, User.id == Application.recruiter_id)
-    else:
-        q = q.outerjoin(Requirement, Requirement.id == Application.requirement_id) \
-             .outerjoin(Consultant, Consultant.id == Application.consultant_id) \
-             .outerjoin(User, User.id == Application.recruiter_id)
-    q = q.where(base_filter)
-
-    order = Application.created_at.desc() if sort_dir == "desc" else Application.created_at.asc()
+    q = select(ApplicationsDetailView).where(base_filter)
+    order = ApplicationsDetailView.created_at.desc() if sort_dir == "desc" else ApplicationsDetailView.created_at.asc()
 
     results = (await db.execute(
         q.order_by(order)
         .offset((page - 1) * page_size)
         .limit(page_size)
-    )).all()
+    )).scalars().all()
 
     data = [
         ApplicationSentRowDTO(
-            id=str(app.id),
-            timestamp=app.created_at.isoformat() if app.created_at else "",
-            consultant_name=cons.full_name if cons else str(app.consultant_id),
-            consultant_id=str(app.consultant_id),
-            requirement_id=str(app.requirement_id),
-            role=req.role if req else "UNKNOWN",
-            vendor_email=app.vendor_email or "",
-            ats_score=float(app.ats_score_at_send) if app.ats_score_at_send else None,
-            resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
-            status=app.status,
-            candidate_id=app.candidate_id,
-            job_posting_id=str(app.job_posting_id) if app.job_posting_id else None,
-            match_score=float(app.match_score) if app.match_score else None,
-            applied_at=app.applied_at.isoformat() if app.applied_at else None,
-            client=req.client if req else None,
-            gmail_message_id=app.gmail_message_id,
-            sent_by_name=(sender.full_name if sender else (cons.full_name if cons else None)),
-            sent_by_role=(sender.role if sender else ("CONSULTANT" if cons else None)),
-            sent_at=app.sent_at.isoformat() if app.sent_at else None,
-            resume_available=bool(app.generated_resume_id or app.resume_attachment_path),
+            id=str(row.application_id),
+            timestamp=row.created_at.isoformat() if row.created_at else "",
+            consultant_name=row.consultant_name if row.consultant_name else str(row.consultant_id),
+            consultant_id=str(row.consultant_id),
+            requirement_id=str(row.requirement_id),
+            role=row.requirement_role if row.requirement_role else "UNKNOWN",
+            vendor_email=row.vendor_email or "",
+            ats_score=float(row.ats_score_at_send) if row.ats_score_at_send else None,
+            resume_id=str(row.generated_resume_id) if row.generated_resume_id else None,
+            status=row.status or "QUEUED",
+            candidate_id=None,
+            job_posting_id=None,
+            match_score=None,
+            applied_at=row.applied_at.isoformat() if row.applied_at else None,
+            client=row.requirement_client,
+            gmail_message_id=row.gmail_message_id,
+            sent_by_name=row.recruiter_name or row.consultant_name,
+            sent_by_role="RECRUITER" if row.recruiter_id else ("CONSULTANT" if row.consultant_id else None),
+            sent_at=row.sent_at.isoformat() if row.sent_at else None,
+            resume_available=bool(row.generated_resume_id),
         )
-        for app, req, cons, sender in results
+        for row in results
     ]
     return PaginatedApplicationsDTO(
         data=data,
