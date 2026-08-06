@@ -1108,6 +1108,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                                         email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
                                     email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
                                     await session.commit()
+                                else:
+                                    raise ValueError(f"Failed to refresh OAuth token: status={res.status_code} body={res.text}")
                 else:
                     access_token = decrypt_token(email_tok.access_token_encrypted)
 
@@ -1334,6 +1336,37 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         if failed_item:
             failed_item.status = "FAILED"
             failed_item.status_text = str(e)
+            
+            # Deauthorize and remove token if OAuth/token refresh failed
+            err_msg = str(e).lower()
+            if (isinstance(e, ValueError) and ("token" in err_msg or "credential" in err_msg)) or "unauthorized" in err_msg or "invalid_grant" in err_msg or "401" in err_msg:
+                try:
+                    from models import Consultant, User, ConsultantEmailToken
+                    cons_res = await session.execute(
+                        select(Consultant).where(Consultant.id == failed_item.consultant_id)
+                    )
+                    consultant = cons_res.scalars().first()
+                    if consultant:
+                        consultant.gmail_connected = False
+                        
+                        user_res = await session.execute(
+                            select(User).where(User.id == consultant.user_id)
+                        )
+                        user = user_res.scalars().first()
+                        if user:
+                            user.is_authorized = False
+
+                        tok_res = await session.execute(
+                            select(ConsultantEmailToken).where(
+                                ConsultantEmailToken.consultant_id == consultant.id
+                            )
+                        )
+                        tok = tok_res.scalars().first()
+                        if tok:
+                            await session.delete(tok)
+                except Exception as deauth_err:
+                    print(f"[email-queue] Failed to auto-deauthorize invalid token: {deauth_err}")
+
             if failed_item.requirement_id:
                 from models import Application
                 app_result = await session.execute(
