@@ -715,7 +715,38 @@ SET gmail_connected = CASE
     WHEN id IN (SELECT consultant_id FROM consultant_email_tokens) THEN TRUE
     ELSE FALSE
 END;
-
-
-
+-- 11. Create view for applications with joins to requirements, consultants, and recruiters
+CREATE OR REPLACE VIEW v_applications_detail AS
+SELECT 
+    a.id AS application_id,
+    a.consultant_id,
+    a.requirement_id,
+    a.recruiter_id,
+    a.generated_resume_id,
+    a.status,
+    a.gmail_message_id,
+    a.email_subject,
+    a.email_body_preview,
+    a.sent_at,
+    a.applied_at,
+    a.created_at,
+    a.updated_at,
+    a.vendor_email,
+    a.ats_score_at_send,
+    a.error_message,
+    
+    r.client AS requirement_client,
+    r.role AS requirement_role,
+    r.job_description AS requirement_job_description,
+    r.vendor_email AS requirement_vendor_email,
+    
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    
+    u.full_name AS recruiter_name,
+    u.email AS recruiter_email
+FROM applications a
+LEFT OUTER JOIN requirements r ON r.id = a.requirement_id
+LEFT OUTER JOIN consultants c ON c.id = a.consultant_id
+LEFT OUTER JOIN users u ON u.id = a.recruiter_id;
 

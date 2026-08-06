@@ -287,7 +287,6 @@ async def lifespan(app: FastAPI):
                 a.recruiter_id,
                 a.generated_resume_id,
                 a.status,
-                a.status_text,
                 a.gmail_message_id,
                 a.email_subject,
                 a.email_body_preview,
@@ -298,10 +297,6 @@ async def lifespan(app: FastAPI):
                 a.vendor_email,
                 a.ats_score_at_send,
                 a.error_message,
-                a.scheduled_at,
-                a.send_permission_granted,
-                a.email_body_preview_length,
-                a.gmail_thread_id,
                 
                 r.client AS requirement_client,
                 r.role AS requirement_role,

@@ -760,7 +760,6 @@ class ApplicationsDetailView(Base):
     recruiter_id = Column(FK_TYPE)
     generated_resume_id = Column(FK_TYPE)
     status = Column(Text)
-    status_text = Column(Text)
     gmail_message_id = Column(Text)
     email_subject = Column(Text)
     email_body_preview = Column(Text)
@@ -771,9 +770,6 @@ class ApplicationsDetailView(Base):
     vendor_email = Column(Text)
     ats_score_at_send = Column(Numeric)
     error_message = Column(Text)
-    scheduled_at = Column(TIMESTAMP(timezone=True))
-    send_permission_granted = Column(Boolean)
-    gmail_thread_id = Column(Text)
     
     requirement_client = Column(Text)
     requirement_role = Column(Text)
