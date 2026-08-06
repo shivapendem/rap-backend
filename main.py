@@ -279,6 +279,7 @@ async def lifespan(app: FastAPI):
     from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.execute(text("""
+            DROP VIEW IF EXISTS v_applications_detail CASCADE;
             CREATE OR REPLACE VIEW v_applications_detail AS
             SELECT 
                 a.id AS application_id,

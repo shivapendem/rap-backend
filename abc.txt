@@ -672,7 +672,7 @@ CREATE INDEX IF NOT EXISTS ix_email_queue_consultant_status ON email_queue (cons
 CREATE INDEX IF NOT EXISTS ix_emails_parse_status_received ON emails (parse_status, received_at DESC);
 CREATE INDEX IF NOT EXISTS ix_requirements_status_received ON requirements (status, received_date DESC);
 CREATE INDEX IF NOT EXISTS ix_consultants_status_updated ON consultants (status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS ix_users_role_active ON users (role, is_active);
+CREATE INDEX IF NOT EXISTS ix_users_role_authorized ON users (role, is_authorized);
 
 -- 5. Anti-Spam Email Queue Scheduled Dispatch Column & Index
 ALTER TABLE public.email_queue ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
@@ -716,6 +716,7 @@ SET gmail_connected = CASE
     ELSE FALSE
 END;
 -- 11. Create view for applications with joins to requirements, consultants, and recruiters
+DROP VIEW IF EXISTS v_applications_detail CASCADE;
 CREATE OR REPLACE VIEW v_applications_detail AS
 SELECT 
     a.id AS application_id,
