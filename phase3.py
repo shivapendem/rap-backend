@@ -378,11 +378,13 @@ async def _consultant_to_profile_response(
 
     resume = None
     if c.base_resume_file_path:
+        from s3_service import get_s3_file_metadata
         fname = Path(c.base_resume_file_path).name
+        size_bytes, _content_type = get_s3_file_metadata(c.base_resume_file_path)
         resume = {
             "filename": fname,
             "uploadedAt": c.updated_at.isoformat() if c.updated_at else datetime.utcnow().isoformat(),
-            "sizeBytes": 0,  # size not stored — safe default
+            "sizeBytes": size_bytes or 0,
         }
 
     # BUG FIX: was `float(c.ats_score or 0)` — Consultant.ats_score is a
