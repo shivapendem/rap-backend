@@ -696,5 +696,26 @@ ALTER TABLE consultants ADD COLUMN IF NOT EXISTS education JSONB;
 -- 9. Rename users.is_active to users.is_authorized
 ALTER TABLE users RENAME COLUMN is_active TO is_authorized;
 
+-- 10. Sync user authorization status and gmail connection states with active OAuth tokens
+-- For Consultant users: set is_authorized and gmail_connected based on active tokens.
+-- For Admin and Recruiter users: ensure they remain authorized.
+UPDATE users
+SET is_authorized = CASE
+    WHEN role IN ('ADMIN', 'RECRUITER') THEN TRUE
+    WHEN id IN (
+        SELECT c.user_id 
+        FROM consultants c
+        JOIN consultant_email_tokens t ON c.id = t.consultant_id
+    ) THEN TRUE
+    ELSE FALSE
+END;
+
+UPDATE consultants
+SET gmail_connected = CASE
+    WHEN id IN (SELECT consultant_id FROM consultant_email_tokens) THEN TRUE
+    ELSE FALSE
+END;
+
+
 
 
