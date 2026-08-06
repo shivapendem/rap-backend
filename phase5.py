@@ -1505,7 +1505,7 @@ async def get_consultant_applications(
         .outerjoin(GeneratedResume, GeneratedResume.id == Application.generated_resume_id)
         .outerjoin(User, User.id == Application.recruiter_id)
         .where(Application.consultant_id == consultant.id)
-        .order_by(Application.sent_at.desc().nullslast())
+        .order_by(Application.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )).all()
@@ -1533,7 +1533,7 @@ async def get_consultant_applications(
             vendor=req.vendor,
             vendor_email=app.vendor_email,
             application_status=app.status,
-            sent_at=app.sent_at.isoformat() if app.sent_at else None,
+            sent_at=(app.sent_at or app.created_at).isoformat(),
             resume_url=resume.pdf_url if resume else None,
             resume_id=str(app.generated_resume_id) if app.generated_resume_id else None,
             resume_available=bool(app.generated_resume_id or app.resume_attachment_path),

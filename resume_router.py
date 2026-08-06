@@ -663,6 +663,66 @@ async def list_resumes(
         total_pages=total_pages
     )
 
+class BaseResumeTextDTO(BaseModel):
+    text: Optional[str] = ""
+    filename: Optional[str] = None
+
+class BaseResumeTextUpdateRequest(BaseModel):
+    text: str
+
+@router.get("/base/text", response_model=BaseResumeTextDTO)
+async def get_base_resume_text(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+        
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+    
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+    
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+        
+    from pathlib import Path
+    filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
+    
+    return BaseResumeTextDTO(
+        text=consultant.base_resume_text or "",
+        filename=filename
+    )
+
+@router.put("/base/text")
+async def update_base_resume_text(
+    request: BaseResumeTextUpdateRequest,
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+        
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+    
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+    
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+        
+    consultant.base_resume_text = request.text
+    await db.commit()
+    return {"success": True, "message": "Base resume text updated successfully"}
+
 @router.get("/base/download")
 async def download_base_resume(
     user_id: Optional[int] = None,
