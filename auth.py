@@ -117,6 +117,8 @@ async def get_current_user(
 
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalars().first()
-    if not user or not user.is_active:
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    if user.role in ("ADMIN", "RECRUITER") and not user.is_authorized:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
     return user
