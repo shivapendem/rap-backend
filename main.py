@@ -922,6 +922,11 @@ async def get_consultants(
 class UpdateMeRequest(BaseModel):
     full_name: Optional[str] = None
     email: Optional[str] = None
+    mobile_number: Optional[str] = None
+    extension: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    designation: Optional[str] = None
+    email_signature: Optional[str] = None
 
 
 @app.get("/auth/me")
@@ -944,6 +949,7 @@ async def get_me(
         "extension": current_user.extension,
         "linkedin_url": current_user.linkedin_url,
         "designation": current_user.designation,
+        "email_signature": current_user.email_signature,
     }
 
 
@@ -953,10 +959,21 @@ async def update_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if body.full_name:
+    if body.full_name is not None:
         current_user.full_name = body.full_name
-    if body.email:
+    if body.email is not None:
         current_user.email = body.email.lower().strip()
+    if body.mobile_number is not None:
+        current_user.mobile_number = body.mobile_number
+    if body.extension is not None:
+        current_user.extension = body.extension
+    if body.linkedin_url is not None:
+        current_user.linkedin_url = body.linkedin_url
+    if body.designation is not None:
+        current_user.designation = body.designation
+    if body.email_signature is not None:
+        current_user.email_signature = body.email_signature
+
     await db.commit()
     await db.refresh(current_user)
     return {

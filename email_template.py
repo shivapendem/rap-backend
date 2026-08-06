@@ -232,7 +232,10 @@ def resolve_sender_fields(current_user, consultant) -> dict:
             "sender_direct_number": getattr(current_user, "mobile_number", None),
             "sender_extension": getattr(current_user, "extension", None),
             "sender_linkedin_url": getattr(current_user, "linkedin_url", None),
+            "sender_signature": getattr(current_user, "email_signature", None),
         }
+    
+    cons_sig = getattr(current_user, "email_signature", None) if current_user else None
     return {
         "sender_name": (consultant.full_name if consultant else "") or "",
         "sender_title": "Consultant",
@@ -240,6 +243,7 @@ def resolve_sender_fields(current_user, consultant) -> dict:
         "sender_direct_number": consultant.phone if consultant else None,
         "sender_extension": None,
         "sender_linkedin_url": getattr(consultant, "linkedin_url", None) if consultant else None,
+        "sender_signature": cons_sig,
     }
 
 
@@ -258,6 +262,7 @@ def build_application_email(
     sender_direct_number: Optional[str] = None,
     sender_extension: Optional[str] = None,
     sender_linkedin_url: Optional[str] = None,
+    sender_signature: Optional[str] = None,
     for_preview: bool = False,
 ) -> dict:
     """
@@ -295,14 +300,21 @@ def build_application_email(
     sig_email = sender_email or consultant_email
     sig_direct = sender_direct_number or consultant_phone
 
-    text_signature = build_signature_text(
-        sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
-    )
-    banner_kwargs = {"banner_src": "/api/settings/company-banner"} if for_preview else {}
-    html_signature = build_signature_html(
-        sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
-        **banner_kwargs,
-    )
+    if sender_signature:
+        html_signature = f'<div style="margin-top:12px;">{sender_signature}</div>'
+        # Simple tag strip to generate the plain text version of the custom signature
+        import re
+        clean_text_sig = re.sub(r'<[^>]*>', '', sender_signature)
+        text_signature = f"\n\n{clean_text_sig.strip()}"
+    else:
+        text_signature = build_signature_text(
+            sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
+        )
+        banner_kwargs = {"banner_src": "/api/settings/company-banner"} if for_preview else {}
+        html_signature = build_signature_html(
+            sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
+            **banner_kwargs,
+        )
 
     body = intro + text_signature
     html_body = (

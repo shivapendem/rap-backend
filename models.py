@@ -83,6 +83,10 @@ class User(Base):
     # MIGRATION REQUIRED, same as the three columns above:
     #     ALTER TABLE users ADD COLUMN designation TEXT;
     designation = Column(Text, nullable=True)
+    # Rich HTML email signature for application emails:
+    # MIGRATION REQUIRED:
+    #     ALTER TABLE users ADD COLUMN email_signature TEXT;
+    email_signature = Column(Text, nullable=True)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 
