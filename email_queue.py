@@ -679,6 +679,35 @@ async def send_email_now(
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
     now_utc = datetime.now(timezone.utc)
 
+    # BUG FIX ("Failed to send application email." with literally nothing
+    # else to go on): calculate_next_scheduled_at enforces a mandatory
+    # ANTI_SPAM_DELAY_MINUTES gap between sends from the same from_email —
+    # correct and needed for the deferred/background-queue flow, but this
+    # is send_email_now, which exists specifically to send RIGHT NOW and
+    # give the caller a real result (see this function's own docstring
+    # further down). Reusing the same staggering function here meant that
+    # sending twice from the same address within the cooldown window
+    # silently created a QUEUED item scheduled minutes in the future, and
+    # process_single_email_queue_item's own SCHEDULE TIME GUARD then
+    # bailed out instantly and silently — before printing a single debug
+    # line, before setting any status_text — leaving item.status at its
+    # default and this function's `item.status_text or "Failed to send
+    # application email."` fallback as the ONLY thing the caller ever
+    # saw. Fail fast here instead, with the real reason and exactly how
+    # long is left, rather than creating an item that was doomed to this
+    # same silent failure the moment it was written to the DB.
+    if scheduled_at > now_utc:
+        wait_seconds = (scheduled_at - now_utc).total_seconds()
+        wait_minutes = max(1, round(wait_seconds / 60))
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"To prevent spam, only one email can be sent from {body.from_email} "
+                f"every {ANTI_SPAM_DELAY_MINUTES} minutes. Please wait about "
+                f"{wait_minutes} more minute{'s' if wait_minutes != 1 else ''} and try again."
+            ),
+        )
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
@@ -993,11 +1022,22 @@ def original_filename_from_ref(ref: str) -> str:
     return _ATTACHMENT_UUID_PREFIX_RE.sub("", base) or base
 
 # TESTING GUARD: while we validate the email queue pipeline, only allow sends
-# to this domain. Remove/relax this check once testing is complete and real
-# sends to arbitrary vendor/client addresses are approved. Lives here (not
-# main.py) so both the background worker and the send-now endpoint below
-# read the exact same value.
-EMAIL_QUEUE_TEST_DOMAIN_SUFFIX = "@savantisintelli.com"
+# to this domain. Lives here (not main.py) so both the background worker and
+# the send-now endpoint below read the exact same value.
+#
+# BUG FIX (well, guard fix): this was hardcoded to "@savantisintelli.com"
+# with no way to turn it off short of a code change — and it was silently
+# rejecting every real vendor/client send (decisionsix.com, insyncstaffing.
+# com, itech-us.com, etc.) the whole time. It went unnoticed because the
+# send-now endpoint used to just queue and report fake success without ever
+# actually running this check in real time (see the earlier BUG FIX on
+# send_email_now below); once that was fixed to send synchronously, this
+# guard's rejection became immediately visible as "Failed to send
+# application email." Now reads from an env var and is OFF by default (real
+# sends to any address allowed) — set EMAIL_QUEUE_TEST_DOMAIN_SUFFIX in the
+# environment (e.g. to "@savantisintelli.com") to restrict sends again for
+# a staging pipeline test, without touching code.
+EMAIL_QUEUE_TEST_DOMAIN_SUFFIX = os.getenv("EMAIL_QUEUE_TEST_DOMAIN_SUFFIX", "")
 
 async def process_single_email_queue_item(session: AsyncSession, item) -> None:
     """
@@ -1017,9 +1057,30 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
     exact same send/attachment-resolution/Application-upsert logic rather
     than risking two copies drifting apart.
     """
-    from gmail_send_service import send_application_email_async, decrypt_token
-    from models import EmailQueue, Application
-    from datetime import datetime, timezone, timedelta
+    # BUG FIX: these imports used to sit outside the try block below — if
+    # ANY of them failed (a broken import in gmail_send_service.py, a
+    # missing dependency, etc.), the exception propagated out of this
+    # function before a single print() ran and before the except block
+    # below ever got a chance to record a real status_text. The caller
+    # (send_email_now) saw item.status still at its default "QUEUED" and
+    # fell back to a completely generic "Failed to send application
+    # email." with nothing in the backend terminal to explain why — the
+    # worst possible failure mode to debug. Moved inside try/except so an
+    # import failure here now behaves exactly like any other failure:
+    # logged with a full traceback and a real status_text.
+    try:
+        from gmail_send_service import send_application_email_async, decrypt_token
+        from models import EmailQueue, Application
+        from datetime import datetime, timezone, timedelta
+    except Exception as import_err:
+        import traceback
+        print(f"[email-queue debug {item.id}] Failed to import send dependencies: {import_err}\nTraceback:\n{traceback.format_exc()}")
+        from error_logger import log_db_error
+        await log_db_error(stage="email_queue_worker_item_import", error=import_err, source_type="email_queue", source_id=item.id)
+        item.status = "FAILED"
+        item.status_text = f"{type(import_err).__name__}: {import_err}" or f"{type(import_err).__name__} (no error message)"
+        await session.commit()
+        return
 
     try:
         # SCHEDULE TIME GUARD: ensure email is only triggered when scheduled_at <= now()
@@ -1032,7 +1093,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 print(f"[email-queue] item {item.id} skipped: scheduled_at ({item_sched.isoformat()}) is in the future")
                 return
 
-        print(f"[email-queue debug {item.id}] Starting send processing for from_email={item.from_email} to_email={item.to_email}")
+        print(f"[email-queue debug {item.id}] Starting send processing for from_email={item.from_email} to_email={item.to_email}", flush=True)
 
         async def mark_app_failed(err_msg: str):
             if item.requirement_id:
@@ -1056,8 +1117,10 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             await session.commit()
             return
 
-        # TESTING GUARD: only send to the internal test domain.
-        if not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
+        # TESTING GUARD: only enforced when EMAIL_QUEUE_TEST_DOMAIN_SUFFIX is
+        # actually set (see the module-level guard-fix comment above) — off
+        # by default, so real sends to any address go through normally.
+        if EMAIL_QUEUE_TEST_DOMAIN_SUFFIX and not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
             print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
             item.status = "FAILED"
             item.status_text = "not test domain for now"
@@ -1352,7 +1415,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         item_id = item.id
         import traceback
         tb_str = traceback.format_exc()
-        print(f"[email-queue debug {item_id}] Failed to send item: {e}\nTraceback:\n{tb_str}")
+        print(f"[email-queue debug {item_id}] Failed to send item: {e}\nTraceback:\n{tb_str}", flush=True)
         from error_logger import log_db_error
         await log_db_error(stage="email_queue_worker_item", error=e, source_type="email_queue", source_id=item_id)
         await session.rollback()
@@ -1361,7 +1424,18 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         failed_item = result.scalars().first()
         if failed_item:
             failed_item.status = "FAILED"
-            failed_item.status_text = str(e)
+            # BUG FIX: str(e) is empty for some exception types (certain
+            # HTTP client errors raised with no message), which made
+            # status_text == "" — falsy, so send_email_now's `item.
+            # status_text or "Failed to send application email."` fell
+            # back to that generic message, hiding the real cause even in
+            # this row's own status_text field (the traceback above still
+            # printed to the console, but the actual error type/class
+            # wasn't visible anywhere the frontend or a status lookup
+            # could see it). Always include the exception's class name so
+            # there's a real signal here even when the message itself is
+            # blank.
+            failed_item.status_text = str(e) or f"{type(e).__name__} (no error message)"
             
             # Deauthorize and remove token if OAuth/token refresh failed
             err_msg = str(e).lower()

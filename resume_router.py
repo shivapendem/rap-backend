@@ -1,6 +1,8 @@
 import os
+import io
 import uuid
 import math
+import asyncio
 from typing import Optional, List
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body
@@ -14,9 +16,10 @@ from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3
-from claude_service import generate_tailored_resume, parse_resume_text_to_structured_data
+from claude_service import generate_tailored_resume
 from phase8_ai_usage_service import save_claude_rate_limits
 from resume_validation import get_missing_resume_fields, missing_fields_message
+from phase3 import _extract_text_from_docx
 
 # You can import openai and use it if an API key is provided
 # import openai
@@ -565,9 +568,13 @@ async def upload_resume(
                 raise HTTPException(status_code=403, detail="That consultant isn't assigned to you.")
         owner_id = target_user_id
 
-    file_bytes = await file.read()
     s3_key = f"users/{owner_id}/resumes/{uuid.uuid4()}/final.docx"
-    import io
+
+    # Read into memory once so the same bytes can both upload to Spaces AND
+    # feed text extraction below — file.file's stream position isn't safe
+    # to rely on after upload_fileobj() consumes it.
+    file_bytes = await file.read()
+
     success = upload_file_to_s3(
         io.BytesIO(file_bytes),
         s3_key,
@@ -576,61 +583,26 @@ async def upload_resume(
     if not success:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
 
-    # BUG FIX: this only ever stored the raw file (s3_key) with data left
-    # at its {} default — so clicking "Edit" on an uploaded resume opened
-    # the same rich structured editor generated resumes use, but every
-    # field showed blank since nothing had ever been parsed out of the
-    # uploaded file. Extract the text and have Claude parse it into the
-    # same ResumeData schema generate_tailored_resume produces (pure
-    # extraction, no tailoring/invention), so the editor opens pre-filled
-    # with the resume's actual content and Save already regenerates the
-    # DOCX correctly via the existing update_resume() logic below.
-    parsed_data = {}
-    try:
-        from docx import Document
-        doc = Document(io.BytesIO(file_bytes))
-        parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    if cell.text.strip():
-                        parts.append(cell.text.strip())
-        raw_text = "\n".join(parts)
-        parsed_data, rate_limits, usage_info = parse_resume_text_to_structured_data(raw_text)
-        # Same reporting as /generate — otherwise this call's real spend
-        # would silently vanish from the admin AI usage/budget dashboard.
-        if rate_limits:
-            await save_claude_rate_limits(db, rate_limits)
-        if usage_info:
-            from phase8_ai_usage_service import log_ai_usage
-            await log_ai_usage(
-                db,
-                purpose="resume_upload_parsing",
-                model="claude-sonnet-4-6",
-                input_tokens=usage_info["input_tokens"],
-                output_tokens=usage_info["output_tokens"],
-                consultant_id=str(owner_id),
-            )
-    except Exception as e:
-        # Don't fail the upload over a parsing hiccup — the raw file is
-        # already safely uploaded above; the editor just falls back to
-        # blank fields (previous behavior) if parsing didn't come through.
-        print(f"Uploaded-resume text parsing failed: {e}")
-        from error_logger import log_db_error
-        await log_db_error(
-            stage="uploaded_resume_parse",
-            error=e,
-            source_type="resume",
-            source_id=str(owner_id),
-        )
+    # BUG FIX: manually-uploaded resumes previously had no extracted
+    # content at all — `data` stayed the JSONB column's empty-dict default
+    # forever. The "Edit" button in My Resumes always routed every non-base
+    # resume to the structured JSON editor (personal info / experience /
+    # education fields), which had nothing to populate those fields with,
+    # so it silently rendered a blank template with just the label showing
+    # — looked broken with no error anywhere. Extracting text here (same
+    # DOCX -> text logic the base resume already uses) and storing it under
+    # data["raw_text"] gives these resumes something real to edit, via a
+    # plain-text editor instead of the structured one — see GET/PUT
+    # /{id}/text below.
+    extracted_text = _extract_text_from_docx(file_bytes)
 
     new_resume = Resume(
         user_id=owner_id,
         title=title,
         target_role=target_role,
-        data=parsed_data,
         s3_key=s3_key,
-        status='completed'
+        status='completed',
+        data={"raw_text": extracted_text},
     )
 
     db.add(new_resume)
@@ -879,6 +851,54 @@ async def update_base_resume_text(
     await db.commit()
     return {"success": True, "message": "Base resume text updated successfully"}
 
+
+@router.get("/{id}/text", response_model=BaseResumeTextDTO)
+async def get_resume_text(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Plain-text counterpart to the structured GET /{id} — for a manually
+    uploaded resume (see /upload above), `data` only ever holds
+    {"raw_text": "..."}, never the structured personal_info/experience/
+    education fields the JSON editor (GET /{id} + ResumeEditorPage.tsx)
+    expects. Reusing that editor for these resumes rendered a blank
+    template with every field empty and no error anywhere — this endpoint
+    (and PUT below) back a dedicated plain-text editor instead, mirroring
+    GET/PUT /base/text for the base resume.
+    """
+    resume = await _get_resume_for_user(db, id, current_user)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    return BaseResumeTextDTO(
+        text=(resume.data or {}).get("raw_text", "") or "",
+        filename=resume.title,
+    )
+
+
+@router.put("/{id}/text")
+async def update_resume_text(
+    id: int,
+    request: BaseResumeTextUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    resume = await _get_resume_for_user(db, id, current_user)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # Reassign (rather than mutate in place) so SQLAlchemy's change
+    # tracking reliably picks up the JSONB column update — mutating a
+    # dict in place on some backends/drivers doesn't always mark the
+    # attribute dirty for JSON columns.
+    existing = dict(resume.data or {})
+    existing["raw_text"] = request.text
+    resume.data = existing
+    await db.commit()
+    return {"success": True, "message": "Resume text updated successfully"}
+
 @router.get("/base/download")
 async def download_base_resume(
     user_id: Optional[int] = None,
@@ -977,7 +997,7 @@ async def download_base_resume(
         if presigned:
             return {"url": presigned, "filename": display_name, "mimeType": media_type}
 
-    body, content_type = download_file_from_s3(stored)
+    body, content_type = await asyncio.to_thread(download_file_from_s3, stored)
     if body is None:
         raise HTTPException(
             status_code=404,
@@ -1280,7 +1300,7 @@ async def download_resume_file(
     if not resume.s3_key:
         raise HTTPException(status_code=400, detail="Resume does not have a generated PDF.")
 
-    body, content_type = download_file_from_s3(resume.s3_key)
+    body, content_type = await asyncio.to_thread(download_file_from_s3, resume.s3_key)
     if body is None:
         raise HTTPException(status_code=502, detail="Could not retrieve the resume file from storage.")
 
@@ -1322,7 +1342,7 @@ async def download_resume_docx(
         raise HTTPException(status_code=400, detail="Resume does not have a generated file.")
 
     docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx"
-    body, content_type = download_file_from_s3(docx_key)
+    body, content_type = await asyncio.to_thread(download_file_from_s3, docx_key)
     if body is None:
         raise HTTPException(status_code=400, detail="Resume does not have a generated DOCX.")
 

@@ -76,7 +76,10 @@ class CreateUserRequestDTO(BaseModel):
     # linkedin_url on ConsultantAdminRowDTO/UpdateConsultantRequestDTO
     # instead (see AdminConsultantCreateRequest in phase3.py).
     mobile_number: Optional[str] = Field(None, max_length=30)
-    extension: Optional[str] = Field(None, max_length=10)
+    # BUG FIX: max_length was 10, sized for just the 3-digit extension
+    # digits — now that this field holds the whole free-text value (e.g.
+    # "+1 469-392-4030 EXT 123"), 10 chars would silently reject it.
+    extension: Optional[str] = Field(None, max_length=60)
     linkedin_url: Optional[str] = None
     designation: Optional[str] = Field(None, max_length=100)
 
@@ -134,7 +137,7 @@ class EditUserRequestDTO(BaseModel):
     # the separate consultant-profile PUT /admin/consultants/{id} instead,
     # via UpdateConsultantRequestDTO.linkedin_url).
     mobile_number: Optional[str] = Field(None, max_length=30)
-    extension: Optional[str] = Field(None, max_length=10)
+    extension: Optional[str] = Field(None, max_length=60)
     linkedin_url: Optional[str] = None
     designation: Optional[str] = Field(None, max_length=100)
 
