@@ -367,6 +367,118 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
     return normalized
 
 
+PARSE_SYSTEM_PROMPT = """You are a resume-parsing engine. You will be given the raw extracted text of an
+uploaded resume document. Extract its content into this exact JSON schema — do not
+tailor, embellish, or invent anything; every value must come from the source text.
+Leave a field blank ("" or []) rather than guessing when the text doesn't contain it.
+
+{
+  "name": string,
+  "email": string,
+  "phone": string,
+  "location": string,
+  "linkedin": string,
+  "github": string,
+  "summary": string,
+  "skills": string[],
+  "technical_proficiencies": [{"category": string, "skills": string[]}],
+  "experience": [{"client": string, "role": string, "start": string, "end": string, "location": string, "description": string, "bullets": string[]}],
+  "education": [{"degree": string, "institution": string, "year": string, "details": string}],
+  "certifications": string[]
+}
+
+Return ONLY the JSON object, no markdown fences, no commentary."""
+
+
+def parse_resume_text_to_structured_data(raw_text: str) -> tuple[dict, dict, Optional[dict]]:
+    """
+    Calls Anthropic API to parse the raw extracted text of an uploaded resume
+    (docx -> plain text) into the same structured schema generate_tailored_resume
+    produces, so an uploaded resume gets a populated editor instead of a blank
+    one. Never tailors or invents content -- it's a straight extraction.
+
+    Returns (resume_json, rate_limit_headers, usage_info) — same three-tuple
+    shape as generate_tailored_resume, so the caller can feed rate_limits into
+    save_claude_rate_limits() and usage_info into log_ai_usage() exactly like
+    /generate already does. Skipping that would silently undercount real AI
+    spend on the admin usage/budget dashboard.
+
+    Falls back to a name-only skeleton (rather than fabricating content) when
+    the API key isn't configured or the call fails, matching the offline
+    fallback style already used in generate_tailored_resume above.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    fallback = {
+        "name": "Unknown",
+        "email": "",
+        "phone": "",
+        "location": "",
+        "linkedin": "",
+        "github": "",
+        "summary": "",
+        "skills": [],
+        "technical_proficiencies": [],
+        "experience": [],
+        "education": [],
+        "certifications": [],
+        "generation_notes": "Automatic parsing was unavailable — please fill in the fields below manually.",
+    }
+
+    if not raw_text or not raw_text.strip():
+        return _normalize_resume_data(fallback, {}), {}, None
+
+    if not api_key or api_key.startswith("your_"):
+        logger.warning("ANTHROPIC_API_KEY not found or is a placeholder, returning blank skeleton for uploaded resume parsing.")
+        return _normalize_resume_data(fallback, {}), {}, None
+
+    try:
+        client = Anthropic(api_key=api_key)
+        user_prompt = f"""RAW RESUME TEXT:
+{raw_text}
+
+Extract the JSON now."""
+
+        response = client.messages.with_raw_response.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2500,
+            system=PARSE_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+
+        headers = response.headers
+        rate_limits = {
+            "tokens-limit": headers.get("anthropic-ratelimit-tokens-limit"),
+            "tokens-remaining": headers.get("anthropic-ratelimit-tokens-remaining"),
+            "tokens-reset": headers.get("anthropic-ratelimit-tokens-reset"),
+            "requests-limit": headers.get("anthropic-ratelimit-requests-limit"),
+            "requests-remaining": headers.get("anthropic-ratelimit-requests-remaining"),
+            "requests-reset": headers.get("anthropic-ratelimit-requests-reset"),
+        }
+
+        parsed_response = response.parse()
+        content = parsed_response.content[0].text
+
+        usage_info = {
+            "input_tokens": parsed_response.usage.input_tokens,
+            "output_tokens": parsed_response.usage.output_tokens,
+        }
+
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+
+        result_json = json.loads(content.strip())
+        return _normalize_resume_data(result_json, {}), rate_limits, usage_info
+    except Exception as e:
+        logger.warning(f"Error calling Claude API for uploaded-resume parsing: {e}. Falling back to blank skeleton.")
+        return _normalize_resume_data(fallback, {}), {}, None
+
+
 def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
     """
     Calls Anthropic API to generate a structured JSON resume based on resume_info and job_description.

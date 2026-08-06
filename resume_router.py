@@ -14,7 +14,7 @@ from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3
-from claude_service import generate_tailored_resume
+from claude_service import generate_tailored_resume, parse_resume_text_to_structured_data
 from phase8_ai_usage_service import save_claude_rate_limits
 from resume_validation import get_missing_resume_fields, missing_fields_message
 
@@ -565,20 +565,70 @@ async def upload_resume(
                 raise HTTPException(status_code=403, detail="That consultant isn't assigned to you.")
         owner_id = target_user_id
 
+    file_bytes = await file.read()
     s3_key = f"users/{owner_id}/resumes/{uuid.uuid4()}/final.docx"
-
+    import io
     success = upload_file_to_s3(
-        file.file,
+        io.BytesIO(file_bytes),
         s3_key,
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
 
+    # BUG FIX: this only ever stored the raw file (s3_key) with data left
+    # at its {} default — so clicking "Edit" on an uploaded resume opened
+    # the same rich structured editor generated resumes use, but every
+    # field showed blank since nothing had ever been parsed out of the
+    # uploaded file. Extract the text and have Claude parse it into the
+    # same ResumeData schema generate_tailored_resume produces (pure
+    # extraction, no tailoring/invention), so the editor opens pre-filled
+    # with the resume's actual content and Save already regenerates the
+    # DOCX correctly via the existing update_resume() logic below.
+    parsed_data = {}
+    try:
+        from docx import Document
+        doc = Document(io.BytesIO(file_bytes))
+        parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        parts.append(cell.text.strip())
+        raw_text = "\n".join(parts)
+        parsed_data, rate_limits, usage_info = parse_resume_text_to_structured_data(raw_text)
+        # Same reporting as /generate — otherwise this call's real spend
+        # would silently vanish from the admin AI usage/budget dashboard.
+        if rate_limits:
+            await save_claude_rate_limits(db, rate_limits)
+        if usage_info:
+            from phase8_ai_usage_service import log_ai_usage
+            await log_ai_usage(
+                db,
+                purpose="resume_upload_parsing",
+                model="claude-sonnet-4-6",
+                input_tokens=usage_info["input_tokens"],
+                output_tokens=usage_info["output_tokens"],
+                consultant_id=str(owner_id),
+            )
+    except Exception as e:
+        # Don't fail the upload over a parsing hiccup — the raw file is
+        # already safely uploaded above; the editor just falls back to
+        # blank fields (previous behavior) if parsing didn't come through.
+        print(f"Uploaded-resume text parsing failed: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="uploaded_resume_parse",
+            error=e,
+            source_type="resume",
+            source_id=str(owner_id),
+        )
+
     new_resume = Resume(
         user_id=owner_id,
         title=title,
         target_role=target_role,
+        data=parsed_data,
         s3_key=s3_key,
         status='completed'
     )
@@ -761,7 +811,6 @@ async def update_base_resume_text(
         raise HTTPException(status_code=404, detail="Consultant profile not found")
         
     consultant.base_resume_text = request.text
-
     # BUG FIX: this endpoint only ever updated base_resume_text (the plain
     # text used for AI tailoring/matching) — the actual file streamed back
     # by GET /base/download reads consultant.base_resume_file_path, which
@@ -772,23 +821,50 @@ async def update_base_resume_text(
     # overwrite the file in place — same path/filename, so every other
     # place that already stores or serves base_resume_file_path keeps
     # working unchanged.
+    import io
     from pathlib import Path
     from docx import Document
-
     try:
         doc = Document()
         for line in (request.text or "").split("\n"):
             doc.add_paragraph(line)
-
-        if consultant.base_resume_file_path:
-            dest_path = Path(consultant.base_resume_file_path)
+        buf = io.BytesIO()
+        doc.save(buf)
+        docx_bytes = buf.getvalue()
+        stored = consultant.base_resume_file_path
+        if stored and os.path.isfile(stored):
+            # Locally stored file — how every current upload is stored (see
+            # phase3.py's _save_resume_file). Some records predate the
+            # DOCX-only upload restriction and still end in .pdf — force
+            # the extension to .docx and drop the old file rather than
+            # writing DOCX bytes under a stale .pdf name, which would
+            # mislabel the media_type the download endpoint serves.
+            old_path = Path(stored)
+            new_path = old_path.with_suffix(".docx")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            new_path.write_bytes(docx_bytes)
+            if new_path != old_path and old_path.exists():
+                old_path.unlink()
+            consultant.base_resume_file_path = str(new_path)
+        elif stored:
+            # Not a local path -> a Spaces/S3 object key (mirrors the same
+            # local-vs-Spaces branching download_base_resume already does).
+            # Re-upload under a .docx key so a pre-migration .pdf key
+            # doesn't end up mislabeled the same way as the local case.
+            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
+            if upload_file_to_s3(
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                consultant.base_resume_file_path = key
         else:
+            # No file on record yet (text entered without ever uploading a
+            # file) — create one locally, same layout _save_resume_file uses.
             upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            dest_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            consultant.base_resume_file_path = str(dest_path)
-
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(dest_path)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
     except Exception as e:
         # Don't fail the save over a DOCX regen hiccup — base_resume_text
         # itself already committed below and still powers AI tailoring.
@@ -800,7 +876,6 @@ async def update_base_resume_text(
             source_type="consultant",
             source_id=str(consultant.id),
         )
-
     await db.commit()
     return {"success": True, "message": "Base resume text updated successfully"}
 
