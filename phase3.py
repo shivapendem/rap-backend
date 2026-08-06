@@ -500,17 +500,17 @@ def _exp_to_response(e: ConsultantExperience) -> ExperienceResponse:
     )
 
 def _save_resume_file(file_bytes: bytes, consultant_id: int, original_filename: str, content_type: str) -> str:
-    """Save file to disk, return relative path."""
+    """Upload file to S3, return the S3 key."""
+    import io
+    from s3_service import upload_file_to_s3
     ext_map = {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
         "application/pdf": ".pdf",
     }
     ext = ext_map.get(content_type, ".bin")
-    dest_dir = UPLOAD_DIR / str(consultant_id)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / f"{uuid.uuid4().hex}{ext}"
-    dest_path.write_bytes(file_bytes)
-    return str(dest_path)
+    s3_key = f"uploads/resumes/{consultant_id}/{uuid.uuid4().hex}{ext}"
+    upload_file_to_s3(io.BytesIO(file_bytes), s3_key, content_type)
+    return s3_key
 
 
 def _delete_file_if_exists(path: str) -> None:
@@ -1113,11 +1113,15 @@ async def get_own_resume(
     if not consultant.base_resume_file_path:
         raise HTTPException(404, "No resume uploaded")
 
+    from s3_service import get_s3_file_metadata
+    size_bytes, _content_type = get_s3_file_metadata(consultant.base_resume_file_path)
+
     return {
         "filename": Path(consultant.base_resume_file_path).name,
         "uploadedAt": consultant.updated_at.isoformat() if consultant.updated_at else None,
         "hasExtractedText": bool(consultant.base_resume_text),
         "extractedTextLength": len(consultant.base_resume_text or ""),
+        "sizeBytes": size_bytes or 0,
     }
 
 
