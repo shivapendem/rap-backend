@@ -850,13 +850,18 @@ async def get_consultants_for_resumes(
             return []
 
     if current_user.role == "ADMIN":
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.role == "CONSULTANT")
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.role == "CONSULTANT",
+            User.is_active == True,
+            Consultant.status == "ACTIVE"
+        )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
         return [map_user_consultant(u, c) for u, c in results]
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
+            Consultant.status == "ACTIVE",
             or_(
                 Consultant.sales_recruiter_user_id == current_user.id,
                 Consultant.id.in_(
@@ -866,16 +871,23 @@ async def get_consultants_for_resumes(
                 )
             )
         )
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id.in_(consultant_users_query),
-            User.role == "CONSULTANT"
+            User.role == "CONSULTANT",
+            User.is_active == True,
+            Consultant.status == "ACTIVE"
         )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
         return [map_user_consultant(u, c) for u, c in results]
     else:
-        query = select(User, Consultant).outerjoin(Consultant, Consultant.user_id == User.id).where(User.id == current_user.id)
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.id == current_user.id,
+            User.role == "CONSULTANT",
+            User.is_active == True,
+            Consultant.status == "ACTIVE"
+        )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()

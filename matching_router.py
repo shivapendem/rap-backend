@@ -146,7 +146,15 @@ async def run_matching_engine(
     )
     requirements = reqs_res.scalars().all()
 
-    cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+    cons_res = await db.execute(
+        select(Consultant)
+        .join(User, Consultant.user_id == User.id)
+        .where(
+            Consultant.status == "ACTIVE",
+            User.role == "CONSULTANT",
+            User.is_active == True
+        )
+    )
     consultants = cons_res.scalars().all()
 
     existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
