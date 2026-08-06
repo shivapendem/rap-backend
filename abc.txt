@@ -689,3 +689,8 @@ CREATE INDEX IF NOT EXISTS ix_generated_resumes_cons_req ON generated_resumes (c
 -- 7. Add Custom Email Signature to Users
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_signature TEXT;
 
+-- 8. Add linkedin_url and education Columns to Consultants
+ALTER TABLE consultants ADD COLUMN IF NOT EXISTS linkedin_url TEXT;
+ALTER TABLE consultants ADD COLUMN IF NOT EXISTS education JSONB;
+
+
