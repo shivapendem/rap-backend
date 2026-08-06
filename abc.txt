@@ -685,3 +685,7 @@ CREATE INDEX IF NOT EXISTS ix_applications_consultant_created_at ON applications
 CREATE INDEX IF NOT EXISTS ix_recruiter_consultants_rec_active ON recruiter_consultants (recruiter_id, is_active);
 CREATE INDEX IF NOT EXISTS ix_recruiter_consultants_cons_active ON recruiter_consultants (consultant_id, is_active);
 CREATE INDEX IF NOT EXISTS ix_generated_resumes_cons_req ON generated_resumes (consultant_id, requirement_id);
+
+-- 7. Add Custom Email Signature to Users
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_signature TEXT;
+
