@@ -463,7 +463,7 @@ async def login(
             detail="Invalid email or password",
         )
 
-    if not user.is_active:
+    if user.role in ("ADMIN", "RECRUITER") and not user.is_authorized:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is deactivated. Contact your administrator.",
@@ -563,7 +563,7 @@ async def google_login(
             detail="User not registered. Please contact your administrator.",
         )
 
-    if not user.is_active:
+    if user.role in ("ADMIN", "RECRUITER") and not user.is_authorized:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is deactivated.",
@@ -938,7 +938,8 @@ async def get_me(
         "full_name": current_user.full_name,
         "email": current_user.email,
         "role": current_user.role,
-        "is_active": current_user.is_active,
+        "is_authorized": current_user.is_authorized,
+        "is_active": current_user.is_authorized,
         "skills": current_user.skills if isinstance(current_user.skills, list) else [],
         "experience_years": float(current_user.experience_years) if current_user.experience_years is not None else None,
         # Needed by the Apply-to-Requirement page's signature preview (see

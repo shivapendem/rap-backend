@@ -35,8 +35,8 @@ class UserAdminRowDTO(BaseModel):
     full_name: str
     email: str
     role: str
-    status: str          # "Active" | "Inactive" — derived from is_active
-    is_active: bool
+    status: str          # "Authorized" | "Unauthorized" — derived from is_authorized
+    is_authorized: bool
     created_at: str
     updated_at: str = ""
     skills: Optional[List[str]] = None
@@ -119,7 +119,7 @@ class EditUserRequestDTO(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=100)
     email: EmailStr
     role: str
-    is_active: bool
+    is_authorized: bool
     # consultant-only optional fields — applied only when role == CONSULTANT
     work_authorization: Optional[str] = None
     preferred_employment_types: Optional[List[str]] = None

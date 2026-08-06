@@ -852,7 +852,7 @@ async def get_consultants_for_resumes(
     if current_user.role == "ADMIN":
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.role == "CONSULTANT",
-            User.is_active == True,
+            User.is_authorized == True,
             Consultant.status == "ACTIVE"
         )
         if matched_consultant_ids is not None:
@@ -874,7 +874,7 @@ async def get_consultants_for_resumes(
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id.in_(consultant_users_query),
             User.role == "CONSULTANT",
-            User.is_active == True,
+            User.is_authorized == True,
             Consultant.status == "ACTIVE"
         )
         if matched_consultant_ids is not None:
@@ -885,7 +885,7 @@ async def get_consultants_for_resumes(
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id == current_user.id,
             User.role == "CONSULTANT",
-            User.is_active == True,
+            User.is_authorized == True,
             Consultant.status == "ACTIVE"
         )
         if matched_consultant_ids is not None:

@@ -11,7 +11,7 @@ async def notify_by_role(db, roles: list[str], title: str, body: str):
     """
     try:
         result = await db.execute(
-            select(User).where(User.role.in_(roles), User.is_active == True)
+            select(User).where(User.role.in_(roles), User.is_authorized == True)
         )
         users = result.scalars().all()
         for u in users:

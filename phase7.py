@@ -293,6 +293,7 @@ async def connect_gmail(
         ))
 
     consultant.gmail_connected = True
+    current_user.is_authorized = True
     await db.commit()
 
     return {
@@ -324,6 +325,7 @@ async def disconnect_gmail(
         await db.delete(token)
 
     consultant.gmail_connected = False
+    current_user.is_authorized = False
     await db.commit()
 
     return {"success": True, "message": "Gmail disconnected."}

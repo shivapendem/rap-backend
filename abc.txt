@@ -693,4 +693,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS email_signature TEXT;
 ALTER TABLE consultants ADD COLUMN IF NOT EXISTS linkedin_url TEXT;
 ALTER TABLE consultants ADD COLUMN IF NOT EXISTS education JSONB;
 
+-- 9. Rename users.is_active to users.is_authorized
+ALTER TABLE users RENAME COLUMN is_active TO is_authorized;
+
+
 

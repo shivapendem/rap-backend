@@ -34,8 +34,8 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
         full_name=u.full_name,
         email=u.email,
         role=u.role,
-        status="Active" if u.is_active else "Inactive",
-        is_active=u.is_active,
+        status="Authorized" if u.is_authorized else "Unauthorized",
+        is_authorized=u.is_authorized,
         created_at=u.created_at.isoformat() if u.created_at else "",
         updated_at=u.updated_at.isoformat() if u.updated_at else "",
         skills=u.skills if isinstance(u.skills, list) else None,
@@ -205,7 +205,7 @@ class UserService:
             email=req.email,
             role=req.role,
             password_hash=get_password_hash(req.password),
-            is_active=True,
+            is_authorized=True,
             experience_years=req.experience_years,
             resume_info=req.resume_info,
             mobile_number=req.mobile_number,
@@ -252,12 +252,12 @@ class UserService:
             if existing and existing.id != user.id:
                 raise HTTPException(status_code=409, detail="A user with this email already exists.")
 
-        before = {"full_name": user.full_name, "email": user.email, "role": user.role, "is_active": user.is_active}
+        before = {"full_name": user.full_name, "email": user.email, "role": user.role, "is_authorized": user.is_authorized}
 
         user.full_name = req.full_name.strip()
         user.email = req.email
         user.role = req.role
-        user.is_active = req.is_active
+        user.is_authorized = req.is_authorized
         if req.skills is not None:
             user.skills = req.skills
         if req.needsto_fetch_mail is not None:
@@ -321,7 +321,7 @@ class UserService:
             entity_type="User", entity_id=str(user.id),
             metadata={"before": before, "after": {
                 "full_name": user.full_name, "email": user.email,
-                "role": user.role, "is_active": user.is_active,
+                "role": user.role, "is_authorized": user.is_authorized,
             }},
         )
         await db.commit()
@@ -351,10 +351,10 @@ class UserService:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        old_status = "Active" if user.is_active else "Inactive"
-        user.is_active = (status_value == "ACTIVE")
+        old_status = "Authorized" if user.is_authorized else "Unauthorized"
+        user.is_authorized = (status_value == "ACTIVE" or status_value == "AUTHORIZED")
         user = await UserRepository.update(db, user)
-        new_status = "Active" if user.is_active else "Inactive"
+        new_status = "Authorized" if user.is_authorized else "Unauthorized"
 
         await log_action(
             db, "USER_STATUS_CHANGED",

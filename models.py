@@ -56,7 +56,7 @@ class User(Base):
     email = Column(Text, nullable=False, unique=True, index=True)
     password_hash = Column(Text, nullable=True)
     role = Column(Text, nullable=False)
-    is_active = Column(Boolean, nullable=False, default=True)
+    is_authorized = Column(Boolean, nullable=False, default=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     last_login_at = Column(TIMESTAMP(timezone=True), nullable=True)
