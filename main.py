@@ -292,6 +292,33 @@ async def lifespan(app: FastAPI):
                 print(f"Seeded default user: {u['email']}")
         await session.commit()
 
+        # Fallback sync: set is_authorized and gmail_connected states based on active tokens
+        try:
+            from sqlalchemy import text
+            await session.execute(text("""
+                UPDATE users
+                SET is_authorized = CASE
+                    WHEN role IN ('ADMIN', 'RECRUITER') THEN TRUE
+                    WHEN id IN (
+                        SELECT c.user_id 
+                        FROM consultants c
+                        JOIN consultant_email_tokens t ON c.id = t.consultant_id
+                    ) THEN TRUE
+                    ELSE FALSE
+                END;
+            """))
+            await session.execute(text("""
+                UPDATE consultants
+                SET gmail_connected = CASE
+                    WHEN id IN (SELECT consultant_id FROM consultant_email_tokens) THEN TRUE
+                    ELSE FALSE
+                END;
+            """))
+            await session.commit()
+            print("Successfully synchronized user authorization and gmail_connected states with active tokens.")
+        except Exception as sync_err:
+            print(f"Failed to synchronize authorization states on startup: {sync_err}")
+
     sync_task = asyncio.create_task(_gmail_to_requirements_loop())
     email_queue_task = asyncio.create_task(_email_queue_worker_loop())
 
