@@ -761,12 +761,66 @@ async def update_base_resume_text(
         raise HTTPException(status_code=404, detail="Consultant profile not found")
         
     consultant.base_resume_text = request.text
+
+    # BUG FIX: this endpoint only ever updated base_resume_text (the plain
+    # text used for AI tailoring/matching) — the actual file streamed back
+    # by GET /base/download reads consultant.base_resume_file_path, which
+    # was never touched here. Edits saved on this page had no effect on
+    # what "Download" served; it kept returning the exact original
+    # uploaded file forever. Base resumes are DOCX-only (see phase3.py's
+    # ALLOWED_RESUME_TYPES), so regenerate a DOCX from the edited text and
+    # overwrite the file in place — same path/filename, so every other
+    # place that already stores or serves base_resume_file_path keeps
+    # working unchanged.
+    from pathlib import Path
+    from docx import Document
+
+    try:
+        doc = Document()
+        for line in (request.text or "").split("\n"):
+            doc.add_paragraph(line)
+
+        if consultant.base_resume_file_path:
+            dest_path = Path(consultant.base_resume_file_path)
+        else:
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            dest_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            consultant.base_resume_file_path = str(dest_path)
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(dest_path)
+    except Exception as e:
+        # Don't fail the save over a DOCX regen hiccup — base_resume_text
+        # itself already committed below and still powers AI tailoring.
+        print(f"Base resume DOCX regeneration on save failed for consultant {consultant.id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="base_resume_docx_regen_on_save",
+            error=e,
+            source_type="consultant",
+            source_id=str(consultant.id),
+        )
+
     await db.commit()
     return {"success": True, "message": "Base resume text updated successfully"}
 
 @router.get("/base/download")
 async def download_base_resume(
     user_id: Optional[int] = None,
+    # BUG FIX ("view keeps downloading" — same root cause and same fix as
+    # phase7.py's download_application_resume): a browser can only render
+    # a PDF or image inline on its own. For a .docx base resume, there is
+    # no in-browser renderer at all — avoiding "attachment" headers isn't
+    # enough, the browser still has nothing to show it with and falls
+    # back to a download regardless. force_stream=False (View) now
+    # returns a presigned Spaces URL as JSON when the file is in object
+    # storage, for the frontend to hand to Google's Docs Viewer (whose
+    # own servers fetch it — browser CORS never applies there).
+    # force_stream=True (the actual Download button) always streams real
+    # bytes through this same-origin endpoint, since a presigned URL
+    # fetched directly by the browser fails — this bucket has no CORS
+    # policy allowing that.
+    force_stream: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -827,7 +881,10 @@ async def download_base_resume(
     )
     display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
 
-    # Legacy local-disk record (pre-Spaces migration).
+    # Legacy local-disk record (pre-Spaces migration) — no object-storage
+    # key to presign, so this path always streams bytes regardless of
+    # force_stream. Rare/legacy case; a .docx here still won't preview
+    # inline in the browser, same underlying browser limitation.
     try:
         if os.path.isfile(stored):
             with open(stored, "rb") as fh:
@@ -839,6 +896,11 @@ async def download_base_resume(
             )
     except OSError:
         pass
+
+    if not force_stream:
+        presigned = generate_presigned_url(stored)
+        if presigned:
+            return {"url": presigned, "filename": display_name, "mimeType": media_type}
 
     body, content_type = download_file_from_s3(stored)
     if body is None:

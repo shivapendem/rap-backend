@@ -432,7 +432,19 @@ async def list_applications(
             sent_by_name=row.recruiter_name or row.consultant_name,
             sent_by_role="RECRUITER" if row.recruiter_id else ("CONSULTANT" if row.consultant_id else None),
             sent_at=row.sent_at.isoformat() if row.sent_at else None,
-            resume_available=bool(row.generated_resume_id),
+            # BUG FIX: this only ever checked generated_resume_id, despite
+            # this DTO field's own docstring above saying it should
+            # reflect either source. generated_resume_id is only set by
+            # the ATS-gated recruiter confirm-send flow — every
+            # application sent through the ordinary Apply / email-queue
+            # flow (the vast majority) attaches its resume via
+            # resume_attachment_path instead and NEVER gets a
+            # generated_resume_id, so the Resume column showed "—" for
+            # nearly every row in the tracker regardless of whether a
+            # resume actually went out. Requires resume_attachment_path
+            # to be added to the v_applications_detail view — see the
+            # MIGRATION REQUIRED note on that column in models.py.
+            resume_available=bool(row.generated_resume_id or row.resume_attachment_path),
         )
         for row in results
     ]

@@ -770,7 +770,23 @@ class ApplicationsDetailView(Base):
     vendor_email = Column(Text)
     ats_score_at_send = Column(Numeric)
     error_message = Column(Text)
-    
+    # MIGRATION REQUIRED — this view is defined directly in the database
+    # (no SQL migration file for it exists in this repo), so it can't be
+    # altered from here. Add resume_attachment_path to its SELECT list
+    # and re-run as CREATE OR REPLACE VIEW, e.g.:
+    #     CREATE OR REPLACE VIEW v_applications_detail AS
+    #     SELECT ...<all existing columns, unchanged>...,
+    #            a.resume_attachment_path
+    #     FROM applications a
+    #     ...<existing JOINs, unchanged>...;
+    # (alias "a" here stands in for whatever the view's own FROM clause
+    # already aliases the applications table as — match it to what's
+    # actually there). Application.resume_attachment_path is a real
+    # column on the base table (see below); this view was just never
+    # updated to select it, which is why resume_available below couldn't
+    # see it until this column is added on the database side too.
+    resume_attachment_path = Column(Text)
+
     requirement_client = Column(Text)
     requirement_role = Column(Text)
     requirement_job_description = Column(Text)
@@ -780,4 +796,4 @@ class ApplicationsDetailView(Base):
     consultant_email = Column(Text)
     
     recruiter_name = Column(Text)
-    recruiter_email = Column(Text)
+    recruiter_email = Column(Text)
