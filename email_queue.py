@@ -733,12 +733,38 @@ async def send_email_now(
     await db.commit()
     await db.refresh(item)
 
+    # BUG FIX: despite this function's docstring claiming it "sends
+    # immediately via process_single_email_queue_item", the code never
+    # actually called it — it only ever inserted a QUEUED row and
+    # returned success, leaving the real send to the background
+    # worker's next poll (main.py's _email_queue_worker_loop, on its
+    # own timer). Every "Apply Now" (admin Pending Applications,
+    # recruiter, and consultant) reported success immediately, but the
+    # email only went out once/if that later poll picked the item up —
+    # and the Application row's resume_attachment_path is only ever set
+    # inside process_single_email_queue_item's own SENT-path upsert
+    # (further below in this file), so until that poll actually ran,
+    # the Applications Tracker showed the application with no resume
+    # attached and no email actually sent, exactly matching this
+    # endpoint's own docstring promise that it never kept. Now sends
+    # synchronously, right here, the same way phase5.py's consultant
+    # apply endpoint already does, and reports the real outcome instead
+    # of a blind "queued".
+    await process_single_email_queue_item(db, item)
+    await db.refresh(item)
+
+    if item.status != "SENT":
+        raise HTTPException(
+            status_code=502,
+            detail=item.status_text or "Failed to send application email.",
+        )
+
     return {
         "success": True,
         "id": str(item.id),
-        "status": "QUEUED",
+        "status": item.status,
         "scheduled_at": (item.scheduled_at or scheduled_at or now_utc).isoformat(),
-        "message": "Email added to queue successfully."
+        "message": "Email sent successfully."
     }
 
 @router.post("/api/consultant/email-queue/upload-attachment")

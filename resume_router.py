@@ -226,6 +226,47 @@ async def _build_resume_info(
     # Prepend profile experiences so they are processed as most relevant/recent
     resume_info["experience"] = manual_exp_entries + resume_info["experience"]
 
+    # BUG FIX: this function fetched `consultant` above but only ever used
+    # it for ConsultantExperience rows — it never merged the consultant's
+    # own real profile columns (linkedin_url, phone, total_experience_years,
+    # primary_skills, preferred_roles) into resume_info at all. Those
+    # columns are what the consultant profile screen actually reads/writes
+    # (see phase3.py, phase_users_service.py); resume_info is a separate
+    # JSON blob that only ever reflects whatever was parsed/imported at
+    # signup. So a consultant who filled in LinkedIn (or phone, years of
+    # experience, skills, target role) through their profile after that
+    # initial import still failed the completeness check below and the
+    # AI generation call itself never saw those fields — "Add LinkedIn to
+    # the profile" fired even though it genuinely was on file, just not in
+    # this blob. Backfill every field this checks against from the real
+    # Consultant row, same "real column wins over resume_info fallback"
+    # priority already used elsewhere (see phase3.py's linkedInUrl
+    # resolution) — but only filling gaps, so a richer resume_info value
+    # (e.g. a fuller skills list) is never clobbered by a thinner one.
+    if consultant:
+        def _blank(key: str) -> bool:
+            val = resume_info.get(key)
+            return val is None or (isinstance(val, str) and not val.strip())
+
+        if _blank("linkedin") and consultant.linkedin_url:
+            resume_info["linkedin"] = consultant.linkedin_url
+        if _blank("phone") and consultant.phone:
+            resume_info["phone"] = consultant.phone
+        if _blank("full_name") and consultant.full_name:
+            resume_info["full_name"] = consultant.full_name
+        if _blank("email") and consultant.email:
+            resume_info["email"] = consultant.email
+        if _blank("title") and _blank("target_role") and _blank("target_title") and consultant.preferred_roles:
+            resume_info["title"] = consultant.preferred_roles
+        if (
+            resume_info.get("years_experience") in (None, "")
+            and resume_info.get("total_experience_years") in (None, "")
+            and consultant.total_experience_years is not None
+        ):
+            resume_info["years_experience"] = float(consultant.total_experience_years)
+        if not resume_info.get("skills") and not resume_info.get("tech_stack") and not resume_info.get("technical_proficiencies") and consultant.primary_skills:
+            resume_info["skills"] = [s.strip() for s in consultant.primary_skills.split(",") if s.strip()]
+
     return resume_info
 
 

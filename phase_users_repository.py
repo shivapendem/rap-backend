@@ -41,7 +41,18 @@ class UserRepository:
         if role:
             filters.append(User.role == role)
         if status:
-            filters.append(User.is_active == (status == "Active"))
+            # BUG FIX: this referenced User.is_active, a column that does
+            # not exist on the User model at all — is_active only exists
+            # on RecruiterConsultant, a completely different table. Every
+            # request with a status filter applied raised a SQLAlchemy
+            # AttributeError, which the users list endpoint had no special
+            # handling for, so the frontend just showed "Failed to load
+            # users" with no indication why. The row's actual displayed
+            # status ("Authorized"/"Unauthorized", built in
+            # phase_users_service.py from is_authorized) already comes
+            # from User.is_authorized — filtering needs to match that same
+            # field, not a column from an unrelated table.
+            filters.append(User.is_authorized == (status == "Active"))
         if search:
             kw = f"%{search.lower()}%"
             filters.append(
@@ -55,7 +66,9 @@ class UserRepository:
 
         allowed_sort = {"full_name", "email", "role", "created_at"}
         sort_col_name = sort_by if sort_by in allowed_sort else "full_name"
-        sort_col = User.is_active if sort_by == "status" else getattr(User, sort_col_name)
+        # Same bug, same fix: sorting by "status" referenced the
+        # nonexistent User.is_active instead of User.is_authorized.
+        sort_col = User.is_authorized if sort_by == "status" else getattr(User, sort_col_name)
 
         query = select(User).where(base_filter)
         query = query.order_by(sort_col.desc() if sort_dir == "desc" else sort_col.asc())

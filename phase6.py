@@ -293,7 +293,16 @@ def _build_profile_resume_info(
         else profile_json.get("years_experience"),
         "work_authorization": consultant.work_authorization or profile_json.get("visa_type", ""),
         "current_location": consultant.current_location or profile_json.get("location", ""),
-        "linkedin": profile_json.get("linkedin", ""),
+        # BUG FIX: every other field on this dict correctly prefers the
+        # real Consultant column over the resume_info JSON fallback (see
+        # full_name/email/phone/etc. above) — this one was the sole
+        # exception, reading ONLY from profile_json and never checking
+        # consultant.linkedin_url at all. A consultant who filled in
+        # LinkedIn through the profile screen (which writes to that real
+        # column) still failed the "Add LinkedIn to the profile" check and
+        # never had it included in what's sent to the AI, even though it
+        # genuinely was on file — just not in this JSON blob.
+        "linkedin": consultant.linkedin_url or profile_json.get("linkedin", ""),
         "github": profile_json.get("github", ""),
         "tech_stack": {"expert": primary, "familiar": secondary},
         "skills": primary + secondary,
