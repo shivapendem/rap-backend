@@ -971,6 +971,16 @@ async def get_base_resume_content(
             if rate_limits:
                 await save_claude_rate_limits(db, rate_limits)
             if usage_info:
+                # usage_info is only non-None when the AI call actually
+                # succeeded (see parse_resume_text_to_structured_data) —
+                # only THEN persist the result. Otherwise parsed_data is
+                # just its blank "Automatic parsing was unavailable..."
+                # skeleton (e.g. ANTHROPIC_API_KEY missing/invalid, or a
+                # transient API error) — saving that would look identical
+                # to a completed backfill and permanently block every
+                # future retry, since this block only runs while
+                # base_resume_content is still empty. Leave it unsaved so
+                # the next GET tries again.
                 from phase8_ai_usage_service import log_ai_usage
                 await log_ai_usage(
                     db,
@@ -980,8 +990,10 @@ async def get_base_resume_content(
                     output_tokens=usage_info["output_tokens"],
                     consultant_id=str(resolved_id),
                 )
-            consultant.base_resume_content = parsed_data
-            await db.commit()
+                consultant.base_resume_content = parsed_data
+                await db.commit()
+            else:
+                print(f"Base resume content backfill returned no usage_info (AI call unavailable) for consultant {consultant.id}; not persisting fallback skeleton.")
         except Exception as e:
             # Don't fail the read over a backfill hiccup — fall back to the
             # blank editor as before; the next GET will just retry.
