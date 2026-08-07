@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import uuid
 import math
 import asyncio
@@ -861,6 +862,161 @@ class BaseResumeContentUpdateRequest(BaseModel):
     content: dict
 
 
+_HEURISTIC_SECTION_HEADERS = [
+    ("career_objective", re.compile(r'^career\s+objective\s*:?$', re.I)),
+    ("technical_proficiencies", re.compile(r'^technical\s+proficienc(?:y|ies)\s*:?$', re.I)),
+    ("experience", re.compile(r'^(?:experience|work\s+experience|professional\s+experience)\s*:?$', re.I)),
+    ("educational_background", re.compile(r'^educational\s+background\s*:?$|^education\s*:?$', re.I)),
+]
+_HEURISTIC_ASSOCIATED_RE = re.compile(r'^Associated with\s+(.+?)\s*\(([^)]*)\)\s*$', re.I)
+_HEURISTIC_DESIGNATION_RE = re.compile(r'^Designation:\s*(.+)$', re.I)
+_HEURISTIC_EDU_LINE_RE = re.compile(
+    r'(university|college|institute|bachelor|master|b\.?tech|m\.?tech|b\.?s\.?c?\b|m\.?s\.?c?\b|ph\.?d|diploma).*\(\d{4}\)\s*$',
+    re.I,
+)
+
+
+def _heuristic_parse_resume_text(text: str) -> Optional[dict]:
+    """
+    Free, non-AI fallback for turning base_resume_text into the same
+    structured shape parse_resume_text_to_structured_data produces —
+    used when the Claude call is unavailable (e.g. billing/credits, no
+    API key). Only understands the specific template these base resumes
+    follow: Name / contact line / "CAREER OBJECTIVE:" / "TECHNICAL
+    PROFICIENCIES:" (a table, so its actual content — regardless of
+    where the header sits — is appended after every other paragraph by
+    phase3.py's _extract_text_from_docx; see the pairs picked up at the
+    end below) / "EXPERIENCE:" ("Associated with X (dates)" +
+    "Designation: Y" + bullet lines per role) / "EDUCATIONAL
+    BACKGROUND:". Returns None if the text doesn't contain any of these
+    headers, so the caller knows to leave base_resume_content unset
+    (and retry via AI later) rather than saving a bad guess.
+    """
+    if not text or not text.strip():
+        return None
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 3:
+        return None
+
+    header_positions = []
+    for idx, line in enumerate(lines):
+        for key, pattern in _HEURISTIC_SECTION_HEADERS:
+            if pattern.match(line):
+                header_positions.append((key, idx))
+                break
+    if not header_positions:
+        return None
+
+    first_header_idx = header_positions[0][1]
+    name = lines[0] if first_header_idx > 0 else "Unknown"
+    contact_line = lines[1] if first_header_idx > 1 else ""
+
+    email = ""
+    phone = ""
+    linkedin = ""
+    if contact_line:
+        m = re.search(r'[\w.\-+]+@[\w.\-]+\.\w+', contact_line)
+        if m:
+            email = m.group(0)
+        m = re.search(r'(\+?\d[\d\s\-().]{7,}\d)', contact_line)
+        if m:
+            phone = m.group(1).strip()
+        m = re.search(r'https?://\S+', contact_line)
+        if m:
+            linkedin = m.group(0).rstrip('.,')
+
+    boundaries = header_positions + [("__end__", len(lines))]
+    sections: dict = {}
+    for i, (key, start) in enumerate(header_positions):
+        _, end = boundaries[i + 1]
+        sections[key] = lines[start + 1:end]
+
+    career_objective = " ".join(sections.get("career_objective", [])).strip()
+
+    experience = []
+    current = None
+    for line in sections.get("experience", []):
+        m = _HEURISTIC_ASSOCIATED_RE.match(line)
+        if m:
+            if current:
+                experience.append(current)
+            dates = m.group(2).strip()
+            start_date, sep, end_date = dates.partition("–")
+            if not sep:
+                start_date, sep, end_date = dates.partition("-")
+            current = {
+                "client": m.group(1).strip(),
+                "role": "",
+                "start_date": start_date.strip(),
+                "end_date": end_date.strip() if sep else "",
+                "bullets": [],
+            }
+            continue
+        m = _HEURISTIC_DESIGNATION_RE.match(line)
+        if m and current is not None:
+            current["role"] = m.group(1).strip()
+            continue
+        if current is not None:
+            current["bullets"].append(line)
+    if current:
+        experience.append(current)
+
+    # Whatever's left after the last recognized section's content is the
+    # flattened technical-proficiencies table (see docstring above). When
+    # "Educational Background" is that last section there's no header to
+    # bound where the degree entries end and the table begins, so only
+    # lines that actually look like a degree entry (mentions a
+    # university/degree and ends in a "(YYYY)") are kept as education;
+    # everything after the run of those is treated as trailing table
+    # content instead of being swallowed into education.
+    last_key, last_start = header_positions[-1]
+    last_section_lines = sections.get(last_key, [])
+
+    if last_key == "educational_background":
+        education = []
+        consumed = 0
+        for line in last_section_lines:
+            if _HEURISTIC_EDU_LINE_RE.search(line):
+                education.append({"degree": line, "institution": "", "year": ""})
+                consumed += 1
+            else:
+                break
+        if not education and last_section_lines:
+            education.append({"degree": last_section_lines[0], "institution": "", "year": ""})
+            consumed = 1
+        trailing = last_section_lines[consumed:]
+    else:
+        education = [
+            {"degree": line, "institution": "", "year": ""}
+            for line in sections.get("educational_background", [])
+        ]
+        trailing = last_section_lines
+
+    technical_proficiencies = []
+    if trailing and len(trailing) % 2 == 0:
+        for i in range(0, len(trailing), 2):
+            technical_proficiencies.append({"category": trailing[i], "skills": trailing[i + 1]})
+    elif trailing:
+        technical_proficiencies.append({"category": "Skills", "skills": ", ".join(trailing)})
+
+    return {
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "location": "",
+        "linkedin": linkedin,
+        "github": "",
+        "career_objective": career_objective,
+        "summary": "",
+        "technical_proficiencies": technical_proficiencies,
+        "skills": [],
+        "experience": experience,
+        "education": education,
+        "certifications": [],
+        "generation_notes": "Parsed automatically from plain text (no AI used) — please review for accuracy.",
+    }
+
+
 def _flatten_base_resume_content_to_text(data: dict) -> str:
     """
     Plain-text projection of the structured base resume content, kept in
@@ -993,11 +1149,12 @@ async def get_base_resume_content(
                 consultant.base_resume_content = parsed_data
                 await db.commit()
             else:
-                print(f"Base resume content backfill returned no usage_info (AI call unavailable) for consultant {consultant.id}; not persisting fallback skeleton.")
+                print(f"Base resume content backfill returned no usage_info (AI call unavailable) for consultant {consultant.id}; trying free heuristic parser.")
         except Exception as e:
-            # Don't fail the read over a backfill hiccup — fall back to the
-            # blank editor as before; the next GET will just retry.
-            print(f"Base resume content backfill failed for consultant {consultant.id}: {e}")
+            # Don't fail the read over a backfill hiccup — the heuristic
+            # fallback below still gets a chance; if that also comes up
+            # empty, the next GET will just retry both.
+            print(f"Base resume content backfill (AI) failed for consultant {consultant.id}: {e}")
             from error_logger import log_db_error
             await log_db_error(
                 stage="base_resume_content_backfill",
@@ -1005,6 +1162,22 @@ async def get_base_resume_content(
                 source_type="consultant",
                 source_id=str(consultant.id),
             )
+
+        # Free fallback when the AI path didn't produce anything to save
+        # (no credits/no key/error) — attempts a plain-text, template-aware
+        # parse instead of leaving the editor blank. Skipped entirely once
+        # the AI path above succeeds, since base_resume_content is set by
+        # then and this whole backfill block won't run again.
+        if not consultant.base_resume_content:
+            try:
+                heuristic_data = _heuristic_parse_resume_text(consultant.base_resume_text)
+                if heuristic_data:
+                    consultant.base_resume_content = heuristic_data
+                    await db.commit()
+                else:
+                    print(f"Heuristic base resume parse found no recognizable sections for consultant {consultant.id}; leaving blank for manual entry or a later AI retry.")
+            except Exception as e:
+                print(f"Base resume content backfill (heuristic) failed for consultant {consultant.id}: {e}")
 
     return BaseResumeContentDTO(
         content=consultant.base_resume_content or {},
