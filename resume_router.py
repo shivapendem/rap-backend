@@ -784,6 +784,11 @@ async def update_base_resume_text(
         raise HTTPException(status_code=404, detail="Consultant profile not found")
         
     consultant.base_resume_text = request.text
+    # The structured JSON editor (GET/PUT /base/content) must not keep
+    # showing whatever was parsed before this plain-text edit — clear it
+    # so its backfill re-parses the NEW text next time that page loads
+    # (same reasoning as the upload endpoint in phase3.py).
+    consultant.base_resume_content = None
     # BUG FIX: this endpoint only ever updated base_resume_text (the plain
     # text used for AI tailoring/matching) — the actual file streamed back
     # by GET /base/download reads consultant.base_resume_file_path, which

@@ -1087,6 +1087,12 @@ async def upload_resume(
 
     consultant.base_resume_file_path = file_path
     consultant.base_resume_text = extracted_text
+    # A new file replaces the old one's content entirely — clear the
+    # structured JSON (base_resume_content) so the Edit Base Resume page's
+    # GET /api/resume/base/content backfill re-parses THIS text instead of
+    # silently continuing to show whatever was parsed from the previous
+    # upload.
+    consultant.base_resume_content = None
     await db.commit()
     await db.refresh(consultant)
 
@@ -1145,6 +1151,7 @@ async def admin_delete_resume(
 
     consultant.base_resume_file_path = None
     consultant.base_resume_text = None
+    consultant.base_resume_content = None
     await db.commit()
 
 
