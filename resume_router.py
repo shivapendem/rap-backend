@@ -955,6 +955,45 @@ async def get_base_resume_content(
     from pathlib import Path
     filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
 
+    # BACKFILL: consultants whose base resume predates this structured
+    # editor only have base_resume_text (plain text) — base_resume_content
+    # is null, which would show a blank {} editor even though a real
+    # resume exists. One-time auto-populate it from the existing text via
+    # the same AI parser uploaded resumes already use
+    # (parse_resume_text_to_structured_data — previously unused), then
+    # persist so this only runs once per consultant. base_resume_text
+    # itself is left untouched here; PUT /base/content keeps it in sync
+    # on every future save.
+    if not consultant.base_resume_content and (consultant.base_resume_text or "").strip():
+        from claude_service import parse_resume_text_to_structured_data
+        try:
+            parsed_data, rate_limits, usage_info = parse_resume_text_to_structured_data(consultant.base_resume_text)
+            if rate_limits:
+                await save_claude_rate_limits(db, rate_limits)
+            if usage_info:
+                from phase8_ai_usage_service import log_ai_usage
+                await log_ai_usage(
+                    db,
+                    purpose="base_resume_backfill",
+                    model="claude-sonnet-4-6",
+                    input_tokens=usage_info["input_tokens"],
+                    output_tokens=usage_info["output_tokens"],
+                    consultant_id=str(resolved_id),
+                )
+            consultant.base_resume_content = parsed_data
+            await db.commit()
+        except Exception as e:
+            # Don't fail the read over a backfill hiccup — fall back to the
+            # blank editor as before; the next GET will just retry.
+            print(f"Base resume content backfill failed for consultant {consultant.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="base_resume_content_backfill",
+                error=e,
+                source_type="consultant",
+                source_id=str(consultant.id),
+            )
+
     return BaseResumeContentDTO(
         content=consultant.base_resume_content or {},
         filename=filename,
