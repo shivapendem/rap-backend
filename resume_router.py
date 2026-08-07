@@ -952,8 +952,13 @@ def _heuristic_parse_resume_text(text: str) -> Optional[dict]:
             current = {
                 "client": m.group(1).strip(),
                 "role": "",
-                "start_date": start_date.strip(),
-                "end_date": end_date.strip() if sep else "",
+                # ResumeRichPreview/ResumeEditorPage's ResumeData type reads
+                # exp.start/exp.end (not start_date/end_date) — using the
+                # wrong keys here meant dates parsed fine but silently never
+                # rendered anywhere.
+                "start": start_date.strip(),
+                "end": end_date.strip() if sep else "",
+                "location": "",
                 "bullets": [],
             }
             continue
