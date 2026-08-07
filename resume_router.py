@@ -852,6 +852,196 @@ async def update_base_resume_text(
     return {"success": True, "message": "Base resume text updated successfully"}
 
 
+class BaseResumeContentDTO(BaseModel):
+    content: dict
+    filename: Optional[str] = None
+
+
+class BaseResumeContentUpdateRequest(BaseModel):
+    content: dict
+
+
+def _flatten_base_resume_content_to_text(data: dict) -> str:
+    """
+    Plain-text projection of the structured base resume content, kept in
+    base_resume_text so nothing that already reads it (AI tailoring in
+    claude_service.py, candidate matching in matching_router.py) has to
+    change or even know this structured editor exists.
+    """
+    if not data:
+        return ""
+    parts: List[str] = []
+
+    def add(label: Optional[str], value):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value if v)
+        value = str(value).strip()
+        if not value:
+            return
+        parts.append(f"{label}: {value}" if label else value)
+
+    add(None, data.get("name"))
+    add("Career Objective", data.get("career_objective") or data.get("summary"))
+
+    tech = data.get("technical_proficiencies")
+    if isinstance(tech, list) and tech:
+        for tp in tech:
+            skills = tp.get("skills") if isinstance(tp, dict) else None
+            add(tp.get("category") if isinstance(tp, dict) else None, skills)
+    else:
+        add("Skills", data.get("skills"))
+
+    for exp in data.get("experience") or []:
+        if not isinstance(exp, dict):
+            continue
+        header = " - ".join(
+            str(v) for v in [exp.get("client") or exp.get("company"), exp.get("role") or exp.get("title")] if v
+        )
+        add(None, header)
+        add(None, exp.get("description"))
+        add(None, exp.get("bullets"))
+
+    for proj in (data.get("key_projects") or []) + (data.get("academic_projects") or []):
+        if not isinstance(proj, dict):
+            continue
+        add(None, proj.get("title") or proj.get("game_name"))
+        add(None, proj.get("description"))
+        add(None, proj.get("responsibilities"))
+
+    edu = data.get("education") or data.get("educational_background")
+    if isinstance(edu, list):
+        for e in edu:
+            if isinstance(e, dict):
+                add(None, " - ".join(str(v) for v in [e.get("degree"), e.get("institution") or e.get("college"), e.get("year")] if v))
+            else:
+                add(None, e)
+    elif edu:
+        add(None, edu)
+
+    add("Certifications", data.get("certifications"))
+    add("Non-Technical Proficiencies", data.get("non_technical_proficiencies"))
+    add("Achievements", data.get("achievements"))
+
+    return "\n".join(parts)
+
+
+@router.get("/base/content", response_model=BaseResumeContentDTO)
+async def get_base_resume_content(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Structured counterpart to GET /base/text — powers the rich JSON + preview
+    Base Resume editor (mirrors GET .../resume/content in phase6.py for
+    tailored resumes). Same auth/resolution as /base/text.
+    """
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+
+    from pathlib import Path
+    filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
+
+    return BaseResumeContentDTO(
+        content=consultant.base_resume_content or {},
+        filename=filename,
+    )
+
+
+@router.put("/base/content")
+async def update_base_resume_content(
+    request: BaseResumeContentUpdateRequest,
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Structured counterpart to PUT /base/text (same bug-fix shape: the DOCX
+    served by GET /base/download must stay in sync with what was last
+    saved here). Regenerates the DOCX via phase6.py's _generate_docx —
+    the same builder tailored/uploaded resumes use — so the downloaded
+    file matches the ResumeRichPreview format the user edits against.
+    Also re-derives base_resume_text so AI tailoring/matching keep working
+    unchanged; neither base_resume_text nor base_resume_file_path's
+    resolution logic elsewhere is touched.
+    """
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+
+    resume_data = request.content
+    consultant.base_resume_content = resume_data
+    consultant.base_resume_text = _flatten_base_resume_content_to_text(resume_data)
+
+    import io
+    import tempfile
+    from pathlib import Path
+    from phase6 import _generate_docx
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            docx_path = Path(tmp_dir) / "base_resume.docx"
+            _generate_docx(resume_data, docx_path)
+            docx_bytes = docx_path.read_bytes()
+
+        stored = consultant.base_resume_file_path
+        if stored and os.path.isfile(stored):
+            old_path = Path(stored)
+            new_path = old_path.with_suffix(".docx")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            new_path.write_bytes(docx_bytes)
+            if new_path != old_path and old_path.exists():
+                old_path.unlink()
+            consultant.base_resume_file_path = str(new_path)
+        elif stored:
+            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
+            if upload_file_to_s3(
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                consultant.base_resume_file_path = key
+        else:
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
+    except Exception as e:
+        print(f"Base resume DOCX regeneration on content save failed for consultant {consultant.id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="base_resume_docx_regen_on_content_save",
+            error=e,
+            source_type="consultant",
+            source_id=str(consultant.id),
+        )
+
+    await db.commit()
+    return {"success": True, "message": "Base resume content updated successfully"}
+
+
 @router.get("/{id}/text", response_model=BaseResumeTextDTO)
 async def get_resume_text(
     id: int,
@@ -896,6 +1086,46 @@ async def update_resume_text(
     existing = dict(resume.data or {})
     existing["raw_text"] = request.text
     resume.data = existing
+    # BUG FIX: this only ever updated data["raw_text"] — the actual file
+    # streamed back by View (/{id}/view) and Download (/{id}/download,
+    # /{id}/download/file) reads resume.s3_key, which was never touched
+    # here. Saving an edit had no effect on what View/Download served; it
+    # kept returning the exact original uploaded file forever — same class
+    # of bug as update_base_resume_text above, same fix: regenerate a DOCX
+    # from the edited text and overwrite the object at the same s3_key, so
+    # nothing else that already references s3_key needs to change.
+    if resume.s3_key:
+        import io
+        from docx import Document
+        try:
+            doc = Document()
+            for line in (request.text or "").split("\n"):
+                doc.add_paragraph(line)
+            buf = io.BytesIO()
+            doc.save(buf)
+            docx_bytes = buf.getvalue()
+            # Uploads always write s3_key ending in .docx (see /upload
+            # above) — force it here too in case this endpoint is ever
+            # reached for an older/differently-keyed record, so the
+            # extension-based media-type detection in the download
+            # endpoints doesn't end up mislabeling the content.
+            key = resume.s3_key if resume.s3_key.lower().endswith(".docx") else resume.s3_key.rsplit(".", 1)[0] + ".docx"
+            upload_file_to_s3(
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            resume.s3_key = key
+        except Exception as e:
+            # Don't fail the save over a DOCX regen hiccup — the raw_text
+            # edit itself already committed below.
+            print(f"Resume DOCX regeneration on text save failed for resume {resume.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_docx_regen_on_text_save",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
     await db.commit()
     return {"success": True, "message": "Resume text updated successfully"}
 
