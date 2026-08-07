@@ -1124,28 +1124,37 @@ async def get_base_resume_content(
     # BACKFILL: consultants whose base resume predates this structured
     # editor only have base_resume_text (plain text) — base_resume_content
     # is null, which would show a blank {} editor even though a real
-    # resume exists. One-time auto-populate it from the existing text via
-    # the same AI parser uploaded resumes already use
-    # (parse_resume_text_to_structured_data — previously unused), then
-    # persist so this only runs once per consultant. base_resume_text
-    # itself is left untouched here; PUT /base/content keeps it in sync
-    # on every future save.
+    # resume exists.
+    #
+    # ORDER FIX: this used to try the AI parser first and only fall back
+    # to the free heuristic parser after it failed — meaning every page
+    # load for a not-yet-backfilled consultant blocked on a real network
+    # call to Anthropic (up to the 30s timeout below) before the page
+    # could render at all. That's exactly why loading felt inconsistent
+    # ("sometimes opens, sometimes stuck") — fast for already-backfilled
+    # consultants, but genuinely slow (not actually hung) for ones still
+    # waiting on that AI round-trip. Since these base resumes reliably
+    # follow one template, try the free, synchronous, near-instant
+    # heuristic parser FIRST — the common case now resolves immediately
+    # — and only reach for the AI parser as a fallback when the text
+    # doesn't match that template at all.
+    if not consultant.base_resume_content and (consultant.base_resume_text or "").strip():
+        try:
+            heuristic_data = _heuristic_parse_resume_text(consultant.base_resume_text)
+            if heuristic_data:
+                consultant.base_resume_content = heuristic_data
+                await db.commit()
+        except Exception as e:
+            print(f"Base resume content backfill (heuristic) failed for consultant {consultant.id}: {e}")
+
     if not consultant.base_resume_content and (consultant.base_resume_text or "").strip():
         from claude_service import parse_resume_text_to_structured_data
         try:
-            # BUG FIX: parse_resume_text_to_structured_data uses the
-            # synchronous Anthropic client and was being called directly
-            # (no await) inside this async endpoint — that blocks the
-            # ENTIRE event loop for the whole duration of the API call,
-            # freezing every other request the backend is serving (not
-            # just this one) until it returns. Unlike the existing
-            # tailored-resume generator (an occasional, deliberate user
-            # action with the same blocking pattern), this runs
-            # automatically on every page load while base_resume_content
-            # is empty, so the freeze was hit far more often — this is
-            # what was hanging the whole admin UI. asyncio.to_thread runs
-            # the blocking call on a worker thread instead, so the event
-            # loop stays free to serve other requests while it's in flight.
+            # asyncio.to_thread runs the blocking Anthropic call on a
+            # worker thread so it doesn't freeze the event loop (and
+            # every other request the backend is serving) while it's in
+            # flight — see claude_service.py for the 30s timeout that
+            # bounds how long this can take.
             parsed_data, rate_limits, usage_info = await asyncio.to_thread(
                 parse_resume_text_to_structured_data, consultant.base_resume_text
             )
@@ -1153,15 +1162,13 @@ async def get_base_resume_content(
                 await save_claude_rate_limits(db, rate_limits)
             if usage_info:
                 # usage_info is only non-None when the AI call actually
-                # succeeded (see parse_resume_text_to_structured_data) —
-                # only THEN persist the result. Otherwise parsed_data is
-                # just its blank "Automatic parsing was unavailable..."
-                # skeleton (e.g. ANTHROPIC_API_KEY missing/invalid, or a
-                # transient API error) — saving that would look identical
-                # to a completed backfill and permanently block every
-                # future retry, since this block only runs while
-                # base_resume_content is still empty. Leave it unsaved so
-                # the next GET tries again.
+                # succeeded — only THEN persist the result. Otherwise
+                # parsed_data is just its blank "Automatic parsing was
+                # unavailable..." skeleton (e.g. ANTHROPIC_API_KEY
+                # missing/invalid, no credits, or a transient API error)
+                # — saving that would look identical to a completed
+                # backfill and permanently block every future retry.
+                # Leave it unsaved so the next GET tries again.
                 from phase8_ai_usage_service import log_ai_usage
                 await log_ai_usage(
                     db,
@@ -1174,11 +1181,10 @@ async def get_base_resume_content(
                 consultant.base_resume_content = parsed_data
                 await db.commit()
             else:
-                print(f"Base resume content backfill returned no usage_info (AI call unavailable) for consultant {consultant.id}; trying free heuristic parser.")
+                print(f"Base resume content backfill returned no usage_info (AI call unavailable) for consultant {consultant.id}.")
         except Exception as e:
-            # Don't fail the read over a backfill hiccup — the heuristic
-            # fallback below still gets a chance; if that also comes up
-            # empty, the next GET will just retry both.
+            # Don't fail the read over a backfill hiccup — the next GET
+            # will just retry both parsers.
             print(f"Base resume content backfill (AI) failed for consultant {consultant.id}: {e}")
             from error_logger import log_db_error
             await log_db_error(
@@ -1187,22 +1193,6 @@ async def get_base_resume_content(
                 source_type="consultant",
                 source_id=str(consultant.id),
             )
-
-        # Free fallback when the AI path didn't produce anything to save
-        # (no credits/no key/error) — attempts a plain-text, template-aware
-        # parse instead of leaving the editor blank. Skipped entirely once
-        # the AI path above succeeds, since base_resume_content is set by
-        # then and this whole backfill block won't run again.
-        if not consultant.base_resume_content:
-            try:
-                heuristic_data = _heuristic_parse_resume_text(consultant.base_resume_text)
-                if heuristic_data:
-                    consultant.base_resume_content = heuristic_data
-                    await db.commit()
-                else:
-                    print(f"Heuristic base resume parse found no recognizable sections for consultant {consultant.id}; leaving blank for manual entry or a later AI retry.")
-            except Exception as e:
-                print(f"Base resume content backfill (heuristic) failed for consultant {consultant.id}: {e}")
 
     return BaseResumeContentDTO(
         content=consultant.base_resume_content or {},
