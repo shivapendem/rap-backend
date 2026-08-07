@@ -1573,9 +1573,71 @@ async def get_resume(
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
-    return resume
+    # BACKFILL: manually-uploaded resumes only ever got data={"raw_text":
+    # ...} at upload time (see /upload above) — no structured fields, so
+    # the frontend routes these to the plain-text editor forever, even
+    # after this same backfill was added for the base resume. Mirrors
+    # get_base_resume_content's approach exactly: try the free,
+    # synchronous heuristic parser first (these resumes reliably follow
+    # one template, so this resolves instantly for the common case), and
+    # only fall back to a real AI call when that doesn't match. raw_text
+    # is kept alongside the parsed fields (not replaced) so the plain-text
+    # editor and AI tailoring/matching, which both still read raw_text,
+    # keep working unchanged.
+    def _is_raw_text_only(d: dict) -> bool:
+        return bool(d) and set(d.keys()) <= {"raw_text"}
 
-@router.put("/{id}", response_model=ResumeResponse)
+    if _is_raw_text_only(resume.data or {}) and (resume.data.get("raw_text") or "").strip():
+        raw_text = resume.data["raw_text"]
+        try:
+            heuristic_data = _heuristic_parse_resume_text(raw_text)
+            if heuristic_data:
+                resume.data = {**heuristic_data, "raw_text": raw_text}
+                await db.commit()
+                await db.refresh(resume)
+        except Exception as e:
+            print(f"Resume content backfill (heuristic) failed for resume {resume.id}: {e}")
+
+    if _is_raw_text_only(resume.data or {}) and (resume.data.get("raw_text") or "").strip():
+        raw_text = resume.data["raw_text"]
+        from claude_service import parse_resume_text_to_structured_data
+        try:
+            parsed_data, rate_limits, usage_info = await asyncio.to_thread(
+                parse_resume_text_to_structured_data, raw_text
+            )
+            if rate_limits:
+                await save_claude_rate_limits(db, rate_limits)
+            if usage_info:
+                # Only persist when the AI call actually succeeded — see
+                # the matching comment in get_base_resume_content for why
+                # (a blank "parsing unavailable" skeleton would otherwise
+                # look identical to a completed backfill and permanently
+                # block every future retry).
+                from phase8_ai_usage_service import log_ai_usage
+                await log_ai_usage(
+                    db,
+                    purpose="resume_backfill",
+                    model="claude-sonnet-4-6",
+                    input_tokens=usage_info["input_tokens"],
+                    output_tokens=usage_info["output_tokens"],
+                    consultant_id=str(resume.user_id),
+                )
+                resume.data = {**parsed_data, "raw_text": raw_text}
+                await db.commit()
+                await db.refresh(resume)
+            else:
+                print(f"Resume content backfill returned no usage_info (AI call unavailable) for resume {resume.id}.")
+        except Exception as e:
+            print(f"Resume content backfill (AI) failed for resume {resume.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_content_backfill",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
+
+    return resume
 async def update_resume(
     id: int,
     request: ResumeUpdateRequest,
