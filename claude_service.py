@@ -432,7 +432,12 @@ def parse_resume_text_to_structured_data(raw_text: str) -> tuple[dict, dict, Opt
         return _normalize_resume_data(fallback, {}), {}, None
 
     try:
-        client = Anthropic(api_key=api_key)
+        # timeout=30 bounds the blocking call this function makes (see the
+        # asyncio.to_thread wrapper at its only call site in
+        # resume_router.py) — without it, a stuck network call could tie
+        # up that worker thread indefinitely instead of failing into the
+        # fallback below.
+        client = Anthropic(api_key=api_key, timeout=30.0)
         user_prompt = f"""RAW RESUME TEXT:
 {raw_text}
 

@@ -1133,7 +1133,22 @@ async def get_base_resume_content(
     if not consultant.base_resume_content and (consultant.base_resume_text or "").strip():
         from claude_service import parse_resume_text_to_structured_data
         try:
-            parsed_data, rate_limits, usage_info = parse_resume_text_to_structured_data(consultant.base_resume_text)
+            # BUG FIX: parse_resume_text_to_structured_data uses the
+            # synchronous Anthropic client and was being called directly
+            # (no await) inside this async endpoint — that blocks the
+            # ENTIRE event loop for the whole duration of the API call,
+            # freezing every other request the backend is serving (not
+            # just this one) until it returns. Unlike the existing
+            # tailored-resume generator (an occasional, deliberate user
+            # action with the same blocking pattern), this runs
+            # automatically on every page load while base_resume_content
+            # is empty, so the freeze was hit far more often — this is
+            # what was hanging the whole admin UI. asyncio.to_thread runs
+            # the blocking call on a worker thread instead, so the event
+            # loop stays free to serve other requests while it's in flight.
+            parsed_data, rate_limits, usage_info = await asyncio.to_thread(
+                parse_resume_text_to_structured_data, consultant.base_resume_text
+            )
             if rate_limits:
                 await save_claude_rate_limits(db, rate_limits)
             if usage_info:
