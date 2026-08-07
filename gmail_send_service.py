@@ -322,13 +322,14 @@ def get_service_account_access_token(service_account_path: str, impersonate_emai
     import time
     import httpx
     import os
-    
     if not os.path.exists(service_account_path):
         env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if env_path and os.path.exists(env_path):
             service_account_path = env_path
         else:
-            raise Exception("Gmail not connected via OAuth and service-account-key.json is missing.")
+            abs_sa_path = os.path.abspath(service_account_path)
+            env_msg = f" (GOOGLE_APPLICATION_CREDENTIALS={os.path.abspath(env_path)})" if env_path else ""
+            raise Exception(f"Gmail not connected via OAuth and service-account-key.json is missing at {abs_sa_path}{env_msg}.")
             
     with open(service_account_path, "r") as f:
         credentials = json.load(f)
