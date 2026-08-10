@@ -152,7 +152,7 @@ async def run_matching_engine(
         .where(
             Consultant.status == "ACTIVE",
             User.role == "CONSULTANT",
-            User.is_active == True
+            User.is_authorized == True
         )
     )
     consultants = cons_res.scalars().all()
