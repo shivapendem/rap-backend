@@ -1375,20 +1375,40 @@ async def apply_to_requirement(
     # so it can't be passed through as-is; same local-then-S3 fallback
     # phase7.py already uses for this identical scenario.
     attachment_refs = None
+    # BUG FIX: this only ever looked up a tailored GeneratedResume
+    # (is_final=True for this requirement) — when a consultant applies
+    # using their BASE resume instead (no tailored resume generated for
+    # this requirement), `resume` is None here and attachment_refs stayed
+    # None the whole way through, so the email queue item was created
+    # with NO attachment at all. Nothing errored (silently missing, not
+    # corrupt), which is why it could look like "sometimes there's an
+    # attachment and sometimes there isn't" depending on whether a
+    # tailored resume happened to exist. Fall back to the consultant's
+    # base resume — same local-vs-Spaces resolution
+    # resume_router.py's download_base_resume already uses.
+    resume_filename = None
+    resume_source_path = None
     if resume and resume.pdf_path:
+        resume_source_path = resume.pdf_path
+        resume_filename = resume.filename or f"Resume_{resume.id}.pdf"
+    elif consultant.base_resume_file_path:
+        resume_source_path = consultant.base_resume_file_path
+        resume_filename = Path(consultant.base_resume_file_path).name
+
+    if resume_source_path:
         body_bytes = None
-        if Path(resume.pdf_path).exists():
-            with open(resume.pdf_path, "rb") as f:
+        if Path(resume_source_path).exists():
+            with open(resume_source_path, "rb") as f:
                 body_bytes = f.read()
         else:
             from s3_service import download_file_from_s3
-            body_bytes, _ = download_file_from_s3(resume.pdf_path)
+            body_bytes, _ = download_file_from_s3(resume_source_path)
 
         if body_bytes:
             safe_name = "".join(
-                c for c in (resume.filename or f"Resume_{resume.id}.pdf")
+                c for c in (resume_filename or "Resume.pdf")
                 if c.isalnum() or c in " -_."
-            ).strip() or f"Resume_{resume.id}.pdf"
+            ).strip() or "Resume.pdf"
             unique_name = f"{_uuid.uuid4()}__{safe_name}"
             with open(Path(UPLOAD_DIR) / unique_name, "wb") as f:
                 f.write(body_bytes)
@@ -1398,7 +1418,7 @@ async def apply_to_requirement(
             # fail loudly instead of silently sending without it.
             raise HTTPException(
                 status_code=502,
-                detail="Could not retrieve the generated resume file to attach. Please regenerate the resume and try again.",
+                detail="Could not retrieve the resume file to attach. Please check your resume and try again.",
             )
 
     queue_item = EmailQueue(

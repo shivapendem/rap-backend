@@ -13,6 +13,7 @@
 
 import os
 import math
+import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -489,35 +490,63 @@ async def confirm_send(
         # holding a Spaces object key instead of a local path — same
         # pattern phase6.py's download endpoint uses, since the local file
         # is deleted after upload.
+        #
+        # BUG FIX (same root cause as apply_to_requirement in phase5.py):
+        # generated_resume_id is Optional and independent of ats_score —
+        # when it isn't populated (consultant applying with their base
+        # resume, no tailored resume generated for this match), this whole
+        # block was skipped and attachment_path stayed None the entire
+        # way through, sending the email with no attachment and no error.
+        # Fall back to the consultant's base resume in that case, same
+        # source resume_router.py's download_base_resume already reads.
         attachment_path = None
         tmp_resume_path = None
+        resume_source_path = None
+        resume_display_name = None
         if request.generated_resume_id:
             try:
                 resume_result = await db.execute(
                     select(GeneratedResume).where(GeneratedResume.id == request.generated_resume_id)
                 )
                 selected_resume = resume_result.scalars().first()
-                if selected_resume and selected_resume.docx_path:
-                    body_bytes = None
-                    if Path(selected_resume.docx_path).exists():
-                        with open(selected_resume.docx_path, "rb") as f:
-                            body_bytes = f.read()
-                    else:
-                        from s3_service import download_file_from_s3
-                        body_bytes, _ = download_file_from_s3(selected_resume.docx_path)
-                    if body_bytes:
-                        import tempfile
-                        safe_title = "".join(
-                            c for c in (selected_resume.filename or f"Resume_{selected_resume.id}.docx")
-                            if c.isalnum() or c in " -_."
-                        ).strip() or f"Resume_{selected_resume.id}.docx"
-                        tmp_dir = tempfile.mkdtemp(prefix="rap_apply_")
-                        tmp_resume_path = os.path.join(tmp_dir, safe_title)
-                        with open(tmp_resume_path, "wb") as f:
-                            f.write(body_bytes)
-                        attachment_path = tmp_resume_path
+                if selected_resume and selected_resume.pdf_path:
+                    resume_source_path = selected_resume.pdf_path
+                    resume_display_name = selected_resume.filename or f"Resume_{selected_resume.id}.pdf"
             except Exception as attach_err:
-                print(f"[confirm_send] resume attach FAILED for resume_id={request.generated_resume_id}: {attach_err}")
+                print(f"[confirm_send] resume lookup FAILED for resume_id={request.generated_resume_id}: {attach_err}")
+                from error_logger import log_db_error
+                await log_db_error(
+                    stage="confirm_send_resume_attach",
+                    error=attach_err,
+                    source_type="resume",
+                    source_id=request.generated_resume_id,
+                )
+        if resume_source_path is None and consultant.base_resume_file_path:
+            resume_source_path = consultant.base_resume_file_path
+            resume_display_name = Path(consultant.base_resume_file_path).name
+
+        if resume_source_path:
+            try:
+                body_bytes = None
+                if Path(resume_source_path).exists():
+                    with open(resume_source_path, "rb") as f:
+                        body_bytes = f.read()
+                else:
+                    from s3_service import download_file_from_s3
+                    body_bytes, _ = download_file_from_s3(resume_source_path)
+                if body_bytes:
+                    import tempfile
+                    safe_title = "".join(
+                        c for c in (resume_display_name or "Resume.pdf")
+                        if c.isalnum() or c in " -_."
+                    ).strip() or "Resume.pdf"
+                    tmp_dir = tempfile.mkdtemp(prefix="rap_apply_")
+                    tmp_resume_path = os.path.join(tmp_dir, safe_title)
+                    with open(tmp_resume_path, "wb") as f:
+                        f.write(body_bytes)
+                    attachment_path = tmp_resume_path
+            except Exception as attach_err:
+                print(f"[confirm_send] resume attach FAILED for path={resume_source_path}: {attach_err}")
                 from error_logger import log_db_error
                 await log_db_error(
                     stage="confirm_send_resume_attach",
@@ -842,18 +871,18 @@ async def download_application_resume(
     elif current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Insufficient permissions.")
 
-    filename = f"Resume_{application_id}.docx"
+    filename = f"Resume_{application_id}.pdf"
     local_path = None
     s3_key = None
 
     if app.generated_resume_id:
         resume_result = await db.execute(select(GeneratedResume).where(GeneratedResume.id == app.generated_resume_id))
         resume = resume_result.scalars().first()
-        if resume and resume.docx_path:
-            if Path(resume.docx_path).exists():
-                local_path = resume.docx_path
+        if resume and resume.pdf_path:
+            if Path(resume.pdf_path).exists():
+                local_path = resume.pdf_path
             else:
-                s3_key = resume.docx_path
+                s3_key = resume.pdf_path
             filename = resume.filename or filename
 
     # BUG FIX: applications sent via the email-queue/Apply-to-Requirement
@@ -912,15 +941,49 @@ async def download_application_resume(
     # itself fails.
     if s3_key:
         if not force_stream:
+            # BUG FIX (Google Docs Viewer "no preview available"): a
+            # presigned URL isn't guaranteed to render in Google's
+            # external viewer even when it's perfectly valid and
+            # reachable. Convert to a real PDF on our own side first —
+            # same conversion already used for tailored resume generation
+            # — so View relies on nothing but the browser's built-in PDF
+            # viewer, not a third-party service's ability to fetch our URL.
+            is_docx = filename.lower().endswith(".docx") or media_type == (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            if is_docx:
+                from s3_service import download_file_from_s3 as _dl
+                raw_bytes, _ = await asyncio.to_thread(_dl, s3_key)
+                if raw_bytes:
+                    from file_preview import convert_docx_bytes_to_pdf_bytes
+                    pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+                    if pdf_bytes:
+                        return Response(
+                            content=pdf_bytes,
+                            media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
+                        )
             from s3_service import generate_presigned_url
             presigned = generate_presigned_url(s3_key)
             if presigned:
                 return {"url": presigned, "filename": filename, "mimeType": media_type}
         from s3_service import download_file_from_s3
-        body_bytes, _ = download_file_from_s3(s3_key)
+        body_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
     else:
         with open(local_path, "rb") as f:
             body_bytes = f.read()
+        is_docx = filename.lower().endswith(".docx") or media_type == (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        if is_docx and not force_stream:
+            from file_preview import convert_docx_bytes_to_pdf_bytes
+            pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body_bytes)
+            if pdf_bytes:
+                return Response(
+                    content=pdf_bytes,
+                    media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
+                )
 
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
