@@ -1356,14 +1356,28 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     existing_app.sent_at = now
                     existing_app.applied_at = now
                     existing_app.email_body_preview = (item.content or "")[:500]
-                    # BUG FIX: resume attachment reference was never
-                    # recorded, so the Resume column was always blank for
-                    # every application sent this way. Only overwrite if
-                    # this send actually had an attachment — don't blank
-                    # out a resume recorded by an earlier send.
+                    
+                 # BUG FIX ("Sent Applications shows the wrong/old resume
+                    # after a fresh send"): download_application_resume
+                    # (phase7.py) checks app.generated_resume_id FIRST and
+                    # only falls back to resume_attachment_path if that's
+                    # unset. If this Application row already had a
+                    # generated_resume_id from an EARLIER, unrelated send to
+                    # the same requirement, it lingered here forever — every
+                    # later send that attached something different (like
+                    # the base resume) still showed that old generated
+                    # resume when viewed, since resume_attachment_path was
+                    # never even reached. Whichever attachment a send
+                    # actually used should be the one shown; if this send
+                    # used a raw attachment ref, it's no longer represented
+                    # by a generated_resume_id at all, so clear it here in
+                    # the same place resume_attachment_path gets set.
                     if item.attachments:
                         existing_app.resume_attachment_path = item.attachments[0]
                         existing_app.attachments_sent = item.attachments
+                        existing_app.generated_resume_id = None
+
+
                     # BUG FIX: sender was never recorded on this path.
                     # Only fill in if not already set, so a real recruiter
                     # confirm-send attribution from phase7.py is never
@@ -1491,3 +1505,4 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     source_id=str(item_id),
                 )
                 await session.rollback()
+

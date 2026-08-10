@@ -497,20 +497,20 @@ async def confirm_send(
                     select(GeneratedResume).where(GeneratedResume.id == request.generated_resume_id)
                 )
                 selected_resume = resume_result.scalars().first()
-                if selected_resume and selected_resume.pdf_path:
+                if selected_resume and selected_resume.docx_path:
                     body_bytes = None
-                    if Path(selected_resume.pdf_path).exists():
-                        with open(selected_resume.pdf_path, "rb") as f:
+                    if Path(selected_resume.docx_path).exists():
+                        with open(selected_resume.docx_path, "rb") as f:
                             body_bytes = f.read()
                     else:
                         from s3_service import download_file_from_s3
-                        body_bytes, _ = download_file_from_s3(selected_resume.pdf_path)
+                        body_bytes, _ = download_file_from_s3(selected_resume.docx_path)
                     if body_bytes:
                         import tempfile
                         safe_title = "".join(
-                            c for c in (selected_resume.filename or f"Resume_{selected_resume.id}.pdf")
+                            c for c in (selected_resume.filename or f"Resume_{selected_resume.id}.docx")
                             if c.isalnum() or c in " -_."
-                        ).strip() or f"Resume_{selected_resume.id}.pdf"
+                        ).strip() or f"Resume_{selected_resume.id}.docx"
                         tmp_dir = tempfile.mkdtemp(prefix="rap_apply_")
                         tmp_resume_path = os.path.join(tmp_dir, safe_title)
                         with open(tmp_resume_path, "wb") as f:
@@ -842,18 +842,18 @@ async def download_application_resume(
     elif current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Insufficient permissions.")
 
-    filename = f"Resume_{application_id}.pdf"
+    filename = f"Resume_{application_id}.docx"
     local_path = None
     s3_key = None
 
     if app.generated_resume_id:
         resume_result = await db.execute(select(GeneratedResume).where(GeneratedResume.id == app.generated_resume_id))
         resume = resume_result.scalars().first()
-        if resume and resume.pdf_path:
-            if Path(resume.pdf_path).exists():
-                local_path = resume.pdf_path
+        if resume and resume.docx_path:
+            if Path(resume.docx_path).exists():
+                local_path = resume.docx_path
             else:
-                s3_key = resume.pdf_path
+                s3_key = resume.docx_path
             filename = resume.filename or filename
 
     # BUG FIX: applications sent via the email-queue/Apply-to-Requirement
