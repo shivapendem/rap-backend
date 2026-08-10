@@ -1388,9 +1388,15 @@ async def apply_to_requirement(
     # resume_router.py's download_base_resume already uses.
     resume_filename = None
     resume_source_path = None
-    if resume and resume.pdf_path:
-        resume_source_path = resume.pdf_path
-        resume_filename = resume.filename or f"Resume_{resume.id}.pdf"
+    if resume and resume.docx_path:
+        resume_source_path = resume.docx_path
+        # GeneratedResume.filename is always built with a .pdf extension
+        # (see phase6.py's _build_resume_filename) regardless of which
+        # file is actually being attached — swap it to .docx here since
+        # we're sending the DOCX, not the PDF, or the attachment's real
+        # bytes wouldn't match the extension in its own filename.
+        base_name = resume.filename or f"Resume_{resume.id}.pdf"
+        resume_filename = Path(base_name).stem + ".docx"
     elif consultant.base_resume_file_path:
         resume_source_path = consultant.base_resume_file_path
         resume_filename = Path(consultant.base_resume_file_path).name

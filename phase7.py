@@ -509,9 +509,14 @@ async def confirm_send(
                     select(GeneratedResume).where(GeneratedResume.id == request.generated_resume_id)
                 )
                 selected_resume = resume_result.scalars().first()
-                if selected_resume and selected_resume.pdf_path:
-                    resume_source_path = selected_resume.pdf_path
-                    resume_display_name = selected_resume.filename or f"Resume_{selected_resume.id}.pdf"
+                if selected_resume and selected_resume.docx_path:
+                    resume_source_path = selected_resume.docx_path
+                    # See phase5.py's identical fix: GeneratedResume.filename
+                    # is always built with a .pdf extension regardless of
+                    # which file is actually attached — swap to .docx here
+                    # since we're now sending the DOCX, not the PDF.
+                    base_name = selected_resume.filename or f"Resume_{selected_resume.id}.pdf"
+                    resume_display_name = Path(base_name).stem + ".docx"
             except Exception as attach_err:
                 print(f"[confirm_send] resume lookup FAILED for resume_id={request.generated_resume_id}: {attach_err}")
                 from error_logger import log_db_error
