@@ -788,11 +788,26 @@ def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
     """
     # Try LibreOffice headless
     try:
-        result = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", str(pdf_path.parent), str(docx_path)],
-            capture_output=True, timeout=30, text=True,
-        )
+        # BUG FIX: LibreOffice headless defaults to a single shared user
+        # profile. When two conversions run concurrently (realistic here —
+        # requests are handled via asyncio.to_thread on a thread pool,
+        # and preview conversion now runs on every base-resume/tracker/
+        # email-queue "View" click, not just resume generation), the
+        # second invocation can fail to acquire the profile lock and
+        # exit non-zero — a well-known LibreOffice headless failure mode.
+        # That failure was previously indistinguishable from "LibreOffice
+        # isn't installed" and silently fell back to the external-viewer
+        # path with no visible error. Giving every call its own throwaway
+        # profile directory removes the lock contention entirely.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="lo_profile_") as profile_dir:
+            result = subprocess.run(
+                ["libreoffice", "--headless",
+                 f"-env:UserInstallation=file://{profile_dir}",
+                 "--convert-to", "pdf",
+                 "--outdir", str(pdf_path.parent), str(docx_path)],
+                capture_output=True, timeout=30, text=True,
+            )
         if result.returncode == 0:
             lo_output = pdf_path.parent / (docx_path.stem + ".pdf")
             if lo_output.exists() and lo_output != pdf_path:
@@ -800,7 +815,13 @@ def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
             elif lo_output.exists():
                 pass  # already at correct path
             return pdf_path.exists()
-        logger.warning("LibreOffice failed: %s", result.stderr[:200])
+        # BUG FIX: was result.stderr[:200] — too short to show the actual
+        # LibreOffice error in most cases, making failures unfixable from
+        # the logs alone.
+        logger.warning(
+            "LibreOffice failed (exit %s): %s | stdout: %s",
+            result.returncode, result.stderr, result.stdout,
+        )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         logger.warning("LibreOffice not available (%s), using reportlab fallback.", exc)
 

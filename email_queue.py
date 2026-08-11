@@ -856,15 +856,64 @@ async def download_queue_attachment(
     """
     Get a downloadable URL or serve attachment file for email queue item.
     """
-    from s3_service import generate_presigned_url
-    from fastapi.responses import FileResponse
+    from s3_service import generate_presigned_url, download_file_from_s3
+    from fastapi.responses import FileResponse, Response
 
     clean_ref = ref.strip()
     if not clean_ref:
         raise HTTPException(status_code=400, detail="ref is required")
 
+    # BUG FIX ("Failed to view resume" / endpoint broken for ALL
+    # attachments, not just DOCX ones): file_preview was imported
+    # unconditionally at the top of this function — if that module is
+    # ever missing or broken, importing it here throws before any of the
+    # actual attachment-resolution logic below even runs, taking down
+    # this endpoint entirely regardless of file type. Import it lazily
+    # and defensively instead, so a conversion problem only ever affects
+    # the DOCX-preview nicety, never the endpoint as a whole.
+    import logging
+    _log = logging.getLogger(__name__)
+
+    def _is_docx_like(name: str) -> bool:
+        try:
+            from file_preview import is_docx_like
+            return is_docx_like(name)
+        except Exception:
+            return name.lower().endswith(".docx")
+
+    # BUG FIX (Google Docs Viewer "no preview available"): a presigned URL
+    # isn't guaranteed to render in Google's external viewer even when
+    # it's perfectly valid and reachable. Convert DOCX attachments to a
+    # real PDF on our own side first — same conversion already used for
+    # tailored resume generation and the base-resume/application-tracker
+    # "View" endpoints — so viewing relies on nothing but the browser's
+    # built-in PDF viewer.
+    async def _try_convert_s3(s3_key: str):
+        if not _is_docx_like(s3_key):
+            return None
+        try:
+            raw_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
+            if not raw_bytes:
+                return None
+            from file_preview import convert_docx_bytes_to_pdf_bytes
+            return await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+        except Exception as conv_err:
+            _log.warning("Attachment preview conversion failed for s3_key=%s: %s", s3_key, conv_err)
+            return None
+
+    def _pdf_response(pdf_bytes: bytes, filename: str) -> Response:
+        display = os.path.splitext(filename)[0] + ".pdf"
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{display}"'},
+        )
+
     # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
     if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
+        pdf_bytes = await _try_convert_s3(clean_ref)
+        if pdf_bytes:
+            return _pdf_response(pdf_bytes, os.path.basename(clean_ref))
         url = generate_presigned_url(clean_ref)
         if url:
             return {"url": url}
@@ -873,10 +922,23 @@ async def download_queue_attachment(
     filename = os.path.basename(clean_ref)
     local_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(local_path):
+        if _is_docx_like(filename):
+            try:
+                with open(local_path, "rb") as f:
+                    raw_bytes = f.read()
+                from file_preview import convert_docx_bytes_to_pdf_bytes
+                pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+                if pdf_bytes:
+                    return _pdf_response(pdf_bytes, filename)
+            except Exception as conv_err:
+                _log.warning("Attachment preview conversion failed for local_path=%s: %s", local_path, conv_err)
         return FileResponse(local_path, filename=filename)
 
     # 3. Try fallback with S3 prefix
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
+    pdf_bytes = await _try_convert_s3(s3_key)
+    if pdf_bytes:
+        return _pdf_response(pdf_bytes, filename)
     url = generate_presigned_url(s3_key)
     if url:
         return {"url": url}
@@ -1505,4 +1567,3 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     source_id=str(item_id),
                 )
                 await session.rollback()
-

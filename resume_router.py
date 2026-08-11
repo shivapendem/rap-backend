@@ -1446,13 +1446,27 @@ async def download_base_resume(
     display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
 
     # Legacy local-disk record (pre-Spaces migration) — no object-storage
-    # key to presign, so this path always streams bytes regardless of
-    # force_stream. Rare/legacy case; a .docx here still won't preview
-    # inline in the browser, same underlying browser limitation.
+    # key to presign.
     try:
         if os.path.isfile(stored):
             with open(stored, "rb") as fh:
                 body = fh.read()
+            if ext == ".docx" and not force_stream:
+                try:
+                    from file_preview import convert_docx_bytes_to_pdf_bytes
+                    from pathlib import Path
+                    pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body)
+                    if pdf_bytes:
+                        return Response(
+                            content=pdf_bytes,
+                            media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="{Path(display_name).stem}.pdf"'},
+                        )
+                except Exception as conv_err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Base resume preview conversion failed (local): %s", conv_err
+                    )
             return Response(
                 content=body,
                 media_type=media_type,
@@ -1462,6 +1476,30 @@ async def download_base_resume(
         pass
 
     if not force_stream:
+        # BUG FIX (Google Docs Viewer "no preview available"): a presigned
+        # URL isn't guaranteed to render in Google's external viewer even
+        # when it's perfectly valid and reachable. Convert to a real PDF
+        # on our own side instead — same conversion already used for
+        # tailored resume generation — so View relies on nothing but the
+        # browser's built-in PDF viewer.
+        if ext == ".docx":
+            body, content_type = await asyncio.to_thread(download_file_from_s3, stored)
+            if body is not None:
+                try:
+                    from file_preview import convert_docx_bytes_to_pdf_bytes
+                    from pathlib import Path
+                    pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body)
+                    if pdf_bytes:
+                        return Response(
+                            content=pdf_bytes,
+                            media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="{Path(display_name).stem}.pdf"'},
+                        )
+                except Exception as conv_err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Base resume preview conversion failed (S3): %s", conv_err
+                    )
         presigned = generate_presigned_url(stored)
         if presigned:
             return {"url": presigned, "filename": display_name, "mimeType": media_type}

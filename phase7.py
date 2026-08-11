@@ -957,17 +957,31 @@ async def download_application_resume(
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
             if is_docx:
-                from s3_service import download_file_from_s3 as _dl
-                raw_bytes, _ = await asyncio.to_thread(_dl, s3_key)
-                if raw_bytes:
-                    from file_preview import convert_docx_bytes_to_pdf_bytes
-                    pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
-                    if pdf_bytes:
-                        return Response(
-                            content=pdf_bytes,
-                            media_type="application/pdf",
-                            headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
-                        )
+                # BUG FIX ("Failed to view resume" hard failure): a
+                # missing/broken conversion module or environment issue
+                # (e.g. file_preview.py absent, LibreOffice not installed)
+                # previously propagated as an unhandled exception here —
+                # a 500 the frontend surfaces as "Failed to view resume"
+                # with no fallback. Converting is a nicety, not the only
+                # way to view the file; any failure here should fall
+                # through to the presigned-URL path below, never block it.
+                try:
+                    from s3_service import download_file_from_s3 as _dl
+                    raw_bytes, _ = await asyncio.to_thread(_dl, s3_key)
+                    if raw_bytes:
+                        from file_preview import convert_docx_bytes_to_pdf_bytes
+                        pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+                        if pdf_bytes:
+                            return Response(
+                                content=pdf_bytes,
+                                media_type="application/pdf",
+                                headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
+                            )
+                except Exception as conv_err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Resume preview conversion failed for s3_key=%s: %s", s3_key, conv_err
+                    )
             from s3_service import generate_presigned_url
             presigned = generate_presigned_url(s3_key)
             if presigned:
@@ -981,13 +995,19 @@ async def download_application_resume(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
         if is_docx and not force_stream:
-            from file_preview import convert_docx_bytes_to_pdf_bytes
-            pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body_bytes)
-            if pdf_bytes:
-                return Response(
-                    content=pdf_bytes,
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
+            try:
+                from file_preview import convert_docx_bytes_to_pdf_bytes
+                pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body_bytes)
+                if pdf_bytes:
+                    return Response(
+                        content=pdf_bytes,
+                        media_type="application/pdf",
+                        headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
+                    )
+            except Exception as conv_err:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Resume preview conversion failed for local_path=%s: %s", local_path, conv_err
                 )
 
     if not body_bytes:
