@@ -366,6 +366,16 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 #     allow_headers=["*"],
 # )
 
+# PERF: no compression middleware existed anywhere — every JSON response
+# (the Applications Tracker's paginated lists, Email Queue, dashboards)
+# went over the wire uncompressed. GZipMiddleware only compresses
+# responses over minimum_size (skips tiny ones where gzip overhead isn't
+# worth it) and is a no-op for clients that don't send Accept-Encoding:
+# gzip, so this is purely additive — no behavior change for anything that
+# doesn't benefit from it.
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1077,6 +1087,80 @@ async def upload_company_banner(
         )
 
     return {"success": True, "message": "Company banner updated — live on every send and preview immediately."}
+
+
+# ---------------------------------------------------------------------------
+# Signature images — inline images inside a user's custom email signature
+# (Settings > Email Signature, ReactQuill editor). Quill's built-in image
+# button base64-encodes whatever's picked directly into the saved HTML by
+# default — looks fine in the editor, but Gmail/most clients strip inline
+# data: URIs from a sent email body, so it silently disappears on
+# delivery. These two endpoints mirror the company-banner pattern above:
+# upload to Spaces once, then always serve through this backend proxy so
+# the URL never expires and never needs a public bucket ACL. The Settings
+# editor and the Apply-page signature preview just <img src> this URL
+# directly (fine in-browser); the actual outbound email never uses this
+# URL at all — see email_template.rewrite_signature_images_for_send,
+# which re-embeds the same Spaces object as a real inline Content-ID
+# attachment at send time instead.
+# ---------------------------------------------------------------------------
+SIGNATURE_IMAGE_S3_PREFIX = "signature-images/"
+
+
+@app.post("/api/settings/signature-image")
+async def upload_signature_image(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Any authenticated user can upload an image into their own custom
+    signature. Stored per-user (signature-images/{user_id}/{uuid}.ext) —
+    each upload gets its own key (unlike the company banner's one fixed
+    key) since a signature can hold more than one image and different
+    users' signatures must never collide."""
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file (PNG, JPG, etc.).")
+
+    import uuid as _uuid
+    from s3_service import upload_file_to_s3
+
+    ext = os.path.splitext(file.filename or "")[1] or ".png"
+    s3_key = f"{SIGNATURE_IMAGE_S3_PREFIX}{current_user.id}/{_uuid.uuid4()}{ext}"
+
+    success = upload_file_to_s3(file.file, s3_key, content_type=file.content_type)
+    if not success:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to upload image to storage. Check Spaces/S3 credentials are configured.",
+        )
+
+    # Absolute URL (not relative) — the Settings editor and the Apply-page
+    # preview are served from a different origin than this API, so a
+    # relative src would 404 there. Built from the request that received
+    # this upload so it's correct locally (localhost) and in production
+    # alike, with no hardcoded domain.
+    url = str(request.base_url).rstrip("/") + f"/api/settings/signature-image/{s3_key}"
+    return {"success": True, "key": s3_key, "url": url}
+
+
+@app.get("/api/settings/signature-image/{s3_key:path}")
+async def get_signature_image(s3_key: str):
+    """Public (no auth) — the Settings editor and Apply-page preview both
+    load this as a plain <img src>. Restricted to the signature-images/
+    prefix so this can't be used to fetch arbitrary objects out of the
+    bucket."""
+    if not s3_key.startswith(SIGNATURE_IMAGE_S3_PREFIX):
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    from s3_service import download_file_from_s3
+    import mimetypes
+
+    body, content_type = download_file_from_s3(s3_key)
+    if body is None:
+        raise HTTPException(status_code=404, detail="Image not found.")
+
+    media_type = content_type or mimetypes.guess_type(s3_key)[0] or "image/png"
+    return Response(content=body, media_type=media_type)
 
 
 @app.get("/health")

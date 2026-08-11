@@ -461,7 +461,14 @@ class Application(Base):
     consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False, index=True)
     requirement_id = Column(FK_TYPE, ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False, index=True)
     generated_resume_id = Column(FK_TYPE, ForeignKey("generated_resumes.id", ondelete="SET NULL"), nullable=True)
-    status = Column(Text, nullable=False, default="PENDING")   # PENDING | SENT | FAILED
+    # PERF: filtered on directly by the Applications Tracker's status
+    # dropdown (PENDING/SENT/FAILED) — unindexed meant every filtered
+    # tracker query did a full table scan.
+    #
+    # MIGRATION REQUIRED: run this against the real Postgres database
+    # before deploying this change:
+    #     CREATE INDEX IF NOT EXISTS ix_applications_status ON applications (status);
+    status = Column(Text, nullable=False, default="PENDING", index=True)   # PENDING | SENT | FAILED
     vendor_email = Column(Text, nullable=True)
     recruiter_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     cc_email = Column(Text, nullable=True)
@@ -494,7 +501,14 @@ class Application(Base):
     #     ALTER TABLE applications ADD COLUMN attachments_sent JSONB;
     attachments_sent = JSONBColumn(nullable=True)
     ats_score_at_send = Column(Numeric(5, 2), nullable=True)
-    sent_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    # PERF: this is the ORDER BY column for the Applications Tracker's
+    # default sort (both admin and recruiter queries) — unindexed meant
+    # every page load did a full sort with no index to lean on.
+    #
+    # MIGRATION REQUIRED: run this against the real Postgres database
+    # before deploying this change:
+    #     CREATE INDEX IF NOT EXISTS ix_applications_sent_at ON applications (sent_at);
+    sent_at = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
     error_message = Column(Text, nullable=True)
     candidate_id = Column(Text, nullable=True)
     job_posting_id = Column(FK_TYPE, nullable=True)
@@ -718,7 +732,14 @@ class EmailQueue(Base):
     # fail with "column email_queue.sent_by_user_id does not exist".
     sent_by_user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     scheduled_at = Column(TIMESTAMP(timezone=True), nullable=True, server_default=func.now(), index=True)
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    # PERF: this is the default ORDER BY column for the Email Queue list
+    # (list_email_queue) — unindexed meant every page load sorted the
+    # whole table with nothing to lean on.
+    #
+    # MIGRATION REQUIRED: run this against the real Postgres database
+    # before deploying this change:
+    #     CREATE INDEX IF NOT EXISTS ix_email_queue_created_at ON email_queue (created_at);
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), index=True)
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     VALID_STATUSES = {"QUEUED", "SENT", "FAILED", "PROCESSING"}
 

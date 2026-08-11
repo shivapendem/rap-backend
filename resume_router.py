@@ -1453,9 +1453,9 @@ async def download_base_resume(
                 body = fh.read()
             if ext == ".docx" and not force_stream:
                 try:
-                    from file_preview import convert_docx_bytes_to_pdf_bytes
+                    from file_preview import get_or_convert_pdf_preview
                     from pathlib import Path
-                    pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body)
+                    pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, body)
                     if pdf_bytes:
                         return Response(
                             content=pdf_bytes,
@@ -1486,9 +1486,9 @@ async def download_base_resume(
             body, content_type = await asyncio.to_thread(download_file_from_s3, stored)
             if body is not None:
                 try:
-                    from file_preview import convert_docx_bytes_to_pdf_bytes
+                    from file_preview import get_or_convert_pdf_preview
                     from pathlib import Path
-                    pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body)
+                    pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, body)
                     if pdf_bytes:
                         return Response(
                             content=pdf_bytes,

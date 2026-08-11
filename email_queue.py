@@ -308,6 +308,53 @@ async def create_email_queue(
 
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
 
+    # Auto-append the sender's signature — custom (from Email Signature
+    # settings) if saved, else the default computed contact-card
+    # signature — same logic send_email_now uses below. This endpoint
+    # (create_email_queue, used by the Compose pages) previously stored
+    # body.content completely raw with no signature of any kind ever
+    # appended, so a saved custom signature never showed up on emails
+    # queued from Compose, only on emails sent via the Apply-to-
+    # Requirement flow's send_email_now.
+    final_content = body.content or ""
+    final_html_content = None
+    try:
+        from email_template import build_signature_text, build_signature_html, resolve_sender_fields
+        sender = resolve_sender_fields(current_user, consultant)
+
+        # Custom signature editor/save removed — always use the default
+        # signature card built from the sender's own profile details
+        # (name, title, email, phone, extension, LinkedIn).
+        signature = build_signature_text(
+            sender["sender_name"],
+            sender["sender_title"],
+            sender["sender_email"],
+            sender["sender_direct_number"],
+            sender["sender_extension"],
+            sender["sender_linkedin_url"],
+        )
+        signature_html = build_signature_html(
+            sender["sender_name"],
+            sender["sender_title"],
+            sender["sender_email"],
+            sender["sender_direct_number"],
+            sender["sender_extension"],
+            sender["sender_linkedin_url"],
+        )
+
+        final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
+
+        import html as _html
+        intro_html = _html.escape(body.content or "").replace("\n", "<br>")
+        final_html_content = (
+            f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1e293b;">{intro_html}</div>'
+            + signature_html
+        )
+    except Exception as sig_err:
+        print(f"[email_queue] signature build failed, sending without one: {sig_err}")
+        final_content = body.content or ""
+        final_html_content = None
+
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
@@ -315,9 +362,20 @@ async def create_email_queue(
         to_email=body.to_email,
         cc_email=final_cc,
         subject=body.subject,
-        content=body.content,
+        content=final_content,
+        html_content=final_html_content,
         attachments=body.attachments,
-        status="PROCESSING",  # RACE FIX: claim immediately, matches worker loop's claim
+        # NOTE: must stay QUEUED (not PROCESSING) — this item is picked up
+        # later by the background worker loop (main.py's
+        # _email_queue_worker_loop), which only selects/claims rows where
+        # status == "QUEUED". Marking it PROCESSING here pre-empts that
+        # claim query entirely, so the worker never sees it, never sends
+        # it, and it sits stuck until the next server restart (the only
+        # thing that resets stray PROCESSING rows back to QUEUED). The
+        # "claim immediately" PROCESSING approach belongs to send_email_now,
+        # which sends the item itself right away — not to this
+        # queue-and-wait endpoint.
+        status="QUEUED",
         sent_by_user_id=current_user.id,
         scheduled_at=scheduled_at,
     )
@@ -646,6 +704,10 @@ async def send_email_now(
     try:
         from email_template import build_signature_text, build_signature_html, resolve_sender_fields
         sender = resolve_sender_fields(current_user, consultant)
+
+        # Custom signature editor/save removed — always use the default
+        # signature card built from the sender's own profile details
+        # (name, title, email, phone, extension, LinkedIn).
         signature = build_signature_text(
             sender["sender_name"],
             sender["sender_title"],
@@ -654,10 +716,6 @@ async def send_email_now(
             sender["sender_extension"],
             sender["sender_linkedin_url"],
         )
-        final_content = f"{body.content.rstrip()}\n\n{signature}" if (body.content or "").strip() else signature
-
-        import html as _html
-        intro_html = _html.escape(body.content or "").replace("\n", "<br>")
         signature_html = build_signature_html(
             sender["sender_name"],
             sender["sender_title"],
@@ -666,6 +724,11 @@ async def send_email_now(
             sender["sender_extension"],
             sender["sender_linkedin_url"],
         )
+
+        final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
+
+        import html as _html
+        intro_html = _html.escape(body.content or "").replace("\n", "<br>")
         final_html_content = (
             f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1e293b;">{intro_html}</div>'
             + signature_html
@@ -864,13 +927,9 @@ async def download_queue_attachment(
         raise HTTPException(status_code=400, detail="ref is required")
 
     # BUG FIX ("Failed to view resume" / endpoint broken for ALL
-    # attachments, not just DOCX ones): file_preview was imported
-    # unconditionally at the top of this function — if that module is
-    # ever missing or broken, importing it here throws before any of the
-    # actual attachment-resolution logic below even runs, taking down
-    # this endpoint entirely regardless of file type. Import it lazily
-    # and defensively instead, so a conversion problem only ever affects
-    # the DOCX-preview nicety, never the endpoint as a whole.
+    # attachments, not just DOCX ones): import lazily and defensively so a
+    # missing/broken conversion module only ever affects the DOCX-preview
+    # nicety, never the endpoint as a whole.
     import logging
     _log = logging.getLogger(__name__)
 
@@ -881,13 +940,13 @@ async def download_queue_attachment(
         except Exception:
             return name.lower().endswith(".docx")
 
-    # BUG FIX (Google Docs Viewer "no preview available"): a presigned URL
-    # isn't guaranteed to render in Google's external viewer even when
-    # it's perfectly valid and reachable. Convert DOCX attachments to a
-    # real PDF on our own side first — same conversion already used for
-    # tailored resume generation and the base-resume/application-tracker
-    # "View" endpoints — so viewing relies on nothing but the browser's
-    # built-in PDF viewer.
+    # BUG FIX (Google Docs Viewer "no preview available"): convert DOCX
+    # attachments to a real PDF on our own side, same as the base-resume/
+    # application-tracker "View" endpoints, instead of depending on
+    # Google's external viewer being able to fetch a presigned URL.
+    # PERF: uses the cached conversion (get_or_convert_pdf_preview) so a
+    # resume attached to many different applications only ever pays the
+    # LibreOffice conversion cost once, not on every single view.
     async def _try_convert_s3(s3_key: str):
         if not _is_docx_like(s3_key):
             return None
@@ -895,8 +954,8 @@ async def download_queue_attachment(
             raw_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
             if not raw_bytes:
                 return None
-            from file_preview import convert_docx_bytes_to_pdf_bytes
-            return await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+            from file_preview import get_or_convert_pdf_preview
+            return await asyncio.to_thread(get_or_convert_pdf_preview, raw_bytes)
         except Exception as conv_err:
             _log.warning("Attachment preview conversion failed for s3_key=%s: %s", s3_key, conv_err)
             return None
@@ -926,8 +985,8 @@ async def download_queue_attachment(
             try:
                 with open(local_path, "rb") as f:
                     raw_bytes = f.read()
-                from file_preview import convert_docx_bytes_to_pdf_bytes
-                pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+                from file_preview import get_or_convert_pdf_preview
+                pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, raw_bytes)
                 if pdf_bytes:
                     return _pdf_response(pdf_bytes, filename)
             except Exception as conv_err:
@@ -1375,7 +1434,38 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             # attaches the banner inline via Content-ID when an HTML body
             # is present; rows queued before html_content existed (NULL)
             # still send as plain text only, same as before.
-            from email_template import COMPANY_BANNER_CID
+            from email_template import COMPANY_BANNER_CID, rewrite_signature_images_for_send
+
+            send_html_body = item.html_content or None
+            inline_images = [{"cid": COMPANY_BANNER_CID}] if item.html_content else None
+
+            # Custom signature images: rewrite each stored
+            # .../signature-image/<key> reference in the HTML to a cid:,
+            # download the matching bytes from Spaces to a tmp file, and
+            # queue it up for build_mime_message the exact same way an
+            # explicit-path inline image already works there. Cleaned up
+            # in the same tmp_cleanup_paths pass below as attachments.
+            if send_html_body:
+                import tempfile as _tempfile_sig
+                from s3_service import download_file_from_s3 as _download_sig_img
+
+                send_html_body, sig_images = rewrite_signature_images_for_send(send_html_body)
+                for sig_img in sig_images:
+                    try:
+                        img_bytes, _ct = await asyncio.to_thread(_download_sig_img, sig_img["key"])
+                        if not img_bytes:
+                            continue
+                        fd, tmp_path = _tempfile_sig.mkstemp(
+                            suffix=os.path.splitext(sig_img["key"])[1] or ".png",
+                            prefix="email_sig_img_",
+                        )
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(img_bytes)
+                        inline_images = (inline_images or []) + [{"cid": sig_img["cid"], "path": tmp_path}]
+                        tmp_cleanup_paths.append(tmp_path)
+                    except Exception as sig_img_err:
+                        print(f"[email-queue] skipping signature image {sig_img['key']}: {sig_img_err}")
+
             send_result = await send_application_email_async(
                 access_token=access_token,
                 from_email=item.from_email,
@@ -1385,8 +1475,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 body=item.content or "",
                 attachment_paths=attachment_paths,
                 attachment_names=attachment_names,
-                html_body=item.html_content or None,
-                inline_images=[{"cid": COMPANY_BANNER_CID}] if item.html_content else None,
+                html_body=send_html_body,
+                inline_images=inline_images,
             )
             print(f"[email-queue debug {item.id}] Gmail API returned successfully. Marking status as SENT...")
             item.status = "SENT"

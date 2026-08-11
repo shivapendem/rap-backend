@@ -1892,6 +1892,28 @@ async def dashboard_stats(
 _ws_connections: Set[WebSocket] = set()
 
 
+_broadcast_redis_client = None
+
+
+async def _get_broadcast_redis_client():
+    """Lazily create the Redis client used for publishing dashboard
+    events, once, and reuse it across every _broadcast_event call.
+    Previously a brand new connection was opened and torn down
+    (from_url + aclose) on every single broadcast — real per-call
+    overhead on top of the connection setup itself. If the cached client
+    is ever unusable (e.g. Redis restarted), the caller's own try/except
+    already handles that by falling back to in-memory broadcast, and a
+    fresh client gets created on the next call since the module-level
+    reference is cleared here whenever a publish fails."""
+    global _broadcast_redis_client
+    if _broadcast_redis_client is None:
+        import os
+        import redis.asyncio as aioredis
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _broadcast_redis_client = await aioredis.from_url(redis_url, decode_responses=True)
+    return _broadcast_redis_client
+
+
 async def _broadcast_event(event_type: str, payload: dict):
     """
     Broadcast event to all connected WebSocket clients.
@@ -1905,15 +1927,15 @@ async def _broadcast_event(event_type: str, payload: dict):
 
     # Try Redis pub/sub
     try:
-        import redis.asyncio as aioredis
-        import os
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        r = await aioredis.from_url(redis_url, decode_responses=True)
+        global _broadcast_redis_client
+        r = await _get_broadcast_redis_client()
         await r.publish("dashboard_events", message)
-        await r.aclose()
         return
     except Exception:
-        pass
+        # Clear the cached client so a genuinely dead connection (e.g.
+        # Redis restarted) doesn't keep failing forever — the next call
+        # creates a fresh one.
+        _broadcast_redis_client = None
 
     # Fallback: broadcast directly to connected clients
     dead = set()

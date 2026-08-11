@@ -217,13 +217,54 @@ def extract_top_skills(primary_skills: Optional[str], max_skills: int = 3) -> st
 ROLE_TITLE = {"ADMIN": "Administrator", "RECRUITER": "Recruiter"}
 
 
+# ---------------------------------------------------------------------------
+# Signature images — see the upload/serve endpoints in main.py. A saved
+# custom signature holds real <img src=".../api/settings/signature-image/
+# <key>"> URLs (works fine for in-browser previews), but the actual
+# outbound email must never reference that URL directly — many clients
+# block remote images by default, and a locally-running dev backend isn't
+# even reachable by an external recipient's mail client at all. This
+# rewrites each one to a cid: reference and returns the {cid, key} pairs
+# so the caller (process_single_email_queue_item in email_queue.py, which
+# already downloads/attaches the company banner the same way) can
+# download the actual bytes from Spaces and attach them inline.
+# ---------------------------------------------------------------------------
+import re as _re_sigimg
+
+SIGNATURE_IMAGE_URL_RE = _re_sigimg.compile(
+    r'src="[^"]*?/api/settings/signature-image/(signature-images/[^"]+?)"'
+)
+
+
+def rewrite_signature_images_for_send(html: Optional[str]):
+    """Returns (rewritten_html, [{"cid": str, "key": str}, ...])."""
+    if not html:
+        return html, []
+
+    images = []
+    seen = {}
+
+    def _replace(match):
+        key = match.group(1)
+        if key not in seen:
+            seen[key] = f"sig_img_{len(seen)}"
+            images.append({"cid": seen[key], "key": key})
+        return f'src="cid:{seen[key]}"'
+
+    rewritten = SIGNATURE_IMAGE_URL_RE.sub(_replace, html)
+    return rewritten, images
+
+
 def resolve_sender_fields(current_user, consultant) -> dict:
     """Build the signature's sender identity from whoever is actually
     applying (current_user) — an admin/recruiter's own contact info when
     they're sending on a consultant's behalf, or the consultant's own
     profile info when they're applying for themselves. Title prefers the
     user's own designation (real job title) when set, else a generic
-    role-based label."""
+    role-based label.
+
+    Always builds the default signature card from these fields — the
+    custom signature editor/save feature was removed."""
     if current_user.role in ("ADMIN", "RECRUITER"):
         return {
             "sender_name": current_user.full_name or "",
@@ -232,10 +273,8 @@ def resolve_sender_fields(current_user, consultant) -> dict:
             "sender_direct_number": getattr(current_user, "mobile_number", None),
             "sender_extension": getattr(current_user, "extension", None),
             "sender_linkedin_url": getattr(current_user, "linkedin_url", None),
-            "sender_signature": getattr(current_user, "email_signature", None),
         }
-    
-    cons_sig = getattr(current_user, "email_signature", None) if current_user else None
+
     return {
         "sender_name": (consultant.full_name if consultant else "") or "",
         "sender_title": "Consultant",
@@ -243,7 +282,6 @@ def resolve_sender_fields(current_user, consultant) -> dict:
         "sender_direct_number": consultant.phone if consultant else None,
         "sender_extension": None,
         "sender_linkedin_url": getattr(consultant, "linkedin_url", None) if consultant else None,
-        "sender_signature": cons_sig,
     }
 
 

@@ -17,12 +17,22 @@
 # resumes correctly.
 # =============================================================
 
+import hashlib
 import logging
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# All cached preview PDFs live under this one Spaces prefix, keyed by a
+# hash of the source DOCX's own bytes — not by the source file's own S3
+# key/path. Several base-resume code paths *edit a DOCX in place* (same
+# S3 key, new content) rather than uploading under a new key each time —
+# a path-keyed cache would happily keep serving the old PDF forever after
+# an edit. Hashing the actual bytes means any content change is
+# automatically a cache miss; no explicit invalidation needed anywhere.
+PDF_PREVIEW_CACHE_PREFIX = "preview-cache/"
 
 
 def convert_docx_bytes_to_pdf_bytes(docx_bytes: bytes) -> Optional[bytes]:
@@ -52,6 +62,49 @@ def convert_docx_bytes_to_pdf_bytes(docx_bytes: bytes) -> Optional[bytes]:
     except Exception as exc:
         logger.warning("DOCX->PDF preview conversion raised: %s", exc)
         return None
+
+
+def get_or_convert_pdf_preview(docx_bytes: bytes) -> Optional[bytes]:
+    """
+    Same contract as convert_docx_bytes_to_pdf_bytes (returns PDF bytes or
+    None), but checks a Spaces-backed cache first and populates it after a
+    successful live conversion.
+
+    PERF: every "View" click used to re-run a full LibreOffice conversion
+    from scratch, even for the exact same, unchanged file — real cost
+    (seconds) on every single click, and the first conversion after any
+    idle period pays LibreOffice's cold-start penalty on top of that
+    (10-20s+ before the OS file cache warms up, vs 2-4s once warm),
+    putting it uncomfortably close to (or past) the subprocess's own 30s
+    timeout. That combination is exactly "first click times out /
+    silently falls back, second click works but takes forever" — this
+    function is the fix: convert once, cache the result, every later view
+    of that exact content is a plain Spaces fetch with no LibreOffice
+    involved at all.
+    """
+    from s3_service import download_file_from_s3, upload_file_to_s3
+    import io
+
+    digest = hashlib.sha256(docx_bytes).hexdigest()
+    cache_key = f"{PDF_PREVIEW_CACHE_PREFIX}{digest}.pdf"
+
+    try:
+        cached_bytes, _ct = download_file_from_s3(cache_key)
+        if cached_bytes:
+            return cached_bytes
+    except Exception as exc:
+        logger.warning("PDF preview cache lookup failed for %s: %s", cache_key, exc)
+
+    pdf_bytes = convert_docx_bytes_to_pdf_bytes(docx_bytes)
+    if pdf_bytes:
+        try:
+            upload_file_to_s3(io.BytesIO(pdf_bytes), cache_key, "application/pdf")
+        except Exception as exc:
+            # Cache write failing is never a reason to fail the view —
+            # the freshly-converted bytes are still good to serve now,
+            # this request just won't benefit from the cache next time.
+            logger.warning("PDF preview cache write failed for %s: %s", cache_key, exc)
+    return pdf_bytes
 
 
 def is_docx_like(filename_or_mimetype: str) -> bool:

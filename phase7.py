@@ -969,8 +969,8 @@ async def download_application_resume(
                     from s3_service import download_file_from_s3 as _dl
                     raw_bytes, _ = await asyncio.to_thread(_dl, s3_key)
                     if raw_bytes:
-                        from file_preview import convert_docx_bytes_to_pdf_bytes
-                        pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, raw_bytes)
+                        from file_preview import get_or_convert_pdf_preview
+                        pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, raw_bytes)
                         if pdf_bytes:
                             return Response(
                                 content=pdf_bytes,
@@ -996,8 +996,8 @@ async def download_application_resume(
         )
         if is_docx and not force_stream:
             try:
-                from file_preview import convert_docx_bytes_to_pdf_bytes
-                pdf_bytes = await asyncio.to_thread(convert_docx_bytes_to_pdf_bytes, body_bytes)
+                from file_preview import get_or_convert_pdf_preview
+                pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, body_bytes)
                 if pdf_bytes:
                     return Response(
                         content=pdf_bytes,
