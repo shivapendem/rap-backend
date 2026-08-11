@@ -1834,6 +1834,43 @@ async def download_resume(
                 detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
             )
 
+    # BUG FIX ("upload resume opens in drive view" — base resume and
+    # Applications Tracker resumes already got this treatment, this
+    # endpoint was the one remaining gap): a manually-uploaded resume's
+    # s3_key is a real .docx (see upload_resume above), and this endpoint
+    # used to just hand back a presigned URL to it — no in-browser
+    # renderer for .docx, so the frontend fell back to Google Docs
+    # Viewer, which isn't guaranteed to successfully preview any given
+    # URL. Generated/tailored resumes in this same table are usually
+    # already a real PDF (via the lazy self-heal above, or the original
+    # generate/finalize flow) and don't need conversion at all.
+    if resume.s3_key.lower().endswith(".docx"):
+        from s3_service import download_file_from_s3
+        docx_bytes, _ct = download_file_from_s3(resume.s3_key)
+        if docx_bytes:
+            try:
+                from file_preview import get_or_convert_pdf_preview
+                pdf_bytes = get_or_convert_pdf_preview(docx_bytes)
+                if pdf_bytes:
+                    resume.download_count += 1
+                    resume.last_downloaded = datetime.now(timezone.utc)
+                    await db.commit()
+                    safe_title = "".join(
+                        c for c in (resume.title or "resume") if c.isalnum() or c in " -_"
+                    ).strip() or "resume"
+                    return Response(
+                        content=pdf_bytes,
+                        media_type="application/pdf",
+                        headers={"Content-Disposition": f'inline; filename="{safe_title}.pdf"'},
+                    )
+            except Exception as conv_err:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Resume preview conversion failed for resume_id=%s: %s", id, conv_err
+                )
+        # Conversion unavailable/failed — fall through to the original
+        # presigned-URL behavior below rather than blocking the view.
+
     url = generate_presigned_url(resume.s3_key)
     if not url:
         raise HTTPException(status_code=500, detail="Failed to generate download link.")
