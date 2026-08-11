@@ -236,7 +236,12 @@ async def get_pending_matches(
         )
         .join(Requirement, JobMatch.requirement_id == Requirement.id)
         .join(Consultant, JobMatch.consultant_id == Consultant.id)
-        .where(JobMatch.status == target_status)
+        .join(User, User.id == Consultant.user_id)
+        .where(
+            JobMatch.status == target_status,
+            Consultant.status == "ACTIVE",
+            User.is_authorized == True,
+        )
     )
 
     if consultant_id:

@@ -1020,7 +1020,12 @@ async def get_all_requirements_for_recruiter(
         matches_q = (
             select(RequirementConsultantMatch.requirement_id, Consultant.full_name)
             .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
-            .where(RequirementConsultantMatch.requirement_id.in_(req_ids))
+            .join(User, User.id == Consultant.user_id)
+            .where(
+                RequirementConsultantMatch.requirement_id.in_(req_ids),
+                Consultant.status == "ACTIVE",
+                User.is_authorized == True,
+            )
         )
         if current_user.role == "RECRUITER":
             assigned_result = await db.execute(
