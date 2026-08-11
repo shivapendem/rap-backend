@@ -1676,6 +1676,8 @@ async def get_resume(
             )
 
     return resume
+
+@router.put("/{id}", response_model=ResumeResponse)
 async def update_resume(
     id: int,
     request: ResumeUpdateRequest,
@@ -1880,7 +1882,29 @@ async def download_resume(
     resume.last_downloaded = datetime.now(timezone.utc)
     await db.commit()
 
-    return {"url": url}
+    # BUG FIX ("generated resume view opens in drive view" instead of a
+    # native PDF): this returned bare {"url": ...} with no filename or
+    # mimeType. A generated/tailored resume's s3_key is always .pdf
+    # already (see finalize_resume/generate_resume above) — no
+    # conversion needed, this URL already points at a real PDF — but the
+    # frontend's toViewableUrl has no way to know that without a mimeType
+    # hint, so it defaulted to treating the file as non-viewable and
+    # wrapped it in Google Docs Viewer regardless. Including mimeType
+    # (derived from the real stored extension, same as download_base_resume
+    # does) lets it correctly recognize an already-PDF file and skip the
+    # external viewer entirely.
+    import mimetypes as _mimetypes
+    ext = os.path.splitext(resume.s3_key)[1].lower()
+    mime_type = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if ext == ".docx"
+        else _mimetypes.guess_type(resume.s3_key)[0] or "application/pdf"
+    )
+    safe_title = "".join(
+        c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_"
+    ).strip() or f"Resume_{id}"
+
+    return {"url": url, "filename": f"{safe_title}{ext or '.pdf'}", "mimeType": mime_type}
 
 @router.get("/{id}/download/file")
 async def download_resume_file(
