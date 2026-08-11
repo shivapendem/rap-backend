@@ -279,6 +279,24 @@ async def create_email_queue(
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
 
+    # BUG FIX ("a from address not tied to any real user/consultant row
+    # is being used as the sender"): body.from_email was trusted directly
+    # from the request payload with no server-side verification at all —
+    # the frontend's From field is read-only, but the backend had no
+    # defense if that value were ever wrong, stale, or bypassed some
+    # other way. The only two legitimate senders here are the current
+    # user themselves (an admin/recruiter sending under their own
+    # identity) or the specific consultant just resolved above (sending
+    # on that consultant's behalf) — reject anything else.
+    valid_from_emails = {(current_user.email or "").strip().lower()}
+    if consultant and consultant.email:
+        valid_from_emails.add(consultant.email.strip().lower())
+    if (body.from_email or "").strip().lower() not in valid_from_emails:
+        raise HTTPException(
+            status_code=400,
+            detail="from_email does not match the current user or the resolved consultant — refusing to send.",
+        )
+
     final_cc = body.cc_email.strip() if body.cc_email else ""
     if final_cc:
         if current_user.email not in final_cc:
@@ -648,6 +666,24 @@ async def send_email_now(
         consultant_id = consultant.id if consultant else body.consultant_id
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
+
+    # BUG FIX ("a from address not tied to any real user/consultant row
+    # is being used as the sender"): body.from_email was trusted directly
+    # from the request payload with no server-side verification at all —
+    # the frontend's From field is read-only, but the backend had no
+    # defense if that value were ever wrong, stale, or bypassed some
+    # other way. The only two legitimate senders here are the current
+    # user themselves (an admin/recruiter sending under their own
+    # identity) or the specific consultant just resolved above (sending
+    # on that consultant's behalf) — reject anything else.
+    valid_from_emails = {(current_user.email or "").strip().lower()}
+    if consultant and consultant.email:
+        valid_from_emails.add(consultant.email.strip().lower())
+    if (body.from_email or "").strip().lower() not in valid_from_emails:
+        raise HTTPException(
+            status_code=400,
+            detail="from_email does not match the current user or the resolved consultant — refusing to send.",
+        )
 
     final_cc = body.cc_email.strip() if body.cc_email else ""
     if final_cc:
@@ -1278,14 +1314,6 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     if cons:
                         tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
                         email_tok = tok_res.scalars().first()
-
-            # --- TEMPORARY FALLBACK FOR ADMIN TESTING ---
-            if not email_tok:
-                tok_res = await session.execute(select(ConsultantEmailToken))
-                email_tok = tok_res.scalars().first()
-                if email_tok and email_tok.email_address:
-                    print(f"[email-queue] TEST FALLBACK: Rewriting from_email from {item.from_email} to {email_tok.email_address}")
-                    item.from_email = email_tok.email_address
 
             if email_tok and email_tok.access_token_encrypted:
                 from datetime import datetime, timezone, timedelta
