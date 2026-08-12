@@ -411,23 +411,15 @@ async def _consultant_to_profile_response(
     # screen agrees on the same number. Active apps = applications actually
     # SENT for this consultant (same definition phase_users_service.py uses
     # for total_applications_sent).
-    #
-    # FEATURE CHANGE: "Resume" was removed as a completeness criterion —
-    # base resume upload/management is being phased out in favor of
-    # profile-field-driven resume generation, and base_resume_text is no
-    # longer used by the matching engine either (see matching_router.py).
-    # "Experience" takes its old weight instead, mirroring
-    # features/consultant/profile/components/ProfileCompletenessBar.tsx's
-    # exact criteria and weights so every screen agrees on the same number.
     completeness = 0
     if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
         completeness += 30  # Skills
-    if experience_count > 0:
-        completeness += 25  # Experience
+    if c.base_resume_file_path or c.base_resume_text:
+        completeness += 30  # Resume
     if c.preferred_employment_types:
         completeness += 20  # Employment type
     if (c.work_authorization or "").strip():
-        completeness += 15  # Work auth
+        completeness += 10  # Work auth
     if len((c.current_location or "").strip()) >= 2:
         completeness += 10  # Location
 
@@ -835,23 +827,7 @@ async def list_consultants(
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     rows = (await db.execute(query.order_by(Consultant.created_at.desc()).offset((page - 1) * page_size).limit(page_size))).scalars().all()
 
-    # Batch-count experience rows for this whole page in one query instead
-    # of N+1 — profileCompleteness now factors in Experience, so leaving
-    # this defaulted to 0 here would show every consultant on this roster
-    # as missing Experience regardless of their real data.
-    exp_counts: Dict[int, int] = {}
-    if rows:
-        exp_rows = (await db.execute(
-            select(ConsultantExperience.consultant_id, func.count())
-            .where(ConsultantExperience.consultant_id.in_([c.id for c in rows]))
-            .group_by(ConsultantExperience.consultant_id)
-        )).all()
-        exp_counts = {cons_id: cnt for cons_id, cnt in exp_rows}
-
-    data = [
-        await _consultant_to_profile_response(db, c, exp_counts.get(c.id, 0))
-        for c in rows
-    ]
+    data = [await _consultant_to_profile_response(db, c) for c in rows]
     return ConsultantListResponse(
         data=data,
         total=total,
