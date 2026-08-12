@@ -16,9 +16,13 @@ Please find attached my updated resume for the {role} position.
 My background aligns well with this requirement, especially in {top_skills}.
 
 Please let me know if you need any additional details.
-
-Thanks & Regards,
 """
+# FEATURE CHANGE: previously ended with "Thanks & Regards,\n" — removed
+# now that the appended signature (build_signature_text/html) supplies
+# its own "Best regards," line directly before the consultant's identity,
+# positioned after the new Employer Details block. Keeping both would
+# have shown two sign-off lines back to back with Employer Details
+# sandwiched oddly between them.
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +71,43 @@ def build_signature_text(
     direct_number: Optional[str],
     extension: Optional[str],
     linkedin_url: Optional[str],
+    *,
+    employer_name: Optional[str] = None,
+    employer_title: Optional[str] = None,
+    employer_email: Optional[str] = None,
+    employer_phone: Optional[str] = None,
+    employer_extension: Optional[str] = None,
 ) -> str:
     """Plain-text fallback signature — used as the multipart/plain part of
-    the sent email, and shown in the (plain-text) preview UI."""
-    lines = [name]
+    the sent email, and shown in the (plain-text) preview UI.
+
+    FEATURE CHANGE — layout order: Employer Details (the recruiter
+    actually handling this consultant — see permission_service.
+    get_handling_recruiter) now comes FIRST, directly after the message
+    body, followed by the "Best regards," sign-off and then the
+    consultant's own name/contact card. Previously the consultant's card
+    came first and Employer Details was appended after it — reordered per
+    updated requirement so the sign-off reads naturally right before the
+    actual signer's identity. The employer_* fields are all optional;
+    the whole Employer Details block is omitted when employer_name isn't
+    provided, e.g. a consultant with no assigned recruiter."""
+    lines = []
+
+    if employer_name:
+        lines.append("Employer Details:")
+        lines.append(employer_name)
+        if employer_title:
+            lines.append(employer_title)
+        if employer_email:
+            lines.append(f"E: {employer_email}")
+        if employer_phone:
+            lines.append(f"D: {employer_phone}")
+        if employer_extension:
+            lines.append(f"T: {COMPANY_LINE_NUMBER} EXT {employer_extension}")
+        lines.append("")
+
+    lines.append("Best regards,")
+    lines.append(name)
     if title:
         lines.append(title)
     if linkedin_url:
@@ -83,6 +120,7 @@ def build_signature_text(
     if extension:
         lines.append(f"T: {COMPANY_LINE_NUMBER} EXT {extension}")
     lines.append(f"A: {COMPANY_ADDRESS}")
+
     lines.append("")
     lines.append(COMPANY_NAME)
     lines.append(f'"{COMPANY_TAGLINE}"')
@@ -98,20 +136,32 @@ def build_signature_html(
     linkedin_url: Optional[str],
     *,
     banner_src: str = f"cid:{COMPANY_BANNER_CID}",
+    employer_name: Optional[str] = None,
+    employer_title: Optional[str] = None,
+    employer_email: Optional[str] = None,
+    employer_phone: Optional[str] = None,
+    employer_extension: Optional[str] = None,
+    employer_linkedin_url: Optional[str] = None,
 ) -> str:
     """Rich HTML signature — matches the provided card layout. Sent as the
     multipart/html part (see gmail_send_service.build_mime_message), so it
     only actually renders in HTML-capable email clients; plain-text
     clients fall back to build_signature_text() above.
 
-    banner_src defaults to the cid: reference used for the actual sent
-    email (see BANNER_IMAGE_PATH/COMPANY_BANNER_S3_KEY in
-    gmail_send_service.py, which attaches the real file inline under that
-    Content-ID). A browser can't resolve cid: URLs on its own, so the
-    Email Preview modal instead passes a real servable URL
-    (/api/settings/company-banner — see get_email_preview in phase7.py)
-    so the banner actually shows up there too, not just in the real sent
-    email.
+    FEATURE CHANGE — layout order: Employer Details (the recruiter
+    actually handling this consultant — see permission_service.
+    get_handling_recruiter) now comes FIRST, directly after the message
+    body, followed by a "Best regards," line and then the consultant's
+    own contact card. Previously the consultant's card came first and
+    Employer Details was appended after it — reordered per updated
+    requirement. The employer_* fields are all optional; the whole
+    Employer Details block is omitted when employer_name isn't provided,
+    e.g. a consultant with no assigned recruiter.
+
+    FEATURE CHANGE: the company banner image has been removed from this
+    signature entirely per updated requirement — banner_src is kept as a
+    parameter (unused) only so existing call sites that still pass it
+    don't break.
     """
     import html as _html
 
@@ -134,8 +184,49 @@ def build_signature_html(
     )
     title_html = f'<div style="font-style:italic;color:#334155;margin-top:2px;">{esc(title)}</div>' if title else ""
 
+    # Employer Details — a visually distinct card identifying the
+    # recruiter actually handling this consultant (see permission_service.
+    # get_handling_recruiter), rendered BEFORE the consultant's own card
+    # below. Omitted entirely when employer_name isn't provided, e.g. a
+    # consultant with no assigned recruiter, rather than rendering an
+    # empty/broken-looking block.
+    employer_block_html = ""
+    if employer_name:
+        employer_contact_rows = []
+        if employer_email:
+            employer_contact_rows.append(f'<b>E:</b> <a href="mailto:{esc(employer_email)}" style="color:#2563eb;text-decoration:underline;">{esc(employer_email)}</a>')
+        if employer_phone:
+            employer_contact_rows.append(f'<b>D:</b> {esc(employer_phone)}')
+        if employer_extension:
+            employer_contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)} EXT {esc(employer_extension)}')
+        employer_contact_html = "<br>".join(employer_contact_rows)
+
+        employer_linkedin_html = (
+            f'<div style="margin-top:8px;"><a href="{esc(employer_linkedin_url)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(employer_linkedin_url)}</a></div>'
+            if employer_linkedin_url else ""
+        )
+        employer_title_html = f'<div style="font-style:italic;color:#334155;margin-top:2px;">{esc(employer_title)}</div>' if employer_title else ""
+
+        employer_block_html = f"""
+<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">Employer Details:</div>
+<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;margin-bottom:16px;">
+  <tr>
+    <td style="vertical-align:top;padding-right:20px;">
+      <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(employer_name)}</div>
+      {employer_title_html}
+      {employer_linkedin_html}
+    </td>
+    <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
+      {employer_contact_html}
+    </td>
+  </tr>
+</table>
+"""
+
     return f"""
-<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:12px;">
+{employer_block_html}
+<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#1e293b;margin-top:12px;">Best regards,</div>
+<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;">
   <tr>
     <td style="vertical-align:top;padding-right:20px;">
       <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(name)}</div>
@@ -147,9 +238,6 @@ def build_signature_html(
     </td>
   </tr>
 </table>
-<div style="margin-top:14px;">
-  <img src="{esc(banner_src)}" alt="{esc(COMPANY_NAME)} — &quot;{esc(COMPANY_TAGLINE)}&quot;" style="max-width:600px;width:100%;display:block;border:0;">
-</div>
 """.strip()
 
 
@@ -256,25 +344,26 @@ def rewrite_signature_images_for_send(html: Optional[str]):
 
 
 def resolve_sender_fields(current_user, consultant) -> dict:
-    """Build the signature's sender identity from whoever is actually
-    applying (current_user) — an admin/recruiter's own contact info when
-    they're sending on a consultant's behalf, or the consultant's own
-    profile info when they're applying for themselves. Title prefers the
-    user's own designation (real job title) when set, else a generic
-    role-based label.
+    """Build the signature's identity — always the CONSULTANT's own
+    profile details (name, email, phone, LinkedIn), regardless of who is
+    actually sending the email (the consultant themselves, or an
+    admin/recruiter applying on their behalf). The vendor is applying to
+    work with the consultant, so the consultant's own details are what
+    should represent them in the signature either way.
+
+    FEATURE CHANGE: this previously showed the SENDER's (admin/
+    recruiter's) own contact info instead of the consultant's when an
+    admin/recruiter applied on the consultant's behalf — reverted per
+    updated requirement. See permission_service.get_handling_recruiter
+    for the separate "Employer Details" block that now carries the
+    handling recruiter's contact info instead, wherever that's relevant,
+    rather than folding it into this signature identity.
+
+    current_user is intentionally unused now but kept as a parameter so
+    call sites (email_queue.py, phase7.py) don't need updating.
 
     Always builds the default signature card from these fields — the
     custom signature editor/save feature was removed."""
-    if current_user.role in ("ADMIN", "RECRUITER"):
-        return {
-            "sender_name": current_user.full_name or "",
-            "sender_title": getattr(current_user, "designation", None) or ROLE_TITLE.get(current_user.role),
-            "sender_email": current_user.email or "",
-            "sender_direct_number": getattr(current_user, "mobile_number", None),
-            "sender_extension": getattr(current_user, "extension", None),
-            "sender_linkedin_url": getattr(current_user, "linkedin_url", None),
-        }
-
     return {
         "sender_name": (consultant.full_name if consultant else "") or "",
         "sender_title": "Consultant",
@@ -348,10 +437,8 @@ def build_application_email(
         text_signature = build_signature_text(
             sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
         )
-        banner_kwargs = {"banner_src": "/api/settings/company-banner"} if for_preview else {}
         html_signature = build_signature_html(
             sig_name, sender_title, sig_email, sig_direct, sender_extension, sender_linkedin_url,
-            **banner_kwargs,
         )
 
     body = intro + text_signature
@@ -367,8 +454,11 @@ def build_application_email(
         "body": body,
         "html_body": html_body,
         "preview": body[:500],
-        # gmail_send_service.build_mime_message attaches this inline
-        # (Content-ID, not a regular attachment) when html_body is sent —
-        # see BANNER_IMAGE_PATH there for where the actual file lives.
-        "inline_images": [{"cid": COMPANY_BANNER_CID}],
+        # FEATURE CHANGE: the company banner was removed from the
+        # signature entirely — build_signature_html no longer emits an
+        # <img> tag referencing it, so there's nothing left to attach
+        # inline here either. Kept as an empty list (not removed from the
+        # return shape) so any caller still doing `for img in
+        # result["inline_images"]` doesn't break on a missing key.
+        "inline_images": [],
     }

@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 # Noise patterns to remove
 # ---------------------------------------------------------------------------
 NOISE_PATTERNS = [
-    r'(?is)remove/unsubscribe.*',
+    r'(?im)^.*remove/unsubscribe.*$',
     r'(?is)to unsubscribe from this group.*',
     r'(?is)you received this message because.*',
     r'(?is)-----original message-----.*',

@@ -72,7 +72,16 @@ async def run_matching_for_requirement(
         cons_docs = []
         cons_ids = []
         for cons in consultants:
-            cons_text = f"{cons.primary_skills or ''} {cons.secondary_skills or ''} {cons.preferred_roles or ''} {cons.base_resume_text or ''}"
+            # BUG FIX: matching text previously included cons.base_resume_text,
+            # which pulled in whatever the consultant's uploaded resume
+            # happened to contain — often full job descriptions, boilerplate,
+            # or client names copied from prior roles. That diluted/skewed
+            # the TF-IDF similarity against genuinely relevant terms and made
+            # match quality depend on resume formatting rather than the
+            # consultant's actual declared skills/role. Matching now runs
+            # purely off primary_skills + secondary_skills + preferred_roles,
+            # the same structured fields the consultant profile itself edits.
+            cons_text = f"{cons.primary_skills or ''} {cons.secondary_skills or ''} {cons.preferred_roles or ''}"
             cons_docs.append(cons_text)
             cons_ids.append(cons.id)
         vectorizer = TfidfVectorizer(stop_words='english', lowercase=True)
@@ -167,7 +176,17 @@ async def run_matching_engine(
     cons_docs = []
     cons_ids = []
     for cons in consultants:
-        cons_text = f"{cons.primary_skills or ''} {cons.secondary_skills or ''} {cons.preferred_roles or ''} {cons.base_resume_text or ''}"
+        # BUG FIX: matching text previously included cons.base_resume_text,
+        # which pulled in whatever the consultant's uploaded resume happened
+        # to contain — often full job descriptions, boilerplate, or client
+        # names copied from prior roles. That diluted/skewed the TF-IDF
+        # similarity against genuinely relevant terms and made match
+        # quality depend on resume formatting rather than the consultant's
+        # actual declared skills/role. Matching now runs purely off
+        # primary_skills + secondary_skills + preferred_roles, the same
+        # structured fields the consultant profile itself edits — same fix
+        # as run_matching_for_requirement above, kept in sync.
+        cons_text = f"{cons.primary_skills or ''} {cons.secondary_skills or ''} {cons.preferred_roles or ''}"
         cons_docs.append(cons_text)
         cons_ids.append(cons.id)
 

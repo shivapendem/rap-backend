@@ -1520,14 +1520,18 @@ async def apply_to_requirement(
 async def get_consultant_applications(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "CONSULTANT")
     consultant = await _get_consultant_for_user(db, current_user)
+    filters = [Application.consultant_id == consultant.id]
+    if status:
+        filters.append(Application.status == status)
 
     total = (await db.execute(
-        select(func.count(Application.id)).where(Application.consultant_id == consultant.id)
+        select(func.count(Application.id)).where(and_(*filters))
     )).scalar_one()
 
     results = (await db.execute(
@@ -1535,7 +1539,7 @@ async def get_consultant_applications(
         .join(Requirement, Requirement.id == Application.requirement_id)
         .outerjoin(GeneratedResume, GeneratedResume.id == Application.generated_resume_id)
         .outerjoin(User, User.id == Application.recruiter_id)
-        .where(Application.consultant_id == consultant.id)
+        .where(and_(*filters))
         .order_by(Application.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)

@@ -130,16 +130,16 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
     last_app_time = res_app.scalar()
 
     times = [t for t in (last_eq_time, last_app_time) if t is not None]
-    
+
     # Base reference floor is (now - 5 minutes)
     reference_time = now_utc - timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
-    
+
     if times:
         last_time = max(times)
         if last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=timezone.utc)
         reference_time = max(reference_time, last_time)
-        
+
     return reference_time + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
 
 
@@ -304,25 +304,36 @@ async def create_email_queue(
     else:
         final_cc = current_user.email
 
-    if final_cc.strip() == body.from_email.strip() and consultant_id:
-        from models import RecruiterConsultant, User, Consultant
-        r_res = await db.execute(
-            sa_select(User.email)
-            .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
-            .where(RecruiterConsultant.consultant_id == consultant_id, RecruiterConsultant.is_active == True)
-            .limit(1)
-        )
-        recruiter_email = r_res.scalar()
-        if not recruiter_email:
-            c_res = await db.execute(
-                sa_select(User.email)
-                .join(Consultant, Consultant.sales_recruiter_user_id == User.id)
-                .where(Consultant.id == consultant_id)
-                .limit(1)
-            )
-            recruiter_email = c_res.scalar()
-        if recruiter_email:
-            final_cc = recruiter_email
+    # Resolve the consultant's handling recruiter once — reused below for
+    # both the CONSULTANT self-apply case (swap the self-CC for the
+    # recruiter, since CC'ing yourself on your own sent mail is a no-op)
+    # and the ADMIN-applies-on-behalf case (add the recruiter alongside
+    # the admin). Same resolution used for the signature's Employer
+    # Details block, so both agree on who "the recruiter" is.
+    recruiter_email = None
+    if consultant_id and consultant:
+        from permission_service import get_handling_recruiter
+        handling = await get_handling_recruiter(db, consultant)
+        recruiter_email = handling.get("employer_email") if handling else None
+
+    is_self_apply = final_cc.strip() == body.from_email.strip()
+
+    if is_self_apply and recruiter_email:
+        # CONSULTANT applying for themselves — CC their recruiter.
+        final_cc = recruiter_email
+    elif (
+        current_user.role == "ADMIN"
+        and recruiter_email
+        and recruiter_email.strip().lower() not in final_cc.strip().lower()
+    ):
+        # FEATURE CHANGE: admin applying on the consultant's behalf now
+        # CCs both the admin (who sent it) AND the consultant's assigned
+        # recruiter — previously only the admin was CC'd here, since this
+        # block only ever fired for the self-apply case above.
+        final_cc = f"{final_cc},{recruiter_email}"
+    # RECRUITER applying on behalf: final_cc already equals the
+    # recruiter's own email (current_user.email, set by default above) —
+    # no extra branch needed here.
 
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
 
@@ -338,11 +349,20 @@ async def create_email_queue(
     final_html_content = None
     try:
         from email_template import build_signature_text, build_signature_html, resolve_sender_fields
+        from permission_service import get_handling_recruiter
         sender = resolve_sender_fields(current_user, consultant)
 
+        # Employer Details — the recruiter actually handling this
+        # consultant, shown as a second block below the consultant's own
+        # signature regardless of who is sending. Omitted entirely (empty
+        # dict) when the consultant has no assigned recruiter either way.
+        employer = await get_handling_recruiter(db, consultant) if consultant else None
+        employer = employer or {}
+
         # Custom signature editor/save removed — always use the default
-        # signature card built from the sender's own profile details
-        # (name, title, email, phone, extension, LinkedIn).
+        # signature card built from the consultant's own profile details
+        # (name, title, email, phone, extension, LinkedIn), plus the
+        # handling recruiter's Employer Details block.
         signature = build_signature_text(
             sender["sender_name"],
             sender["sender_title"],
@@ -350,6 +370,11 @@ async def create_email_queue(
             sender["sender_direct_number"],
             sender["sender_extension"],
             sender["sender_linkedin_url"],
+            employer_name=employer.get("employer_name"),
+            employer_title=employer.get("employer_title"),
+            employer_email=employer.get("employer_email"),
+            employer_phone=employer.get("employer_phone"),
+            employer_extension=employer.get("employer_extension"),
         )
         signature_html = build_signature_html(
             sender["sender_name"],
@@ -358,6 +383,12 @@ async def create_email_queue(
             sender["sender_direct_number"],
             sender["sender_extension"],
             sender["sender_linkedin_url"],
+            employer_name=employer.get("employer_name"),
+            employer_title=employer.get("employer_title"),
+            employer_email=employer.get("employer_email"),
+            employer_phone=employer.get("employer_phone"),
+            employer_extension=employer.get("employer_extension"),
+            employer_linkedin_url=employer.get("employer_linkedin_url"),
         )
 
         final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
@@ -692,25 +723,36 @@ async def send_email_now(
     else:
         final_cc = current_user.email
 
-    if final_cc.strip() == body.from_email.strip() and consultant_id:
-        from models import RecruiterConsultant, User, Consultant
-        r_res = await db.execute(
-            sa_select(User.email)
-            .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
-            .where(RecruiterConsultant.consultant_id == consultant_id, RecruiterConsultant.is_active == True)
-            .limit(1)
-        )
-        recruiter_email = r_res.scalar()
-        if not recruiter_email:
-            c_res = await db.execute(
-                sa_select(User.email)
-                .join(Consultant, Consultant.sales_recruiter_user_id == User.id)
-                .where(Consultant.id == consultant_id)
-                .limit(1)
-            )
-            recruiter_email = c_res.scalar()
-        if recruiter_email:
-            final_cc = recruiter_email
+    # Resolve the consultant's handling recruiter once — reused below for
+    # both the CONSULTANT self-apply case (swap the self-CC for the
+    # recruiter, since CC'ing yourself on your own sent mail is a no-op)
+    # and the ADMIN-applies-on-behalf case (add the recruiter alongside
+    # the admin). Same resolution used for the signature's Employer
+    # Details block, so both agree on who "the recruiter" is.
+    recruiter_email = None
+    if consultant_id and consultant:
+        from permission_service import get_handling_recruiter
+        handling = await get_handling_recruiter(db, consultant)
+        recruiter_email = handling.get("employer_email") if handling else None
+
+    is_self_apply = final_cc.strip() == body.from_email.strip()
+
+    if is_self_apply and recruiter_email:
+        # CONSULTANT applying for themselves — CC their recruiter.
+        final_cc = recruiter_email
+    elif (
+        current_user.role == "ADMIN"
+        and recruiter_email
+        and recruiter_email.strip().lower() not in final_cc.strip().lower()
+    ):
+        # FEATURE CHANGE: admin applying on the consultant's behalf now
+        # CCs both the admin (who sent it) AND the consultant's assigned
+        # recruiter — previously only the admin was CC'd here, since this
+        # block only ever fired for the self-apply case above.
+        final_cc = f"{final_cc},{recruiter_email}"
+    # RECRUITER applying on behalf: final_cc already equals the
+    # recruiter's own email (current_user.email, set by default above) —
+    # no extra branch needed here.
 
     # Auto-append the sender's contact-card signature (name, title/
     # designation, LinkedIn, email/mobile/office-extension, address) after
@@ -739,11 +781,20 @@ async def send_email_now(
     final_html_content = None
     try:
         from email_template import build_signature_text, build_signature_html, resolve_sender_fields
+        from permission_service import get_handling_recruiter
         sender = resolve_sender_fields(current_user, consultant)
 
+        # Employer Details — the recruiter actually handling this
+        # consultant, shown as a second block below the consultant's own
+        # signature regardless of who is sending. Omitted entirely (empty
+        # dict) when the consultant has no assigned recruiter either way.
+        employer = await get_handling_recruiter(db, consultant) if consultant else None
+        employer = employer or {}
+
         # Custom signature editor/save removed — always use the default
-        # signature card built from the sender's own profile details
-        # (name, title, email, phone, extension, LinkedIn).
+        # signature card built from the consultant's own profile details
+        # (name, title, email, phone, extension, LinkedIn), plus the
+        # handling recruiter's Employer Details block.
         signature = build_signature_text(
             sender["sender_name"],
             sender["sender_title"],
@@ -751,6 +802,11 @@ async def send_email_now(
             sender["sender_direct_number"],
             sender["sender_extension"],
             sender["sender_linkedin_url"],
+            employer_name=employer.get("employer_name"),
+            employer_title=employer.get("employer_title"),
+            employer_email=employer.get("employer_email"),
+            employer_phone=employer.get("employer_phone"),
+            employer_extension=employer.get("employer_extension"),
         )
         signature_html = build_signature_html(
             sender["sender_name"],
@@ -759,6 +815,12 @@ async def send_email_now(
             sender["sender_direct_number"],
             sender["sender_extension"],
             sender["sender_linkedin_url"],
+            employer_name=employer.get("employer_name"),
+            employer_title=employer.get("employer_title"),
+            employer_email=employer.get("employer_email"),
+            employer_phone=employer.get("employer_phone"),
+            employer_extension=employer.get("employer_extension"),
+            employer_linkedin_url=employer.get("employer_linkedin_url"),
         )
 
         final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
@@ -1465,7 +1527,21 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             from email_template import COMPANY_BANNER_CID, rewrite_signature_images_for_send
 
             send_html_body = item.html_content or None
-            inline_images = [{"cid": COMPANY_BANNER_CID}] if item.html_content else None
+            # BUG FIX (this session): previously attached the banner
+            # unconditionally whenever any html_content existed, even
+            # after build_signature_html stopped emitting the <img
+            # src="cid:..."> tag entirely (logo removed from the
+            # signature per updated requirement) — the image bytes were
+            # still being attached with Content-Disposition: inline and
+            # no matching cid: reference anywhere in the body, which most
+            # clients (Gmail included) then show as a stray regular file
+            # attachment instead of silently dropping it. Only attach it
+            # when the HTML body genuinely references that Content-ID.
+            inline_images = (
+                [{"cid": COMPANY_BANNER_CID}]
+                if send_html_body and f"cid:{COMPANY_BANNER_CID}" in send_html_body
+                else None
+            )
 
             # Custom signature images: rewrite each stored
             # .../signature-image/<key> reference in the HTML to a cid:,
@@ -1536,8 +1612,8 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     existing_app.sent_at = now
                     existing_app.applied_at = now
                     existing_app.email_body_preview = (item.content or "")[:500]
-                    
-                 # BUG FIX ("Sent Applications shows the wrong/old resume
+
+                    # BUG FIX ("Sent Applications shows the wrong/old resume
                     # after a fresh send"): download_application_resume
                     # (phase7.py) checks app.generated_resume_id FIRST and
                     # only falls back to resume_attachment_path if that's
@@ -1556,7 +1632,6 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         existing_app.resume_attachment_path = item.attachments[0]
                         existing_app.attachments_sent = item.attachments
                         existing_app.generated_resume_id = None
-
 
                     # BUG FIX: sender was never recorded on this path.
                     # Only fill in if not already set, so a real recruiter
@@ -1630,7 +1705,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             # there's a real signal here even when the message itself is
             # blank.
             failed_item.status_text = str(e) or f"{type(e).__name__} (no error message)"
-            
+
             # Deauthorize and remove token if OAuth/token refresh failed
             err_msg = str(e).lower()
             if (isinstance(e, ValueError) and ("token" in err_msg or "credential" in err_msg)) or "unauthorized" in err_msg or "invalid_grant" in err_msg or "401" in err_msg:
@@ -1642,7 +1717,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     consultant = cons_res.scalars().first()
                     if consultant:
                         consultant.gmail_connected = False
-                        
+
                         user_res = await session.execute(
                             select(User).where(User.id == consultant.user_id)
                         )

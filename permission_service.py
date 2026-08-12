@@ -143,3 +143,45 @@ async def get_sales_recruiter_email(db: AsyncSession, consultant) -> str:
     )
     recruiter = result.scalars().first()
     return recruiter.email if recruiter else ""
+
+
+async def get_handling_recruiter(db: AsyncSession, consultant) -> dict | None:
+    """Resolve the recruiter actually handling this consultant, for the
+    email signature's "Employer Details" block — distinct from
+    get_sales_recruiter_email above, which only returns a bare email for
+    CC purposes. Same two-step fallback already proven in email_queue.py's
+    CC resolution:
+      1. Active RecruiterConsultant assignment (the real roster mapping).
+      2. Consultant.sales_recruiter_user_id (legacy/simple single-field
+         assignment), only if no active roster mapping exists.
+    Returns None if the consultant has no assigned recruiter either way —
+    callers should omit the Employer Details block entirely in that case
+    rather than show a blank one.
+    """
+    from models import User, RecruiterConsultant
+    recruiter = None
+    mapped = await db.execute(
+        select(User)
+        .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
+        .where(
+            RecruiterConsultant.consultant_id == consultant.id,
+            RecruiterConsultant.is_active == True,
+        )
+        .limit(1)
+    )
+    recruiter = mapped.scalars().first()
+    if not recruiter and consultant.sales_recruiter_user_id:
+        fallback = await db.execute(
+            select(User).where(User.id == consultant.sales_recruiter_user_id)
+        )
+        recruiter = fallback.scalars().first()
+    if not recruiter:
+        return None
+    return {
+        "employer_name": recruiter.full_name or "",
+        "employer_title": getattr(recruiter, "designation", None) or "Recruiter",
+        "employer_email": recruiter.email or "",
+        "employer_phone": getattr(recruiter, "mobile_number", None),
+        "employer_extension": getattr(recruiter, "extension", None),
+        "employer_linkedin_url": getattr(recruiter, "linkedin_url", None),
+    }

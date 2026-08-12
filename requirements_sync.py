@@ -38,7 +38,7 @@
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from parser import parse_requirement
+from parser import parse_requirement, is_reply_email
 from cleaner import clean_requirement_text, html_to_text
 from dedup import save_requirement
 
@@ -103,6 +103,10 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 )
             if row["reply_to"]:
                 headers["reply_to"] = row["reply_to"]
+
+            if is_reply_email(subject):
+                skipped_not_a_requirement += 1
+                continue
 
             parsed = parse_requirement(subject, body, headers)
 

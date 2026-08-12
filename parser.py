@@ -25,7 +25,12 @@ FIELD_BOUNDARIES = [
     'Work Schedule', 'Shift', 'Hours', 'Benefits', 'Perks'
 ]
 
-STOP_PATTERNS = [rf'\b{re.escape(boundary)}\b' for boundary in FIELD_BOUNDARIES]
+# Field boundaries should only stop extraction when they're genuinely acting
+# as a label (start of a line, optionally followed by a colon) — not when
+# they appear naturally mid-sentence, e.g. "5+ years of experience with SQL"
+# was being incorrectly cut at "experience" even though it wasn't a real
+# "Experience:" section label.
+STOP_PATTERNS = [rf'(?:^|\n)\s*{re.escape(boundary)}\s*[:\-]' for boundary in FIELD_BOUNDARIES]
 STOP_PATTERN = re.compile('|'.join(STOP_PATTERNS), re.IGNORECASE)
 
 EMPLOYMENT_KEYWORDS = {
@@ -80,13 +85,13 @@ DURATION_PATTERNS = [
 ]
 
 SKILLS_PATTERNS = [
-    r'(?i)primary\s*skills?\s*[:\-]\s*(.+)',
-    r'(?i)required\s*skills?\s*[:\-]\s*(.+)',
-    r'(?i)technical\s*skills?\s*[:\-]\s*(.+)',
-    r'(?i)key\s*skills?\s*[:\-]\s*(.+)',
-    r'(?i)skills?\s*[:\-]\s*(.+)',
-    r'(?i)skill\s*set\s*[:\-]\s*(.+)',
-    r'(?i)tech(?:nology|nical)?\s*stack\s*[:\-]\s*(.+)',
+    r'(?i)primary\s*skills?\s*[:\-]\s*\n?\s*(.+)',
+    r'(?i)required\s*skills?\s*[:\-]\s*\n?\s*(.+)',
+    r'(?i)technical\s*skills?\s*[:\-]\s*\n?\s*(.+)',
+    r'(?i)key\s*skills?\s*[:\-]\s*\n?\s*(.+)',
+    r'(?i)skills?\s*[:\-]\s*\n?\s*(.+)',
+    r'(?i)skill\s*set\s*[:\-]\s*\n?\s*(.+)',
+    r'(?i)tech(?:nology|nical)?\s*stack\s*[:\-]\s*\n?\s*(.+)',
 ]
 
 EXPERIENCE_PATTERNS = [
@@ -357,6 +362,9 @@ def clean_whitespace(text: Optional[str]) -> Optional[str]:
         return None
     return ' '.join(text.split())
 
+def is_reply_email(subject: str) -> bool:
+    """Detect if an email is a reply/forward, which should never be treated as a fresh requirement."""
+    return bool(re.match(r'^\s*(re|fw|fwd)\s*:', subject or '', re.IGNORECASE))
 
 def is_job_requirement_email(text: str) -> bool:
     """Return True when enough job-requirement indicators are found."""
@@ -549,8 +557,14 @@ def extract_skills(text: str) -> List[str]:
     skills = []
     for skill in parts:
         skill = skill.strip()
+        skill = re.sub(r'^[•\-\*\u2022]+\s*', '', skill)  # strip leading bullet characters
         if not skill:
             continue
+        # Reject entire fragment if it's describing years-of-experience,
+        # not naming an actual skill (e.g. "5+ years of experience with SQL")
+        if re.match(r'(?i)^\d+\+?\s*years?\b', skill):
+            continue
+        skill = re.sub(r'(?i)^\s*(?:including|such\s+as)\s*[:\-]?\s*', '', skill)
         skill = re.sub(r'(?i)\b(with|experience|knowledge|required|preferred)\b.*', '', skill)
         skill = re.sub(r'\s+', ' ', skill).strip()
         if 2 < len(skill) < 40:
@@ -652,6 +666,15 @@ def clean_role(role: Optional[str]) -> Optional[str]:
     )
     role = re.sub(r'^[^0-9A-Za-z]+', '', role).strip()
     role = re.sub(r'[\-\u2013,:;]+\s*$', '', role).strip()
+    # ROLE-SPECIFIC PARSING: real job titles are short (typically 2-8 words).
+    # If crop_at_next_field() didn't find a clean boundary (e.g. HTML-collapsed
+    # single-line emails with no recognizable "Location:"/signature marker
+    # nearby), this cuts off at the point runaway sentence text starts,
+    # instead of falling through to a blunt 60-char truncation that grabs
+    # unrelated trailing words like "AWS Engineer so on more unwanted...".
+    words = role.split()
+    if len(words) > 8:
+        role = ' '.join(words[:8])
     if len(role) > 60:
         role = role[:57] + '...'
     return role or None
@@ -669,6 +692,12 @@ def clean_client(client: Optional[str]) -> Optional[str]:
         return None
     client = crop_at_next_field(client)
     client = re.sub(r'(?i)^\s*(?:is|the|our|a|for|at|with)\s+', '', client).strip()
+    # ROLE-SPECIFIC PARSING: real client/company names are short (2-10 words).
+    # Same runaway-text problem as role — cap word count before falling
+    # back to a blunt character truncation.
+    words = client.split()
+    if len(words) > 10:
+        client = ' '.join(words[:10])
     if len(client) > 50:
         client = client[:47] + '...'
     return client or None

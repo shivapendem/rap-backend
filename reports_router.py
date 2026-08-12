@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/reports", tags=["Reports"])
 class UserReportStat(BaseModel):
     user_id: int
     user_name: str
+    user_role: str
     applications_sent: int
     emails_sent: int
 
@@ -118,11 +119,12 @@ async def get_admin_reports(
             select(
                 User.id.label("user_id"),
                 User.full_name.label("user_name"),
+                User.role.label("user_role"),
                 func.count(Application.id).label("app_count"),
             )
             .join(Application, Application.recruiter_id == User.id)
             .where(Application.status == "SENT")
-            .group_by(User.id, User.full_name)
+            .group_by(User.id, User.full_name, User.role)
         )
         if start_dt:
             stats_query = stats_query.where(Application.sent_at >= start_dt)
@@ -152,6 +154,7 @@ async def get_admin_reports(
             applications_per_user.append(UserReportStat(
                 user_id=row.user_id,
                 user_name=row.user_name or "Unknown User",
+                user_role=row.user_role or "",
                 applications_sent=row.app_count,
                 emails_sent=emails_by_user.get(row.user_id, 0)
             ))
