@@ -697,7 +697,7 @@ async def list_resumes(
                 select(Consultant).where(Consultant.user_id == base_target_user_id)
             )).scalar_one_or_none()
 
-              # FEATURE CHANGE: base resume is now generated from the
+            # FEATURE CHANGE: base resume is now generated from the
             # profile (see sync_base_resume_text in this file, called by
             # phase3.py on every profile/experience save) rather than
             # uploaded — base_resume_file_path is a legacy field from the
@@ -1205,113 +1205,8 @@ async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> Non
     consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
 
 
-_MONTH_YEAR_FORMATS = ("%b %Y", "%B %Y")
-
-
-def _parse_month_year(value: Optional[str]) -> Optional[date]:
-    """Parse the Base Resume editor's free-text 'Mon YYYY' / 'Month YYYY'
-    fields into a real date (day fixed to 1). Returns None on anything
-    unparseable rather than raising."""
-    if not value or not value.strip():
-        return None
-    cleaned = value.strip()
-    for fmt in _MONTH_YEAR_FORMATS:
-        try:
-            return datetime.strptime(cleaned, fmt).date().replace(day=1)
-        except ValueError:
-            continue
-    return None
-
-
-def _parse_resume_editor_dates(start: Optional[str], end: Optional[str]):
-    start_date = _parse_month_year(start)
-    end_stripped = (end or "").strip().lower()
-    if not end_stripped or end_stripped in ("present", "current"):
-        return start_date, None, True
-    return start_date, _parse_month_year(end), False
-
-
-def _format_month_year(d: Optional[date]) -> str:
-    return d.strftime("%b %Y") if d else ""
-
-
-async def build_base_resume_content(db: AsyncSession, consultant: Consultant) -> dict:
-    """Overlay the profile-derived fields (Skills, Experience, Education,
-    Name/Phone/Location/LinkedIn) fresh from Consultant/ConsultantExperience/
-    User.resume_info onto whatever resume-only extras (Certifications,
-    career objective wording, etc.) were previously saved. This is the
-    single source of truth both GET /base/content and the auto-sync below
-    use — nothing here is ever read from a stale cached blob."""
-    extra_content = dict(consultant.base_resume_content or {})
-    for _stale_key in (
-        "name", "email", "phone", "location", "linkedin",
-        "career_objective", "summary", "technical_proficiencies",
-        "experience", "education",
-    ):
-        extra_content.pop(_stale_key, None)
-
-    resume_info: dict = {}
-    if consultant.user_id:
-        info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
-        resume_info = info_result.scalar_one_or_none() or {}
-    summary_text = resume_info.get("summary") or ""
-
-    technical_proficiencies = []
-    if (consultant.primary_skills or "").strip():
-        technical_proficiencies.append({"category": "Primary Skills", "skills": consultant.primary_skills})
-    if (consultant.secondary_skills or "").strip():
-        technical_proficiencies.append({"category": "Secondary Skills", "skills": consultant.secondary_skills})
-
-    exp_rows_result = await db.execute(
-        select(ConsultantExperience)
-        .where(ConsultantExperience.consultant_id == consultant.id)
-        .order_by(ConsultantExperience.sort_order.asc())
-    )
-    experience_list = []
-    for exp in exp_rows_result.scalars().all():
-        bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
-        experience_list.append({
-            "id": str(exp.id),
-            "role": exp.role_title or "",
-            "client": exp.client_name or "",
-            "start": _format_month_year(exp.start_date),
-            "end": "Present" if exp.is_present else _format_month_year(exp.end_date),
-            "location": exp.location or "",
-            "bullets": bullets,
-            "technologies": exp.technologies or [],
-        })
-
-    return {
-        **extra_content,
-        "name": consultant.full_name or "",
-        "email": consultant.email or "",
-        "phone": consultant.phone or "",
-        "location": consultant.current_location or "",
-        "linkedin": consultant.linkedin_url or "",
-        "career_objective": summary_text,
-        "summary": summary_text,
-        "technical_proficiencies": technical_proficiencies,
-        "experience": experience_list,
-        "education": consultant.education or [],
-    }
-
-
-async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> None:
-    """Regenerate and stage consultant.base_resume_text from CURRENT
-    profile fields — called by phase3.py whenever Skills, Experience,
-    Education, or contact info changes on My Profile, so base_resume_text
-    (read by both the completeness check and matching_router.py's TF-IDF
-    scoring) never sits stale waiting for someone to manually open and
-    save the Base Resume editor. Stages the change on consultant only —
-    caller still owns db.commit()."""
-    content = await build_base_resume_content(db, consultant)
-    consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
-
-
 @router.get("/base/content", response_model=BaseResumeContentDTO)
 async def get_base_resume_content(
-
-
     user_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -1605,7 +1500,15 @@ async def update_base_resume_content(
             source_id=str(consultant.id),
         )
 
-        await db.commit()
+    # BUG FIX: this was indented inside the `except` above, so it only
+    # ran when DOCX regeneration failed — on the normal success path
+    # every profile/experience field written earlier in this function
+    # (name, phone, location, LinkedIn, education, skills, the full
+    # experience reconciliation, base_resume_content, base_resume_text)
+    # was silently discarded, never reaching the database, even though
+    # the response below still claimed success. Commit needs to happen
+    # unconditionally — whether or not the DOCX step itself succeeded.
+    await db.commit()
     return {"success": True, "message": "Base resume content updated successfully"}
 
 
@@ -1774,27 +1677,15 @@ async def download_base_resume(
     display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
 
     # Legacy local-disk record (pre-Spaces migration) — no object-storage
-    # key to presign.
+    # key to presign, so this stays a direct stream. A .docx here has no
+    # in-browser renderer and can't be handed to Google's viewer either
+    # (it needs a real fetchable URL, not local bytes) — same acknowledged
+    # limitation the Sent Applications endpoint (phase7.py) documents for
+    # its own local-file case.
     try:
         if os.path.isfile(stored):
             with open(stored, "rb") as fh:
                 body = fh.read()
-            if ext == ".docx" and not force_stream:
-                try:
-                    from file_preview import get_or_convert_pdf_preview
-                    from pathlib import Path
-                    pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, body)
-                    if pdf_bytes:
-                        return Response(
-                            content=pdf_bytes,
-                            media_type="application/pdf",
-                            headers={"Content-Disposition": f'inline; filename="{Path(display_name).stem}.pdf"'},
-                        )
-                except Exception as conv_err:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "Base resume preview conversion failed (local): %s", conv_err
-                    )
             return Response(
                 content=body,
                 media_type=media_type,
@@ -1804,30 +1695,12 @@ async def download_base_resume(
         pass
 
     if not force_stream:
-        # BUG FIX (Google Docs Viewer "no preview available"): a presigned
-        # URL isn't guaranteed to render in Google's external viewer even
-        # when it's perfectly valid and reachable. Convert to a real PDF
-        # on our own side instead — same conversion already used for
-        # tailored resume generation — so View relies on nothing but the
-        # browser's built-in PDF viewer.
-        if ext == ".docx":
-            body, content_type = await asyncio.to_thread(download_file_from_s3, stored)
-            if body is not None:
-                try:
-                    from file_preview import get_or_convert_pdf_preview
-                    from pathlib import Path
-                    pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, body)
-                    if pdf_bytes:
-                        return Response(
-                            content=pdf_bytes,
-                            media_type="application/pdf",
-                            headers={"Content-Disposition": f'inline; filename="{Path(display_name).stem}.pdf"'},
-                        )
-                except Exception as conv_err:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "Base resume preview conversion failed (S3): %s", conv_err
-                    )
+        # CHANGED (view now shows the actual DOCX, not a converted PDF):
+        # same requirement as the Sent Applications resume-download
+        # endpoint (phase7.py) — View should open the real file via
+        # Google Docs Viewer (a real, publicly fetchable presigned URL,
+        # fetched by Google's own servers — browser CORS never applies
+        # there) instead of a server-side PDF conversion.
         presigned = generate_presigned_url(stored)
         if presigned:
             return {"url": presigned, "filename": display_name, "mimeType": media_type}
@@ -2190,43 +2063,12 @@ async def download_resume(
                 detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
             )
 
-    # BUG FIX ("upload resume opens in drive view" — base resume and
-    # Applications Tracker resumes already got this treatment, this
-    # endpoint was the one remaining gap): a manually-uploaded resume's
-    # s3_key is a real .docx (see upload_resume above), and this endpoint
-    # used to just hand back a presigned URL to it — no in-browser
-    # renderer for .docx, so the frontend fell back to Google Docs
-    # Viewer, which isn't guaranteed to successfully preview any given
-    # URL. Generated/tailored resumes in this same table are usually
-    # already a real PDF (via the lazy self-heal above, or the original
-    # generate/finalize flow) and don't need conversion at all.
-    if resume.s3_key.lower().endswith(".docx"):
-        from s3_service import download_file_from_s3
-        docx_bytes, _ct = download_file_from_s3(resume.s3_key)
-        if docx_bytes:
-            try:
-                from file_preview import get_or_convert_pdf_preview
-                pdf_bytes = get_or_convert_pdf_preview(docx_bytes)
-                if pdf_bytes:
-                    resume.download_count += 1
-                    resume.last_downloaded = datetime.now(timezone.utc)
-                    await db.commit()
-                    safe_title = "".join(
-                        c for c in (resume.title or "resume") if c.isalnum() or c in " -_"
-                    ).strip() or "resume"
-                    return Response(
-                        content=pdf_bytes,
-                        media_type="application/pdf",
-                        headers={"Content-Disposition": f'inline; filename="{safe_title}.pdf"'},
-                    )
-            except Exception as conv_err:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "Resume preview conversion failed for resume_id=%s: %s", id, conv_err
-                )
-        # Conversion unavailable/failed — fall through to the original
-        # presigned-URL behavior below rather than blocking the view.
-
+    # CHANGED (view now shows the actual DOCX, not a converted PDF): same
+    # requirement as the Sent Applications resume-download endpoint
+    # (phase7.py) and the base resume's download_base_resume below — View
+    # should open the real file via Google Docs Viewer (a real, publicly
+    # fetchable presigned URL, which Google's own servers fetch — browser
+    # CORS never applies there) instead of a server-side PDF conversion.
     url = generate_presigned_url(resume.s3_key)
     if not url:
         raise HTTPException(status_code=500, detail="Failed to generate download link.")

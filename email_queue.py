@@ -1790,6 +1790,38 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         tok = tok_res.scalars().first()
                         if tok:
                             await session.delete(tok)
+
+                        # BUG FIX ("authorize a user, it reverts later on
+                        # its own"): this only ever touched the ONE item
+                        # that just failed. If this consultant has other
+                        # QUEUED items sitting from earlier attempts (all
+                        # doomed to hit this exact same dead token), the
+                        # background worker loop picks each one up on a
+                        # later pass, independently fails the same OAuth
+                        # refresh, and re-fires this whole deauthorize
+                        # block again — silently undoing an admin's manual
+                        # re-authorization sometime after the fact, with no
+                        # single moment where anything visibly "failed" to
+                        # explain why. Since every other QUEUED item for
+                        # this consultant would fail for the identical
+                        # reason, mark them FAILED here too instead of
+                        # leaving them to trigger the same repeat
+                        # deauthorization one-by-one over time.
+                        other_queued_result = await session.execute(
+                            select(EmailQueue).where(
+                                EmailQueue.consultant_id == failed_item.consultant_id,
+                                EmailQueue.status == "QUEUED",
+                                EmailQueue.id != failed_item.id,
+                            )
+                        )
+                        other_queued_items = other_queued_result.scalars().all()
+                        for other_item in other_queued_items:
+                            other_item.status = "FAILED"
+                            other_item.status_text = (
+                                "Skipped — this consultant's Gmail authorization was already "
+                                "found invalid while processing another queued item. "
+                                "Reconnect Gmail before retrying."
+                            )
                 except Exception as deauth_err:
                     print(f"[email-queue] Failed to auto-deauthorize invalid token: {deauth_err}")
 

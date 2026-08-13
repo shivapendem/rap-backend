@@ -393,6 +393,10 @@ class RequirementConsultantMatch(Base):
     matched_skills = ArrayTextColumn(nullable=True)
     missing_skills = ArrayTextColumn(nullable=True)
     match_reason = Column(Text, nullable=True)
+    # Raw (pre-weight) and weighted percentage per scoring factor — lets the
+    # UI show WHY a total came out a certain way (e.g. "Role: 100% raw →
+    # 50.0 pts weighted") instead of just one blended total.
+    score_breakdown = JSONBColumn(nullable=True)
     status = Column(Text, nullable=False, default="ASSIGNED")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

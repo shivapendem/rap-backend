@@ -439,6 +439,17 @@ def score_match(
         "matched_skills": matched_skills,
         "missing_skills": missing_skills,
         "match_reason": match_reason,
+        # Raw, pre-weight percentages (0-100) for each factor — lets the UI
+        # show WHY a total came out a certain way, e.g. "Role: 100% (raw) →
+        # 50.0 pts (weighted)", instead of just a single blended percentage.
+        "score_breakdown": {
+            "skill": {"raw": round(skill_raw, 2), "weight": 0.20, "weighted": round(skill_score, 2)},
+            "role": {"raw": round(role_raw, 2), "weight": 0.50, "weighted": round(role_score, 2)},
+            "experience": {"raw": round(exp_raw, 2), "weight": 0.10, "weighted": round(exp_score, 2)},
+            "employment": {"raw": round(employment_raw, 2), "weight": 0.05, "weighted": round(employment_score, 2)},
+            "location": {"raw": round(location_raw, 2), "weight": 0.10, "weighted": round(location_score, 2)},
+            "auth": {"raw": round(auth_raw, 2), "weight": 0.05, "weighted": round(auth_score, 2)},
+        },
     }
 
 
