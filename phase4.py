@@ -532,6 +532,7 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                     existing.matched_skills = result["matched_skills"]
                     existing.missing_skills = result["missing_skills"]
                     existing.match_reason = result["match_reason"]
+                    existing.score_breakdown = result["score_breakdown"]
                 else:
                     db.add(RequirementConsultantMatch(
                         requirement_id=requirement_id,
@@ -568,6 +569,7 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                 existing.matched_skills = result["matched_skills"]
                 existing.missing_skills = result["missing_skills"]
                 existing.match_reason = result["match_reason"]
+                existing.score_breakdown = result["score_breakdown"]
                 await db.flush()
 
 
@@ -649,6 +651,7 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                     existing.matched_skills = result["matched_skills"]
                     existing.missing_skills = result["missing_skills"]
                     existing.match_reason = result["match_reason"]
+                    existing.score_breakdown = result["score_breakdown"]
                 else:
                     db.add(RequirementConsultantMatch(
                         requirement_id=requirement.id,
@@ -685,6 +688,7 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                 existing.matched_skills = result["matched_skills"]
                 existing.missing_skills = result["missing_skills"]
                 existing.match_reason = result["match_reason"]
+                existing.score_breakdown = result["score_breakdown"]
                 await db.flush()
 
         match_count += 1

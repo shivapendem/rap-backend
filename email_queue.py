@@ -1798,7 +1798,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             err_msg = str(e).lower()
             if (isinstance(e, ValueError) and ("token" in err_msg or "credential" in err_msg)) or "unauthorized" in err_msg or "invalid_grant" in err_msg or "401" in err_msg:
                 try:
-                    from models import Consultant, User, ConsultantEmailToken
+                    from models import Consultant, ConsultantEmailToken
                     cons_res = await session.execute(
                         select(Consultant).where(Consultant.id == failed_item.consultant_id)
                     )
@@ -1806,12 +1806,29 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     if consultant:
                         consultant.gmail_connected = False
 
-                        user_res = await session.execute(
-                            select(User).where(User.id == consultant.user_id)
-                        )
-                        user = user_res.scalars().first()
-                        if user:
-                            user.is_authorized = False
+                        # BUG FIX ("authorized several users, most reverted
+                        # on their own soon after — only two stayed
+                        # Authorized"): this used to also set
+                        # user.is_authorized = False here, conflating two
+                        # genuinely separate things — whether this Gmail
+                        # OAuth connection works, and whether this person
+                        # is allowed to use the platform at all. A broken/
+                        # expired Gmail token is common and expected (OAuth
+                        # tokens do lapse), but it doesn't mean the account
+                        # itself should be locked out of logging in — that
+                        # over-broad reaction is exactly why authorizing a
+                        # batch of users kept silently undoing itself: the
+                        # background worker just needs to find ONE stale
+                        # queued item for someone with a dead token, and
+                        # their whole account got deauthorized along with
+                        # it, even though only Gmail sending was actually
+                        # broken. gmail_connected=False (above) and the
+                        # token deletion (below) already fully capture
+                        # "this consultant needs to reconnect Gmail before
+                        # applying" — that's the correct, narrower signal.
+                        # is_authorized now stays exactly what an admin set
+                        # it to, only ever changed by an explicit admin
+                        # action in User Management.
 
                         tok_res = await session.execute(
                             select(ConsultantEmailToken).where(
