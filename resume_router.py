@@ -5,7 +5,7 @@ import uuid
 import math
 import asyncio
 from typing import Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -1093,8 +1093,216 @@ def _flatten_base_resume_content_to_text(data: dict) -> str:
     return "\n".join(parts)
 
 
+_MONTH_YEAR_FORMATS = ("%b %Y", "%B %Y")
+
+
+def _parse_month_year(value: Optional[str]) -> Optional[date]:
+    """Parse the Base Resume editor's free-text 'Mon YYYY' / 'Month YYYY'
+    fields into a real date (day fixed to 1). Returns None on anything
+    unparseable rather than raising."""
+    if not value or not value.strip():
+        return None
+    cleaned = value.strip()
+    for fmt in _MONTH_YEAR_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date().replace(day=1)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_resume_editor_dates(start: Optional[str], end: Optional[str]):
+    start_date = _parse_month_year(start)
+    end_stripped = (end or "").strip().lower()
+    if not end_stripped or end_stripped in ("present", "current"):
+        return start_date, None, True
+    return start_date, _parse_month_year(end), False
+
+
+def _format_month_year(d: Optional[date]) -> str:
+    return d.strftime("%b %Y") if d else ""
+
+
+async def build_base_resume_content(db: AsyncSession, consultant: Consultant) -> dict:
+    """Overlay the profile-derived fields (Skills, Experience, Education,
+    Name/Phone/Location/LinkedIn) fresh from Consultant/ConsultantExperience/
+    User.resume_info onto whatever resume-only extras (Certifications,
+    career objective wording, etc.) were previously saved. This is the
+    single source of truth both GET /base/content and the auto-sync below
+    use — nothing here is ever read from a stale cached blob."""
+    extra_content = dict(consultant.base_resume_content or {})
+    for _stale_key in (
+        "name", "email", "phone", "location", "linkedin",
+        "career_objective", "summary", "technical_proficiencies",
+        "experience", "education",
+    ):
+        extra_content.pop(_stale_key, None)
+
+    resume_info: dict = {}
+    if consultant.user_id:
+        info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
+        resume_info = info_result.scalar_one_or_none() or {}
+    summary_text = resume_info.get("summary") or ""
+
+    technical_proficiencies = []
+    if (consultant.primary_skills or "").strip():
+        technical_proficiencies.append({"category": "Primary Skills", "skills": consultant.primary_skills})
+    if (consultant.secondary_skills or "").strip():
+        technical_proficiencies.append({"category": "Secondary Skills", "skills": consultant.secondary_skills})
+
+    exp_rows_result = await db.execute(
+        select(ConsultantExperience)
+        .where(ConsultantExperience.consultant_id == consultant.id)
+        .order_by(ConsultantExperience.sort_order.asc())
+    )
+    experience_list = []
+    for exp in exp_rows_result.scalars().all():
+        bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
+        experience_list.append({
+            "id": str(exp.id),
+            "role": exp.role_title or "",
+            "client": exp.client_name or "",
+            "start": _format_month_year(exp.start_date),
+            "end": "Present" if exp.is_present else _format_month_year(exp.end_date),
+            "location": exp.location or "",
+            "bullets": bullets,
+            "technologies": exp.technologies or [],
+        })
+
+    return {
+        **extra_content,
+        "name": consultant.full_name or "",
+        "email": consultant.email or "",
+        "phone": consultant.phone or "",
+        "location": consultant.current_location or "",
+        "linkedin": consultant.linkedin_url or "",
+        "career_objective": summary_text,
+        "summary": summary_text,
+        "technical_proficiencies": technical_proficiencies,
+        "experience": experience_list,
+        "education": consultant.education or [],
+    }
+
+
+async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> None:
+    """Regenerate and stage consultant.base_resume_text from CURRENT
+    profile fields — called by phase3.py whenever Skills, Experience,
+    Education, or contact info changes on My Profile, so base_resume_text
+    (read by both the completeness check and matching_router.py's TF-IDF
+    scoring) never sits stale waiting for someone to manually open and
+    save the Base Resume editor. Stages the change on consultant only —
+    caller still owns db.commit()."""
+    content = await build_base_resume_content(db, consultant)
+    consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
+
+
+_MONTH_YEAR_FORMATS = ("%b %Y", "%B %Y")
+
+
+def _parse_month_year(value: Optional[str]) -> Optional[date]:
+    """Parse the Base Resume editor's free-text 'Mon YYYY' / 'Month YYYY'
+    fields into a real date (day fixed to 1). Returns None on anything
+    unparseable rather than raising."""
+    if not value or not value.strip():
+        return None
+    cleaned = value.strip()
+    for fmt in _MONTH_YEAR_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date().replace(day=1)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_resume_editor_dates(start: Optional[str], end: Optional[str]):
+    start_date = _parse_month_year(start)
+    end_stripped = (end or "").strip().lower()
+    if not end_stripped or end_stripped in ("present", "current"):
+        return start_date, None, True
+    return start_date, _parse_month_year(end), False
+
+
+def _format_month_year(d: Optional[date]) -> str:
+    return d.strftime("%b %Y") if d else ""
+
+
+async def build_base_resume_content(db: AsyncSession, consultant: Consultant) -> dict:
+    """Overlay the profile-derived fields (Skills, Experience, Education,
+    Name/Phone/Location/LinkedIn) fresh from Consultant/ConsultantExperience/
+    User.resume_info onto whatever resume-only extras (Certifications,
+    career objective wording, etc.) were previously saved. This is the
+    single source of truth both GET /base/content and the auto-sync below
+    use — nothing here is ever read from a stale cached blob."""
+    extra_content = dict(consultant.base_resume_content or {})
+    for _stale_key in (
+        "name", "email", "phone", "location", "linkedin",
+        "career_objective", "summary", "technical_proficiencies",
+        "experience", "education",
+    ):
+        extra_content.pop(_stale_key, None)
+
+    resume_info: dict = {}
+    if consultant.user_id:
+        info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
+        resume_info = info_result.scalar_one_or_none() or {}
+    summary_text = resume_info.get("summary") or ""
+
+    technical_proficiencies = []
+    if (consultant.primary_skills or "").strip():
+        technical_proficiencies.append({"category": "Primary Skills", "skills": consultant.primary_skills})
+    if (consultant.secondary_skills or "").strip():
+        technical_proficiencies.append({"category": "Secondary Skills", "skills": consultant.secondary_skills})
+
+    exp_rows_result = await db.execute(
+        select(ConsultantExperience)
+        .where(ConsultantExperience.consultant_id == consultant.id)
+        .order_by(ConsultantExperience.sort_order.asc())
+    )
+    experience_list = []
+    for exp in exp_rows_result.scalars().all():
+        bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
+        experience_list.append({
+            "id": str(exp.id),
+            "role": exp.role_title or "",
+            "client": exp.client_name or "",
+            "start": _format_month_year(exp.start_date),
+            "end": "Present" if exp.is_present else _format_month_year(exp.end_date),
+            "location": exp.location or "",
+            "bullets": bullets,
+            "technologies": exp.technologies or [],
+        })
+
+    return {
+        **extra_content,
+        "name": consultant.full_name or "",
+        "email": consultant.email or "",
+        "phone": consultant.phone or "",
+        "location": consultant.current_location or "",
+        "linkedin": consultant.linkedin_url or "",
+        "career_objective": summary_text,
+        "summary": summary_text,
+        "technical_proficiencies": technical_proficiencies,
+        "experience": experience_list,
+        "education": consultant.education or [],
+    }
+
+
+async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> None:
+    """Regenerate and stage consultant.base_resume_text from CURRENT
+    profile fields — called by phase3.py whenever Skills, Experience,
+    Education, or contact info changes on My Profile, so base_resume_text
+    (read by both the completeness check and matching_router.py's TF-IDF
+    scoring) never sits stale waiting for someone to manually open and
+    save the Base Resume editor. Stages the change on consultant only —
+    caller still owns db.commit()."""
+    content = await build_base_resume_content(db, consultant)
+    consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
+
+
 @router.get("/base/content", response_model=BaseResumeContentDTO)
 async def get_base_resume_content(
+
+
     user_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -1194,8 +1402,9 @@ async def get_base_resume_content(
                 source_id=str(consultant.id),
             )
 
+    content = await build_base_resume_content(db, consultant)
     return BaseResumeContentDTO(
-        content=consultant.base_resume_content or {},
+        content=content,
         filename=filename,
     )
 
@@ -1231,7 +1440,117 @@ async def update_base_resume_content(
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
 
-    resume_data = request.content
+    resume_data = dict(request.content or {})
+
+    if (resume_data.get("name") or "").strip():
+        consultant.full_name = resume_data["name"].strip()
+    if resume_data.get("phone") is not None:
+        consultant.phone = resume_data.get("phone") or None
+    if resume_data.get("location") is not None:
+        consultant.current_location = resume_data.get("location") or None
+    if resume_data.get("linkedin") is not None:
+        consultant.linkedin_url = resume_data.get("linkedin") or None
+    if "education" in resume_data:
+        consultant.education = resume_data.get("education") or []
+
+    summary_val = resume_data.get("career_objective")
+    if summary_val is None:
+        summary_val = resume_data.get("summary")
+    if summary_val is not None and consultant.user_id:
+        user_row_result = await db.execute(select(User).where(User.id == consultant.user_id))
+        user_row = user_row_result.scalar_one_or_none()
+        if user_row:
+            info = dict(user_row.resume_info or {})
+            info["summary"] = summary_val
+            user_row.resume_info = info
+
+    tech_rows = resume_data.get("technical_proficiencies") or []
+    primary_bits, secondary_bits = [], []
+    for row in tech_rows:
+        if not isinstance(row, dict):
+            continue
+        skills_val = row.get("skills")
+        skills_str = ", ".join(skills_val) if isinstance(skills_val, list) else (skills_val or "")
+        skills_str = skills_str.strip()
+        if not skills_str:
+            continue
+        category = (row.get("category") or "").strip().lower()
+        if "primary" in category:
+            primary_bits.append(skills_str)
+        elif "secondary" in category:
+            secondary_bits.append(skills_str)
+        else:
+            secondary_bits.append(skills_str)
+    if primary_bits:
+        consultant.primary_skills = ", ".join(primary_bits)
+    if secondary_bits:
+        consultant.secondary_skills = ", ".join(secondary_bits)
+
+    incoming_experience = resume_data.get("experience") or []
+    existing_rows_result = await db.execute(
+        select(ConsultantExperience).where(ConsultantExperience.consultant_id == consultant.id)
+    )
+    existing_by_id = {e.id: e for e in existing_rows_result.scalars().all()}
+    seen_ids = set()
+    reconciled_experience = []
+
+    for idx, item in enumerate(incoming_experience):
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        exp_id = None
+        if raw_id not in (None, "", "new"):
+            try:
+                exp_id = int(raw_id)
+            except (TypeError, ValueError):
+                exp_id = None
+
+        start_date, end_date, is_present = _parse_resume_editor_dates(item.get("start"), item.get("end"))
+        bullets = item.get("bullets") or []
+        responsibilities = bullets[0] if len(bullets) > 0 else None
+        achievements = "\n".join(bullets[1:]) if len(bullets) > 1 else None
+        technologies = item.get("technologies") or []
+
+        if exp_id is not None and exp_id in existing_by_id:
+            exp = existing_by_id[exp_id]
+            exp.client_name = item.get("client") or exp.client_name
+            exp.role_title = item.get("role") or exp.role_title
+            exp.location = item.get("location")
+            if start_date is not None:
+                exp.start_date = start_date
+            exp.end_date = end_date
+            exp.is_present = is_present
+            exp.technologies = technologies
+            exp.responsibilities = responsibilities
+            exp.achievements = achievements
+            exp.sort_order = idx
+            seen_ids.add(exp_id)
+            reconciled_experience.append(item)
+        else:
+            new_exp = ConsultantExperience(
+                consultant_id=consultant.id,
+                client_name=item.get("client") or "",
+                role_title=item.get("role") or "",
+                start_date=start_date or date.today().replace(day=1),
+                end_date=end_date,
+                is_present=is_present,
+                location=item.get("location"),
+                technologies=technologies,
+                responsibilities=responsibilities,
+                achievements=achievements,
+                sort_order=idx,
+            )
+            db.add(new_exp)
+            await db.flush()
+            seen_ids.add(new_exp.id)
+            reconciled_experience.append({**item, "id": str(new_exp.id)})
+
+    for old_id, old_exp in existing_by_id.items():
+        if old_id not in seen_ids:
+            await db.delete(old_exp)
+
+    resume_data["experience"] = reconciled_experience
+
     consultant.base_resume_content = resume_data
     consultant.base_resume_text = _flatten_base_resume_content_to_text(resume_data)
 
@@ -1277,7 +1596,7 @@ async def update_base_resume_content(
             source_id=str(consultant.id),
         )
 
-    await db.commit()
+        await db.commit()
     return {"success": True, "message": "Base resume content updated successfully"}
 
 
@@ -1994,11 +2313,21 @@ async def download_resume_docx(
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
-    if not resume.s3_key:
-        raise HTTPException(status_code=400, detail="Resume does not have a generated file.")
-
-    docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx"
-    body, content_type = await asyncio.to_thread(download_file_from_s3, docx_key)
+    # BUG FIX ("View/Download both open the browser print dialog instead
+    # of DOCX"): this used to 400 immediately with "Resume does not have
+    # a generated file" whenever s3_key was empty — which is exactly the
+    # case for a resume that only has structured `data` and was never
+    # uploaded/finalized to an actual file. The frontend's fallback for
+    # that 400 was to render the resume client-side and trigger the
+    # browser's print dialog (Save as PDF), which is what was showing up
+    # instead of a DOCX. Now: only attempt the S3 lookup when a s3_key
+    # actually exists: no key at all skips straight to generating from
+    # resume.data below, same as the "found a key but the DOCX at that
+    # key is missing" self-heal case already handles.
+    docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx" if resume.s3_key else None
+    body, content_type = (
+        await asyncio.to_thread(download_file_from_s3, docx_key) if docx_key else (None, None)
+    )
 
     if body is None:
         # SELF-HEAL ("Resume does not have a generated DOCX" — this was the
@@ -2026,11 +2355,16 @@ async def download_resume_docx(
                 _generate_docx(resume.data, docx_path)
                 with open(docx_path, "rb") as f:
                     docx_bytes = f.read()
-                with open(docx_path, "rb") as f:
-                    upload_file_to_s3(
-                        f, docx_key,
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    )
+                # Only upload back to S3 if there's actually a key to put
+                # it at — a resume with no s3_key at all has nowhere
+                # established to store it yet, so just serve the bytes
+                # this once rather than inventing a storage location.
+                if docx_key:
+                    with open(docx_path, "rb") as f:
+                        upload_file_to_s3(
+                            f, docx_key,
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        )
                 body = docx_bytes
                 content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             except Exception as e:

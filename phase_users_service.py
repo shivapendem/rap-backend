@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import User, Consultant, Application, Resume, ConsultantExperience
+from models import User, Consultant, Application, Resume
 from phase_users_repository import (
     UserRepository, ConsultantRepository, RecruiterConsultantRepository,
 )
@@ -52,31 +52,18 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
 async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdminRowDTO:
     recruiters = await ConsultantRepository.get_assigned_recruiters(db, c.id)
 
-    # BUG FIX: profileCompleteness never factored in Experience at all, and
-    # relied only on the presence of a base resume file/text as a proxy for
-    # a "complete" profile. Same fix as phase3.py's
-    # _consultant_to_profile_response — this admin-facing DTO must mirror
-    # that formula exactly (same weights, same criteria) so the admin
-    # table and the consultant's own profile screen never disagree on the
-    # same number. Experience count follows the same per-row query pattern
-    # already used for `recruiters` immediately above.
-    exp_count_result = await db.execute(
-        select(func.count()).where(ConsultantExperience.consultant_id == c.id)
-    )
-    experience_count = exp_count_result.scalar_one()
-
     # Profile completeness — mirrors ProfileCompletenessBar.tsx / phase3.py's
     # _consultant_to_profile_response so the admin screen and the
     # consultant's own profile show the same number.
     completeness = 0
     if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
         completeness += 30  # Skills
-    if experience_count > 0:
-        completeness += 25  # Experience
+    if c.base_resume_file_path or c.base_resume_text:
+        completeness += 30  # Resume
     if c.preferred_employment_types:
         completeness += 20  # Employment type
     if (c.work_authorization or "").strip():
-        completeness += 15  # Work auth
+        completeness += 10  # Work auth
     if len((c.current_location or "").strip()) >= 2:
         completeness += 10  # Location
 

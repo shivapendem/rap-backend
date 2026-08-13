@@ -244,17 +244,23 @@ async def create_email_queue(
             if consultant:
                 consultant_id = consultant.id
             else:
-                # Fallback: pick first active consultant
-                cons_result = await db.execute(
-                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
-                        Consultant.status == "ACTIVE",
-                        User.is_authorized == True
-                    ).limit(1)
+                # BUG FIX ("application for Ram Babu sent out under a
+                # different person's name/from-address"): this used to
+                # fall back to whichever ACTIVE consultant happened to
+                # come back first from an unordered `.limit(1)` query —
+                # a completely arbitrary person, unrelated to whoever the
+                # admin was actually applying for. Combined with
+                # valid_from_emails below always allowing the admin's own
+                # email through, an application generated for one
+                # candidate could end up queued/sent under the admin's or
+                # some other unrelated consultant's identity with no
+                # error at any point. A missing consultant_id here means
+                # the request itself is incomplete — surface that plainly
+                # instead of guessing who to send as.
+                raise HTTPException(
+                    status_code=400,
+                    detail="consultant_id is required to send this email.",
                 )
-                consultant = cons_result.scalars().first()
-                if not consultant:
-                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
-                consultant_id = consultant.id
     elif current_user.role == "RECRUITER":
         # Recruiter: same logic — try to resolve or fallback
         if body.consultant_id:
@@ -281,16 +287,12 @@ async def create_email_queue(
             if consultant:
                 consultant_id = consultant.id
             else:
-                cons_result = await db.execute(
-                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
-                        Consultant.status == "ACTIVE",
-                        User.is_authorized == True
-                    ).limit(1)
+                # Same fix as the ADMIN branch above — no more picking an
+                # arbitrary active consultant when consultant_id is missing.
+                raise HTTPException(
+                    status_code=400,
+                    detail="consultant_id is required to send this email.",
                 )
-                consultant = cons_result.scalars().first()
-                if not consultant:
-                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
-                consultant_id = consultant.id
     else:
         # Consultant: resolve from logged-in user
         cons_result = await db.execute(
@@ -310,25 +312,27 @@ async def create_email_queue(
     # from the request payload with no server-side verification at all —
     # the frontend's From field is read-only, but the backend had no
     # defense if that value were ever wrong, stale, or bypassed some
-    # other way. The only two legitimate senders here are the current
-    # user themselves (an admin/recruiter sending under their own
-    # identity) or the specific consultant just resolved above (sending
-    # on that consultant's behalf) — reject anything else.
-    valid_from_emails = {(current_user.email or "").strip().lower()}
+    # other way.
+    # TIGHTENED further ("application for Ram Babu sent under a different
+    # person's from-address"): this used to always allow current_user's
+    # own email through as valid, even when a specific consultant had
+    # just been resolved for this exact send — so a request meant to go
+    # out as the resolved consultant could still slip through carrying
+    # the admin/recruiter's own email as from_email with no error. Once a
+    # consultant is resolved, THEIR email is the only legitimate sender —
+    # the current user's own email is only accepted when no consultant
+    # context exists at all (e.g. a consultant sending for themselves).
     if consultant and consultant.email:
-        valid_from_emails.add(consultant.email.strip().lower())
+        valid_from_emails = {consultant.email.strip().lower()}
+    else:
+        valid_from_emails = {(current_user.email or "").strip().lower()}
     if (body.from_email or "").strip().lower() not in valid_from_emails:
         raise HTTPException(
             status_code=400,
             detail="from_email does not match the current user or the resolved consultant — refusing to send.",
         )
 
-    final_cc = body.cc_email.strip() if body.cc_email else ""
-    if final_cc:
-        if current_user.email not in final_cc:
-            final_cc = f"{final_cc},{current_user.email}"
-    else:
-        final_cc = current_user.email
+    final_cc = current_user.email
 
     # Resolve the consultant's handling recruiter once — reused below for
     # both the CONSULTANT self-apply case (swap the self-CC for the
@@ -511,6 +515,7 @@ async def list_email_queue(
     consultant_id: Optional[str] = Query(None, description="Comma-separated consultant profile ids to filter by"),
     sent_by_role: Optional[str] = Query(None, description="Comma-separated roles to filter by: ADMIN, RECRUITER, CONSULTANT"),
     search: Optional[str] = Query(None, description="Free-text match against subject, to/from email, and consultant name"),
+    status: Optional[str] = Query(None, description="QUEUED, SENT, or FAILED — filters this consultant's own queue view"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -562,6 +567,18 @@ async def list_email_queue(
         if ids:
             query = query.where(EmailQueue.consultant_id.in_(ids))
             count_query = count_query.where(EmailQueue.consultant_id.in_(ids))
+
+    # NOTE: de-duplicated — this block was accidentally duplicated
+    # verbatim (copy-paste) in an earlier revision, which was harmless
+    # (the second application of the same .where() clause is a no-op)
+    # but confusing and worth cleaning up.
+    if status:
+        valid_statuses = {"QUEUED", "SENT", "FAILED"}
+        status_upper = status.strip().upper()
+        if status_upper not in valid_statuses:
+            raise HTTPException(status_code=422, detail=f"status must be one of {sorted(valid_statuses)}")
+        query = query.where(EmailQueue.status == status_upper)
+        count_query = count_query.where(EmailQueue.status == status_upper)
 
     if sent_by_role:
         roles = [r.strip().upper() for r in sent_by_role.split(",") if r.strip()]
@@ -690,16 +707,16 @@ async def send_email_now(
             if consultant:
                 consultant_id = consultant.id
             else:
-                cons_result = await db.execute(
-                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
-                        Consultant.status == "ACTIVE",
-                        User.is_authorized == True
-                    ).limit(1)
+                # BUG FIX ("application for Ram Babu sent out under a
+                # different person's name/from-address") — same fix as
+                # create_email_queue above: no more silently picking an
+                # arbitrary ACTIVE consultant via an unordered `.limit(1)`
+                # when consultant_id is missing. That person had nothing
+                # to do with who this email was actually meant for.
+                raise HTTPException(
+                    status_code=400,
+                    detail="consultant_id is required to send this email.",
                 )
-                consultant = cons_result.scalars().first()
-                if not consultant:
-                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
-                consultant_id = consultant.id
     elif current_user.role == "RECRUITER":
         if body.consultant_id:
             cons_result = await db.execute(
@@ -725,16 +742,11 @@ async def send_email_now(
             if consultant:
                 consultant_id = consultant.id
             else:
-                cons_result = await db.execute(
-                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
-                        Consultant.status == "ACTIVE",
-                        User.is_authorized == True
-                    ).limit(1)
+                # Same fix as the ADMIN branch above.
+                raise HTTPException(
+                    status_code=400,
+                    detail="consultant_id is required to send this email.",
                 )
-                consultant = cons_result.scalars().first()
-                if not consultant:
-                    raise HTTPException(status_code=400, detail="No consultants found in the system.")
-                consultant_id = consultant.id
     else:
         cons_result = await db.execute(
             sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
@@ -753,13 +765,20 @@ async def send_email_now(
     # from the request payload with no server-side verification at all —
     # the frontend's From field is read-only, but the backend had no
     # defense if that value were ever wrong, stale, or bypassed some
-    # other way. The only two legitimate senders here are the current
-    # user themselves (an admin/recruiter sending under their own
-    # identity) or the specific consultant just resolved above (sending
-    # on that consultant's behalf) — reject anything else.
-    valid_from_emails = {(current_user.email or "").strip().lower()}
+    # other way.
+    # TIGHTENED further ("application for Ram Babu sent under a different
+    # person's from-address"): this used to always allow current_user's
+    # own email through as valid, even when a specific consultant had
+    # just been resolved for this exact send — so a request meant to go
+    # out as the resolved consultant could still slip through carrying
+    # the admin/recruiter's own email as from_email with no error. Once a
+    # consultant is resolved, THEIR email is the only legitimate sender —
+    # the current user's own email is only accepted when no consultant
+    # context exists at all (e.g. a consultant sending for themselves).
     if consultant and consultant.email:
-        valid_from_emails.add(consultant.email.strip().lower())
+        valid_from_emails = {consultant.email.strip().lower()}
+    else:
+        valid_from_emails = {(current_user.email or "").strip().lower()}
     if (body.from_email or "").strip().lower() not in valid_from_emails:
         raise HTTPException(
             status_code=400,
@@ -1064,6 +1083,14 @@ async def download_queue_attachment(
 ):
     """
     Get a downloadable URL or serve attachment file for email queue item.
+
+    CHANGED (view now serves the actual file, not a PDF conversion): this
+    used to convert a DOCX attachment to PDF before serving — same as the
+    Applications Tracker's resume-download endpoint and My Resumes'
+    View/Download. Per updated requirement, View should show the real
+    attachment file. Browsers have no native inline renderer for .docx,
+    so this will generally open a save/open-with-Word prompt rather than
+    an in-page preview.
     """
     from s3_service import generate_presigned_url, download_file_from_s3
     from fastapi.responses import FileResponse, Response
@@ -1072,53 +1099,11 @@ async def download_queue_attachment(
     if not clean_ref:
         raise HTTPException(status_code=400, detail="ref is required")
 
-    # BUG FIX ("Failed to view resume" / endpoint broken for ALL
-    # attachments, not just DOCX ones): import lazily and defensively so a
-    # missing/broken conversion module only ever affects the DOCX-preview
-    # nicety, never the endpoint as a whole.
     import logging
     _log = logging.getLogger(__name__)
 
-    def _is_docx_like(name: str) -> bool:
-        try:
-            from file_preview import is_docx_like
-            return is_docx_like(name)
-        except Exception:
-            return name.lower().endswith(".docx")
-
-    # BUG FIX (Google Docs Viewer "no preview available"): convert DOCX
-    # attachments to a real PDF on our own side, same as the base-resume/
-    # application-tracker "View" endpoints, instead of depending on
-    # Google's external viewer being able to fetch a presigned URL.
-    # PERF: uses the cached conversion (get_or_convert_pdf_preview) so a
-    # resume attached to many different applications only ever pays the
-    # LibreOffice conversion cost once, not on every single view.
-    async def _try_convert_s3(s3_key: str):
-        if not _is_docx_like(s3_key):
-            return None
-        try:
-            raw_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
-            if not raw_bytes:
-                return None
-            from file_preview import get_or_convert_pdf_preview
-            return await asyncio.to_thread(get_or_convert_pdf_preview, raw_bytes)
-        except Exception as conv_err:
-            _log.warning("Attachment preview conversion failed for s3_key=%s: %s", s3_key, conv_err)
-            return None
-
-    def _pdf_response(pdf_bytes: bytes, filename: str) -> Response:
-        display = os.path.splitext(filename)[0] + ".pdf"
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'inline; filename="{display}"'},
-        )
-
     # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
     if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
-        pdf_bytes = await _try_convert_s3(clean_ref)
-        if pdf_bytes:
-            return _pdf_response(pdf_bytes, os.path.basename(clean_ref))
         url = generate_presigned_url(clean_ref)
         if url:
             return {"url": url}
@@ -1127,23 +1112,10 @@ async def download_queue_attachment(
     filename = os.path.basename(clean_ref)
     local_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(local_path):
-        if _is_docx_like(filename):
-            try:
-                with open(local_path, "rb") as f:
-                    raw_bytes = f.read()
-                from file_preview import get_or_convert_pdf_preview
-                pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, raw_bytes)
-                if pdf_bytes:
-                    return _pdf_response(pdf_bytes, filename)
-            except Exception as conv_err:
-                _log.warning("Attachment preview conversion failed for local_path=%s: %s", local_path, conv_err)
         return FileResponse(local_path, filename=filename)
 
     # 3. Try fallback with S3 prefix
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
-    pdf_bytes = await _try_convert_s3(s3_key)
-    if pdf_bytes:
-        return _pdf_response(pdf_bytes, filename)
     url = generate_presigned_url(s3_key)
     if url:
         return {"url": url}

@@ -765,6 +765,12 @@ async def update_own_profile(
     })
     current_user.resume_info = existing_info
 
+    # Regenerate base_resume_text right away — matching_router.py and the
+    # completeness check both read it, and neither should have to wait
+    # for a manual visit to the Base Resume editor to see this save.
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
+
     await db.commit()
     await db.refresh(consultant)
 
@@ -886,6 +892,9 @@ async def update_consultant_by_id(
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
+
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
 
     await db.commit()
     await db.refresh(consultant)
@@ -1226,6 +1235,11 @@ async def create_experience(
         sort_order=0,
     )
     db.add(exp)
+    await db.flush()
+
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
+
     await db.commit()
     await db.refresh(exp)
     return _exp_to_response(exp)
@@ -1269,6 +1283,9 @@ async def update_experience(
     exp.achievements = payload.achievements
     exp.sort_order = payload.sortOrder
 
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
+
     await db.commit()
     await db.refresh(exp)
     return _exp_to_response(exp)
@@ -1297,7 +1314,11 @@ async def delete_experience(
     if not exp:
         raise HTTPException(404, "Experience entry not found")
 
-    await db.delete(exp)
+        await db.delete(exp)
+
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
+
     await db.commit()
 
 
@@ -1332,6 +1353,12 @@ async def reorder_experience(
             )
             .values(sort_order=idx)
         )
+
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
+
+    from resume_router import sync_base_resume_text
+    await sync_base_resume_text(db, consultant)
 
     await db.commit()
     return {"message": f"Reordered {len(payload.orderedIds)} entries"}

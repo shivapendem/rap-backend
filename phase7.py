@@ -952,44 +952,16 @@ async def download_application_resume(
     # same-origin endpoint; the default (view) keeps using a presigned URL
     # when one is available, falling back to streaming only if presigning
     # itself fails.
+    # CHANGED (view now serves DOCX, not a PDF conversion): this used to
+    # convert an S3-stored .docx to PDF before serving, specifically so
+    # the browser's built-in PDF viewer could render it inline. Per
+    # updated requirement, View should show the actual DOCX file — same
+    # as the fix already applied to My Resumes' View/Download. Browsers
+    # have no native inline renderer for .docx, so this will generally
+    # open a save/open-with-Word prompt in the new tab rather than an
+    # in-page preview; that's an inherent browser limitation, not a bug.
     if s3_key:
         if not force_stream:
-            # BUG FIX (Google Docs Viewer "no preview available"): a
-            # presigned URL isn't guaranteed to render in Google's
-            # external viewer even when it's perfectly valid and
-            # reachable. Convert to a real PDF on our own side first —
-            # same conversion already used for tailored resume generation
-            # — so View relies on nothing but the browser's built-in PDF
-            # viewer, not a third-party service's ability to fetch our URL.
-            is_docx = filename.lower().endswith(".docx") or media_type == (
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-            if is_docx:
-                # BUG FIX ("Failed to view resume" hard failure): a
-                # missing/broken conversion module or environment issue
-                # (e.g. file_preview.py absent, LibreOffice not installed)
-                # previously propagated as an unhandled exception here —
-                # a 500 the frontend surfaces as "Failed to view resume"
-                # with no fallback. Converting is a nicety, not the only
-                # way to view the file; any failure here should fall
-                # through to the presigned-URL path below, never block it.
-                try:
-                    from s3_service import download_file_from_s3 as _dl
-                    raw_bytes, _ = await asyncio.to_thread(_dl, s3_key)
-                    if raw_bytes:
-                        from file_preview import get_or_convert_pdf_preview
-                        pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, raw_bytes)
-                        if pdf_bytes:
-                            return Response(
-                                content=pdf_bytes,
-                                media_type="application/pdf",
-                                headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
-                            )
-                except Exception as conv_err:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "Resume preview conversion failed for s3_key=%s: %s", s3_key, conv_err
-                    )
             from s3_service import generate_presigned_url
             presigned = generate_presigned_url(s3_key)
             if presigned:
@@ -999,24 +971,6 @@ async def download_application_resume(
     else:
         with open(local_path, "rb") as f:
             body_bytes = f.read()
-        is_docx = filename.lower().endswith(".docx") or media_type == (
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-        if is_docx and not force_stream:
-            try:
-                from file_preview import get_or_convert_pdf_preview
-                pdf_bytes = await asyncio.to_thread(get_or_convert_pdf_preview, body_bytes)
-                if pdf_bytes:
-                    return Response(
-                        content=pdf_bytes,
-                        media_type="application/pdf",
-                        headers={"Content-Disposition": f'inline; filename="{Path(filename).stem}.pdf"'},
-                    )
-            except Exception as conv_err:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "Resume preview conversion failed for local_path=%s: %s", local_path, conv_err
-                )
 
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")

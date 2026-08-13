@@ -182,7 +182,7 @@ def build_signature_html(
         f'<div style="margin-top:8px;"><a href="{esc(linkedin_url)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(linkedin_url)}</a></div>'
         if linkedin_url else ""
     )
-    title_html = f'<div style="font-style:italic;color:#334155;margin-top:2px;">{esc(title)}</div>' if title else ""
+    title_html = f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(title)}</div>' if title else ""
 
     # Employer Details — a visually distinct card identifying the
     # recruiter actually handling this consultant (see permission_service.
@@ -205,10 +205,18 @@ def build_signature_html(
             f'<div style="margin-top:8px;"><a href="{esc(employer_linkedin_url)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(employer_linkedin_url)}</a></div>'
             if employer_linkedin_url else ""
         )
-        employer_title_html = f'<div style="font-style:italic;color:#334155;margin-top:2px;">{esc(employer_title)}</div>' if employer_title else ""
+        # CHANGED: smaller than the name above it (was inheriting the
+        # table's 13px, same size as the name) so it reads as a
+        # subordinate label, not competing with it.
+        employer_title_html = f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(employer_title)}</div>' if employer_title else ""
 
+        # CHANGED: was a distinct small-caps uppercase label style
+        # (11px, bold, letter-spacing) — now matches "Best regards,"
+        # below exactly (same font-size, weight, color, and the same
+        # margin-top, so the gap above both reads the same too),
+        # per updated design.
         employer_block_html = f"""
-<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">Employer Details:</div>
+<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#1e293b;margin-top:12px;">Employer Details:</div>
 <table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;margin-bottom:16px;">
   <tr>
     <td style="vertical-align:top;padding-right:20px;">
