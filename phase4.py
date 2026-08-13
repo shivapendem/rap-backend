@@ -558,6 +558,7 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                 existing.match_reason = result["match_reason"]
                 await db.flush()
 
+
         assignment_count += 1
 
     # BUG FIX: match_requirement() upserted rows into

@@ -485,6 +485,36 @@ Extract the JSON now."""
         return _normalize_resume_data(fallback, {}), {}, None
 
 
+def _build_factual_career_objective(resume_info: dict, real_skills: list, job_description: str) -> str:
+    """Constructs a plain, factual career-objective sentence from only real
+    profile data (years of experience, real skills) — used when there's no
+    stored summary AND the AI call itself failed (so there's no real
+    tailored objective either). Never invents a job title, employer, or
+    achievement the profile doesn't actually have; only states facts
+    already present in resume_info, same anti-fabrication rule the rest of
+    this fallback already follows.
+    """
+    years = resume_info.get("years_experience") or resume_info.get("total_experience_years")
+    top_skills = [s for s in (real_skills or []) if s][:5]
+
+    years_str = None
+    if years not in (None, ""):
+        try:
+            years_num = float(years)
+            years_str = f"{years_num:.0f}+ years" if years_num == int(years_num) else f"{years_num}+ years"
+        except (TypeError, ValueError):
+            years_str = None
+
+    parts = [f"Technology professional with {years_str} of experience" if years_str else "Technology professional"]
+    if top_skills:
+        parts.append(f"skilled in {', '.join(top_skills)}")
+    objective = " ".join(parts) + "."
+
+    if job_description and job_description.strip() and job_description.strip().lower() != "general role":
+        objective += " Seeking to apply this background to the requirements outlined in the target job description."
+    return objective
+
+
 def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
     """
     Calls Anthropic API to generate a structured JSON resume based on resume_info and job_description.
@@ -516,6 +546,19 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
         or resume_info.get("tech_stack", {}).get("intermediate", [])
         or []
     )
+    # BUG FIX ("career objective missing" — reported for a candidate whose
+    # DB profile has no stored summary field): when there's no summary to
+    # pass through AND the code has reached this fallback (meaning the
+    # real AI call — which would otherwise generate a genuinely tailored
+    # objective — failed or is unavailable), real_summary used to just
+    # stay "" and the Career Objective section vanished entirely (the
+    # frontend only renders it when non-empty). Build a plain, factual
+    # sentence from data that IS real (years of experience, actual
+    # skills) instead of leaving it blank — still never invents a title,
+    # employer, or achievement, consistent with this fallback's existing
+    # no-fabrication rule.
+    if not real_summary:
+        real_summary = _build_factual_career_objective(resume_info, real_skills, job_description)
     # TECHNICAL PROFICIENCIES table: prefer resume_info's own categorized
     # list if it has one, otherwise build one from the full tech_stack
     # (expert + exposure/intermediate + familiar tiers merged) so the

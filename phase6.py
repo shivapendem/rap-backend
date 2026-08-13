@@ -528,7 +528,7 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     if resume_data.get("email"):
         contact_parts.append(resume_data["email"])
     if resume_data.get("phone"):
-        contact_parts.append(f"Mobile. No: {resume_data['phone']}")
+        contact_parts.append(f"Contact: {resume_data['phone']}")
     if resume_data.get("location"):
         contact_parts.append(resume_data["location"])
     if resume_data.get("linkedin"):
