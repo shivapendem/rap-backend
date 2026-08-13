@@ -136,14 +136,29 @@ CRITICAL STANDARDS & INSTRUCTIONS:
    - PERSONAL DETAILS (Father's name, DOB, languages known, permanent address, desired work location)
    - DECLARATION (Formal declaration text, place, name)
 
-2. DYNAMIC TARGET ROLE ALIGNMENT (TARGET 80% MATCH):
-   - Analyze the provided Job Description to identify the target job title and core required skills.
-   - Tailor the Candidate's Career Objective and terminology to closely mirror the Job Description, targeting approximately an 80% match rate with the JD keywords.
-   - Strategically align experience role titles (`role`) and bullet points so they reflect the target domain while keeping authentic company names and dates.
+2. CAREER OBJECTIVE GENERATION — FOLLOW THIS EXACT PROCESS FOR EVERY JD:
+   The candidate's provided profile data is the source of truth for the Career Objective, exactly as it is for every other section. It must be freshly written for THIS specific JD every single time — never reuse or lightly reword a previous objective, and never simply copy the candidate's existing summary/objective text if one was provided as background; treat it only as source material to rewrite from, not text to preserve.
 
-3. DETAILED CONTEXT & STRICT TRUTHFULNESS:
+   Step 1 — Identify the Target Role: extract the primary role/title from the CURRENT job description (e.g. "Java Full Stack Developer", "Senior Data Analyst", "React Developer"). The objective must target this role specifically.
+
+   Step 2 — Analyze the Current JD: identify the most important role requirements, technical skills, programming languages, frameworks, tools, cloud technologies, database technologies, responsibilities, domain requirements, and experience requirements. Prioritize whichever of these matter most for this specific role.
+
+   Step 3 — Analyze the candidate's actual profile data (the single source of truth): current/previous roles, years of experience, technical skills, frameworks, tools, projects, responsibilities, domain experience, achievements, certifications — only what is actually present.
+
+   Step 4 — Match profile against Current JD: find the strongest verified overlap, prioritizing in this order — (1) Target Role, (2) Relevant Experience, (3) Core Technical Skills, (4) Frameworks/Tools, (5) Relevant Responsibilities, (6) Domain Experience. Use only the strongest VERIFIED matches.
+
+   Step 5 — Generate a NEW Career Objective for this JD: 50–100 words (60–80 preferred), ATS-friendly, naturally incorporating verified JD keywords, clearly targeting the JD role, professional and natural in tone. Do not simply copy sentences from the JD — understand it and incorporate relevant requirements naturally. Avoid keyword stuffing, generic filler statements, and unsupported claims.
+
+   80% MATCHING RULE: target approximately 80% relevance to the JD — but this is a target, never a reason to fabricate. Only use skills, experience, technologies, responsibilities, projects, and achievements the candidate's actual profile supports. If the JD wants a skill the profile doesn't have: do NOT claim it, do NOT add it to the objective, do NOT invent experience with it, do NOT inflate years of experience.
+     Example — JD wants: Java, Spring Boot, AWS, Kubernetes. Profile has: Java, Spring Boot, Microservices.
+     Correct: "Experienced Java developer with expertise in Spring Boot and microservices, seeking to contribute strong backend development skills to scalable application projects."
+     Incorrect: "Experienced Java developer with expertise in Spring Boot, microservices, AWS, and Kubernetes." — AWS and Kubernetes aren't supported by the profile and must not be claimed.
+
+   Also strategically align experience role titles (`role`) and bullet points so they reflect the target domain while keeping authentic company names and dates unchanged.
+
+3. DETAILED CONTEXT & STRICT TRUTHFULNESS (applies to every section, not just Career Objective):
    - Generate detailed bullet points following: [Action Verb] + [Specific Tech Stack / Frameworks] + [Business / System Context] + [Quantified Impact Metric].
-   - **CRITICAL**: Maintain strict accuracy of the candidate's actual experience. Do NOT invent fake projects, clients, skills, or hallucinate arbitrary metrics. Only include metrics if they are reasonably derived from the provided profile. If a JD skill is entirely absent from the candidate's history, mark it as missing; do not fabricate experience with it. Do NOT add false or unsupported experience simply to force a higher match percentage.
+   - **CRITICAL**: Maintain strict accuracy of the candidate's actual experience. Do NOT invent fake projects, clients, skills, or hallucinate arbitrary metrics. Only include metrics if they are reasonably derived from the provided profile. If a JD skill is entirely absent from the candidate's history, mark it as missing; do not fabricate experience with it. Do NOT add false or unsupported experience simply to force a higher match percentage. Truthfulness always outranks JD matching, which always outranks keyword optimization.
 
 4. KEYWORD MARKDOWN BOLDING (`**text**`):
    - Wrap key technical terms, framework names, target role titles, tools, and metrics in markdown bold tags (`**term**`).
@@ -156,7 +171,7 @@ Return EXACTLY this JSON structure with no markdown code fences:
   "location": "string",
   "linkedin": "string",
   "github": "string",
-  "career_objective": "string (Rich tailored objective with **bolded keywords**)",
+  "career_objective": "string (60-80 words preferred, 50-100 word range, freshly written for THIS JD per the process above, with **bolded keywords**)",
   "summary": "string",
   "technical_proficiencies": [
     {"category": "Programming Languages", "skills": ["C", "C++", "Java", "Python", "SQL"]},

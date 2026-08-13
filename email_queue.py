@@ -1410,7 +1410,20 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                         client_id = os.getenv("GOOGLE_CLIENT_ID")
                         client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
                         if client_id and client_secret:
-                            async with httpx.AsyncClient() as client:
+                            # BUG FIX (Cloudflare "invalid or incomplete
+                            # response" / origin timeout): this had no
+                            # explicit timeout at all, relying on httpx's
+                            # default — under load, or if Google's token
+                            # endpoint is slow, this call (plus the PDF
+                            # conversion and Gmail API call that follow it,
+                            # all now synchronous within a single request —
+                            # see the BUG FIX above this function) could run
+                            # long enough to blow past the proxy's timeout,
+                            # which drops the connection before this server
+                            # ever sends a response. A short, explicit
+                            # timeout means a hung/slow OAuth call fails
+                            # fast and cleanly instead.
+                            async with httpx.AsyncClient(timeout=15.0) as client:
                                 res = await client.post(
                                     "https://oauth2.googleapis.com/token",
                                     data={
@@ -1429,7 +1442,31 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                                     email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
                                     await session.commit()
                                 else:
-                                    raise ValueError(f"Failed to refresh OAuth token: status={res.status_code} body={res.text}")
+                                    # BUG FIX ("reactivated the user, then
+                                    # applying auto-deactivates them again"):
+                                    # this ValueError's message is what the
+                                    # auto-deauthorize check further below
+                                    # matches against ("invalid_grant",
+                                    # "unauthorized", "401", etc.) — a
+                                    # revoked/expired refresh token (which
+                                    # can happen while a user sits
+                                    # deactivated for a while, independent
+                                    # of the User Management authorized/
+                                    # unauthorized flag) reliably reproduces
+                                    # Google's real "invalid_grant" error
+                                    # here. Re-authorizing the USER record
+                                    # doesn't reconnect Gmail, so every
+                                    # subsequent apply attempt hits this
+                                    # same dead token and gets deauthorized
+                                    # again — an admin needs a message that
+                                    # actually says so, not a bare status
+                                    # code and response body.
+                                    raise ValueError(
+                                        f"Gmail authorization has expired or was revoked for this consultant "
+                                        f"(refresh_token rejected: status={res.status_code} body={res.text}). "
+                                        f"Reactivating the user account alone will not fix this — the consultant "
+                                        f"needs to reconnect their Gmail account before applying again."
+                                    )
                 else:
                     access_token = decrypt_token(email_tok.access_token_encrypted)
 

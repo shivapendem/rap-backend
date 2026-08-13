@@ -697,7 +697,16 @@ async def list_resumes(
                 select(Consultant).where(Consultant.user_id == base_target_user_id)
             )).scalar_one_or_none()
 
-            if base_consultant and base_consultant.base_resume_file_path:
+              # FEATURE CHANGE: base resume is now generated from the
+            # profile (see sync_base_resume_text in this file, called by
+            # phase3.py on every profile/experience save) rather than
+            # uploaded — base_resume_file_path is a legacy field from the
+            # old upload flow and stays NULL forever for every consultant
+            # going forward, so gating on it alone hid this card for
+            # everyone. Show it whenever the consultant profile exists at
+            # all; an empty/just-started profile still has a valid (if
+            # sparse) generated resume to view/edit.
+            if base_consultant:
                 base_ts = base_consultant.updated_at or datetime.now(timezone.utc)
                 response_data.insert(0, ResumeResponse(
                     id=-1,
