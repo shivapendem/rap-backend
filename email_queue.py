@@ -1395,7 +1395,38 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     cons = cons_res.scalars().first()
                     if cons:
                         tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
-                        email_tok = tok_res.scalars().first()
+                        candidate_tok = tok_res.scalars().first()
+                        # BUG FIX ("email sent from an unrelated staff
+                        # member's real Gmail account instead of the
+                        # intended consultant" — e.g. Ram Babu's
+                        # application arriving from Jashwanth's inbox):
+                        # this fallback used to trust whatever token row
+                        # was linked to consultant_id with no check that
+                        # its own email_address actually matches
+                        # item.from_email. A mislinked/corrupted token row
+                        # (saved under the wrong consultant_id at
+                        # OAuth-connect time) was silently accepted and
+                        # used to authenticate the send — Gmail then sends
+                        # as whoever that token's real account is,
+                        # regardless of the requested From header, since
+                        # it has no "send as" alias for item.from_email.
+                        # Only use this fallback token when its own
+                        # email_address genuinely matches (or is unset,
+                        # for older rows saved before this column
+                        # existed) — otherwise treat it the same as "no
+                        # token found" rather than sending under the
+                        # wrong identity.
+                        if candidate_tok and (
+                            not candidate_tok.email_address
+                            or candidate_tok.email_address.strip().lower() == (item.from_email or "").strip().lower()
+                        ):
+                            email_tok = candidate_tok
+                        elif candidate_tok:
+                            print(
+                                f"[email-queue debug {item.id}] Refusing mismatched token: "
+                                f"consultant_id={cons.id} token.email_address={candidate_tok.email_address!r} "
+                                f"but item.from_email={item.from_email!r}"
+                            )
 
             if email_tok and email_tok.access_token_encrypted:
                 from datetime import datetime, timezone, timedelta

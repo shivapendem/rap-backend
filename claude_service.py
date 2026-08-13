@@ -500,6 +500,23 @@ Extract the JSON now."""
         return _normalize_resume_data(fallback, {}), {}, None
 
 
+def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str:
+    """Appends a short, factual line naming which of the candidate's real
+    skills overlap with THIS job description — used even when a stored
+    summary already exists, so the Career Objective isn't byte-identical
+    across every different job requirement it's generated for. Same
+    keyword-overlap approach as _build_factual_career_objective, and same
+    rule: only ever names skills the candidate actually has.
+    """
+    if not job_description or job_description.strip().lower() in ("", "general role"):
+        return ""
+    jd_lower = job_description.lower()
+    overlapping = [s for s in (real_skills or []) if s and s.lower() in jd_lower]
+    if not overlapping:
+        return ""
+    return f"This experience directly aligns with the target role's emphasis on {', '.join(overlapping[:5])}."
+
+
 def _build_factual_career_objective(resume_info: dict, real_skills: list, job_description: str) -> str:
     """Constructs a plain, factual career-objective sentence from only real
     profile data (years of experience, real skills) — used when there's no
@@ -508,9 +525,21 @@ def _build_factual_career_objective(resume_info: dict, real_skills: list, job_de
     achievement the profile doesn't actually have; only states facts
     already present in resume_info, same anti-fabrication rule the rest of
     this fallback already follows.
+
+    IMPROVED (still without an LLM call): rather than listing an arbitrary
+    slice of the candidate's skills, this now prioritizes whichever real
+    skills actually appear in the job description text — simple
+    case-insensitive keyword overlap, not fabrication — so the sentence
+    reads as genuinely relevant to THIS job instead of a generic list,
+    even in the no-AI fallback path. Falls back to the candidate's first
+    few skills if none happen to overlap with the JD text.
     """
     years = resume_info.get("years_experience") or resume_info.get("total_experience_years")
-    top_skills = [s for s in (real_skills or []) if s][:5]
+    all_skills = [s for s in (real_skills or []) if s]
+
+    jd_lower = (job_description or "").lower()
+    overlapping = [s for s in all_skills if s.lower() in jd_lower]
+    remaining = [s for s in all_skills if s not in overlapping]
 
     years_str = None
     if years not in (None, ""):
@@ -521,12 +550,21 @@ def _build_factual_career_objective(resume_info: dict, real_skills: list, job_de
             years_str = None
 
     parts = [f"Technology professional with {years_str} of experience" if years_str else "Technology professional"]
-    if top_skills:
-        parts.append(f"skilled in {', '.join(top_skills)}")
+    if overlapping:
+        # These are the skills that actually matter for THIS JD — lead
+        # with them explicitly rather than burying them in a generic list.
+        parts.append(f"directly experienced with {', '.join(overlapping[:5])}")
+        if remaining[:3]:
+            parts.append(f"and additional expertise in {', '.join(remaining[:3])}")
+    elif all_skills:
+        parts.append(f"skilled in {', '.join(all_skills[:5])}")
     objective = " ".join(parts) + "."
 
     if job_description and job_description.strip() and job_description.strip().lower() != "general role":
-        objective += " Seeking to apply this background to the requirements outlined in the target job description."
+        if overlapping:
+            objective += " These skills align closely with the requirements outlined in the target job description."
+        else:
+            objective += " Seeking to apply this background to the requirements outlined in the target job description."
     return objective
 
 
@@ -572,8 +610,27 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
     # skills) instead of leaving it blank — still never invents a title,
     # employer, or achievement, consistent with this fallback's existing
     # no-fabrication rule.
+    #
+    # BUG FIX ("every new requirement should generate a new career
+    # objective — this one is identical to the base resume, and would
+    # stay identical for every other job too"): when resume_info DOES
+    # have a stored summary, this used to pass it through completely
+    # unchanged regardless of which job requirement generation was
+    # running for — so Base Resume and Generated Resume showed the exact
+    # same text, and regenerating for a totally different JD produced
+    # that same frozen text again. The stored summary is kept as the
+    # primary content (it's real, specific, and already states years of
+    # experience), but a short JD-relevance line now gets appended
+    # naming whichever of the candidate's real skills this specific JD
+    # actually asks for — so the objective genuinely varies per
+    # requirement instead of being static, without inventing anything
+    # the stored summary or profile doesn't already support.
     if not real_summary:
         real_summary = _build_factual_career_objective(resume_info, real_skills, job_description)
+    else:
+        addendum = _build_jd_relevance_addendum(real_skills, job_description)
+        if addendum:
+            real_summary = real_summary.rstrip() + " " + addendum
     # TECHNICAL PROFICIENCIES table: prefer resume_info's own categorized
     # list if it has one, otherwise build one from the full tech_stack
     # (expert + exposure/intermediate + familiar tiers merged) so the

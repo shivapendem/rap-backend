@@ -216,7 +216,7 @@ def build_signature_html(
         # margin-top, so the gap above both reads the same too),
         # per updated design.
         employer_block_html = f"""
-<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#1e293b;margin-top:12px;">Employer Details:</div>
+    <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Employer Details:</div>
 <table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;margin-bottom:16px;">
   <tr>
     <td style="vertical-align:top;padding-right:20px;">
@@ -233,7 +233,7 @@ def build_signature_html(
 
     return f"""
 {employer_block_html}
-<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#1e293b;margin-top:12px;">Best regards,</div>
+<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Best regards,</div>
 <table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;">
   <tr>
     <td style="vertical-align:top;padding-right:20px;">

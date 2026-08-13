@@ -546,6 +546,7 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                         matched_skills=result["matched_skills"],
                         missing_skills=result["missing_skills"],
                         match_reason=result["match_reason"],
+                        score_breakdown=result["score_breakdown"],
                         status="ASSIGNED",
                     ))
                 await db.flush()
@@ -662,6 +663,7 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                         matched_skills=result["matched_skills"],
                         missing_skills=result["missing_skills"],
                         match_reason=result["match_reason"],
+                        score_breakdown=result["score_breakdown"],
                         status="ASSIGNED",
                     ))
                 await db.flush()
