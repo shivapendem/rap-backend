@@ -542,9 +542,14 @@ def extract_skills(text: str) -> List[str]:
     """Extract skills from text as a list."""
     if not text:
         return []
+        
+    # Restrict to first 1500 chars to avoid extracting generic skills from recruiter boilerplates
+    # which makes the matching too broad.
+    text_scope = text[:1500]
+    
     skills_text = None
     for pattern in SKILLS_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text_scope, re.IGNORECASE)
         if match:
             skills_text = match.group(1).strip()
             stop_match = STOP_PATTERN.search(skills_text)

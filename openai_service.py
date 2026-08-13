@@ -32,14 +32,14 @@ CRITICAL STANDARDS & INSTRUCTIONS:
    - PERSONAL DETAILS (Father's name, DOB, languages known, permanent address, desired work location)
    - DECLARATION (Formal declaration text, place, name)
 
-2. DYNAMIC TARGET ROLE ALIGNMENT:
-   - Identify the target job title from the Job Description (e.g. "DevOps Engineer", "Applications Developer", "Game Programmer", "Full-Stack Developer").
-   - Align the Candidate's Career Objective to start explicitly with this Target Role Title.
-   - Strategically align experience role titles (`role`) so they reflect the target domain while keeping authentic company names and dates.
+2. DYNAMIC TARGET ROLE ALIGNMENT (TARGET 80% MATCH):
+   - Analyze the provided Job Description to identify the target job title and core required skills.
+   - Tailor the Candidate's Career Objective and terminology to closely mirror the Job Description, targeting approximately an 80% match rate with the JD keywords.
+   - Strategically align experience role titles (`role`) and bullet points so they reflect the target domain while keeping authentic company names and dates.
 
-3. DETAILED CONTEXT & HIGH-IMPACT BULLETS:
+3. DETAILED CONTEXT & STRICT TRUTHFULNESS:
    - Generate detailed bullet points following: [Action Verb] + [Specific Tech Stack / Frameworks] + [Business / System Context] + [Quantified Impact Metric].
-   - Include realistic high-impact metrics (e.g. "10K+ suppliers", "$5M revenue", "sub-25ms latency", "40% database load reduction", "60% deployment reduction", "99.9% uptime").
+   - **CRITICAL**: Maintain strict accuracy of the candidate's actual experience. Do NOT invent fake projects, clients, skills, or hallucinate arbitrary metrics. Only include metrics if they are reasonably derived from the provided profile. If a JD skill is entirely absent from the candidate's history, mark it as missing; do not fabricate experience with it. Do NOT add false or unsupported experience simply to force a higher match percentage.
 
 4. KEYWORD MARKDOWN BOLDING (`**text**`):
    - Wrap key technical terms, framework names, target role titles, tools, and metrics in markdown bold tags (`**term**`).

@@ -115,9 +115,11 @@ def clean_requirement_text(text: str) -> str:
     for pattern in NOISE_PATTERNS:
         text = re.sub(pattern, "", text)
 
-    # Normalize whitespace only (do NOT rewrite content)
-    text = re.sub(r'\n{3,}', '\n\n', text)  # max 2 newlines
-    text = re.sub(r' {2,}', ' ', text)       # max 1 space
+    # Normalize whitespace
+    text = re.sub(r'[ \t]+\n', '\n', text)   # remove trailing spaces
+    text = re.sub(r'\n[ \t]+', '\n', text)   # remove leading spaces
+    text = re.sub(r'\n{2,}', '\n', text)     # replace multiple newlines with a single newline (no empty lines)
+    text = re.sub(r' {2,}', ' ', text)       # max 1 space between words
     text = text.strip()
 
     return text.replace("\x00", "").replace("\u0000", "")

@@ -221,7 +221,11 @@ async def create_email_queue(
         if body.consultant_id:
             # Admin provided consultant_id explicitly — verify it exists
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.id == body.consultant_id,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if not consultant:
@@ -230,7 +234,11 @@ async def create_email_queue(
         else:
             # Admin didn't provide consultant_id — try to resolve from user's email
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.email == current_user.email)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.email == current_user.email,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if consultant:
@@ -238,7 +246,10 @@ async def create_email_queue(
             else:
                 # Fallback: pick first active consultant
                 cons_result = await db.execute(
-                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                        Consultant.status == "ACTIVE",
+                        User.is_authorized == True
+                    ).limit(1)
                 )
                 consultant = cons_result.scalars().first()
                 if not consultant:
@@ -248,7 +259,11 @@ async def create_email_queue(
         # Recruiter: same logic — try to resolve or fallback
         if body.consultant_id:
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.id == body.consultant_id,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if not consultant:
@@ -256,14 +271,21 @@ async def create_email_queue(
             consultant_id = consultant.id
         else:
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.email == current_user.email)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.email == current_user.email,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if consultant:
                 consultant_id = consultant.id
             else:
                 cons_result = await db.execute(
-                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                        Consultant.status == "ACTIVE",
+                        User.is_authorized == True
+                    ).limit(1)
                 )
                 consultant = cons_result.scalars().first()
                 if not consultant:
@@ -272,7 +294,11 @@ async def create_email_queue(
     else:
         # Consultant: resolve from logged-in user
         cons_result = await db.execute(
-            sa_select(Consultant).where(Consultant.user_id == current_user.id)
+            sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                Consultant.user_id == current_user.id,
+                Consultant.status == "ACTIVE",
+                User.is_authorized == True
+            )
         )
         consultant = cons_result.scalars().first()
         consultant_id = consultant.id if consultant else body.consultant_id
@@ -322,14 +348,12 @@ async def create_email_queue(
         # CONSULTANT applying for themselves — CC their recruiter.
         final_cc = recruiter_email
     elif (
-        current_user.role == "ADMIN"
+        current_user.role in ("ADMIN", "RECRUITER")
         and recruiter_email
         and recruiter_email.strip().lower() not in final_cc.strip().lower()
     ):
-        # FEATURE CHANGE: admin applying on the consultant's behalf now
-        # CCs both the admin (who sent it) AND the consultant's assigned
-        # recruiter — previously only the admin was CC'd here, since this
-        # block only ever fired for the self-apply case above.
+        # FEATURE CHANGE: admin or recruiter applying on the consultant's behalf now
+        # CCs both the sender AND the consultant's assigned recruiter.
         final_cc = f"{final_cc},{recruiter_email}"
     # RECRUITER applying on behalf: final_cc already equals the
     # recruiter's own email (current_user.email, set by default above) —
@@ -644,7 +668,11 @@ async def send_email_now(
     if current_user.role == "ADMIN":
         if body.consultant_id:
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.id == body.consultant_id,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if not consultant:
@@ -652,14 +680,21 @@ async def send_email_now(
             consultant_id = consultant.id
         else:
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.email == current_user.email)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.email == current_user.email,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if consultant:
                 consultant_id = consultant.id
             else:
                 cons_result = await db.execute(
-                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                        Consultant.status == "ACTIVE",
+                        User.is_authorized == True
+                    ).limit(1)
                 )
                 consultant = cons_result.scalars().first()
                 if not consultant:
@@ -668,7 +703,11 @@ async def send_email_now(
     elif current_user.role == "RECRUITER":
         if body.consultant_id:
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.id == body.consultant_id)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.id == body.consultant_id,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if not consultant:
@@ -676,14 +715,21 @@ async def send_email_now(
             consultant_id = consultant.id
         else:
             cons_result = await db.execute(
-                sa_select(Consultant).where(Consultant.email == current_user.email)
+                sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                    Consultant.email == current_user.email,
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True
+                )
             )
             consultant = cons_result.scalars().first()
             if consultant:
                 consultant_id = consultant.id
             else:
                 cons_result = await db.execute(
-                    sa_select(Consultant).where(Consultant.status == "ACTIVE").limit(1)
+                    sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                        Consultant.status == "ACTIVE",
+                        User.is_authorized == True
+                    ).limit(1)
                 )
                 consultant = cons_result.scalars().first()
                 if not consultant:
@@ -691,7 +737,11 @@ async def send_email_now(
                 consultant_id = consultant.id
     else:
         cons_result = await db.execute(
-            sa_select(Consultant).where(Consultant.user_id == current_user.id)
+            sa_select(Consultant).join(User, User.id == Consultant.user_id).where(
+                Consultant.user_id == current_user.id,
+                Consultant.status == "ACTIVE",
+                User.is_authorized == True
+            )
         )
         consultant = cons_result.scalars().first()
         consultant_id = consultant.id if consultant else body.consultant_id
@@ -741,14 +791,12 @@ async def send_email_now(
         # CONSULTANT applying for themselves — CC their recruiter.
         final_cc = recruiter_email
     elif (
-        current_user.role == "ADMIN"
+        current_user.role in ("ADMIN", "RECRUITER")
         and recruiter_email
         and recruiter_email.strip().lower() not in final_cc.strip().lower()
     ):
-        # FEATURE CHANGE: admin applying on the consultant's behalf now
-        # CCs both the admin (who sent it) AND the consultant's assigned
-        # recruiter — previously only the admin was CC'd here, since this
-        # block only ever fired for the self-apply case above.
+        # FEATURE CHANGE: admin or recruiter applying on the consultant's behalf now
+        # CCs both the sender AND the consultant's assigned recruiter.
         final_cc = f"{final_cc},{recruiter_email}"
     # RECRUITER applying on behalf: final_cc already equals the
     # recruiter's own email (current_user.email, set by default above) —

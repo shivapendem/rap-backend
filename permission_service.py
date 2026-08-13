@@ -21,11 +21,15 @@ async def resolve_apply_consultant(
     - RECRUITER  → must specify consultant_id from their assigned list
     - ADMIN      → can specify any consultant_id
     """
-    from models import Consultant, RecruiterConsultant
+    from models import Consultant, RecruiterConsultant, User
 
     if current_user.role == "CONSULTANT":
         result = await db.execute(
-            select(Consultant).where(Consultant.user_id == current_user.id)
+            select(Consultant).join(User, User.id == Consultant.user_id).where(
+                Consultant.user_id == current_user.id,
+                Consultant.status == "ACTIVE",
+                User.is_authorized == True
+            )
         )
         consultant = result.scalars().first()
         if not consultant:
@@ -54,7 +58,11 @@ async def resolve_apply_consultant(
                 detail="You are not assigned to this consultant.",
             )
         result = await db.execute(
-            select(Consultant).where(Consultant.id == consultant_id)
+            select(Consultant).join(User, User.id == Consultant.user_id).where(
+                Consultant.id == consultant_id,
+                Consultant.status == "ACTIVE",
+                User.is_authorized == True
+            )
         )
         consultant = result.scalars().first()
         if not consultant:
@@ -68,7 +76,11 @@ async def resolve_apply_consultant(
                 detail="Admin must specify consultant_id.",
             )
         result = await db.execute(
-            select(Consultant).where(Consultant.id == consultant_id)
+            select(Consultant).join(User, User.id == Consultant.user_id).where(
+                Consultant.id == consultant_id,
+                Consultant.status == "ACTIVE",
+                User.is_authorized == True
+            )
         )
         consultant = result.scalars().first()
         if not consultant:

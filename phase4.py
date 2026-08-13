@@ -164,36 +164,62 @@ def score_role(
     experiences: Optional[List[ConsultantExperience]] = None,
 ) -> float:
     """
-    Role title token overlap — simple word-set comparison.
+    Role title token overlap — smarter token-based comparison.
 
-    BUG FIX: previously only compared against consultant.preferred_roles,
-    an optional free-text profile field that's rarely filled in — meaning
-    this factor silently scored 0 for nearly every consultant, dragging
-    every match's total below MATCH_THRESHOLD regardless of actual fit.
-    Now also pulls comparison tokens from the consultant's real job
-    titles (ConsultantExperience.role_title), which is populated far
-    more reliably than the preference field.
+    BUG FIX: filters out punctuation and common noise words (e.g. 'remote', 'senior',
+    'contract') from the requirement role so that a consultant doesn't get heavily
+    penalized just because the JD title string was noisy (e.g. "Sr. Java Developer
+    (Remote) - 6 months" vs "Java Developer").
     """
     if not requirement_role:
         return 0.0
 
-    req_tokens = set(requirement_role.lower().split())
+    # Clean punctuation and split
+    req_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', requirement_role).lower()
+    raw_req_tokens = set(req_clean.split())
+    
+    # Filter noise for the denominator
+    noise_words = {
+        "remote", "onsite", "hybrid", "contract", "months", "years", "w2", "c2c",
+        "c2h", "h1b", "urgently", "urgent", "hiring", "immediate", "sr", "senior",
+        "jr", "junior", "mid", "level", "role", "position"
+    }
+    req_tokens = {t for t in raw_req_tokens if t not in noise_words and not t.isdigit() and len(t) > 1}
+    
+    if not req_tokens:
+        req_tokens = raw_req_tokens # Fallback if everything was noise
+        
     if not req_tokens:
         return 0.0
 
     pref_tokens = set()
     if consultant_preferred_roles:
-        pref_tokens |= set(consultant_preferred_roles.lower().replace(",", " ").split())
+        t_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', consultant_preferred_roles).lower()
+        pref_tokens |= set(t_clean.split())
     if experiences:
         for exp in experiences:
             if exp.role_title:
-                pref_tokens |= set(exp.role_title.lower().split())
+                t_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', exp.role_title).lower()
+                pref_tokens |= set(t_clean.split())
 
     if not pref_tokens:
         return 0.0
 
     overlap = req_tokens & pref_tokens
-    return round((len(overlap) / len(req_tokens)) * 100, 2)
+    
+    # Calculate ratio against meaningful tokens
+    ratio = len(overlap) / len(req_tokens)
+    
+    # Boost: if they matched the core technology (e.g. "java", "developer") which is usually 1-2 words.
+    # If they match 2+ tokens, it's usually a solid match.
+    if len(overlap) >= 2 and ratio < 0.8:
+        ratio = min(1.0, ratio + 0.3) # 30% boost for matching multiple core tokens
+        
+    # If it's a 1-token requirement and they matched it
+    if len(req_tokens) == 1 and len(overlap) == 1:
+        ratio = 1.0
+
+    return round(ratio * 100, 2)
 
 
 def _calculate_total_experience_years(experiences: List[ConsultantExperience]) -> float:
@@ -348,7 +374,24 @@ def score_match(
       skill 40%, role 20%, experience 15%, employment 10%, location 10%, auth 5%
     Returns dict with total score, breakdown, matched/missing skills, and reason.
     """
-    requirement_skills = extract_skills(requirement.job_description)
+    # Prioritize tightly scoped skills extracted by parser.py (if any)
+    requirement_skills = []
+    if requirement.parsed_fields and requirement.parsed_fields.get("skills"):
+        raw_skills = requirement.parsed_fields.get("skills")
+        # Map raw extracted skills to canonical names
+        canonical_req = set()
+        for raw_skill in raw_skills:
+            lower = str(raw_skill).lower()
+            for canonical, aliases in SKILL_ALIASES.items():
+                if any(alias in lower for alias in aliases) or lower == canonical:
+                    canonical_req.add(canonical)
+        requirement_skills = sorted(list(canonical_req))
+        
+    if not requirement_skills:
+        # Fallback: scan JD, but restrict to first 1500 chars to avoid footer spam
+        jd_text = (requirement.job_description or "")[:1500]
+        requirement_skills = extract_skills(jd_text)
+
     consultant_skills = _consultant_skills(consultant)
 
     skill_raw, matched_skills, missing_skills = score_skills(requirement_skills, consultant_skills)
@@ -358,14 +401,20 @@ def score_match(
     location_raw = score_location(requirement, consultant, experiences)
     auth_raw = score_work_auth(requirement, consultant)
 
-    skill_score = skill_raw * 0.40
-    role_score = role_raw * 0.20
-    exp_score = exp_raw * 0.15
-    employment_score = employment_raw * 0.10
+    skill_score = skill_raw * 0.20
+    role_score = role_raw * 0.50
+    exp_score = exp_raw * 0.10
+    employment_score = employment_raw * 0.05
     location_score = location_raw * 0.10
     auth_score = auth_raw * 0.05
 
     total = round(skill_score + role_score + exp_score + employment_score + location_score + auth_score, 2)
+
+    # If the role match is extremely low, penalize the entire match.
+    # We do not want to surface a 70% match just because skills/location match
+    # when the role is completely wrong.
+    if role_raw < 15.0:
+        total = round(total * 0.2, 2)  # 80% penalty for completely missing the role
 
     reason_parts = []
     if matched_skills:

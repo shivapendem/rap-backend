@@ -358,13 +358,7 @@ async def get_email_preview(
         recruiter_email = await get_sales_recruiter_email(db, consultant)
         if recruiter_email:
             cc_email = recruiter_email
-    elif current_user.role == "ADMIN":
-        # Admin applying on the consultant's behalf — CC both the admin
-        # (who's sending it) and the consultant's assigned recruiter, so
-        # the recruiter stays in the loop on an application they didn't
-        # personally send. RECRUITER role needs no extra branch here —
-        # cc_email already defaults to current_user.email above, which is
-        # exactly the recruiter's own address.
+    elif current_user.role in ("ADMIN", "RECRUITER"):
         recruiter_email = await get_sales_recruiter_email(db, consultant)
         if recruiter_email and recruiter_email.lower() != (current_user.email or "").lower():
             cc_email = f"{current_user.email}, {recruiter_email}"
@@ -466,8 +460,7 @@ async def confirm_send(
             recruiter_email = await get_sales_recruiter_email(db, consultant)
             if recruiter_email:
                 cc_email = recruiter_email
-        elif current_user.role == "ADMIN":
-            # Same CC rule as the preview endpoint above — keep in sync.
+        elif current_user.role in ("ADMIN", "RECRUITER"):
             recruiter_email = await get_sales_recruiter_email(db, consultant)
             if recruiter_email and recruiter_email.lower() != (current_user.email or "").lower():
                 cc_email = f"{current_user.email}, {recruiter_email}"
