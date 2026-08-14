@@ -1403,7 +1403,22 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
         # TESTING GUARD: only enforced when EMAIL_QUEUE_TEST_DOMAIN_SUFFIX is
         # actually set (see the module-level guard-fix comment above) — off
         # by default, so real sends to any address go through normally.
-        if EMAIL_QUEUE_TEST_DOMAIN_SUFFIX and not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX):
+        # Per-user override: a specific user with allowed_to_send=True can
+        # send to any real address even while EMAIL_QUEUE_TEST_DOMAIN_SUFFIX
+        # is active for everyone else — lets admin roll out real sending to
+        # individual users first, without lifting the domain guard globally.
+        sender_allowed = False
+        if item.sent_by_user_id:
+            sender_result = await session.execute(
+                select(User.allowed_to_send).where(User.id == item.sent_by_user_id)
+            )
+            sender_allowed = sender_result.scalar_one_or_none() or False
+
+        if (
+            EMAIL_QUEUE_TEST_DOMAIN_SUFFIX
+            and not sender_allowed
+            and not item.to_email.lower().endswith(EMAIL_QUEUE_TEST_DOMAIN_SUFFIX)
+        ):
             print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
             item.status = "FAILED"
             item.status_text = "not test domain for now"

@@ -57,44 +57,18 @@ class User(Base):
     password_hash = Column(Text, nullable=True)
     role = Column(Text, nullable=False)
     is_authorized = Column(Boolean, nullable=False, default=True)
+    allowed_to_send = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     last_login_at = Column(TIMESTAMP(timezone=True), nullable=True)
     needsto_fetch_mail = Column("needto_fetch_mail", Boolean, nullable=False, default=False)
     skills = JSONBColumn(nullable=False, default=list)
-    # Recruiter-facing "Experience (Years)" field on the Users screen. Only
-    # meaningful for RECRUITER-role accounts today, but lives on User (not
-    # Consultant) since it's a recruiter attribute, not a consultant one.
-    # REQUIRES A DB MIGRATION before this is usable against the real
-    # Postgres database — see note at top of phase_users_schema.py.
     experience_years = Column(Numeric, nullable=True)
     resume_info = JSONBColumn(nullable=True)
-    # Admin/Recruiter contact fields — MIGRATION REQUIRED (same as
-    # experience_years above): run against the real Postgres database
-    # before deploying this change:
-    #     ALTER TABLE users ADD COLUMN mobile_number TEXT;
-    #     ALTER TABLE users ADD COLUMN extension TEXT;
-    #     ALTER TABLE users ADD COLUMN linkedin_url TEXT;
     mobile_number = Column(Text, nullable=True)
-    # BUG FIX: the "Extension" field in the admin Add/Edit User UI showed a
-    # company-line prefix (e.g. "+1 469-392-4030") next to the 3-digit
-    # extension, but that prefix was hardcoded frontend text — the field
-    # looked editable but any change to it silently vanished on
-    # save/reload, since only the 3-digit part was ever actually saved.
-    # This column now holds the whole thing as one free-text value (e.g.
-    # "+1 469-392-4030 EXT 123") instead of splitting it into two pieces,
-    # so it's genuinely editable with no separate column/migration needed
-    # beyond what already existed here.
     extension = Column(Text, nullable=True)
     linkedin_url = Column(Text, nullable=True)
-    # Real job title (e.g. "Lead Bench Sales Recruiter"), shown in the
-    # application-email signature instead of the generic role label —
-    # MIGRATION REQUIRED, same as the three columns above:
-    #     ALTER TABLE users ADD COLUMN designation TEXT;
     designation = Column(Text, nullable=True)
-    # Rich HTML email signature for application emails:
-    # MIGRATION REQUIRED:
-    #     ALTER TABLE users ADD COLUMN email_signature TEXT;
     email_signature = Column(Text, nullable=True)
 
     VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
