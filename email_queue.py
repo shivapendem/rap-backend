@@ -785,12 +785,8 @@ async def send_email_now(
     # used for every downstream use of "who is actually sending this" —
     # validation, anti-spam scheduling, and the EmailQueue row itself —
     # so the record accurately reflects who really sent it.
-    fallback_sender_used = bool(
-        consultant
-        and not consultant.gmail_connected
-        and current_user.role in ("ADMIN", "RECRUITER")
-    )
-    effective_from_email = current_user.email if fallback_sender_used else body.from_email
+    # fallback_sender_used logic removed per user request: from should ALWAYS be the applicant email address.
+    effective_from_email = body.from_email
 
     # BUG FIX ("a from address not tied to any real user/consultant row
     # is being used as the sender"): body.from_email was trusted directly
@@ -806,11 +802,8 @@ async def send_email_now(
     # the admin/recruiter's own email as from_email with no error. Once a
     # consultant is resolved, THEIR email is the only legitimate sender —
     # the current user's own email is only accepted when no consultant
-    # context exists at all (e.g. a consultant sending for themselves),
-    # or when the gmail-not-connected fallback above explicitly kicked in.
-    if fallback_sender_used:
-        valid_from_emails = {(current_user.email or "").strip().lower()}
-    elif consultant and consultant.email:
+    # context exists at all (e.g. a consultant sending for themselves).
+    if consultant and consultant.email:
         valid_from_emails = {consultant.email.strip().lower()}
     else:
         valid_from_emails = {(current_user.email or "").strip().lower()}
@@ -1067,17 +1060,12 @@ async def send_email_now(
         "id": str(item.id),
         "status": item.status,
         "scheduled_at": (item.scheduled_at or scheduled_at or now_utc).isoformat(),
-        "message": (
-            f"Email sent successfully via {effective_from_email} — {consultant.full_name if consultant else 'this consultant'} "
-            f"hasn't connected Gmail yet, so this went out from your mailbox on their behalf."
-            if fallback_sender_used else
-            "Email sent successfully."
-        ),
+        "message": "Email sent successfully.",
         # Lets the frontend show a clear "sent as you, not as the
         # consultant" notice instead of the send silently looking
         # identical to a normal consultant-sent application.
         "sent_from": effective_from_email,
-        "fallback_sender_used": fallback_sender_used,
+        "fallback_sender_used": False,
     }
 
 @router.post("/api/consultant/email-queue/upload-attachment")
