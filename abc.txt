@@ -32,488 +32,806 @@ CREATE TABLE IF NOT EXISTS message_templates (
 );
 
 INSERT INTO message_templates (name, content) VALUES
-('Template 1', 'Hello,
+('Software Engineer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on designing scalable applications, writing clean code, and optimizing system performance. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 2', 'Hello,
+('Software Engineer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in designing scalable applications, writing clean code, and optimizing system performance. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 3', 'Hello,
+('Software Engineer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in designing scalable applications, writing clean code, and optimizing system performance. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 4', 'Hello,
+('Software Engineer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on designing scalable applications, writing clean code, and optimizing system performance. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 5', 'Hello,
+('Full Stack Developer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on building end-to-end solutions, bridging frontend user experiences with robust backend architecture. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 6', 'Hello,
+('Full Stack Developer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in building end-to-end solutions, bridging frontend user experiences with robust backend architecture. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 7', 'Hello,
+('Full Stack Developer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in building end-to-end solutions, bridging frontend user experiences with robust backend architecture. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 8', 'Hello,
+('Full Stack Developer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on building end-to-end solutions, bridging frontend user experiences with robust backend architecture. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 9', 'Hello,
+('Backend Developer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on architecting resilient server-side logic, optimizing APIs, and scaling database operations. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 10', 'Hello,
+('Backend Developer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in architecting resilient server-side logic, optimizing APIs, and scaling database operations. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 11', 'Hello,
+('Backend Developer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in architecting resilient server-side logic, optimizing APIs, and scaling database operations. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 12', 'Hello,
+('Backend Developer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on architecting resilient server-side logic, optimizing APIs, and scaling database operations. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 13', 'Hello,
+('Frontend Developer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on crafting responsive, accessible, and highly performant user interfaces. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 14', 'Hello,
+('Frontend Developer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in crafting responsive, accessible, and highly performant user interfaces. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 15', 'Hello,
+('Frontend Developer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in crafting responsive, accessible, and highly performant user interfaces. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 16', 'Hello,
+('Frontend Developer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on crafting responsive, accessible, and highly performant user interfaces. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 17', 'Hello,
+('DevOps Engineer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on streamlining CI/CD pipelines, automating infrastructure, and enhancing deployment reliability. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 18', 'Hello,
+('DevOps Engineer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in streamlining CI/CD pipelines, automating infrastructure, and enhancing deployment reliability. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 19', 'Hello,
+('DevOps Engineer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in streamlining CI/CD pipelines, automating infrastructure, and enhancing deployment reliability. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 20', 'Hello,
+('DevOps Engineer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on streamlining CI/CD pipelines, automating infrastructure, and enhancing deployment reliability. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 21', 'Hello,
+('Cloud Engineer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on architecting secure, scalable, and highly available cloud infrastructure. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 22', 'Hello,
+('Cloud Engineer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in architecting secure, scalable, and highly available cloud infrastructure. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 23', 'Hello,
+('Cloud Engineer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in architecting secure, scalable, and highly available cloud infrastructure. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 24', 'Hello,
+('Cloud Engineer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on architecting secure, scalable, and highly available cloud infrastructure. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 25', 'Hello,
+('Data Engineer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on building robust data pipelines, scaling ETL processes, and optimizing data architecture. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 26', 'Hello,
+('Data Engineer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in building robust data pipelines, scaling ETL processes, and optimizing data architecture. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 27', 'Hello,
+('Data Engineer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in building robust data pipelines, scaling ETL processes, and optimizing data architecture. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 28', 'Hello,
+('Data Engineer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on building robust data pipelines, scaling ETL processes, and optimizing data architecture. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 29', 'Hello,
+('Data Scientist - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on extracting actionable insights, building predictive models, and leveraging statistical analysis. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 30', 'Hello,
+('Data Scientist - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in extracting actionable insights, building predictive models, and leveraging statistical analysis. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 31', 'Hello,
+('Data Scientist - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in extracting actionable insights, building predictive models, and leveraging statistical analysis. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 32', 'Hello,
+('Data Scientist - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on extracting actionable insights, building predictive models, and leveraging statistical analysis. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 33', 'Hello,
+('AI / Machine Learning Engineer - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on designing intelligent algorithms, training robust models, and deploying AI solutions. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 34', 'Hello,
+('AI / Machine Learning Engineer - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in designing intelligent algorithms, training robust models, and deploying AI solutions. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 35', 'Hello,
+('AI / Machine Learning Engineer - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in designing intelligent algorithms, training robust models, and deploying AI solutions. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 36', 'Hello,
+('AI / Machine Learning Engineer - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on designing intelligent algorithms, training robust models, and deploying AI solutions. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}'),
-('Template 37', 'Hello,
+('Database Administrator - Professional', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to express my strong interest in the {role} position at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on ensuring data integrity, optimizing query performance, and managing database security. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
 
 Best regards,
 {name}'),
-('Template 38', 'Hello,
+('Database Administrator - Direct & Concise', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in ensuring data integrity, optimizing query performance, and managing database security. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
 
 Best regards,
 {name}'),
-('Template 39', 'Hello,
+('Database Administrator - Skills-Focused', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+Please accept my application for the {role} position with {client}. 
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in ensuring data integrity, optimizing query performance, and managing database security. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
-
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
 
 Best regards,
 {name}'),
-('Template 40', 'Hello,
+('Database Administrator - Impact-Driven', 'Hello,
 
-I hope this message finds you well. I am writing to express my strong interest in the opportunity to connect regarding this position. 
+I am writing to apply for the {role} role at {client}.
 
-My name is {name} and I am currently working as a {working_titke}. Over the course of my career, I have accumulated {exp_years} years of professional experience, consistently delivering high-quality solutions, driving impactful projects, and collaborating effectively within cross-functional teams. 
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on ensuring data integrity, optimizing query performance, and managing database security. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
 
-I am highly motivated to bring my technical expertise, problem-solving skills, and dedication to your organization. I am confident that my background aligns perfectly with the demands of this role, and I would welcome the chance to discuss how my unique blend of skills can contribute to your continued success. 
+I have attached my resume for your detailed review and look forward to hearing from you.
 
-I have attached my resume for your detailed review. I look forward to hearing from you soon.
+Best regards,
+{name}'),
+('QA / Test Engineer - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on ensuring software quality through rigorous automated and manual testing methodologies. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('QA / Test Engineer - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in ensuring software quality through rigorous automated and manual testing methodologies. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('QA / Test Engineer - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in ensuring software quality through rigorous automated and manual testing methodologies. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('QA / Test Engineer - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on ensuring software quality through rigorous automated and manual testing methodologies. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Project Manager - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on leading cross-functional teams, mitigating risks, and driving agile project delivery. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Project Manager - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in leading cross-functional teams, mitigating risks, and driving agile project delivery. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Project Manager - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in leading cross-functional teams, mitigating risks, and driving agile project delivery. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Project Manager - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on leading cross-functional teams, mitigating risks, and driving agile project delivery. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Scrum Master - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on facilitating agile ceremonies, removing blockers, and empowering cross-functional teams. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Scrum Master - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in facilitating agile ceremonies, removing blockers, and empowering cross-functional teams. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Scrum Master - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in facilitating agile ceremonies, removing blockers, and empowering cross-functional teams. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Scrum Master - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on facilitating agile ceremonies, removing blockers, and empowering cross-functional teams. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Product Manager - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on defining product vision, prioritizing roadmaps, and bridging technical execution with business strategy. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Product Manager - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in defining product vision, prioritizing roadmaps, and bridging technical execution with business strategy. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Product Manager - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in defining product vision, prioritizing roadmaps, and bridging technical execution with business strategy. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Product Manager - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on defining product vision, prioritizing roadmaps, and bridging technical execution with business strategy. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Business Analyst - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on translating complex business needs into clear technical requirements and data-driven insights. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Business Analyst - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in translating complex business needs into clear technical requirements and data-driven insights. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Business Analyst - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in translating complex business needs into clear technical requirements and data-driven insights. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Business Analyst - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on translating complex business needs into clear technical requirements and data-driven insights. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Systems Administrator - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on maintaining system uptime, managing IT infrastructure, and resolving complex technical issues. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Systems Administrator - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in maintaining system uptime, managing IT infrastructure, and resolving complex technical issues. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Systems Administrator - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in maintaining system uptime, managing IT infrastructure, and resolving complex technical issues. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Systems Administrator - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on maintaining system uptime, managing IT infrastructure, and resolving complex technical issues. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Network Engineer - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on designing resilient network architectures, optimizing bandwidth, and securing communications. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Network Engineer - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in designing resilient network architectures, optimizing bandwidth, and securing communications. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Network Engineer - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in designing resilient network architectures, optimizing bandwidth, and securing communications. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Network Engineer - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on designing resilient network architectures, optimizing bandwidth, and securing communications. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Cybersecurity Engineer - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on identifying vulnerabilities, implementing robust security protocols, and protecting critical infrastructure. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Cybersecurity Engineer - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in identifying vulnerabilities, implementing robust security protocols, and protecting critical infrastructure. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Cybersecurity Engineer - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in identifying vulnerabilities, implementing robust security protocols, and protecting critical infrastructure. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Cybersecurity Engineer - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on identifying vulnerabilities, implementing robust security protocols, and protecting critical infrastructure. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('UI / UX Designer - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on conducting user research, designing intuitive workflows, and creating engaging digital experiences. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('UI / UX Designer - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in conducting user research, designing intuitive workflows, and creating engaging digital experiences. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('UI / UX Designer - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in conducting user research, designing intuitive workflows, and creating engaging digital experiences. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('UI / UX Designer - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on conducting user research, designing intuitive workflows, and creating engaging digital experiences. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
+
+Best regards,
+{name}'),
+('Site Reliability Engineer (SRE) - Professional', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+My name is {name} and I am currently working as a {working_title}. Throughout my {exp_years} years of experience, I have focused on enhancing system observability, reducing downtime, and balancing feature velocity with reliability. My strong technical foundation in {skills} makes me confident in my ability to hit the ground running and deliver high-quality results for your team.
+
+I have attached my resume for your detailed review. I look forward to discussing how my background aligns with your goals.
+
+Best regards,
+{name}'),
+('Site Reliability Engineer (SRE) - Direct & Concise', 'Hello,
+
+I hope this message finds you well. I am reaching out to apply for the {role} opportunity at {client}.
+
+I am {name}, currently working as a {working_title} with {exp_years} years of hands-on experience in enhancing system observability, reducing downtime, and balancing feature velocity with reliability. Having read through the job description, I am confident that my expertise in {skills} directly addresses the needs of this position. 
+
+I would welcome the chance to discuss how my technical expertise can add immediate value to your team. Please find my resume attached for your review.
+
+Best regards,
+{name}'),
+('Site Reliability Engineer (SRE) - Skills-Focused', 'Hello,
+
+Please accept my application for the {role} position with {client}. 
+
+As a {working_title} with {exp_years} years of experience, I have built a strong foundation in enhancing system observability, reducing downtime, and balancing feature velocity with reliability. After reviewing your requirements, I am excited about the opportunity to bring my proficiency in {skills} to help streamline your technical objectives.
+
+I have attached my resume for your consideration and would appreciate the opportunity to discuss my qualifications further. Thank you for your time.
+
+Best regards,
+{name}'),
+('Site Reliability Engineer (SRE) - Impact-Driven', 'Hello,
+
+I am writing to apply for the {role} role at {client}.
+
+My name is {name} and I am a {working_title} with {exp_years} years of experience focused on enhancing system observability, reducing downtime, and balancing feature velocity with reliability. I have a proven track record of leveraging {skills} to solve complex challenges and drive tangible business value. I am eager to bring this same level of dedication and impact to your organization.
+
+I have attached my resume for your detailed review and look forward to hearing from you.
 
 Best regards,
 {name}');
-
-
 
 CREATE TABLE IF NOT EXISTS consultant_email_tokens (
     id BIGSERIAL PRIMARY KEY,
