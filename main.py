@@ -399,6 +399,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# BUG FIX ("delete/save appears to work, then reverts a moment later" —
+# first seen on the Base Resume View endpoint, then again on Work
+# Experience's delete-then-refetch): this app sits behind Cloudflare
+# (see the httpx timeout comments in email_queue.py), which can cache a
+# GET API response at the edge unless a route explicitly forbids it.
+# Several places refetch immediately after a mutation (React Query's
+# invalidateQueries) expecting fresh data — if that refetch is served
+# from an edge cache instead of hitting this backend, it silently hands
+# back pre-mutation data, which looks exactly like the mutation itself
+# failed or got undone. Rather than adding Cache-Control headers to each
+# endpoint one at a time as this keeps resurfacing, every /api/* response
+# is now marked non-cacheable at the source. Registered AFTER CORS
+# (Starlette runs middleware outermost-last-added-first on the request
+# path, innermost-last-added-first on the response path) so these
+# headers are the last thing set before the response actually leaves —
+# nothing downstream can override them back off.
+@app.middleware("http")
+async def no_cache_api_responses(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 # ---------------------------------------------------------------------------
 # Phase 2 router — requirement detail/status/stats, pipeline endpoints
 # ---------------------------------------------------------------------------

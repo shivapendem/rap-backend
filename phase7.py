@@ -326,7 +326,13 @@ async def disconnect_gmail(
         await db.delete(token)
 
     consultant.gmail_connected = False
-    current_user.is_authorized = False
+    # BUG FIX: this used to also set current_user.is_authorized = False —
+    # same conflation as email_queue.py's auto-deauthorize logic (see the
+    # note there). Disconnecting Gmail correctly disables applying
+    # (gmail_connected=False already does that), but it shouldn't also
+    # lock the consultant out of the platform entirely — those are two
+    # separate things. is_authorized is now only ever changed by an
+    # explicit admin action in User Management.
     await db.commit()
 
     return {"success": True, "message": "Gmail disconnected."}
