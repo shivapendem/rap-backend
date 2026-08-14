@@ -380,7 +380,14 @@ MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
 
     # claude_service swallows API errors and silently returns mock data.
     # Persisting that as a real resume would be worse than failing loudly.
-    if "Mock generated" in (resume_data.get("generation_notes") or ""):
+    # NOTE: claude_service's mock-fallback marker text has changed at least
+    # once ("AI generation was unavailable" vs "Mock generated" have both
+    # been seen in generation_notes across deployments). Check for either
+    # so this guard keeps working regardless of which claude_service
+    # revision is actually deployed, instead of silently stopping working
+    # if only one marker string is checked.
+    _generation_notes = resume_data.get("generation_notes") or ""
+    if "AI generation was unavailable" in _generation_notes or "Mock generated" in _generation_notes:
         logger.error(
             "Claude returned mock fallback (consultant_id=%s requirement_id=%s) - check ANTHROPIC_API_KEY",
             consultant.id, requirement.id,
@@ -1536,6 +1543,7 @@ async def download_resume(
         path=file_path,
         media_type=media_type,
         filename=correct_filename,
+        headers={"Cache-Control": "no-store"},
     )
 
 

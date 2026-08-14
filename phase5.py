@@ -398,6 +398,7 @@ class RequirementDetailResponse(BaseModel):
     status: str
     received_date: Optional[str] = None
     parse_confidence: Optional[float] = None
+    skills: Optional[List[str]] = None
 
 
 class GeneratedResumeDTO(BaseModel):
@@ -1285,6 +1286,11 @@ async def get_requirement_detail(
         status=req.status,
         received_date=req.received_date.isoformat() if req.received_date else None,
         parse_confidence=float(req.parse_confidence) if req.parse_confidence else None,
+        # BUG FIX: parsed_fields['skills'] (see parser.py) was parsed off
+        # every incoming JD but never made it into this response, so the
+        # frontend had no requirement-side skills to compare a candidate's
+        # primary skills against for the application-template {skills} fill.
+        skills=(req.parsed_fields or {}).get("skills") if req.parsed_fields else None,
     )
 
 
