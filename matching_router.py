@@ -83,10 +83,16 @@ async def run_matching_for_requirement(
             continue
             
         experiences = experiences_by_consultant.get(cons.id, [])
+        
+        # STRICT VALIDATION GATE
+        from phase4 import validate_match
+        if not validate_match(requirement, cons, experiences):
+            continue
+
         result = score_match(requirement, cons, experiences)
         
         score = result["total"]
-        if score > 15.0:
+        if score > 0:  # Matches are already strictly validated, so just ensure it's > 0 or whatever minimum
             breakdown = result["score_breakdown"]
             flat_info = {
                 "title": breakdown["role"]["weighted"],

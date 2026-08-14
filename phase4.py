@@ -364,6 +364,60 @@ def score_work_auth(requirement: Requirement, consultant: Consultant) -> float:
     return 100.0
 
 
+def validate_match(
+    requirement: Requirement,
+    consultant: Consultant,
+    experiences: List[ConsultantExperience],
+) -> bool:
+    """
+    Strict step-by-step validation pipeline.
+    A candidate must pass all gates to be considered for a match.
+    """
+    # 1. Title Validation
+    # Matches must score at least 35/50 on the weighted role score,
+    # which translates to a raw score of 70%.
+    role_raw = score_role(requirement.role, consultant.preferred_roles, experiences)
+    if role_raw < 70.0:
+        return False
+
+    # 2. Employment Type Validation
+    req_types = [t.upper() for t in (requirement.employment_types or []) if t]
+    cons_types = [t.upper() for t in (consultant.preferred_employment_types or []) if t]
+    
+    # If it's explicitly fulltime, show to all.
+    # Otherwise, it's considered contract-based.
+    is_fulltime = "FULLTIME" in req_types
+    if not is_fulltime:
+        # Contract-based job: candidate must support C2C or C2B
+        if "C2C" not in cons_types and "C2B" not in cons_types:
+            return False
+
+    # 3. Visa / Work Auth Validation
+    # Currently set to always pass per requirements.
+    # In the future, match req_types against consultant.work_authorization here.
+    visa_pass = True
+    if not visa_pass:
+        return False
+
+    # 4. Experience Validation
+    # Candidate must be within +/- 20% of the required years.
+    required_years = _parse_min_years_required(requirement)
+    if required_years is not None and required_years > 0:
+        years = float(consultant.total_experience_years or 0)
+        if years <= 0 and experiences:
+            years = _calculate_total_experience_years(experiences)
+        
+        lower_bound = required_years * 0.8
+        upper_bound = required_years * 1.2
+        if years < lower_bound or years > upper_bound:
+            return False
+
+    # 5. Location Validation
+    # Skipped for now.
+
+    return True
+
+
 def score_match(
     requirement: Requirement,
     consultant: Consultant,
