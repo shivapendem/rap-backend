@@ -1454,8 +1454,16 @@ async def apply_to_requirement(
     await db.refresh(queue_item)
 
     if queue_item.status != "SENT":
+        # BUG FIX: was status_code=502. This can fail for ordinary,
+        # user-actionable reasons (e.g. no Gmail OAuth token connected
+        # yet) — not a proxy/gateway malfunction. 502 gets specially
+        # intercepted by Cloudflare, which replaces this response's real
+        # detail with its own generic "origin returned an invalid or
+        # incomplete response" page, so the actual reason never reaches
+        # the consultant. 422 passes through untouched. Same fix as
+        # email_queue.py's send_email_now for the admin/recruiter path.
         raise HTTPException(
-            status_code=502,
+            status_code=422,
             detail=queue_item.status_text or "Failed to send application email.",
         )
 

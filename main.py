@@ -18,6 +18,7 @@ from database import engine, Base, get_db, AsyncSessionLocal, DATABASE_URL
 from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch, RecruiterConsultant, Application
 import asyncio
 from requirements_sync import sync_pending_emails
+from parser import is_email_body
 from auth import (
     pwd_context,
     SECRET_KEY,
@@ -291,21 +292,26 @@ async def lifespan(app: FastAPI):
                 print(f"Seeded default user: {u['email']}")
         await session.commit()
 
-        # Fallback sync: set is_authorized and gmail_connected states based on active tokens
+        # BUG FIX ("authorize a candidate, restart the backend, they're back
+        # to Unauthorized"): this used to also run an unconditional UPDATE
+        # on `users.is_authorized` on every single app startup, recomputing
+        # it for every CONSULTANT purely from whether they had a Gmail
+        # token connected — silently overwriting whatever an admin had
+        # manually set in User Management, every time the process
+        # restarted (which in dev happens on every --reload, and in prod
+        # on every redeploy). is_authorized is meant to be admin-controlled
+        # ONLY — see the matching comment in phase7.py's Gmail-disconnect
+        # endpoint, which already established that same principle for a
+        # different code path. That was a reasonable ONE-TIME backfill
+        # back when the is_authorized column was first introduced, but it
+        # should never have stayed in the perpetual startup path — removed.
+        # gmail_connected below is unaffected by this fix: unlike
+        # is_authorized it isn't an admin decision, it's just a mirror of
+        # whether a real token row currently exists, so re-deriving it on
+        # every boot is harmless and keeps it accurate after any out-of-
+        # band token changes (e.g. a token row deleted directly in the DB).
         try:
             from sqlalchemy import text
-            await session.execute(text("""
-                UPDATE users
-                SET is_authorized = CASE
-                    WHEN role IN ('ADMIN', 'RECRUITER') THEN TRUE
-                    WHEN id IN (
-                        SELECT c.user_id 
-                        FROM consultants c
-                        JOIN consultant_email_tokens t ON c.id = t.consultant_id
-                    ) THEN TRUE
-                    ELSE FALSE
-                END;
-            """))
             await session.execute(text("""
                 UPDATE consultants
                 SET gmail_connected = CASE
@@ -314,9 +320,9 @@ async def lifespan(app: FastAPI):
                 END;
             """))
             await session.commit()
-            print("Successfully synchronized user authorization and gmail_connected states with active tokens.")
+            print("Successfully synchronized gmail_connected state with active tokens.")
         except Exception as sync_err:
-            print(f"Failed to synchronize authorization states on startup: {sync_err}")
+            print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
 
     sync_task = asyncio.create_task(_gmail_to_requirements_loop())
     email_queue_task = asyncio.create_task(_email_queue_worker_loop())
@@ -689,6 +695,85 @@ async def google_login(
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
+# BUG FIX: sentinel/junk values leaking into the Requirements list.
+# parser.py falls back to the literal string "UNKNOWN" for client/vendor/
+# work_mode/employment_types whenever it can't confidently extract a real
+# value (see parser.py's parse()). That's a reasonable internal sentinel,
+# but the frontend rendered it verbatim as a badge ("UNKNOWN") instead of
+# treating it as "no value" the way it already does for a genuinely empty
+# string. Older parses also occasionally captured a stray sentence
+# fragment from the email body instead of the actual field (e.g. a
+# "client" of "reported issues.") — is_email_body() already exists in
+# parser.py to catch full-body captures, but a short one- or two-sentence
+# fragment slips past that check, so we add a cheap heuristic here too:
+# a value that starts lowercase and ends in sentence punctuation reads as
+# a fragment of prose, not a company/location/vendor name.
+_UNKNOWN_SENTINELS = {"unknown", "n/a", "na", "none", "null", "-", "unspecified", "tbd"}
+
+
+def _clean_display_value(value: Optional[str]) -> Optional[str]:
+    """Normalize a raw parsed field for display. Returns None (frontend
+    renders a dash) instead of a literal sentinel or a stray body fragment."""
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if v.lower() in _UNKNOWN_SENTINELS:
+        return None
+    if is_email_body(v):
+        return None
+    if v[0].islower() and v.rstrip().endswith((".", "!", "?")) and len(v.split()) > 1:
+        return None
+    return v
+
+
+def _clean_employment_types(values: Optional[List[str]]) -> Optional[List[str]]:
+    if not values:
+        return None
+    cleaned = [v for v in values if v and v.strip().lower() not in _UNKNOWN_SENTINELS]
+    return cleaned or None
+
+
+def _coerce_skills_list(value) -> List[str]:
+    """parsed_fields['skills'] is normally a List[str] (see parser.py's
+    extract_skills), but older rows — or any future bad data — may have
+    it stored as a raw comma-separated string. Normalize defensively so a
+    single malformed row can't break the whole list response."""
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if v and str(v).strip()]
+    if isinstance(value, str) and value.strip():
+        return [s.strip() for s in value.split(",") if s.strip()]
+    return []
+
+
+def _serialize_requirement(r: Requirement) -> RequirementResponse:
+    """Build the API row for a Requirement, filling in skills/experience
+    from parsed_fields (BUG FIX: RequirementResponse.skills/experience
+    were declared on the response schema but Requirement has no such
+    columns at all — only parsed_fields JSON — so both always
+    serialized as null/empty regardless of what was actually parsed)
+    and scrubbing sentinel/junk values from the free-text display
+    fields so the frontend shows a dash instead of "UNKNOWN" or a
+    stray sentence fragment."""
+    resp = RequirementResponse.model_validate(r)
+    resp.client = _clean_display_value(resp.client)
+    resp.location = _clean_display_value(resp.location)
+    resp.vendor = _clean_display_value(resp.vendor)
+    resp.work_mode = _clean_display_value(resp.work_mode)
+    resp.employment_types = _clean_employment_types(resp.employment_types)
+
+    parsed_fields = r.parsed_fields or {}
+    skills = _coerce_skills_list(parsed_fields.get("skills"))
+    resp.skills = ", ".join(skills) if skills else None
+
+    experience = parsed_fields.get("experience")
+    experience = str(experience).strip() if experience else None
+    resp.experience = experience or None
+
+    return resp
+
+
 @app.get("/api/requirements", response_model=PaginatedRequirements)
 async def get_requirements(
     page: int = 1,
@@ -938,7 +1023,7 @@ async def get_requirements(
                 r.already_applied = r.id in applied_ids
 
     return PaginatedRequirements(
-        data=reqs,
+        data=[_serialize_requirement(r) for r in reqs],
         total=total,
         page=page,
         page_size=page_size,

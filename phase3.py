@@ -1332,7 +1332,13 @@ async def delete_experience(
     if not exp:
         raise HTTPException(404, "Experience entry not found")
 
-        await db.delete(exp)
+    # BUG FIX ("delete returns 204 but the row is still there"): this
+    # was indented one level too deep, inside the if not exp: raise
+    # block above — since raise exits immediately, and that branch only
+    # runs when exp is None, this line was completely unreachable dead
+    # code. The endpoint ran to completion, committed successfully, and
+    # returned 204 every time — without ever actually deleting anything.
+    await db.delete(exp)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant)

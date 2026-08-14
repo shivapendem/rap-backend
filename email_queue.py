@@ -1011,8 +1011,19 @@ async def send_email_now(
     await db.refresh(item)
 
     if item.status != "SENT":
+        # BUG FIX: this used to raise 502. 502 is a gateway/proxy status —
+        # it tells Cloudflare (sitting in front of this API) "the origin
+        # is malfunctioning", so Cloudflare swallows the real body/detail
+        # here and replaces the whole response with its own generic
+        # "origin returned an invalid or incomplete response" interstitial.
+        # The actual reason (e.g. "No OAuth token found for candidate/
+        # consultant and not a Savantis sender" — a completely ordinary,
+        # user-actionable failure, not a server malfunction) never made it
+        # to the browser at all. 422 is a normal client-facing error
+        # Cloudflare passes straight through untouched, so the frontend
+        # can actually surface item.status_text to the user.
         raise HTTPException(
-            status_code=502,
+            status_code=422,
             detail=item.status_text or "Failed to send application email.",
         )
 

@@ -2069,7 +2069,50 @@ async def download_resume(
     # should open the real file via Google Docs Viewer (a real, publicly
     # fetchable presigned URL, which Google's own servers fetch — browser
     # CORS never applies there) instead of a server-side PDF conversion.
-    url = generate_presigned_url(resume.s3_key)
+    #
+    # FEATURE CHANGE: a generated/tailored resume's s3_key is always a
+    # .pdf (see generate_resume/finalize_resume above) — the .docx it was
+    # actually built from is a rendering source, not what gets stored as
+    # the canonical file. Prefer showing THAT .docx here too, same as
+    # manually-uploaded resumes already do, rather than the PDF that's
+    # just a byproduct of it. Reuses the exact same find-or-regenerate
+    # logic download_resume_docx below already has — if the .docx object
+    # is missing from storage (generate_resume's own DOCX upload runs in
+    # a best-effort try/except that can fail independently of the PDF
+    # succeeding), rebuild it from resume.data and upload it before
+    # presigning, instead of silently falling back to PDF.
+    view_key = resume.s3_key
+    if resume.s3_key.lower().endswith(".pdf"):
+        docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx"
+        docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, docx_key)
+        if docx_bytes is None and resume.data:
+            from phase6 import _generate_docx
+            from pathlib import Path
+
+            resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+            resume_dir.mkdir(parents=True, exist_ok=True)
+            tmp_docx_path = resume_dir / "resume_view.docx"
+            try:
+                _generate_docx(resume.data, tmp_docx_path)
+                with open(tmp_docx_path, "rb") as f:
+                    if upload_file_to_s3(f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+                        docx_bytes = True  # just need to know it now exists
+            except Exception as e:
+                print(f"View-time DOCX regeneration failed for resume {resume.id}: {e}")
+                from error_logger import log_db_error
+                await log_db_error(
+                    stage="resume_view_docx_regen",
+                    error=e,
+                    source_type="resume",
+                    source_id=str(resume.id),
+                )
+        if docx_bytes is not None:
+            view_key = docx_key
+        # else: no .docx obtainable at all (no resume.data to rebuild
+        # from) — falls through and shows the .pdf instead, same as
+        # today, rather than failing View entirely.
+
+    url = generate_presigned_url(view_key)
     if not url:
         raise HTTPException(status_code=500, detail="Failed to generate download link.")
 
@@ -2090,11 +2133,11 @@ async def download_resume(
     # does) lets it correctly recognize an already-PDF file and skip the
     # external viewer entirely.
     import mimetypes as _mimetypes
-    ext = os.path.splitext(resume.s3_key)[1].lower()
+    ext = os.path.splitext(view_key)[1].lower()
     mime_type = (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         if ext == ".docx"
-        else _mimetypes.guess_type(resume.s3_key)[0] or "application/pdf"
+        else _mimetypes.guess_type(view_key)[0] or "application/pdf"
     )
     safe_title = "".join(
         c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_"
