@@ -1733,13 +1733,32 @@ async def get_consultants_for_resumes(
     db: AsyncSession = Depends(get_db)
 ):
     def map_user_consultant(u, c):
+        # BUG FIX: was reading u.skills (User.skills, a JSONB column that
+        # nothing in the consultant-profile flow ever writes to — profile
+        # edits, resume generation, and matching all read/write
+        # Consultant.primary_skills instead, see phase3.py/phase6.py/
+        # resume_router.py's own resume-building code). Real consultants
+        # therefore showed up with an empty skills list here, which fed
+        # straight into ApplyToRequirementPage's {skills} template fill
+        # and silently fell back to "relevant technologies" even when the
+        # consultant had skills on file. Prefer primary_skills (+
+        # secondary_skills) split into a list; keep u.skills as a
+        # last-resort fallback for any user row that predates Consultant.
+        consultant_skills = [
+            s.strip()
+            for s in ", ".join(filter(None, [
+                c.primary_skills if c else None,
+                c.secondary_skills if c else None,
+            ])).split(",")
+            if s.strip()
+        ] if c else []
         return {
             "id": u.id, # Keep id for backward compatibility (maps to user_id)
             "user_id": u.id,
             "consultant_id": c.id if c else None,
             "name": u.full_name or u.email,
             "email": u.email,
-            "skills": u.skills,
+            "skills": consultant_skills or u.skills,
             "experience_years": u.experience_years or (c.total_experience_years if c else 0)
         }
 
