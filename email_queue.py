@@ -760,6 +760,38 @@ async def send_email_now(
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
 
+    # BUG FIX (the actual thing blocking sends): once a consultant is
+    # resolved, THEIR email used to be the ONLY accepted from_email — full
+    # stop. If that consultant hadn't connected Gmail yet (no OAuth token
+    # on file), every application on their behalf was permanently stuck:
+    # "No OAuth token found for candidate/consultant and not a Savantis
+    # sender", with no way to actually get the email out until the
+    # consultant went and connected Gmail themselves. An admin/recruiter
+    # standing right here trying to send it for them had no path forward.
+    #
+    # FEATURE: for ADMIN/RECRUITER only (never for a CONSULTANT applying
+    # for themselves — they should still connect their own Gmail, this
+    # isn't a way around that), fall back to sending via the admin/
+    # recruiter's OWN mailbox when the resolved consultant has no Gmail
+    # connected. process_single_email_queue_item already sends any
+    # "savantis" address through the domain-delegated service account
+    # with no OAuth token required, so this fallback "just works" for any
+    # admin/recruiter on a real @savantis.com account — no new sending
+    # infrastructure needed.
+    #
+    # This is a real, visible trade-off, not a bug: the vendor will see
+    # the admin/recruiter's address as the sender for this specific send,
+    # not the consultant's. effective_from_email (not body.from_email) is
+    # used for every downstream use of "who is actually sending this" —
+    # validation, anti-spam scheduling, and the EmailQueue row itself —
+    # so the record accurately reflects who really sent it.
+    fallback_sender_used = bool(
+        consultant
+        and not consultant.gmail_connected
+        and current_user.role in ("ADMIN", "RECRUITER")
+    )
+    effective_from_email = current_user.email if fallback_sender_used else body.from_email
+
     # BUG FIX ("a from address not tied to any real user/consultant row
     # is being used as the sender"): body.from_email was trusted directly
     # from the request payload with no server-side verification at all —
@@ -774,12 +806,15 @@ async def send_email_now(
     # the admin/recruiter's own email as from_email with no error. Once a
     # consultant is resolved, THEIR email is the only legitimate sender —
     # the current user's own email is only accepted when no consultant
-    # context exists at all (e.g. a consultant sending for themselves).
-    if consultant and consultant.email:
+    # context exists at all (e.g. a consultant sending for themselves),
+    # or when the gmail-not-connected fallback above explicitly kicked in.
+    if fallback_sender_used:
+        valid_from_emails = {(current_user.email or "").strip().lower()}
+    elif consultant and consultant.email:
         valid_from_emails = {consultant.email.strip().lower()}
     else:
         valid_from_emails = {(current_user.email or "").strip().lower()}
-    if (body.from_email or "").strip().lower() not in valid_from_emails:
+    if effective_from_email.strip().lower() not in valid_from_emails:
         raise HTTPException(
             status_code=400,
             detail="from_email does not match the current user or the resolved consultant — refusing to send.",
@@ -804,7 +839,7 @@ async def send_email_now(
         handling = await get_handling_recruiter(db, consultant)
         recruiter_email = handling.get("employer_email") if handling else None
 
-    is_self_apply = final_cc.strip() == body.from_email.strip()
+    is_self_apply = final_cc.strip() == effective_from_email.strip()
 
     if is_self_apply and recruiter_email:
         # CONSULTANT applying for themselves — CC their recruiter.
@@ -904,7 +939,7 @@ async def send_email_now(
         final_html_content = None
 
     from datetime import datetime, timezone
-    scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
+    scheduled_at = await calculate_next_scheduled_at(db, effective_from_email)
     now_utc = datetime.now(timezone.utc)
 
     # BUG FIX ("Failed to send application email." with literally nothing
@@ -930,7 +965,7 @@ async def send_email_now(
         raise HTTPException(
             status_code=429,
             detail=(
-                f"To prevent spam, only one email can be sent from {body.from_email} "
+                f"To prevent spam, only one email can be sent from {effective_from_email} "
                 f"every {ANTI_SPAM_DELAY_MINUTES} minutes. Please wait about "
                 f"{wait_minutes} more minute{'s' if wait_minutes != 1 else ''} and try again."
             ),
@@ -939,7 +974,7 @@ async def send_email_now(
     item = EmailQueue(
         consultant_id=consultant_id,
         requirement_id=body.requirement_id,
-        from_email=body.from_email,
+        from_email=effective_from_email,
         to_email=body.to_email,
         cc_email=final_cc,
         subject=body.subject,
@@ -1032,7 +1067,17 @@ async def send_email_now(
         "id": str(item.id),
         "status": item.status,
         "scheduled_at": (item.scheduled_at or scheduled_at or now_utc).isoformat(),
-        "message": "Email sent successfully."
+        "message": (
+            f"Email sent successfully via {effective_from_email} — {consultant.full_name if consultant else 'this consultant'} "
+            f"hasn't connected Gmail yet, so this went out from your mailbox on their behalf."
+            if fallback_sender_used else
+            "Email sent successfully."
+        ),
+        # Lets the frontend show a clear "sent as you, not as the
+        # consultant" notice instead of the send silently looking
+        # identical to a normal consultant-sent application.
+        "sent_from": effective_from_email,
+        "fallback_sender_used": fallback_sender_used,
     }
 
 @router.post("/api/consultant/email-queue/upload-attachment")
