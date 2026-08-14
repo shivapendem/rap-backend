@@ -544,6 +544,7 @@ class JobMatch(Base):
     requirement_id = Column(FK_TYPE, ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False, index=True)
     consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False, index=True)
     match_score = Column(Numeric(5, 2), nullable=True)
+    matching_info = JSONBColumn(nullable=True)
     match_reasoning = Column(Text, nullable=True)
     status = Column(Text, nullable=False, default="PENDING", index=True) # PENDING, APPLIED, REJECTED
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())

@@ -3,9 +3,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from models import User, Consultant, Requirement, JobMatch
+from models import User, Consultant, Requirement, JobMatch, ConsultantExperience
 from database import get_db
 from auth import get_current_user
+from phase4 import score_match
 import re
 
 router = APIRouter()
@@ -56,75 +57,55 @@ async def run_matching_for_requirement(
     consultants: list,
     existing_pairs: set,
     *,
-    vectorizer=None,
-    cons_matrix=None,
-    feature_names=None,
-    cons_ids=None,
+    experiences_by_consultant: dict = None,
 ) -> int:
     """
     Compute and persist JobMatch rows for ONE requirement against the given
-    consultant roster. Returns the number of new matches created.
+    consultant roster using the robust Phase 4 scoring engine.
+    Returns the number of new matches created.
     """
-    if not SKLEARN_AVAILABLE or not consultants:
+    if not consultants:
         return 0
 
-    if vectorizer is None:
-        cons_docs = []
-        cons_ids = []
-        for cons in consultants:
-            cons_text = f"{cons.primary_skills or ''} {cons.secondary_skills or ''} {cons.preferred_roles or ''} {cons.base_resume_text or ''}"
-            cons_docs.append(cons_text)
-            cons_ids.append(cons.id)
-        vectorizer = TfidfVectorizer(stop_words='english', lowercase=True)
-        cons_matrix = vectorizer.fit_transform(cons_docs)
-        feature_names = vectorizer.get_feature_names_out()
-
-    req_skills = ""
-    if isinstance(requirement.parsed_fields, dict):
-        skills_list = requirement.parsed_fields.get("skills")
-        if isinstance(skills_list, list):
-            req_skills = " ".join(str(s) for s in skills_list)
-    req_text = f"{requirement.role or ''} {req_skills} {requirement.job_description or ''}"
-    if not req_text.strip():
-        return 0
-
-    try:
-        req_vector = vectorizer.transform([req_text])
-        cosine_sim = cosine_similarity(req_vector, cons_matrix)[0]
-    except Exception as e:
-        print(f"[JobMatch] TF-IDF matching failed for requirement_id={requirement.id}: {e}")
-        from error_logger import log_db_error
-        await log_db_error(
-            stage="matching_tfidf_per_requirement",
-            error=e,
-            source_type="requirement",
-            source_id=str(requirement.id),
+    if experiences_by_consultant is None:
+        # If not passed in (e.g. from single requirement sync), fetch locally
+        cons_ids = [c.id for c in consultants]
+        exp_res = await db.execute(
+            select(ConsultantExperience).where(ConsultantExperience.consultant_id.in_(cons_ids))
         )
-        return 0
+        experiences_by_consultant = {}
+        for exp in exp_res.scalars().all():
+            experiences_by_consultant.setdefault(exp.consultant_id, []).append(exp)
 
     new_matches = 0
-    for idx, cons_id in enumerate(cons_ids):
-        score = float(cosine_sim[idx]) * 100
+    for cons in consultants:
+        if (requirement.id, cons.id) in existing_pairs:
+            continue
+            
+        experiences = experiences_by_consultant.get(cons.id, [])
+        result = score_match(requirement, cons, experiences)
+        
+        score = result["total"]
         if score > 15.0:
-            if (requirement.id, cons_id) in existing_pairs:
-                continue
-
-            req_arr = req_vector.toarray()[0]
-            cons_arr = cons_matrix[idx].toarray()[0]
-            intersection_weights = np.minimum(req_arr, cons_arr)
-            top_indices = intersection_weights.argsort()[-5:][::-1]
-            top_terms = [feature_names[i] for i in top_indices if intersection_weights[i] > 0]
-            reasoning = f"Strong semantic match ({score:.1f}%). Key overlapping features: {', '.join(top_terms)}"
-
+            breakdown = result["score_breakdown"]
+            flat_info = {
+                "title": breakdown["role"]["weighted"],
+                "skill": breakdown["skill"]["weighted"],
+                "location": breakdown["location"]["weighted"],
+                "experience": breakdown["experience"]["weighted"],
+                "employment":breakdown["employment"]["weighted"],
+                "auth": breakdown["auth"]["weighted"]
+            }
             new_match = JobMatch(
                 requirement_id=requirement.id,
-                consultant_id=cons_id,
+                consultant_id=cons.id,
                 match_score=score,
-                match_reasoning=reasoning,
+                matching_info=flat_info,
+                match_reasoning=result["match_reason"],
                 status="PENDING",
             )
             db.add(new_match)
-            existing_pairs.add((requirement.id, cons_id))
+            existing_pairs.add((requirement.id, cons.id))
             new_matches += 1
 
     return new_matches
@@ -163,43 +144,29 @@ async def run_matching_engine(
     if not consultants or not requirements:
         return {"success": True, "new_matches": 0}
 
-    # Prepare consultant documents
-    cons_docs = []
-    cons_ids = []
-    for cons in consultants:
-        cons_text = f"{cons.primary_skills or ''} {cons.secondary_skills or ''} {cons.preferred_roles or ''} {cons.base_resume_text or ''}"
-        cons_docs.append(cons_text)
-        cons_ids.append(cons.id)
+    # Batch query ALL experiences for ALL active consultants
+    cons_ids = [c.id for c in consultants]
+    exp_res = await db.execute(
+        select(ConsultantExperience).where(ConsultantExperience.consultant_id.in_(cons_ids))
+    )
+    experiences_by_consultant = {}
+    for exp in exp_res.scalars().all():
+        experiences_by_consultant.setdefault(exp.consultant_id, []).append(exp)
 
     new_matches = 0
-    if SKLEARN_AVAILABLE:
-        try:
-            # Fit TF-IDF on consultants ONCE for the entire run, then reuse
-            # this same fitted state for every requirement below via
-            # run_matching_for_requirement's optional pre-fitted args —
-            # avoids re-fitting per requirement, which is what previously
-            # caused a real N+1-style timeout on this bulk endpoint when
-            # looped over every open requirement in one request.
-            vectorizer = TfidfVectorizer(stop_words='english', lowercase=True)
-            cons_matrix = vectorizer.fit_transform(cons_docs)
-            feature_names = vectorizer.get_feature_names_out()
-
-            for req in requirements:
-                new_matches += await run_matching_for_requirement(
-                    db, req, consultants, existing_pairs,
-                    vectorizer=vectorizer,
-                    cons_matrix=cons_matrix,
-                    feature_names=feature_names,
-                    cons_ids=cons_ids,
-                )
-
-        except Exception as e:
-            print(f"[JobMatch] TF-IDF batch vectorization failed: {e}")
-            from error_logger import log_db_error
-            await log_db_error(
-                stage="matching_tfidf_batch",
-                error=e,
+    try:
+        for req in requirements:
+            new_matches += await run_matching_for_requirement(
+                db, req, consultants, existing_pairs,
+                experiences_by_consultant=experiences_by_consultant
             )
+    except Exception as e:
+        print(f"[JobMatch] Batch matching failed: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="matching_batch",
+            error=e,
+        )
 
     await db.commit()
     return {"success": True, "new_matches": new_matches}
@@ -230,6 +197,7 @@ async def get_pending_matches(
             Consultant.full_name.label("consultant_name"),
             Consultant.email.label("consultant_email"),
             JobMatch.match_score,
+            JobMatch.matching_info,
             JobMatch.match_reasoning,
             JobMatch.status,
             JobMatch.created_at
@@ -286,6 +254,7 @@ async def get_pending_matches(
             "consultant_name": row["consultant_name"],
             "consultant_email": row["consultant_email"],
             "match_score": _safe_float(row["match_score"]),
+            "matching_info": row["matching_info"],
             "match_reasoning": row["match_reasoning"],
             "status": row["status"],
             "created_at": row["created_at"],
