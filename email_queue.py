@@ -1400,26 +1400,14 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             await session.commit()
             return
 
-        # TESTING GUARD: only enforced when EMAIL_QUEUE_TEST_DOMAIN_SUFFIX is
-        # actually set (see the module-level guard-fix comment above) — off
-        # by default, so real sends to any address go through normally.
-        
-            print(f"[email-queue] item {item.id} skipped: '{item.to_email}' is not a test recipient ({EMAIL_QUEUE_TEST_DOMAIN_SUFFIX})")
-            item.status = "FAILED"
-            item.status_text = "not test domain for now"
-            await mark_app_failed(item.status_text)
-            await session.commit()
-            return
-
-        print(f"[email-queue debug {item.id}] Passed testing guards. Resolving token...")
-
-        from gmail_send_service import get_service_account_access_token, decrypt_token
+        # TESTING GUARD / Per-user override: only enforced when
+        # EMAIL_QUEUE_TEST_DOMAIN_SUFFIX is actually set (see the
+        # module-level guard-fix comment above) — off by default, so real
+        # sends to any address go through normally. A user with
+        # allowed_to_send=True bypasses this even when it IS set, letting
+        # admin roll out real sending to individual users first.
         from models import User, Consultant, ConsultantEmailToken
 
-        # Per-user override: a specific user with allowed_to_send=True can
-        # send to any real address even while EMAIL_QUEUE_TEST_DOMAIN_SUFFIX
-        # is active for everyone else — lets admin roll out real sending to
-        # individual users first, without lifting the domain guard globally.
         sender_allowed = False
         if item.sent_by_user_id:
             sender_result = await session.execute(
@@ -1438,6 +1426,10 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             await mark_app_failed(item.status_text)
             await session.commit()
             return
+
+        print(f"[email-queue debug {item.id}] Passed testing guards. Resolving token...")
+
+        from gmail_send_service import get_service_account_access_token, decrypt_token
 
         access_token = None
 
