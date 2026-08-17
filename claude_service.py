@@ -500,21 +500,127 @@ Extract the JSON now."""
         return _normalize_resume_data(fallback, {}), {}, None
 
 
+def _bold_terms(text: str, terms: list[str]) -> str:
+    """Wraps whole-word, case-insensitive matches of the given terms in
+    **markdown bold** so JD-relevant keywords stand out visually in the
+    preview/PDF (ResumeRichPreview already renders **text** as <strong>).
+    Only ever bolds terms that are already present in the text — never
+    inserts new words — and skips a match that's already inside ** **
+    so re-running this on already-bolded text is a no-op, not a double
+    wrap.
+    """
+    if not text or not terms:
+        return text
+    # Longest-first so e.g. "Spring Boot" is bolded as a phrase before
+    # "Spring" (if that were also a term) could bold half of it.
+    for term in sorted({t.strip() for t in terms if t and t.strip()}, key=len, reverse=True):
+        pattern = re.compile(r"(?<!\*)\b(" + re.escape(term) + r")\b(?!\*)", re.IGNORECASE)
+        text = pattern.sub(r"**\1**", text, count=1)
+    return text
+
+
+def _tailor_experience_for_jd(experience: list, real_skills: list, job_description: str) -> list:
+    """Bolds JD-matching skill mentions inside each existing bullet, and
+    — for JD-matching skills the candidate genuinely has but that aren't
+    named in any existing bullet — appends up to 2 short new bullets to
+    the most recent (first) role. Never invents a project, employer, or
+    metric: a new bullet only ever states that the candidate applied a
+    skill they actually have, nothing more specific than that.
+    """
+    if not experience:
+        return experience
+    jd_lower = (job_description or "").lower()
+    overlapping = [s for s in (real_skills or []) if s and s.lower() in jd_lower]
+    if not overlapping:
+        return experience
+
+    already_mentioned = set()
+    for exp in experience:
+        for bullet in exp.get("bullets", []):
+            b_lower = str(bullet).lower()
+            for skill in overlapping:
+                if skill.lower() in b_lower:
+                    already_mentioned.add(skill)
+
+    tailored = []
+    for i, exp in enumerate(experience):
+        bullets = [_bold_terms(b, overlapping) for b in exp.get("bullets", [])]
+        if i == 0:
+            missing = [s for s in overlapping if s not in already_mentioned][:2]
+            for skill in missing:
+                bullets.append(_bold_terms(f"Applied {skill} as part of day-to-day engineering work.", [skill]))
+        tailored.append({**exp, "bullets": bullets})
+    return tailored
+
+
+_ROLE_HINT_RE = re.compile(r"(?im)^\s*(?:role|position|job title)\s*:\s*(.+)$")
+
+# Marks a span of text as "genuinely new for this requirement" so the
+# frontend (ResumeRichPreview.tsx) can highlight only that span instead
+# of the whole Career Objective block — matching how skills/bullets/
+# certifications are already highlighted per-item, not per-section.
+# Plain HTML the frontend already trusts (dangerouslySetInnerHTML) and
+# passes through untouched; renderFormattedText only rewrites **bold**.
+_MARK_OPEN = '<mark style="background:#fef9c3;border-radius:2px;padding:0 2px;">'
+_MARK_CLOSE = "</mark>"
+
+
+def _extract_role_hint(job_description: str) -> Optional[str]:
+    """Pulls a short role/position name straight out of the JD text (e.g.
+    a 'Role: AI-Native Java Developer' line, which is how requirements
+    are formatted upstream — see phase6.py's jd_context). Returns None
+    if no such line is present; never guesses or invents a title.
+    """
+    if not job_description:
+        return None
+    match = _ROLE_HINT_RE.search(job_description)
+    if not match:
+        return None
+    role = match.group(1).strip()
+    return role[:80] if role else None
+
+
 def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str:
-    """Appends a short, factual line naming which of the candidate's real
-    skills overlap with THIS job description — used even when a stored
-    summary already exists, so the Career Objective isn't byte-identical
-    across every different job requirement it's generated for. Same
-    keyword-overlap approach as _build_factual_career_objective, and same
-    rule: only ever names skills the candidate actually has.
+    """Appends a short, factual line tying the Career Objective to THIS
+    specific job requirement — so it's never byte-identical to the base
+    resume's objective, and never identical across two different
+    requirements either.
+
+    Prefers naming which of the candidate's real skills overlap with the
+    JD (same keyword-overlap approach as _build_factual_career_objective,
+    same rule: only ever names skills the candidate actually has). When
+    there's no skill overlap at all, this used to return "" — meaning the
+    objective silently stayed frozen for that requirement, contradicting
+    "every new requirement needs a new career objective". Falls back to
+    naming the JD's own role/position line (if present) instead, which is
+    real requirement data, not a fabrication, and differs per requirement
+    by construction. Only returns "" if neither is available at all.
+
+    The returned sentence is wrapped in _MARK_OPEN/_MARK_CLOSE — this is
+    the only actually-new text being appended to an existing stored
+    summary, so it's the only part that should render highlighted.
     """
     if not job_description or job_description.strip().lower() in ("", "general role"):
         return ""
     jd_lower = job_description.lower()
     overlapping = [s for s in (real_skills or []) if s and s.lower() in jd_lower]
-    if not overlapping:
-        return ""
-    return f"This experience directly aligns with the target role's emphasis on {', '.join(overlapping[:5])}."
+    if overlapping:
+        top = overlapping[:5]
+        sentence = f"This experience directly aligns with the target role's emphasis on {', '.join(top)}."
+        return _MARK_OPEN + _bold_terms(sentence, top) + _MARK_CLOSE
+    role_hint = _extract_role_hint(job_description)
+    if role_hint:
+        sentence = f"Excited to bring this background to the {role_hint} opportunity."
+        return _MARK_OPEN + _bold_terms(sentence, [role_hint]) + _MARK_CLOSE
+    # Last resort: neither a skill overlap nor a "Role:"-style line was
+    # found. Rather than give up and leave the objective frozen, quote a
+    # short literal fragment of this JD's own opening text — it's the
+    # requirement's real text, not invented, and guarantees the sentence
+    # differs across requirements even in this edge case.
+    jd_snippet = " ".join(job_description.split())[:60].rstrip(",.;: ")
+    if jd_snippet:
+        return _MARK_OPEN + f'Reviewed this opportunity closely: "{jd_snippet}…"' + _MARK_CLOSE
+    return ""
 
 
 def _build_factual_career_objective(resume_info: dict, real_skills: list, job_description: str) -> str:
@@ -564,8 +670,13 @@ def _build_factual_career_objective(resume_info: dict, real_skills: list, job_de
         if overlapping:
             objective += " These skills align closely with the requirements outlined in the target job description."
         else:
-            objective += " Seeking to apply this background to the requirements outlined in the target job description."
-    return objective
+            role_hint = _extract_role_hint(job_description)
+            if role_hint:
+                objective += f" Seeking to apply this background to the {role_hint} opportunity."
+            else:
+                jd_snippet = " ".join(job_description.split())[:60].rstrip(",.;: ")
+                objective += f' Seeking to apply this background to this opportunity: "{jd_snippet}…"' if jd_snippet else " Seeking to apply this background to the requirements outlined in the target job description."
+    return _MARK_OPEN + _bold_terms(objective, overlapping) + _MARK_CLOSE
 
 
 def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
@@ -628,6 +739,13 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
     if not real_summary:
         real_summary = _build_factual_career_objective(resume_info, real_skills, job_description)
     else:
+        # Bold whichever of the candidate's real skills are both in their
+        # stored summary AND in this JD, so the summary visually reads as
+        # tailored to this requirement (matches the bold-keyword style of
+        # a hand-tailored resume) without changing a single word of it.
+        jd_lower = (job_description or "").lower()
+        overlapping_in_summary = [s for s in real_skills if s and s.lower() in jd_lower]
+        real_summary = _bold_terms(real_summary, overlapping_in_summary)
         addendum = _build_jd_relevance_addendum(real_skills, job_description)
         if addendum:
             real_summary = real_summary.rstrip() + " " + addendum
@@ -663,17 +781,21 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
         "technical_proficiencies": real_tech_proficiencies,
         "skills": real_skills,
         "missing_skills": [],
-        "experience": [
-            {
-                "client": exp.get("company", ""),
-                "role": exp.get("role", exp.get("title", "")),
-                "start": exp.get("start_date", exp.get("start", "")),
-                "end": exp.get("end_date", exp.get("end", "Present")),
-                "location": exp.get("location", ""),
-                "bullets": exp.get("bullets", [])
-            }
-            for exp in resume_info.get("experience", [])
-        ],
+        "experience": _tailor_experience_for_jd(
+            [
+                {
+                    "client": exp.get("company", ""),
+                    "role": exp.get("role", exp.get("title", "")),
+                    "start": exp.get("start_date", exp.get("start", "")),
+                    "end": exp.get("end_date", exp.get("end", "Present")),
+                    "location": exp.get("location", ""),
+                    "bullets": exp.get("bullets", [])
+                }
+                for exp in resume_info.get("experience", [])
+            ],
+            real_skills,
+            job_description,
+        ),
         "education": real_education,
         "certifications": real_certifications,
         "personal_details": resume_info.get("personal_details") or {},
