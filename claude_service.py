@@ -628,6 +628,44 @@ def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str
     return ""
 
 
+def _match_skills_against_jd(real_skills: list, job_description: str) -> tuple[list, list]:
+    """Splits the candidate's real skills into (exact_matches,
+    related_matches) against the JD text.
+
+    Exact: the skill string itself appears in the JD (same as the
+    existing overlap check elsewhere in this file). Related: the skill
+    belongs to the same canonical technology family (via phase4.py's
+    SKILL_ALIASES — the same grouping the real matching engine uses,
+    e.g. "azure data factory" and "etl" both canonicalize toward
+    data-pipeline tooling) as something the JD asks for, even when the
+    exact string doesn't appear. Both lists only ever contain skills the
+    candidate's own profile actually lists — never invents a skill they
+    don't have.
+    """
+    jd_lower = (job_description or "").lower()
+    exact = [s for s in real_skills if s and s.lower() in jd_lower]
+
+    related: list = []
+    try:
+        from phase4 import SKILL_ALIASES, extract_skills as _extract_jd_skills
+        jd_canonical = set(_extract_jd_skills(job_description))
+        for skill in real_skills:
+            if not skill or skill in exact:
+                continue
+            skill_lower = skill.lower()
+            for canonical, aliases in SKILL_ALIASES.items():
+                if canonical in jd_canonical and any(alias in skill_lower for alias in aliases):
+                    related.append(skill)
+                    break
+    except Exception:
+        # Best-effort only — if phase4 isn't importable for any reason,
+        # related-skill detection is simply skipped; exact matches still
+        # work fine on their own.
+        pass
+
+    return exact, related
+
+
 def _build_factual_career_objective(
     resume_info: dict, real_skills: list, job_description: str, target_role: Optional[str] = None
 ) -> str:
@@ -640,18 +678,26 @@ def _build_factual_career_objective(
     anti-fabrication rule the rest of this fallback already follows.
 
     Follows the same 4-part structure the AI prompt is instructed to use:
-    (a) exact JD designation/title, (b) years of experience + core domain,
-    (c) top 2-3 skills that exist in BOTH the profile and the JD, (d) one
-    value-proposition line. `target_role` — the requirement's actual title
-    field — is authoritative when supplied; only falls back to sniffing a
-    "Role:"-style line out of the free-text JD when it isn't.
+    (a) exact JD designation/title, (b) years of experience + core domain
+    — now drawn from the candidate's actual work experience (most recent
+    role/employer) when resume_info doesn't have an explicit domain field,
+    not just a bare years count, (c) top skills that exist in BOTH the
+    profile and the JD — both exact matches AND skills in the same
+    technology family (e.g. "Azure Data Factory" counts as related to a
+    JD asking for "ETL", via phase4.py's same SKILL_ALIASES groups used
+    for real matching), (d) one value-proposition line. `target_role` —
+    the requirement's actual title field — is authoritative when
+    supplied; only falls back to sniffing a "Role:"-style line out of the
+    free-text JD when it isn't.
     """
     years = resume_info.get("years_experience") or resume_info.get("total_experience_years")
     domain = resume_info.get("domain") or resume_info.get("core_domain")
     all_skills = [s for s in (real_skills or []) if s]
 
-    jd_lower = (job_description or "").lower()
-    overlapping = [s for s in all_skills if s.lower() in jd_lower][:3]
+    exact_matched, related_matched = _match_skills_against_jd(all_skills, job_description)
+    # Exact matches lead (they're the strongest signal); related ones fill
+    # out the remainder, capped so the objective stays 2-3 lines.
+    top_skills = (exact_matched + [s for s in related_matched if s not in exact_matched])[:5]
 
     years_str = None
     if years not in (None, ""):
@@ -663,7 +709,22 @@ def _build_factual_career_objective(
 
     role = target_role or _extract_role_hint(job_description)
 
-    # Line (a) + (b): title, years, domain — only the parts we actually have.
+    # Line (a) + (b): title, years, domain — falls back to the candidate's
+    # most recent real work experience (role + employer) when no explicit
+    # domain field is stored, so the objective reflects actual experience
+    # instead of just a bare years count.
+    recent_role_context = None
+    experience = resume_info.get("experience") or []
+    if not domain and experience:
+        recent = experience[0] if isinstance(experience, list) else None
+        if recent:
+            recent_title = recent.get("role") or recent.get("title")
+            recent_employer = recent.get("company") or recent.get("client")
+            if recent_title and recent_employer:
+                recent_role_context = f"most recently as {recent_title} at {recent_employer}"
+            elif recent_title:
+                recent_role_context = f"most recently as {recent_title}"
+
     opener_bits = []
     if role:
         opener_bits.append(role)
@@ -671,25 +732,28 @@ def _build_factual_career_objective(
         opener_bits.append(f"with {years_str} of experience" if role else f"Technology professional with {years_str} of experience")
     if domain:
         opener_bits.append(f"in {domain}")
+    elif recent_role_context:
+        opener_bits.append(recent_role_context)
     if opener_bits:
         line_a = " ".join(opener_bits).strip() + "."
     else:
         line_a = "Technology professional."
 
-    # Line (c): top matching skills, only if there's real overlap.
-    line_b = f"Skilled in {', '.join(overlapping)}." if overlapping else ""
+    # Line (c): top matching skills — exact + related — only if there's
+    # real overlap.
+    line_b = f"Skilled in {', '.join(top_skills)}." if top_skills else ""
 
     # Line (d): one factual value-proposition sentence — never a generic
     # unsupported claim, tied only to skills the candidate actually has.
-    if overlapping:
-        line_c = f"Brings hands-on experience with {', '.join(overlapping)} directly relevant to this role's requirements."
+    if top_skills:
+        line_c = f"Brings hands-on experience with {', '.join(top_skills)} directly relevant to this role's requirements."
     elif all_skills:
         line_c = f"Brings hands-on experience with {', '.join(all_skills[:3])} applicable to this role."
     else:
         line_c = ""
 
     objective = " ".join(p for p in (line_a, line_b, line_c) if p)
-    return _MARK_OPEN + _bold_terms(objective, overlapping) + _MARK_CLOSE
+    return _MARK_OPEN + _bold_terms(objective, top_skills) + _MARK_CLOSE
 
 
 def generate_tailored_resume(
@@ -787,6 +851,31 @@ def generate_tailored_resume(
         or (categorize_skills(all_tech_skills) if all_tech_skills else None)
         or (categorize_skills(real_skills) if real_skills else None)
     )
+    # BUG FIX ("any skill missing in TECHNICAL PROFICIENCIES add those
+    # skill"): the block above is an OR chain — once resume_info already
+    # has SOME stored technical_proficiencies table, that table is used
+    # exactly as-is, even when it's missing skills the candidate's own
+    # profile lists elsewhere (the flat `skills` field, or tech_stack's
+    # other tiers) — those just silently never showed up in the rendered
+    # table. Top up the existing table with any real skill (including
+    # ones matched/related to this JD) that isn't already present in any
+    # category, instead of only using the fuller list when the table was
+    # completely absent.
+    if real_tech_proficiencies:
+        already_listed = set()
+        for cat in real_tech_proficiencies:
+            cat_skills = cat.get("skills")
+            cat_list = cat_skills if isinstance(cat_skills, list) else str(cat_skills or "").split(",")
+            already_listed.update(s.strip().lower() for s in cat_list if s and s.strip())
+
+        jd_exact, jd_related = _match_skills_against_jd(real_skills, job_description)
+        candidate_pool = list(dict.fromkeys([*real_skills, *all_tech_skills, *jd_exact, *jd_related]))
+        missing = [s for s in candidate_pool if s and s.strip().lower() not in already_listed]
+        if missing:
+            real_tech_proficiencies = [
+                *real_tech_proficiencies,
+                {"category": "Additional Skills", "skills": missing},
+            ]
     real_education = resume_info.get("education") or resume_info.get("educational_background") or []
     real_certifications = resume_info.get("certifications") or []
 

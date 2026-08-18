@@ -14,6 +14,7 @@
 import os
 import math
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -38,6 +39,7 @@ from models import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1001,46 @@ async def download_application_resume(
     # have no native inline renderer for .docx, so this will generally
     # open a save/open-with-Word prompt in the new tab rather than an
     # in-page preview; that's an inherent browser limitation, not a bug.
+    # BUG FIX ("view resume is downloading instead of previewing"): this
+    # used to route non-PDF files to Google Docs Viewer via a presigned
+    # URL — but Google's viewer isn't reliably able to fetch a
+    # DigitalOcean Spaces presigned URL (unlike a real Google Drive
+    # link), so it silently falls back to just downloading the raw file
+    # instead of rendering a preview — exactly the "view keeps
+    # downloading" symptom this was meant to fix, just reintroduced by a
+    # different path. Reverted to on-demand DOCX->PDF conversion (the
+    # same _convert_to_pdf already used for resume generation) for the
+    # View path specifically — a real PDF is something every browser can
+    # actually render inline, so this sidesteps Google's viewer
+    # reliability entirely. The Download button (force_stream=True)
+    # still gets the real original file untouched, since that's a
+    # genuine "give me the file" request, not a preview.
     if s3_key:
+        if not force_stream and filename.lower().endswith(".docx"):
+            from s3_service import download_file_from_s3
+            import tempfile
+            from phase6 import _convert_to_pdf
+
+            docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
+            if docx_bytes:
+                try:
+                    with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
+                        tmp_docx = Path(tmpdir) / "resume.docx"
+                        tmp_pdf = Path(tmpdir) / "resume.pdf"
+                        tmp_docx.write_bytes(docx_bytes)
+                        converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
+                        if converted and tmp_pdf.exists():
+                            pdf_bytes = tmp_pdf.read_bytes()
+                            pdf_filename = filename[:-5] + ".pdf"
+                            return Response(
+                                content=pdf_bytes,
+                                media_type="application/pdf",
+                                headers={"Content-Disposition": f'inline; filename="{pdf_filename}"'},
+                            )
+                except Exception as exc:
+                    logger.warning("On-demand DOCX->PDF conversion failed for view (application %s): %s", application_id, exc)
+                    # Fall through to the presigned-URL/raw-bytes path below
+                    # as a safety net so View degrades instead of breaking.
         if not force_stream:
             from s3_service import generate_presigned_url
             presigned = generate_presigned_url(s3_key)
@@ -1010,6 +1051,28 @@ async def download_application_resume(
     else:
         with open(local_path, "rb") as f:
             body_bytes = f.read()
+        # Same on-demand conversion for a locally-stored (non-S3) docx —
+        # see the s3_key branch above for the full rationale.
+        if not force_stream and filename.lower().endswith(".docx"):
+            import tempfile
+            from phase6 import _convert_to_pdf
+            try:
+                with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
+                    tmp_docx = Path(tmpdir) / "resume.docx"
+                    tmp_pdf = Path(tmpdir) / "resume.pdf"
+                    tmp_docx.write_bytes(body_bytes)
+                    converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
+                    if converted and tmp_pdf.exists():
+                        pdf_filename = filename[:-5] + ".pdf"
+                        return Response(
+                            content=tmp_pdf.read_bytes(),
+                            media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="{pdf_filename}"'},
+                        )
+            except Exception as exc:
+                logger.warning("On-demand DOCX->PDF conversion failed for view (application %s): %s", application_id, exc)
+                # Fall through — body_bytes (the raw docx) still gets
+                # served below via the normal inline response.
 
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")

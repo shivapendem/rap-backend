@@ -5,6 +5,7 @@ import uuid
 import math
 import asyncio
 from typing import Optional, List
+from pathlib import Path
 from datetime import datetime, timezone, date
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body
 from fastapi.responses import Response
@@ -332,7 +333,9 @@ async def generate_resume(
         )
 
     try:
-        generated_data, rate_limits, usage_info = generate_tailored_resume(resume_info, request.job_description or "General Role")
+        generated_data, rate_limits, usage_info = generate_tailored_resume(
+            resume_info, request.job_description or "General Role", target_role=request.target_role
+        )
         if rate_limits:
             await save_claude_rate_limits(db, rate_limits)
         if usage_info:
@@ -1178,7 +1181,21 @@ def _build_base_career_objective(consultant: Consultant) -> str:
         except (TypeError, ValueError):
             years_str = None
 
-    role = (consultant.preferred_roles or "").split(",")[0].strip() or None
+    # BUG FIX ("DevOps Engineer Senior DevOps Engineer Cloud Engineer Cloud
+    # Infrastructure Engineer Site Reliability Engineer (SRE)..." showing
+    # up as one garbled title): this only ever split preferred_roles on
+    # commas. Several consultants' `preferred_roles` are actually stored
+    # as a space-separated list of alternative titles with no commas at
+    # all — in that case split(",")[0] returns the ENTIRE string, so the
+    # whole list got concatenated into the objective as if it were one
+    # job title. Split on comma/slash/semicolon/" and " (whichever
+    # delimiter is actually present) first; if the result is still one
+    # long undivided blob, cap it to a handful of words so it reads as a
+    # single reasonable title instead of a run-on sentence.
+    role_raw = re.split(r",|/|;|\band\b", consultant.preferred_roles or "")[0].strip()
+    role_words = role_raw.split()
+    role = " ".join(role_words[:5]) if len(role_words) > 5 else role_raw
+    role = role or None
     skills = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()][:3]
 
     opener_bits = []
@@ -1789,16 +1806,33 @@ async def download_base_resume(
     )
     display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
 
-    # Legacy local-disk record (pre-Spaces migration) — no object-storage
-    # key to presign, so this stays a direct stream. A .docx here has no
-    # in-browser renderer and can't be handed to Google's viewer either
-    # (it needs a real fetchable URL, not local bytes) — same acknowledged
-    # limitation the Sent Applications endpoint (phase7.py) documents for
-    # its own local-file case.
+    # BUG FIX ("view resume is downloading instead of previewing"): local
+    # (pre-Spaces) files have no fetchable URL to hand to an external
+    # viewer, so a .docx here always downloaded — now converted on-demand
+    # to PDF (same _convert_to_pdf resume generation already uses) so it
+    # actually previews inline, same fix applied to the S3 branch below.
     try:
         if os.path.isfile(stored):
             with open(stored, "rb") as fh:
                 body = fh.read()
+            if not force_stream and ext == ".docx":
+                import tempfile
+                from phase6 import _convert_to_pdf
+                try:
+                    with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
+                        tmp_docx = Path(tmpdir) / "resume.docx"
+                        tmp_pdf = Path(tmpdir) / "resume.pdf"
+                        tmp_docx.write_bytes(body)
+                        converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
+                        if converted and tmp_pdf.exists():
+                            pdf_name = os.path.splitext(display_name)[0] + ".pdf"
+                            return Response(
+                                content=tmp_pdf.read_bytes(),
+                                media_type="application/pdf",
+                                headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
+                            )
+                except Exception:
+                    pass  # fall through — raw docx bytes still served below
             return Response(
                 content=body,
                 media_type=media_type,
@@ -1807,13 +1841,36 @@ async def download_base_resume(
     except OSError:
         pass
 
+    # BUG FIX ("view resume is downloading instead of previewing"): this
+    # used to hand a presigned S3 URL to Google Docs Viewer — Google's
+    # viewer isn't reliably able to fetch a DigitalOcean Spaces presigned
+    # URL, so it silently falls back to downloading the raw file instead
+    # of rendering a preview. Converts on-demand to PDF instead — a real
+    # PDF renders natively inline in every browser, no external viewer
+    # dependency at all. The Download button (force_stream=True) still
+    # gets the real original file untouched.
+    if not force_stream and ext == ".docx":
+        import tempfile
+        from phase6 import _convert_to_pdf
+        docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, stored)
+        if docx_bytes:
+            try:
+                with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
+                    tmp_docx = Path(tmpdir) / "resume.docx"
+                    tmp_pdf = Path(tmpdir) / "resume.pdf"
+                    tmp_docx.write_bytes(docx_bytes)
+                    converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
+                    if converted and tmp_pdf.exists():
+                        pdf_name = os.path.splitext(display_name)[0] + ".pdf"
+                        return Response(
+                            content=tmp_pdf.read_bytes(),
+                            media_type="application/pdf",
+                            headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
+                        )
+            except Exception:
+                pass  # fall through to presigned-URL/raw-bytes below
+
     if not force_stream:
-        # CHANGED (view now shows the actual DOCX, not a converted PDF):
-        # same requirement as the Sent Applications resume-download
-        # endpoint (phase7.py) — View should open the real file via
-        # Google Docs Viewer (a real, publicly fetchable presigned URL,
-        # fetched by Google's own servers — browser CORS never applies
-        # there) instead of a server-side PDF conversion.
         presigned = generate_presigned_url(stored)
         if presigned:
             return {"url": presigned, "filename": display_name, "mimeType": media_type}

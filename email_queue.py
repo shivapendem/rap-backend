@@ -1126,25 +1126,27 @@ async def download_queue_attachment(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Serve an email-queue attachment for "View".
+    Get a downloadable URL or serve attachment file for email queue item.
 
-    CHANGED (back to real PDF preview, not a raw-file/Google-Docs-Viewer
-    hand-off): DOCX attachments are now converted to a real PDF on the
-    fly (cached — see file_preview.py) so the browser's own native PDF
-    viewer renders them inline. The previous "serve the real file"
-    approach relied on Google Docs Viewer fetching a presigned Spaces
-    URL server-side — that's unreliable for private/signed URLs and
-    commonly falls back to forcing a raw download instead of actually
-    previewing, which is exactly the "opens a tab, then downloads"
-    behavior this replaces. Falls back to the old presigned-URL / raw
-    bytes behavior if conversion isn't applicable (non-docx) or fails
-    for any reason — Download always still works even when preview
-    doesn't.
+    CHANGED (view now serves the actual file, not a PDF conversion): this
+    used to convert a DOCX attachment to PDF before serving — same as the
+    Applications Tracker's resume-download endpoint and My Resumes'
+    View/Download. Per updated requirement, View should show the real
+    attachment file. Browsers have no native inline renderer for .docx,
+    so this will generally open a save/open-with-Word prompt rather than
+    an in-page preview.
+
+    NOTE (merge): an earlier revision of this endpoint reintroduced
+    on-the-fly DOCX->PDF conversion (via file_preview.get_or_convert_pdf_preview)
+    for inline preview. That approach was superseded by this simpler
+    "serve the real file" version per the updated requirement above, so
+    the PDF-conversion path was intentionally dropped when merging the
+    two revisions. If inline DOCX preview is still wanted going forward,
+    it should be reintroduced deliberately rather than resurrected by
+    accident in a future merge.
     """
-    from pathlib import Path
     from s3_service import generate_presigned_url, download_file_from_s3
     from fastapi.responses import FileResponse, Response
-    from file_preview import get_or_convert_pdf_preview, is_docx_like
 
     clean_ref = ref.strip()
     if not clean_ref:
@@ -1153,44 +1155,20 @@ async def download_queue_attachment(
     import logging
     _log = logging.getLogger(__name__)
 
-    filename = os.path.basename(clean_ref)
-    docx_like = is_docx_like(clean_ref) or is_docx_like(filename)
-
-    def try_pdf_preview(docx_bytes: Optional[bytes]):
-        if not docx_bytes:
-            return None
-        pdf_bytes = get_or_convert_pdf_preview(docx_bytes)
-        if pdf_bytes:
-            return Response(content=pdf_bytes, media_type="application/pdf")
-        return None
-
-    # 1. Try Spaces S3 directly if ref is an S3 key
+    # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
     if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
-        if docx_like:
-            file_bytes, _ct = download_file_from_s3(clean_ref)
-            preview = try_pdf_preview(file_bytes)
-            if preview:
-                return preview
         url = generate_presigned_url(clean_ref)
         if url:
             return {"url": url}
 
     # 2. Try local file path if present
+    filename = os.path.basename(clean_ref)
     local_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(local_path):
-        if docx_like:
-            preview = try_pdf_preview(Path(local_path).read_bytes())
-            if preview:
-                return preview
         return FileResponse(local_path, filename=filename)
 
     # 3. Try fallback with S3 prefix
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
-    if docx_like:
-        file_bytes, _ct = download_file_from_s3(s3_key)
-        preview = try_pdf_preview(file_bytes)
-        if preview:
-            return preview
     url = generate_presigned_url(s3_key)
     if url:
         return {"url": url}

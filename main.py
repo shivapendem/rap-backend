@@ -533,11 +533,20 @@ async def login(
             detail="Invalid email or password",
         )
 
-    if user.role in ("ADMIN", "RECRUITER") and not user.is_authorized:
+    if not user.is_authorized:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is deactivated. Contact your administrator.",
         )
+    if user.role == "CONSULTANT":
+        consultant_status_result = await db.execute(
+            select(Consultant.status).where(Consultant.user_id == user.id)
+        )
+        if consultant_status_result.scalar_one_or_none() == "INACTIVE":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deactivated. Contact your administrator.",
+            )
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
@@ -633,17 +642,25 @@ async def google_login(
             detail="User not registered. Please contact your administrator.",
         )
 
-    if user.role in ("ADMIN", "RECRUITER") and not user.is_authorized:
+    if not user.is_authorized:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is deactivated.",
         )
+    if user.role == "CONSULTANT":
+        consultant_status_result = await db.execute(
+            select(Consultant.status).where(Consultant.user_id == user.id)
+        )
+        if consultant_status_result.scalar_one_or_none() == "INACTIVE":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deactivated.",
+            )
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
 
-    # Real last-login tracking — see matching note in /auth/login.
-    user.last_login_at = datetime.now(timezone.utc)
+    # Real last-login tracking — see matching note in /auth/login.    user.last_login_at = datetime.now(timezone.utc)
 
     # Insert Login Notification
     new_notif = Notification(

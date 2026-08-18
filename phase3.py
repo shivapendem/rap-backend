@@ -833,11 +833,41 @@ async def list_consultants(
 
     if status:
         if status not in Consultant.VALID_STATUSES:
-            raise HTTPException(422, f"status must be one of {sorted(Consultant.VALID_STATUSES)}")
+            raise HTTPException(
+                422,
+                f"status must be one of {sorted(Consultant.VALID_STATUSES)}",
+            )
+
         query = query.where(Consultant.status == status)
 
-    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
-    rows = (await db.execute(query.order_by(Consultant.created_at.desc()).offset((page - 1) * page_size).limit(page_size))).scalars().all()
+    else:
+        from sqlalchemy import or_
+
+        query = query.where(
+            Consultant.status == "ACTIVE"
+        ).where(
+            or_(
+                Consultant.user_id.is_(None),
+                Consultant.user_id.in_(
+                    select(User.id).where(User.is_authorized == True)
+                ),
+            )
+        )
+
+    total = (
+        await db.execute(
+            select(func.count()).select_from(query.subquery())
+        )
+    ).scalar_one()
+
+    rows = (
+        await db.execute(
+            query
+            .order_by(Consultant.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).scalars().all()
 
     # Batch-count experience rows for this whole page in one query instead
     # of N+1 — profileCompleteness now factors in Experience, so leaving
