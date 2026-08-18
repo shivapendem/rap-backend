@@ -677,7 +677,7 @@ async def send_email_now(
     caller gets a real success/failure result and, on success, a real
     `applications` row — not just "queued".
     """
-    from models import EmailQueue, Consultant
+    from models import EmailQueue, Consultant, User
     from sqlalchemy import select as sa_select
 
     consultant_id = None
