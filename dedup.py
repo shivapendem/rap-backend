@@ -127,7 +127,13 @@ async def save_requirement(
     )
 
     db.add(new_req)
-    await db.commit()
-    await db.refresh(new_req)
-
-    return {"status": "saved", "id": new_req.id}
+    try:
+        await db.commit()
+        await db.refresh(new_req)
+        return {"status": "saved", "id": new_req.id}
+    except Exception as e:
+        await db.rollback()
+        import sqlalchemy.exc
+        if isinstance(e, sqlalchemy.exc.IntegrityError) and "dedup_key" in str(e):
+            return {"status": "duplicate", "id": None}
+        raise

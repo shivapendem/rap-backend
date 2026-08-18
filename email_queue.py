@@ -1561,7 +1561,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     access_token = decrypt_token(email_tok.access_token_encrypted)
 
             if not access_token:
-                raise ValueError("No OAuth token found for candidate/consultant and not a Savantis sender")
+                raise ValueError(f"No OAuth token found for candidate/consultant ({item.from_email}) and not a Savantis sender")
 
         print(f"[email-queue debug {item.id}] Token resolved successfully. Resolving attachments...")
 

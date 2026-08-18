@@ -262,12 +262,16 @@ async def _email_queue_worker_loop():
                 for item in queued_items:
                     await process_single_email_queue_item(session, item)
         except Exception as e:
-            print(f"[email-queue] loop error: {e}")
-            from error_logger import log_db_error
-            await log_db_error(stage="email_queue_worker_loop", error=e)
-            try:
-                from notification_helper import notify_by_role
-                async with AsyncSessionLocal() as notif_session:
+            err_str = str(e).lower()
+            if "connection was closed" in err_str or "connection does not exist" in err_str:
+                print(f"[email-queue] transient connection drop: {e}")
+            else:
+                print(f"[email-queue] loop error: {e}")
+                from error_logger import log_db_error
+                await log_db_error(stage="email_queue_worker_loop", error=e)
+                try:
+                    from notification_helper import notify_by_role
+                    async with AsyncSessionLocal() as notif_session:
                     await notify_by_role(notif_session, roles=["ADMIN"], title="Email queue sync failed", body=f"Email queue worker loop failed: {e}")
             except Exception as notif_err:
                 print(f"[email-queue] notify failed: {notif_err}")

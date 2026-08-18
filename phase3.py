@@ -962,7 +962,7 @@ async def admin_create_consultant(
         except (TypeError, ValueError):
             raise HTTPException(422, f"Invalid recruiter_id: {payload.recruiter_id}")
         r = await db.execute(
-            select(User).where(User.id == recruiter_id_int, User.role == "RECRUITER", User.is_active == True)
+            select(User).where(User.id == recruiter_id_int, User.role == "RECRUITER", User.is_authorized == True)
         )
         if not r.scalars().first():
             raise HTTPException(404, f"Active recruiter with id={recruiter_id_int} not found")
@@ -1547,7 +1547,7 @@ async def set_recruiters_for_consultant(
 
     for rid in recruiter_ids:
         r = await db.execute(
-            select(User).where(User.id == rid, User.role == "RECRUITER", User.is_active == True)
+            select(User).where(User.id == rid, User.role == "RECRUITER", User.is_authorized == True)
         )
         if not r.scalars().first():
             raise HTTPException(404, f"Active recruiter with id={rid} not found")
