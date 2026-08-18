@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 
 from typing import Optional, List, Any
-from pydantic import BaseModel, EmailStr, field_validator, Field
+from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 VALID_STATUSES = {"Active", "Inactive"}
@@ -216,6 +216,7 @@ class ConsultantAdminRowDTO(BaseModel):
     # to and un-editable from admin. Now backed by Consultant.education.
     education: List["EducationEntryDTO"] = []
     resume_info: Optional[Any] = None
+    resume_rich_text: Optional[str] = None
     updated_at: str = ""
     has_resume: bool = False  # base_resume_file_path/base_resume_text can be large — expose presence, not raw content
     last_login_at: Optional[str] = None
@@ -263,6 +264,7 @@ class UpdateConsultantRequestDTO(BaseModel):
     linkedin_url: Optional[str] = None
     education: Optional[List[EducationEntryDTO]] = None
     resume_info: Optional[Any] = None
+    resume_rich_text: Optional[str] = None
 
     @field_validator("status")
     @classmethod
@@ -276,3 +278,12 @@ class UpdateConsultantResponseDTO(BaseModel):
     success: bool
     message: str
     consultant: ConsultantAdminRowDTO
+
+class UpdateResumeRichTextRequestDTO(BaseModel):
+    resume_rich_text: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+class UpdateResumeRichTextResponseDTO(BaseModel):
+    success: bool
+    message: str
+    consultant_id: str

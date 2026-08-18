@@ -23,6 +23,7 @@ from phase_users_schema import (
     AssignConsultantRequestDTO, AssignConsultantResponseDTO,
     UpdateRecruiterConsultantsRequestDTO, UpdateRecruiterConsultantsResponseDTO,
     UpdateConsultantRequestDTO, UpdateConsultantResponseDTO,
+    UpdateResumeRichTextRequestDTO, UpdateResumeRichTextResponseDTO,
 )
 from phase_users_service import UserService, ConsultantAssignmentService, RESUME_INFO_NOT_PROVIDED
 
@@ -256,8 +257,25 @@ async def update_consultant(
         # all" (leave it alone) — same distinction Pydantic's own
         # exclude_unset is built for.
         resume_info=body.resume_info if "resume_info" in body.model_fields_set else RESUME_INFO_NOT_PROVIDED,
+        resume_rich_text=body.resume_rich_text if "resume_rich_text" in body.model_fields_set else None,
         admin_id=current_user.get("sub"),
     )
     return UpdateConsultantResponseDTO(
         success=True, message="Consultant profile updated.", consultant=consultant,
+    )
+
+@router.patch("/consultants/{consultant_id}/resume-rich-text", response_model=UpdateResumeRichTextResponseDTO)
+async def update_consultant_resume_rich_text(
+    consultant_id: int,
+    body: UpdateResumeRichTextRequestDTO,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    await ConsultantAssignmentService.update_resume_rich_text(
+        db, consultant_id,
+        resume_rich_text=body.resume_rich_text,
+        admin_id=current_user.get("sub"),
+    )
+    return UpdateResumeRichTextResponseDTO(
+        success=True, message="Consultant resume rich text updated.", consultant_id=str(consultant_id),
     )

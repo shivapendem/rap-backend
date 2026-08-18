@@ -127,6 +127,7 @@ class Consultant(Base):
     # reads base_resume_text) and Download (which reads
     # base_resume_file_path) keep working unchanged.
     base_resume_content = JSONBColumn(nullable=True)
+    resume_rich_text = Column(Text, nullable=True)
     gmail_connected = Column(Boolean, nullable=False, default=False)
     ats_score = Column(Numeric(5, 2), default=0)
     status = Column(Text, nullable=False, default="ACTIVE")

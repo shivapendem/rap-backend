@@ -131,6 +131,7 @@ class ProfileUpdateRequest(BaseModel):
     title: Optional[str] = None
     summary: Optional[str] = None
     education: List[EducationEntryRequest] = []
+    resumeRichText: Optional[str] = None
 
     @field_validator("workAuth")
     @classmethod
@@ -182,6 +183,7 @@ class ProfileResponse(BaseModel):
     title: Optional[str] = None
     summary: Optional[str] = None
     education: List[EducationEntryRequest] = []
+    resumeRichText: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +219,7 @@ class AdminConsultantCreateRequest(BaseModel):
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     resume_info: Optional[dict] = None
+    resume_rich_text: Optional[str] = None
     linkedin_url: Optional[str] = None
     education: List[EducationEntryRequest] = []
 
@@ -466,7 +469,8 @@ async def _consultant_to_profile_response(
         # Prefer the real Consultant.education column (what admin now
         # edits) — fall back to the legacy resume_info blob only for rows
         # saved before update_own_profile started writing the column too.
-        education=c.education or resume_info.get("education") or [],
+        education=c.education if c.education is not None else resume_info.get("education", []),
+        resumeRichText=c.resume_rich_text,
         totalExperienceYears=float(c.total_experience_years) if c.total_experience_years is not None else None,
         availabilityStatus=c.availability_status,
         createdAt=c.created_at.isoformat() if c.created_at else None,
@@ -743,6 +747,7 @@ async def update_own_profile(
     # column (what admin now reads/edits) in addition to resume_info below
     # (kept for resume_validation.py's FIELD_CHECKS / resume generation).
     consultant.education = [e.model_dump() for e in payload.education]
+    consultant.resume_rich_text = payload.resumeRichText
 
     # BUG FIX: this consultant self-service endpoint never wrote to
     # User.resume_info at all — the AI generation eligibility check
@@ -996,6 +1001,7 @@ async def admin_create_consultant(
         total_experience_years=payload.total_experience_years,
         linkedin_url=payload.linkedin_url,
         education=[e.model_dump() for e in payload.education],
+        resume_rich_text=payload.resume_rich_text,
     )
     # availability_status isn't referenced elsewhere in this file, so only
     # set it if the model actually defines that column.

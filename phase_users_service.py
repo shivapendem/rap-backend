@@ -157,6 +157,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
         education=c.education or (resume_info or {}).get("education") or [],
         resume_info=resume_info,
+        resume_rich_text=c.resume_rich_text,
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
         has_resume=bool(c.base_resume_file_path or c.base_resume_text),
         last_login_at=last_login_at.isoformat() if last_login_at else None,
@@ -417,6 +418,7 @@ class ConsultantAssignmentService:
         linkedin_url: Optional[str] = None,
         education: Optional[list] = None,
         resume_info: Any = RESUME_INFO_NOT_PROVIDED,
+        resume_rich_text: Optional[str] = None,
     ) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -448,6 +450,10 @@ class ConsultantAssignmentService:
             consultant.linkedin_url = linkedin_url
         if education is not None:
             consultant.education = education
+        if resume_info is not RESUME_INFO_NOT_PROVIDED:
+            consultant.resume_info = resume_info
+        if resume_rich_text is not None:
+            consultant.resume_rich_text = resume_rich_text
 
         # resume_info lives on User, not Consultant (see admin_create_consultant
         # and generate_resume() in resume_router.py, which both read/write it
@@ -471,6 +477,26 @@ class ConsultantAssignmentService:
             actor_user_id=admin_id, actor_name=admin_id, actor_role="ADMIN",
             entity_type="Consultant", entity_id=str(consultant.id),
             metadata={"type": "consultant_profile_update"},
+        )
+        await db.commit()
+        return await _consultant_to_dto(db, consultant)
+
+    @staticmethod
+    async def update_resume_rich_text(
+        db: AsyncSession, consultant_id: int, resume_rich_text: Optional[str], *, admin_id: str
+    ) -> ConsultantAdminRowDTO:
+        consultant = await ConsultantRepository.get_by_id(db, consultant_id)
+        if not consultant:
+            raise HTTPException(status_code=404, detail="Consultant not found")
+
+        consultant.resume_rich_text = resume_rich_text
+        consultant = await ConsultantRepository.update(db, consultant)
+
+        await log_action(
+            db, "USER_UPDATED",
+            actor_user_id=admin_id, actor_name=admin_id, actor_role="ADMIN",
+            entity_type="Consultant", entity_id=str(consultant.id),
+            metadata={"type": "consultant_resume_rich_text_update"},
         )
         await db.commit()
         return await _consultant_to_dto(db, consultant)
