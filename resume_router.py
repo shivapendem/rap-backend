@@ -569,6 +569,31 @@ async def upload_resume(
                 raise HTTPException(status_code=403, detail="That consultant isn't assigned to you.")
         owner_id = target_user_id
 
+    # BUG FIX: nothing stopped uploading a resume with the exact same
+    # title an owner already has — easy to do by accident (double-
+    # clicking Upload, or re-uploading the same file after a page
+    # refresh), and it silently clutters "My Resumes" with indistinguishable
+    # duplicates. Scoped per owner_id (not per-uploader), so this applies
+    # the same way whether a consultant uploads for themselves or an
+    # admin/recruiter uploads on their behalf — and per role automatically,
+    # since every role shares this one endpoint (PdfUploadModal.tsx).
+    # Case-insensitive/trimmed so "My Resume" and "my resume " still count
+    # as the same title. The synthetic base resume entry (id=-1, injected
+    # in list_resumes rather than a real row here) is never a match target,
+    # since this only ever queries real Resume rows.
+    clean_title = title.strip()
+    existing_title = await db.execute(
+        select(Resume).where(
+            Resume.user_id == owner_id,
+            func.lower(Resume.title) == clean_title.lower(),
+        )
+    )
+    if existing_title.scalars().first():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A resume titled \"{clean_title}\" already exists. Please use a different title.",
+        )
+
     s3_key = f"users/{owner_id}/resumes/{uuid.uuid4()}/final.docx"
 
     # Read into memory once so the same bytes can both upload to Spaces AND
@@ -1132,6 +1157,43 @@ def _format_month_year(d: Optional[date]) -> str:
     return d.strftime("%b %Y") if d else ""
 
 
+def _build_base_career_objective(consultant: Consultant) -> str:
+    """Builds a plain, factual 2-3 line Career Objective straight from the
+    consultant's own stored profile fields (years, preferred role, primary
+    skills) — used only when there's no stored `summary` to show. Without
+    this, the Base Resume preview simply skipped the whole CAREER
+    OBJECTIVE section (ResumeRichPreview only renders it when non-empty),
+    which is why Base Resume and Generated Resume looked structurally
+    different side by side even though they render through the exact same
+    component. Never invents a title, employer, or skill the profile
+    doesn't already have — same no-fabrication rule as the AI-tailored
+    path in claude_service.py, just without a JD to match against.
+    """
+    years = consultant.total_experience_years
+    years_str = None
+    if years is not None:
+        try:
+            years_num = float(years)
+            years_str = f"{years_num:.0f}+ years" if years_num == int(years_num) else f"{years_num}+ years"
+        except (TypeError, ValueError):
+            years_str = None
+
+    role = (consultant.preferred_roles or "").split(",")[0].strip() or None
+    skills = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()][:3]
+
+    opener_bits = []
+    if role:
+        opener_bits.append(role)
+    if years_str:
+        opener_bits.append(f"with {years_str} of experience" if role else f"Technology professional with {years_str} of experience")
+    line_a = (" ".join(opener_bits).strip() + ".") if opener_bits else "Technology professional."
+
+    line_b = f"Skilled in {', '.join(skills)}." if skills else ""
+    line_c = f"Brings hands-on experience with {', '.join(skills)} to deliver reliable, high-quality outcomes." if skills else ""
+
+    return " ".join(p for p in (line_a, line_b, line_c) if p)
+
+
 async def build_base_resume_content(db: AsyncSession, consultant: Consultant) -> dict:
     """Overlay the profile-derived fields (Skills, Experience, Education,
     Name/Phone/Location/LinkedIn) fresh from Consultant/ConsultantExperience/
@@ -1151,7 +1213,7 @@ async def build_base_resume_content(db: AsyncSession, consultant: Consultant) ->
     if consultant.user_id:
         info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
         resume_info = info_result.scalar_one_or_none() or {}
-    summary_text = resume_info.get("summary") or ""
+    summary_text = resume_info.get("summary") or _build_base_career_objective(consultant)
 
     technical_proficiencies = []
     if (consultant.primary_skills or "").strip():
@@ -1193,6 +1255,58 @@ async def build_base_resume_content(db: AsyncSession, consultant: Consultant) ->
     }
 
 
+async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consultant, content: dict) -> None:
+    """Rebuild the actual downloadable/viewable DOCX from `content` and
+    overwrite it in place at consultant.base_resume_file_path (or create
+    one if none exists yet) — same logic update_base_resume_content below
+    already runs on every editor save, extracted here so
+    sync_base_resume_text can trigger it too. Best-effort: logs and
+    returns on failure rather than raising, matching the try/except
+    already wrapping this same logic at its original call site."""
+    import io
+    import tempfile
+    from pathlib import Path
+    from phase6 import _generate_docx
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            docx_path = Path(tmp_dir) / "base_resume.docx"
+            _generate_docx(content, docx_path)
+            docx_bytes = docx_path.read_bytes()
+
+        stored = consultant.base_resume_file_path
+        if stored and os.path.isfile(stored):
+            old_path = Path(stored)
+            new_path = old_path.with_suffix(".docx")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            new_path.write_bytes(docx_bytes)
+            if new_path != old_path and old_path.exists():
+                old_path.unlink()
+            consultant.base_resume_file_path = str(new_path)
+        elif stored:
+            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
+            if upload_file_to_s3(
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                consultant.base_resume_file_path = key
+        else:
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
+        await db.commit()
+    except Exception as e:
+        print(f"Base resume DOCX regeneration (background sync) failed for consultant {consultant.id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="base_resume_docx_regen_on_profile_sync",
+            error=e,
+            source_type="consultant",
+            source_id=str(consultant.id),
+        )
+
+
 async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> None:
     """Regenerate and stage consultant.base_resume_text from CURRENT
     profile fields — called by phase3.py whenever Skills, Experience,
@@ -1200,9 +1314,42 @@ async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> Non
     (read by both the completeness check and matching_router.py's TF-IDF
     scoring) never sits stale waiting for someone to manually open and
     save the Base Resume editor. Stages the change on consultant only —
-    caller still owns db.commit()."""
+    caller still owns db.commit().
+
+    BUG FIX ("edit Full Name on My Profile, View still shows the old
+    name"): this used to only update base_resume_text (the flat text used
+    for matching) — the actual downloadable/viewable DOCX file at
+    base_resume_file_path was never touched here, only when someone
+    explicitly opened and saved the Base Resume EDITOR (which is why the
+    editor always showed live data — it reads fresh from the database
+    every time — but View kept serving that same stale, unregenerated
+    file). Now also fires off a background regeneration of that file, so
+    View reflects a My Profile edit without requiring a detour through
+    the editor first. Runs as a genuinely separate background task with
+    its own DB session (not awaited inline here) — a DOCX build + S3
+    upload is real, unpredictable I/O latency that a routine profile save
+    shouldn't have to wait on synchronously, same reasoning already
+    applied to the re-matching background task in phase3.py's
+    update_own_profile."""
     content = await build_base_resume_content(db, consultant)
     consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
+
+    consultant_id = consultant.id
+
+    async def _regen_in_background(cid: int):
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as bg_session:
+            bg_consultant_result = await bg_session.execute(
+                select(Consultant).where(Consultant.id == cid)
+            )
+            bg_consultant = bg_consultant_result.scalars().first()
+            if not bg_consultant:
+                return
+            bg_content = await build_base_resume_content(bg_session, bg_consultant)
+            await _regenerate_base_resume_docx_file(bg_session, bg_consultant, bg_content)
+
+    import asyncio
+    asyncio.create_task(_regen_in_background(consultant_id))
 
 
 @router.get("/base/content", response_model=BaseResumeContentDTO)
@@ -1458,47 +1605,13 @@ async def update_base_resume_content(
     consultant.base_resume_content = resume_data
     consultant.base_resume_text = _flatten_base_resume_content_to_text(resume_data)
 
-    import io
-    import tempfile
-    from pathlib import Path
-    from phase6 import _generate_docx
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            docx_path = Path(tmp_dir) / "base_resume.docx"
-            _generate_docx(resume_data, docx_path)
-            docx_bytes = docx_path.read_bytes()
-
-        stored = consultant.base_resume_file_path
-        if stored and os.path.isfile(stored):
-            old_path = Path(stored)
-            new_path = old_path.with_suffix(".docx")
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            new_path.write_bytes(docx_bytes)
-            if new_path != old_path and old_path.exists():
-                old_path.unlink()
-            consultant.base_resume_file_path = str(new_path)
-        elif stored:
-            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
-            if upload_file_to_s3(
-                io.BytesIO(docx_bytes), key,
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ):
-                consultant.base_resume_file_path = key
-        else:
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
-    except Exception as e:
-        print(f"Base resume DOCX regeneration on content save failed for consultant {consultant.id}: {e}")
-        from error_logger import log_db_error
-        await log_db_error(
-            stage="base_resume_docx_regen_on_content_save",
-            error=e,
-            source_type="consultant",
-            source_id=str(consultant.id),
-        )
+    # Same DOCX rebuild logic sync_base_resume_text's background task now
+    # also uses — extracted into _regenerate_base_resume_docx_file so the
+    # two call sites can't drift apart. This one still runs inline/awaited
+    # (not backgrounded) since this IS the explicit "save my edits" action
+    # on this specific screen — the person expects Save to mean the file
+    # is actually updated by the time it returns, not "eventually."
+    await _regenerate_base_resume_docx_file(db, consultant, resume_data)
 
     # BUG FIX: this was indented inside the `except` above, so it only
     # ran when DOCX regeneration failed — on the normal success path

@@ -1126,18 +1126,25 @@ async def download_queue_attachment(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Get a downloadable URL or serve attachment file for email queue item.
+    Serve an email-queue attachment for "View".
 
-    CHANGED (view now serves the actual file, not a PDF conversion): this
-    used to convert a DOCX attachment to PDF before serving — same as the
-    Applications Tracker's resume-download endpoint and My Resumes'
-    View/Download. Per updated requirement, View should show the real
-    attachment file. Browsers have no native inline renderer for .docx,
-    so this will generally open a save/open-with-Word prompt rather than
-    an in-page preview.
+    CHANGED (back to real PDF preview, not a raw-file/Google-Docs-Viewer
+    hand-off): DOCX attachments are now converted to a real PDF on the
+    fly (cached — see file_preview.py) so the browser's own native PDF
+    viewer renders them inline. The previous "serve the real file"
+    approach relied on Google Docs Viewer fetching a presigned Spaces
+    URL server-side — that's unreliable for private/signed URLs and
+    commonly falls back to forcing a raw download instead of actually
+    previewing, which is exactly the "opens a tab, then downloads"
+    behavior this replaces. Falls back to the old presigned-URL / raw
+    bytes behavior if conversion isn't applicable (non-docx) or fails
+    for any reason — Download always still works even when preview
+    doesn't.
     """
+    from pathlib import Path
     from s3_service import generate_presigned_url, download_file_from_s3
     from fastapi.responses import FileResponse, Response
+    from file_preview import get_or_convert_pdf_preview, is_docx_like
 
     clean_ref = ref.strip()
     if not clean_ref:
@@ -1146,20 +1153,44 @@ async def download_queue_attachment(
     import logging
     _log = logging.getLogger(__name__)
 
-    # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
+    filename = os.path.basename(clean_ref)
+    docx_like = is_docx_like(clean_ref) or is_docx_like(filename)
+
+    def try_pdf_preview(docx_bytes: Optional[bytes]):
+        if not docx_bytes:
+            return None
+        pdf_bytes = get_or_convert_pdf_preview(docx_bytes)
+        if pdf_bytes:
+            return Response(content=pdf_bytes, media_type="application/pdf")
+        return None
+
+    # 1. Try Spaces S3 directly if ref is an S3 key
     if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
+        if docx_like:
+            file_bytes, _ct = download_file_from_s3(clean_ref)
+            preview = try_pdf_preview(file_bytes)
+            if preview:
+                return preview
         url = generate_presigned_url(clean_ref)
         if url:
             return {"url": url}
 
     # 2. Try local file path if present
-    filename = os.path.basename(clean_ref)
     local_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(local_path):
+        if docx_like:
+            preview = try_pdf_preview(Path(local_path).read_bytes())
+            if preview:
+                return preview
         return FileResponse(local_path, filename=filename)
 
     # 3. Try fallback with S3 prefix
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
+    if docx_like:
+        file_bytes, _ct = download_file_from_s3(s3_key)
+        preview = try_pdf_preview(file_bytes)
+        if preview:
+            return preview
     url = generate_presigned_url(s3_key)
     if url:
         return {"url": url}
@@ -1488,6 +1519,26 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                             )
 
             if email_tok and email_tok.access_token_encrypted:
+                # BUG FIX: this used to proceed straight to using the
+                # stored access token regardless of whether Gmail's send
+                # scope was actually granted at connect time (see the
+                # phase7.py fix — send_permission_granted used to be
+                # hardcoded True on every token, whether or not the user
+                # actually granted the gmail.send permission on Google's
+                # consent screen). That meant a token which could
+                # authenticate fine but genuinely lacked send permission
+                # sailed through every check here and only failed deep
+                # inside the actual Gmail API call, surfacing as a raw
+                # "Gmail API error 403: {...ACCESS_TOKEN_SCOPE_INSUFFICIENT...}"
+                # JSON blob with no indication of what to actually do.
+                # Catch it here instead, before spending an API call, with
+                # a message that tells the admin/consultant the real fix.
+                if email_tok.send_permission_granted is False:
+                    raise ValueError(
+                        f"Gmail is connected for {item.from_email} but without send permission "
+                        f"(the 'Send email on your behalf' permission was not granted). "
+                        f"The consultant needs to reconnect Gmail and grant that permission before applying again."
+                    )
                 from datetime import datetime, timezone, timedelta
                 import httpx
                 from gmail_send_service import encrypt_token

@@ -139,20 +139,25 @@ CRITICAL STANDARDS & INSTRUCTIONS:
 2. CAREER OBJECTIVE GENERATION — FOLLOW THIS EXACT PROCESS FOR EVERY JD:
    The candidate's provided profile data is the source of truth for the Career Objective, exactly as it is for every other section. It must be freshly written for THIS specific JD every single time — never reuse or lightly reword a previous objective, and never simply copy the candidate's existing summary/objective text if one was provided as background; treat it only as source material to rewrite from, not text to preserve.
 
-   Step 1 — Identify the Target Role: extract the primary role/title from the CURRENT job description (e.g. "Java Full Stack Developer", "Senior Data Analyst", "React Developer"). The objective must target this role specifically.
+   Step 1 — Identify the Target Role: if a TARGET ROLE is supplied explicitly in the user message, that is the exact designation/title to use verbatim — do not paraphrase, shorten, or re-derive it from the JD text. Only when no TARGET ROLE is supplied, extract the primary role/title from the CURRENT job description (e.g. "Java Full Stack Developer", "Senior Data Analyst", "React Developer").
 
    Step 2 — Analyze the Current JD: identify the most important role requirements, technical skills, programming languages, frameworks, tools, cloud technologies, database technologies, responsibilities, domain requirements, and experience requirements. Prioritize whichever of these matter most for this specific role.
 
    Step 3 — Analyze the candidate's actual profile data (the single source of truth): current/previous roles, years of experience, technical skills, frameworks, tools, projects, responsibilities, domain experience, achievements, certifications — only what is actually present.
 
-   Step 4 — Match profile against Current JD: find the strongest verified overlap, prioritizing in this order — (1) Target Role, (2) Relevant Experience, (3) Core Technical Skills, (4) Frameworks/Tools, (5) Relevant Responsibilities, (6) Domain Experience. Use only the strongest VERIFIED matches.
+   Step 4 — Match profile against Current JD: find the strongest verified overlap between the candidate's real skills and the JD's required/preferred skills. Select only the top 2-3 strongest VERIFIED matches — do not list more than 3 skills in the objective.
 
-   Step 5 — Generate a NEW Career Objective for this JD: 50–100 words (60–80 preferred), ATS-friendly, naturally incorporating verified JD keywords, clearly targeting the JD role, professional and natural in tone. Do not simply copy sentences from the JD — understand it and incorporate relevant requirements naturally. Avoid keyword stuffing, generic filler statements, and unsupported claims.
+   Step 5 — Generate a NEW Career Objective for this JD, exactly 2-3 lines (roughly 30-50 words total), structured as:
+     (a) Open with the exact designation/title from Step 1.
+     (b) State the candidate's years of experience and core domain (drawn only from the candidate's actual profile).
+     (c) Name the 2-3 top matching skills identified in Step 4 — skills that exist in BOTH the candidate's profile AND the JD.
+     (d) Close with one sentence on the specific value the candidate brings, tied to a goal or pain point evident in the JD (e.g. reliability, delivery speed, scale, cost, quality) — grounded in what the candidate's profile actually supports, not a generic claim.
+   Keep it ATS-friendly and professional: no fluff, no generic filler phrases ("highly motivated", "team player", "results-oriented"), no keyword stuffing. Do not simply copy sentences from the JD — understand it and incorporate relevant requirements naturally.
 
-   80% MATCHING RULE: target approximately 80% relevance to the JD — but this is a target, never a reason to fabricate. Only use skills, experience, technologies, responsibilities, projects, and achievements the candidate's actual profile supports. If the JD wants a skill the profile doesn't have: do NOT claim it, do NOT add it to the objective, do NOT invent experience with it, do NOT inflate years of experience.
+   TRUTHFULNESS RULE: only use skills, experience, technologies, responsibilities, projects, and achievements the candidate's actual profile supports. If the JD wants a skill the profile doesn't have: do NOT claim it, do NOT add it to the objective, do NOT invent experience with it, do NOT inflate years of experience.
      Example — JD wants: Java, Spring Boot, AWS, Kubernetes. Profile has: Java, Spring Boot, Microservices.
-     Correct: "Experienced Java developer with expertise in Spring Boot and microservices, seeking to contribute strong backend development skills to scalable application projects."
-     Incorrect: "Experienced Java developer with expertise in Spring Boot, microservices, AWS, and Kubernetes." — AWS and Kubernetes aren't supported by the profile and must not be claimed.
+     Correct (2-3 lines): "Senior Java Developer with 6+ years of experience in backend and microservices development. Skilled in Java, Spring Boot, and Microservices architecture. Brings proven ability to design scalable, maintainable backend systems that reduce production issues and speed up delivery."
+     Incorrect: "...expertise in Spring Boot, microservices, AWS, and Kubernetes." — AWS and Kubernetes aren't supported by the profile and must not be claimed.
 
    Also strategically align experience role titles (`role`) and bullet points so they reflect the target domain while keeping authentic company names and dates unchanged.
 
@@ -171,7 +176,7 @@ Return EXACTLY this JSON structure with no markdown code fences:
   "location": "string",
   "linkedin": "string",
   "github": "string",
-  "career_objective": "string (60-80 words preferred, 50-100 word range, freshly written for THIS JD per the process above, with **bolded keywords**)",
+  "career_objective": "string (exactly 2-3 lines / ~30-50 words, freshly written for THIS JD per the process above — exact JD title, years+domain, top 2-3 matching skills, one value-proposition line — with **bolded keywords**)",
   "summary": "string",
   "technical_proficiencies": [
     {"category": "Programming Languages", "skills": ["C", "C++", "Java", "Python", "SQL"]},
@@ -623,29 +628,30 @@ def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str
     return ""
 
 
-def _build_factual_career_objective(resume_info: dict, real_skills: list, job_description: str) -> str:
-    """Constructs a plain, factual career-objective sentence from only real
-    profile data (years of experience, real skills) — used when there's no
-    stored summary AND the AI call itself failed (so there's no real
-    tailored objective either). Never invents a job title, employer, or
-    achievement the profile doesn't actually have; only states facts
-    already present in resume_info, same anti-fabrication rule the rest of
-    this fallback already follows.
+def _build_factual_career_objective(
+    resume_info: dict, real_skills: list, job_description: str, target_role: Optional[str] = None
+) -> str:
+    """Constructs a plain, factual 2-3 line career objective from only real
+    profile data (title, years of experience, domain, real skills) — used
+    when there's no stored summary AND the AI call itself failed (so
+    there's no real tailored objective either). Never invents a job title,
+    employer, or achievement the profile doesn't actually have; only
+    states facts already present in resume_info / target_role, same
+    anti-fabrication rule the rest of this fallback already follows.
 
-    IMPROVED (still without an LLM call): rather than listing an arbitrary
-    slice of the candidate's skills, this now prioritizes whichever real
-    skills actually appear in the job description text — simple
-    case-insensitive keyword overlap, not fabrication — so the sentence
-    reads as genuinely relevant to THIS job instead of a generic list,
-    even in the no-AI fallback path. Falls back to the candidate's first
-    few skills if none happen to overlap with the JD text.
+    Follows the same 4-part structure the AI prompt is instructed to use:
+    (a) exact JD designation/title, (b) years of experience + core domain,
+    (c) top 2-3 skills that exist in BOTH the profile and the JD, (d) one
+    value-proposition line. `target_role` — the requirement's actual title
+    field — is authoritative when supplied; only falls back to sniffing a
+    "Role:"-style line out of the free-text JD when it isn't.
     """
     years = resume_info.get("years_experience") or resume_info.get("total_experience_years")
+    domain = resume_info.get("domain") or resume_info.get("core_domain")
     all_skills = [s for s in (real_skills or []) if s]
 
     jd_lower = (job_description or "").lower()
-    overlapping = [s for s in all_skills if s.lower() in jd_lower]
-    remaining = [s for s in all_skills if s not in overlapping]
+    overlapping = [s for s in all_skills if s.lower() in jd_lower][:3]
 
     years_str = None
     if years not in (None, ""):
@@ -655,33 +661,47 @@ def _build_factual_career_objective(resume_info: dict, real_skills: list, job_de
         except (TypeError, ValueError):
             years_str = None
 
-    parts = [f"Technology professional with {years_str} of experience" if years_str else "Technology professional"]
-    if overlapping:
-        # These are the skills that actually matter for THIS JD — lead
-        # with them explicitly rather than burying them in a generic list.
-        parts.append(f"directly experienced with {', '.join(overlapping[:5])}")
-        if remaining[:3]:
-            parts.append(f"and additional expertise in {', '.join(remaining[:3])}")
-    elif all_skills:
-        parts.append(f"skilled in {', '.join(all_skills[:5])}")
-    objective = " ".join(parts) + "."
+    role = target_role or _extract_role_hint(job_description)
 
-    if job_description and job_description.strip() and job_description.strip().lower() != "general role":
-        if overlapping:
-            objective += " These skills align closely with the requirements outlined in the target job description."
-        else:
-            role_hint = _extract_role_hint(job_description)
-            if role_hint:
-                objective += f" Seeking to apply this background to the {role_hint} opportunity."
-            else:
-                jd_snippet = " ".join(job_description.split())[:60].rstrip(",.;: ")
-                objective += f' Seeking to apply this background to this opportunity: "{jd_snippet}…"' if jd_snippet else " Seeking to apply this background to the requirements outlined in the target job description."
+    # Line (a) + (b): title, years, domain — only the parts we actually have.
+    opener_bits = []
+    if role:
+        opener_bits.append(role)
+    if years_str:
+        opener_bits.append(f"with {years_str} of experience" if role else f"Technology professional with {years_str} of experience")
+    if domain:
+        opener_bits.append(f"in {domain}")
+    if opener_bits:
+        line_a = " ".join(opener_bits).strip() + "."
+    else:
+        line_a = "Technology professional."
+
+    # Line (c): top matching skills, only if there's real overlap.
+    line_b = f"Skilled in {', '.join(overlapping)}." if overlapping else ""
+
+    # Line (d): one factual value-proposition sentence — never a generic
+    # unsupported claim, tied only to skills the candidate actually has.
+    if overlapping:
+        line_c = f"Brings hands-on experience with {', '.join(overlapping)} directly relevant to this role's requirements."
+    elif all_skills:
+        line_c = f"Brings hands-on experience with {', '.join(all_skills[:3])} applicable to this role."
+    else:
+        line_c = ""
+
+    objective = " ".join(p for p in (line_a, line_b, line_c) if p)
     return _MARK_OPEN + _bold_terms(objective, overlapping) + _MARK_CLOSE
 
 
-def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
+def generate_tailored_resume(
+    resume_info: dict, job_description: str, target_role: Optional[str] = None
+) -> tuple[dict, dict, Optional[dict]]:
     """
     Calls Anthropic API to generate a structured JSON resume based on resume_info and job_description.
+    `target_role` — the requirement's actual title (e.g. "Sr. Java Backend
+    Developer") — is the authoritative exact designation/title for the
+    Career Objective when supplied, taking priority over whatever the AI
+    (or the offline fallback) would otherwise guess out of the free-text
+    job_description.
     Returns (resume_json, rate_limit_headers, usage_info).
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -737,7 +757,7 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
     # requirement instead of being static, without inventing anything
     # the stored summary or profile doesn't already support.
     if not real_summary:
-        real_summary = _build_factual_career_objective(resume_info, real_skills, job_description)
+        real_summary = _build_factual_career_objective(resume_info, real_skills, job_description, target_role)
     else:
         # Bold whichever of the candidate's real skills are both in their
         # stored summary AND in this JD, so the summary visually reads as
@@ -809,10 +829,14 @@ def generate_tailored_resume(resume_info: dict, job_description: str) -> tuple[d
     try:
         client = Anthropic(api_key=api_key)
         
+        target_role_line = (
+            f"\nTARGET ROLE (authoritative — use this exact title verbatim in the Career Objective, per Step 1):\n{target_role}\n"
+            if target_role else ""
+        )
         user_prompt = f"""
 CANDIDATE PROFILE (JSON):
 {json.dumps(resume_info, indent=2)}
-
+{target_role_line}
 TARGET JOB DESCRIPTION:
 {job_description}
 

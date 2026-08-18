@@ -324,7 +324,7 @@ async def parse_text_endpoint(
     summary="Get raw email — checks gmail_emails first, falls back to emails table",
 )
 async def get_raw_email(
-    email_id: int,
+    email_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -342,8 +342,43 @@ async def get_raw_email(
     Checks gmail_emails first since that's where raw_email_id actually
     points; falls back to the emails table only for any legacy rows that
     predate this pipeline (there shouldn't be any going forward).
+
+    BUG FIX ("View Raw shows an error for some requirements, works fine
+    for others"): the frontend (RequirementsDebugTable.tsx) sends a
+    synthetic "req-{requirementId}" id for any requirement with no real
+    raw_email_id, per a comment claiming a Next.js reference build's API
+    route has special-case handling for that exact prefix — that route
+    doesn't exist in this backend; it was never ported. email_id used to
+    be typed `int` here, so FastAPI rejected "req-123" with a 422 before
+    this function even ran, for every requirement lacking a real linked
+    email. Now accepts the id as a string and special-cases that prefix
+    with a clean, honest response instead of an error.
     """
     _require_role(current_user, "ADMIN", "RECRUITER", "CONSULTANT")
+
+    if email_id.startswith("req-"):
+        return {
+            "source": "none",
+            "id": email_id,
+            "subject": None,
+            "from_address": None,
+            "fetched_at": None,
+            "body_text": None,
+            "body_html": None,
+            # The frontend's fetchRawEmail checks `raw.body` first, before
+            # falling back through body_text/body_html to a generic
+            # "(empty)" — adding this key directly is what actually
+            # surfaces this message, rather than the two cases (never
+            # had a linked email vs. a linked email with a genuinely
+            # empty body) looking identical to the person viewing it.
+            "body": "No email is linked to this requirement.",
+            "processed": False,
+        }
+
+    try:
+        email_id_int = int(email_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid email id: {email_id!r}")
     # BUG FIX: this endpoint used to block CONSULTANT entirely, so the
     # "View Raw" button on the consultant's own Requirements page always
     # 403'd. Consultants can view raw email content, but ONLY for a
@@ -359,13 +394,13 @@ async def get_raw_email(
         owns_req = await db.execute(
             select(Requirement.id)
             .join(RequirementConsultantMatch, RequirementConsultantMatch.requirement_id == Requirement.id)
-            .where(Requirement.raw_email_id == email_id, RequirementConsultantMatch.consultant_id == consultant.id)
+            .where(Requirement.raw_email_id == email_id_int, RequirementConsultantMatch.consultant_id == consultant.id)
         )
         if not owns_req.scalars().first():
             owns_req_job = await db.execute(
                 select(Requirement.id)
                 .join(JobMatch, JobMatch.requirement_id == Requirement.id)
-                .where(Requirement.raw_email_id == email_id, JobMatch.consultant_id == consultant.id)
+                .where(Requirement.raw_email_id == email_id_int, JobMatch.consultant_id == consultant.id)
             )
             if not owns_req_job.scalars().first():
                 raise HTTPException(status_code=403, detail="This email isn't linked to a requirement matched to you.")
@@ -381,7 +416,7 @@ async def get_raw_email(
                    EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = gmail_emails.id) AS has_requirement
             FROM gmail_emails WHERE id = :id
         """),
-        {"id": email_id}
+        {"id": email_id_int}
     )
     row = result.mappings().first()
     if row:
@@ -389,7 +424,7 @@ async def get_raw_email(
 
     # Fall back to the emails table — this is the correct source for any
     # requirement created after the raw_email_id FK fix.
-    email_result = await db.execute(select(Email).where(Email.id == email_id))
+    email_result = await db.execute(select(Email).where(Email.id == email_id_int))
     email = email_result.scalars().first()
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")

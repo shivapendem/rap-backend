@@ -118,7 +118,7 @@ class ProfileUpdateRequest(BaseModel):
     primarySkills: List[str] = []
     secondarySkills: List[str] = []
     workAuth: Optional[str] = None
-    employmentTypes: List[str] = ["C2C"]
+    employmentTypes: List[str] = Field(default=["C2C"], min_length=1)
     preferredRoles: Optional[str] = None
     preferredLocations: Optional[str] = None
     totalExperienceYears: Optional[float] = Field(None, ge=0, le=60)

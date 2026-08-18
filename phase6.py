@@ -368,7 +368,7 @@ MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
     # regardless of whether generation would have actually succeeded.
     try:
         resume_data, rate_limits, usage_info = await asyncio.to_thread(
-            generate_tailored_resume, resume_info, jd_context
+            generate_tailored_resume, resume_info, jd_context, requirement.role
         )
     except Exception as exc:  # noqa: BLE001 - surface any client/transport error
         logger.error("Claude resume generation failed: %s", exc)

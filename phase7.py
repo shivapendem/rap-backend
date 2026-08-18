@@ -258,6 +258,23 @@ async def connect_gmail(
     access_token = token_data.get("access_token", "")
     refresh_token = token_data.get("refresh_token", "")
 
+    # BUG FIX ("Insufficient Permission / ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+    # at actual send time): this used to hardcode send_permission_granted
+    # = True on every successful token exchange, without ever checking
+    # what scopes Google actually granted. Google's consent screen lets a
+    # user uncheck the sensitive "Send email on your behalf" checkbox
+    # while still completing sign-in with only openid/email — and an
+    # unverified OAuth app can have the sensitive gmail.send scope
+    # silently dropped even when requested. Either way the token exchange
+    # still returns 200, so this endpoint was storing a token that looked
+    # fully connected but couldn't actually send — the only place that
+    # ever surfaced was a raw Gmail API 403 deep inside the send queue,
+    # with no indication of what to fix. Google returns the actually-
+    # granted scopes in `scope` (space-separated); only mark send
+    # permission granted when gmail.send is genuinely present.
+    granted_scopes = (token_data.get("scope") or "").split()
+    has_send_scope = "https://www.googleapis.com/auth/gmail.send" in granted_scopes
+
     gmail_email = ""
     try:
         import jwt as pyjwt
@@ -281,7 +298,7 @@ async def connect_gmail(
         existing.access_token_encrypted = encrypt_token(access_token)
         existing.refresh_token_encrypted = encrypt_token(refresh_token)
         existing.token_expiry = token_expiry
-        existing.send_permission_granted = True
+        existing.send_permission_granted = has_send_scope
     else:
         db.add(ConsultantEmailToken(
             consultant_id=consultant.id,
@@ -290,17 +307,33 @@ async def connect_gmail(
             access_token_encrypted=encrypt_token(access_token),
             refresh_token_encrypted=encrypt_token(refresh_token),
             token_expiry=token_expiry,
-            send_permission_granted=True,
+            send_permission_granted=has_send_scope,
         ))
 
     consultant.gmail_connected = True
     current_user.is_authorized = True
     await db.commit()
 
+    if not has_send_scope:
+        # Still a 200 — the account IS connected, just without send
+        # permission — so the frontend can show a specific, actionable
+        # message instead of the caller assuming this succeeded fully.
+        return {
+            "success": False,
+            "message": (
+                "Gmail connected, but send permission was not granted. "
+                "Reconnect and make sure to allow \"Send email on your behalf\" "
+                "on Google's permission screen — applications can't be sent until this is granted."
+            ),
+            "email_address": gmail_email,
+            "send_permission_granted": False,
+        }
+
     return {
         "success": True,
         "message": "Gmail connected successfully.",
         "email_address": gmail_email,
+        "send_permission_granted": True,
     }
 
 
