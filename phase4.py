@@ -374,46 +374,85 @@ def validate_match(
     A candidate must pass all gates to be considered for a match.
     """
     # 1. Title Validation
-    # Matches must score at least 35/50 on the weighted role score,
-    # which translates to a raw score of 70%.
-    role_raw = score_role(requirement.role, consultant.preferred_roles, experiences)
+    req_role = requirement.role or ""
+    generic_roles = {
+        "developer", "engineer", "consultant", "analyst", "architect", "lead", 
+        "manager", "expert", "programmer", "administrator", "specialist",
+        "tester", "qa", "scientist", "researcher", "admin", "dba", "ba", 
+        "associate", "professional", "worker", 
+        "data analyst", "data scientist", "business analyst",
+        "qa tester", "qa engineer", "software engineer", "software developer",
+        "ml engineer", "ai engineer"
+    }
+    role_clean = re.sub(r'[^a-zA-Z0-9\s]', '', req_role).strip().lower()
+    
+    if role_clean in generic_roles:
+        # Get skills to make generic role more specific
+        skills = requirement.parsed_fields.get("skills", []) if requirement.parsed_fields else []
+        if not skills:
+            jd_text = (requirement.job_description or "")[:1500]
+            skills = extract_skills(jd_text)
+        if skills:
+            req_role = f"{' '.join(skills[:2])} {req_role}"
+
+    role_raw = score_role(req_role, consultant.preferred_roles, experiences)
     if role_raw < 70.0:
         return False
 
     # 2. Employment Type Validation
-    req_types = [t.upper() for t in (requirement.employment_types or []) if t]
-    cons_types = [t.upper() for t in (consultant.preferred_employment_types or []) if t]
-    
-    # If it's explicitly fulltime, show to all.
-    # Otherwise, it's considered contract-based.
-    is_fulltime = "FULLTIME" in req_types
-    if not is_fulltime:
-        # Contract-based job: candidate must support C2C or C2B
-        if "C2C" not in cons_types and "C2B" not in cons_types:
-            return False
+    req_types = [t.upper() for t in (requirement.employment_types or []) if t and t.upper() != "N/A"]
+    if req_types:
+        cons_types = [t.upper() for t in (consultant.preferred_employment_types or []) if t]
+        is_fulltime = "FULLTIME" in req_types
+        if not is_fulltime:
+            # Contract-based job: candidate must support C2C or C2B
+            if "C2C" not in cons_types and "C2B" not in cons_types:
+                return False
 
     # 3. Visa / Work Auth Validation
-    # Currently set to always pass per requirements.
-    # In the future, match req_types against consultant.work_authorization here.
-    visa_pass = True
-    if not visa_pass:
-        return False
+    jd = (requirement.job_description or "").lower()
+    req_batch = 0 # 0 means N/A (passes all)
+    
+    # Simple regex/keyword scan for work auth in JD
+    if re.search(r'\b(usc|gc|green card|us citizen|citizens only|citizen|gc ead|tn visa|l1|u visa)\b', jd):
+        req_batch = 3
+    elif re.search(r'\b(h1b|h1-b)\b', jd):
+        req_batch = 2
+    elif re.search(r'\b(f1|opt|cpt|stem opt)\b', jd):
+        req_batch = 1
+        
+    if req_batch > 0:
+        cons_auth = (consultant.work_authorization or "").upper().replace(" ", "").replace("-", "")
+        cons_batch = 0
+        if cons_auth in ["F1", "OPT", "CPT", "STEMOPT", "F1OPT"]:
+            cons_batch = 1
+        elif cons_auth in ["H1B"]:
+            cons_batch = 2
+        elif cons_auth in ["USC", "USCITIZEN", "CITIZEN", "GC", "GREENCARD", "GCEAD", "L1", "TN", "UVISA"]:
+            cons_batch = 3
+        elif cons_auth:
+            # For unmapped known consultant auths, assume batch 3 (strictest/safest)
+            cons_batch = 3
+        
+        # If requirement needs F1 or H1B (1 or 2), it pushes to all batches (1, 2, 3)
+        # If requirement needs Batch 3, it only pushes to Batch 3 candidates.
+        if req_batch == 3 and cons_batch < 3:
+            return False
 
     # 4. Experience Validation
-    # Candidate must be within +/- 20% of the required years.
     required_years = _parse_min_years_required(requirement)
     if required_years is not None and required_years > 0:
         years = float(consultant.total_experience_years or 0)
         if years <= 0 and experiences:
             years = _calculate_total_experience_years(experiences)
         
-        lower_bound = required_years * 0.8
-        upper_bound = required_years * 1.2
-        if years < lower_bound or years > upper_bound:
+        # Candidate must be within -2 years of requirement. N/A allows all.
+        lower_bound = max(0, required_years - 2)
+        if years < lower_bound:
             return False
 
     # 5. Location Validation
-    # Skipped for now.
+    # N/A defaults to passing all. (Skipped for now)
 
     return True
 
