@@ -272,9 +272,9 @@ async def _email_queue_worker_loop():
                 try:
                     from notification_helper import notify_by_role
                     async with AsyncSessionLocal() as notif_session:
-                    await notify_by_role(notif_session, roles=["ADMIN"], title="Email queue sync failed", body=f"Email queue worker loop failed: {e}")
-            except Exception as notif_err:
-                print(f"[email-queue] notify failed: {notif_err}")
+                        await notify_by_role(notif_session, roles=["ADMIN"], title="Email queue sync failed", body=f"Email queue worker loop failed: {e}")
+                except Exception as notif_err:
+                    print(f"[email-queue] notify failed: {notif_err}")
         await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
 
 @asynccontextmanager
