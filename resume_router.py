@@ -1839,33 +1839,14 @@ async def download_base_resume(
     )
     display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
 
-    # BUG FIX ("view resume is downloading instead of previewing"): local
-    # (pre-Spaces) files have no fetchable URL to hand to an external
-    # viewer, so a .docx here always downloaded — now converted on-demand
-    # to PDF (same _convert_to_pdf resume generation already uses) so it
-    # actually previews inline, same fix applied to the S3 branch below.
+    # View now always serves the real stored file as-is (DOCX stays
+    # DOCX — no on-demand PDF conversion). force_stream still exists to
+    # force real bytes through this same-origin endpoint for the actual
+    # Download button, same as before.
     try:
         if os.path.isfile(stored):
             with open(stored, "rb") as fh:
                 body = fh.read()
-            if not force_stream and ext == ".docx":
-                import tempfile
-                from phase6 import _convert_to_pdf
-                try:
-                    with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
-                        tmp_docx = Path(tmpdir) / "resume.docx"
-                        tmp_pdf = Path(tmpdir) / "resume.pdf"
-                        tmp_docx.write_bytes(body)
-                        converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
-                        if converted and tmp_pdf.exists():
-                            pdf_name = os.path.splitext(display_name)[0] + ".pdf"
-                            return Response(
-                                content=tmp_pdf.read_bytes(),
-                                media_type="application/pdf",
-                                headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
-                            )
-                except Exception:
-                    pass  # fall through — raw docx bytes still served below
             return Response(
                 content=body,
                 media_type=media_type,
@@ -1873,35 +1854,6 @@ async def download_base_resume(
             )
     except OSError:
         pass
-
-    # BUG FIX ("view resume is downloading instead of previewing"): this
-    # used to hand a presigned S3 URL to Google Docs Viewer — Google's
-    # viewer isn't reliably able to fetch a DigitalOcean Spaces presigned
-    # URL, so it silently falls back to downloading the raw file instead
-    # of rendering a preview. Converts on-demand to PDF instead — a real
-    # PDF renders natively inline in every browser, no external viewer
-    # dependency at all. The Download button (force_stream=True) still
-    # gets the real original file untouched.
-    if not force_stream and ext == ".docx":
-        import tempfile
-        from phase6 import _convert_to_pdf
-        docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, stored)
-        if docx_bytes:
-            try:
-                with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
-                    tmp_docx = Path(tmpdir) / "resume.docx"
-                    tmp_pdf = Path(tmpdir) / "resume.pdf"
-                    tmp_docx.write_bytes(docx_bytes)
-                    converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
-                    if converted and tmp_pdf.exists():
-                        pdf_name = os.path.splitext(display_name)[0] + ".pdf"
-                        return Response(
-                            content=tmp_pdf.read_bytes(),
-                            media_type="application/pdf",
-                            headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
-                        )
-            except Exception:
-                pass  # fall through to presigned-URL/raw-bytes below
 
     if not force_stream:
         presigned = generate_presigned_url(stored)
@@ -2296,25 +2248,17 @@ async def download_resume(
                 detail += f" (Storage error: {upload_error[0]})"
             raise HTTPException(status_code=400, detail=detail)
 
-    # CHANGED (view now shows the actual DOCX, not a converted PDF): same
-    # requirement as the Sent Applications resume-download endpoint
-    # (phase7.py) and the base resume's download_base_resume below — View
-    # should open the real file via Google Docs Viewer (a real, publicly
-    # fetchable presigned URL, which Google's own servers fetch — browser
-    # CORS never applies there) instead of a server-side PDF conversion.
-    #
-    # FEATURE CHANGE: a generated/tailored resume's s3_key is always a
-    # .pdf (see generate_resume/finalize_resume above) — the .docx it was
-    # actually built from is a rendering source, not what gets stored as
-    # the canonical file. Prefer showing THAT .docx here too, same as
-    # manually-uploaded resumes already do, rather than the PDF that's
-    # just a byproduct of it. Reuses the exact same find-or-regenerate
-    # logic download_resume_docx below already has — if the .docx object
-    # is missing from storage (generate_resume's own DOCX upload runs in
-    # a best-effort try/except that can fail independently of the PDF
+    # View shows the actual DOCX, not the PDF. A generated/tailored
+    # resume's s3_key is always a .pdf (see generate_resume/finalize_resume
+    # above) — the .docx it was actually built from is a rendering source,
+    # not what gets stored as the canonical file. Show that .docx here
+    # too, same as manually-uploaded resumes. If the .docx object is
+    # missing from storage (generate_resume's own DOCX upload runs in a
+    # best-effort try/except that can fail independently of the PDF
     # succeeding), rebuild it from resume.data and upload it before
     # presigning, instead of silently falling back to PDF.
     view_key = resume.s3_key
+    view_mime = "application/pdf"
     if resume.s3_key.lower().endswith(".pdf"):
         docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx"
         docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, docx_key)
@@ -2341,6 +2285,7 @@ async def download_resume(
                 )
         if docx_bytes is not None:
             view_key = docx_key
+            view_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         # else: no .docx obtainable at all (no resume.data to rebuild
         # from) — falls through and shows the .pdf instead, same as
         # today, rather than failing View entirely.
@@ -2354,29 +2299,12 @@ async def download_resume(
     resume.last_downloaded = datetime.now(timezone.utc)
     await db.commit()
 
-    # BUG FIX ("generated resume view opens in drive view" instead of a
-    # native PDF): this returned bare {"url": ...} with no filename or
-    # mimeType. A generated/tailored resume's s3_key is always .pdf
-    # already (see finalize_resume/generate_resume above) — no
-    # conversion needed, this URL already points at a real PDF — but the
-    # frontend's toViewableUrl has no way to know that without a mimeType
-    # hint, so it defaulted to treating the file as non-viewable and
-    # wrapped it in Google Docs Viewer regardless. Including mimeType
-    # (derived from the real stored extension, same as download_base_resume
-    # does) lets it correctly recognize an already-PDF file and skip the
-    # external viewer entirely.
-    import mimetypes as _mimetypes
     ext = os.path.splitext(view_key)[1].lower()
-    mime_type = (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        if ext == ".docx"
-        else _mimetypes.guess_type(view_key)[0] or "application/pdf"
-    )
     safe_title = "".join(
         c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_"
     ).strip() or f"Resume_{id}"
 
-    return {"url": url, "filename": f"{safe_title}{ext or '.pdf'}", "mimeType": mime_type}
+    return {"url": url, "filename": f"{safe_title}{ext or '.docx'}", "mimeType": view_mime}
 
 @router.get("/{id}/download/file")
 async def download_resume_file(

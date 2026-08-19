@@ -1128,82 +1128,20 @@ async def download_queue_attachment(
     """
     Get a downloadable URL or serve attachment file for email queue item.
 
-    BUG FIX ("view keeps downloading" for DOCX attachments): this used to
-    always hand back the raw file (a presigned S3 URL or the local bytes)
-    — fine for a PDF, which every browser renders natively inline, but a
-    DOCX has no in-browser renderer, so opening it here just triggered a
-    save/open-with-Word prompt instead of an actual preview. Every caller
-    of this endpoint (EmailDetailModal, ApplicationEmailPreviewModal,
-    EmailPreviewModal, Email Queue list pages) uses it purely for
-    viewing — none of it is a "download the original file" button — so a
-    DOCX is now converted on-demand to PDF (same _convert_to_pdf already
-    used for resume generation and the sibling resume-view fixes in
-    phase7.py/resume_router.py) and served inline. A real PDF renders
-    natively in every browser, sidestepping the whole "no in-browser DOCX
-    renderer" problem entirely. Any other file type (PDF, images, etc.)
-    is untouched — this only kicks in for .docx specifically, and falls
-    back to the original raw-file behavior if conversion fails for any
-    reason, so a broken LibreOffice install degrades instead of breaking
-    attachment viewing outright.
-
-    NOTE (merge): an earlier revision of this endpoint reintroduced
-    on-the-fly DOCX->PDF conversion (via file_preview.get_or_convert_pdf_preview)
-    for inline preview. That approach was superseded by this simpler
-    "serve the real file" version per the updated requirement above, so
-    the PDF-conversion path was intentionally dropped when merging the
-    two revisions. If inline DOCX preview is still wanted going forward,
-    it should be reintroduced deliberately rather than resurrected by
-    accident in a future merge.
-
-    UPDATE: inline DOCX preview IS wanted after all (per the above "NOTE"
-    itself) — reintroduced deliberately this time, directly in this
-    endpoint rather than via the old file_preview module, so it can't be
-    silently dropped again in a future merge without touching this exact
-    docstring.
+    Serves the real attachment file as-is (DOCX stays DOCX — no
+    on-demand PDF conversion). Used by EmailDetailModal,
+    ApplicationEmailPreviewModal, EmailPreviewModal, and the Email Queue
+    list pages.
     """
     from s3_service import generate_presigned_url, download_file_from_s3
-    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import FileResponse
 
     clean_ref = ref.strip()
     if not clean_ref:
         raise HTTPException(status_code=400, detail="ref is required")
 
-    import logging
-    _log = logging.getLogger(__name__)
-
-    def _is_docx(name: str) -> bool:
-        return name.lower().endswith(".docx")
-
-    def _try_convert_docx_to_pdf(docx_bytes: bytes):
-        """Returns PDF bytes on success, or None on any failure — callers
-        fall back to serving the original file untouched."""
-        import tempfile
-        from pathlib import Path as _Path
-        from phase6 import _convert_to_pdf
-        try:
-            with tempfile.TemporaryDirectory(prefix="attachment_view_convert_") as tmpdir:
-                tmp_docx = _Path(tmpdir) / "attachment.docx"
-                tmp_pdf = _Path(tmpdir) / "attachment.pdf"
-                tmp_docx.write_bytes(docx_bytes)
-                if _convert_to_pdf(tmp_docx, tmp_pdf) and tmp_pdf.exists():
-                    return tmp_pdf.read_bytes()
-        except Exception as exc:
-            _log.warning("On-demand DOCX->PDF conversion failed for attachment %r: %s", clean_ref, exc)
-        return None
-
     # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
     if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
-        if _is_docx(clean_ref):
-            docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, clean_ref)
-            if docx_bytes:
-                pdf_bytes = await asyncio.to_thread(_try_convert_docx_to_pdf, docx_bytes)
-                if pdf_bytes:
-                    pdf_name = os.path.splitext(os.path.basename(clean_ref))[0] + ".pdf"
-                    return Response(
-                        content=pdf_bytes,
-                        media_type="application/pdf",
-                        headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
-                    )
         url = generate_presigned_url(clean_ref)
         if url:
             return {"url": url}
@@ -1212,32 +1150,10 @@ async def download_queue_attachment(
     filename = os.path.basename(clean_ref)
     local_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(local_path):
-        if _is_docx(filename):
-            with open(local_path, "rb") as f:
-                docx_bytes = f.read()
-            pdf_bytes = await asyncio.to_thread(_try_convert_docx_to_pdf, docx_bytes)
-            if pdf_bytes:
-                pdf_name = os.path.splitext(filename)[0] + ".pdf"
-                return Response(
-                    content=pdf_bytes,
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
-                )
         return FileResponse(local_path, filename=filename)
 
     # 3. Try fallback with S3 prefix
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
-    if _is_docx(filename):
-        docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
-        if docx_bytes:
-            pdf_bytes = await asyncio.to_thread(_try_convert_docx_to_pdf, docx_bytes)
-            if pdf_bytes:
-                pdf_name = os.path.splitext(filename)[0] + ".pdf"
-                return Response(
-                    content=pdf_bytes,
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
-                )
     url = generate_presigned_url(s3_key)
     if url:
         return {"url": url}

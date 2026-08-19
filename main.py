@@ -696,8 +696,29 @@ async def google_login(
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
         expires_in = token_data.get("expires_in", 3599)
-        
-        if access_token:
+
+        # BUG FIX ("login with Gmail auto-connects Gmail, then send fails
+        # with 403 insufficientPermissions"): "Sign in with Google"
+        # (LoginForm.tsx buildGoogleOAuthURL) only ever requests scope
+        # "openid email profile" — never "gmail.send". This block used to
+        # take that login token unconditionally and upsert it into
+        # ConsultantEmailToken as if Gmail were freshly connected, with no
+        # scope check at all. Two bugs from that: (1) it marked the
+        # account "connected" in the UI with a token that could never
+        # send, guaranteeing a 403 the first time a send was attempted;
+        # (2) if the consultant had already gone through the real Connect
+        # Gmail flow (OAuthRedirectButton / GmailStatusCard, which do
+        # request gmail.send) and then simply logged in again with
+        # Google, this silently overwrote that good, working token with
+        # the useless login-only one — breaking a connection that used to
+        # work. Only touch ConsultantEmailToken here when this specific
+        # token actually carries gmail.send, and never overwrite an
+        # existing token that already has send permission with one that
+        # doesn't.
+        granted_scopes = (token_data.get("scope") or "").split()
+        has_send_scope = "https://www.googleapis.com/auth/gmail.send" in granted_scopes
+
+        if access_token and has_send_scope:
             if user.role == "CONSULTANT":
                 cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
             else:
@@ -717,7 +738,8 @@ async def google_login(
                         email_address=user.email,
                         access_token_encrypted=encrypt_token(access_token),
                         refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
-                        token_expiry=expiry_dt
+                        token_expiry=expiry_dt,
+                        send_permission_granted=True,
                     )
                     db.add(email_token)
                 else:
@@ -726,6 +748,7 @@ async def google_login(
                     if refresh_token:
                         email_token.refresh_token_encrypted = encrypt_token(refresh_token)
                     email_token.token_expiry = expiry_dt
+                    email_token.send_permission_granted = True
                 
                 await db.commit()
 

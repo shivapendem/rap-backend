@@ -488,8 +488,26 @@ async def confirm_send(
 
         await check_duplicate_application(db, request.requirement_id, consultant.id)
 
+        # BUG FIX ("Gmail API error 403: insufficientPermissions /
+        # ACCESS_TOKEN_SCOPE_INSUFFICIENT" at send time): patch8.py had
+        # replaced the assert_gmail_connected(db, consultant.id) call that
+        # used to sit here with this raw query, in order to add the
+        # service-account fallback below for consultants with no Gmail
+        # token at all. That swap dropped the send_permission_granted
+        # check entirely — a token missing the gmail.send scope (consent
+        # checkbox unchecked, or silently stripped by Google for an
+        # unverified app) was still passed straight to the Gmail API,
+        # which only surfaces the problem downstream as this raw 403.
+        # Re-added the scope check here, keeping the fallback intact for
+        # consultants who have no token on file yet.
         token_res = await db.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id))
         token = token_res.scalars().first()
+        if token and not token.send_permission_granted:
+            raise HTTPException(
+                status_code=403,
+                detail="Gmail send permission not granted. Please reconnect Gmail and "
+                       "make sure to allow the 'Send email on your behalf' permission.",
+            )
 
         result = await db.execute(select(Requirement).where(Requirement.id == request.requirement_id))
         requirement = result.scalars().first()
@@ -969,78 +987,13 @@ async def download_application_resume(
     guessed_type, _ = mimetypes.guess_type(filename)
     media_type = guessed_type or "application/octet-stream"
 
-    # BUG FIX ("view keeps downloading"): a browser can only render a PDF
-    # or image inline on its own — for a .docx (or any other Office
-    # format), there is no in-browser renderer, so simply avoiding the
-    # `attachment` Content-Disposition (see below) is NOT enough; the
-    # browser still has nothing to show and falls back to a download
-    # prompt regardless of headers. A prior version of this endpoint
-    # always returned a presigned Spaces URL (JSON) for the frontend to
-    # hand to an external viewer (Google Docs Viewer/Office Online)
-    # instead of proxying bytes.
-    #
-    # BUG FIX (refined, not fully reverted): that approach broke the
-    # consultant's plain "download" button — this bucket
-    # (nyc3.digitaloceanspaces.com) has no CORS configuration allowing
-    # browser access at all, so a presigned URL fetched directly by the
-    # browser (as a real download needs to) failed outright with "blocked
-    # by CORS policy: No 'Access-Control-Allow-Origin' header". Admin/
-    # recruiter's "view" feature was unaffected by that, because it hands
-    # the presigned URL to Google's Docs Viewer, whose own servers fetch
-    # it server-side — browser CORS never applies there. So both behaviors
-    # are correct for their respective caller: force_stream=True (used by
-    # the download button) always streams real bytes through this
-    # same-origin endpoint; the default (view) keeps using a presigned URL
-    # when one is available, falling back to streaming only if presigning
-    # itself fails.
-    # CHANGED (view now serves DOCX, not a PDF conversion): this used to
-    # convert an S3-stored .docx to PDF before serving, specifically so
-    # the browser's built-in PDF viewer could render it inline. Per
-    # updated requirement, View should show the actual DOCX file — same
-    # as the fix already applied to My Resumes' View/Download. Browsers
-    # have no native inline renderer for .docx, so this will generally
-    # open a save/open-with-Word prompt in the new tab rather than an
-    # in-page preview; that's an inherent browser limitation, not a bug.
-    # BUG FIX ("view resume is downloading instead of previewing"): this
-    # used to route non-PDF files to Google Docs Viewer via a presigned
-    # URL — but Google's viewer isn't reliably able to fetch a
-    # DigitalOcean Spaces presigned URL (unlike a real Google Drive
-    # link), so it silently falls back to just downloading the raw file
-    # instead of rendering a preview — exactly the "view keeps
-    # downloading" symptom this was meant to fix, just reintroduced by a
-    # different path. Reverted to on-demand DOCX->PDF conversion (the
-    # same _convert_to_pdf already used for resume generation) for the
-    # View path specifically — a real PDF is something every browser can
-    # actually render inline, so this sidesteps Google's viewer
-    # reliability entirely. The Download button (force_stream=True)
-    # still gets the real original file untouched, since that's a
-    # genuine "give me the file" request, not a preview.
+    # View shows the actual DOCX file — served directly, no PDF
+    # conversion. A presigned URL is used when available (view path);
+    # the Download button (force_stream=True) always streams real bytes
+    # through this same-origin endpoint, since this bucket
+    # (nyc3.digitaloceanspaces.com) has no CORS policy allowing a
+    # presigned URL to be fetched directly by the browser.
     if s3_key:
-        if not force_stream and filename.lower().endswith(".docx"):
-            from s3_service import download_file_from_s3
-            import tempfile
-            from phase6 import _convert_to_pdf
-
-            docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, s3_key)
-            if docx_bytes:
-                try:
-                    with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
-                        tmp_docx = Path(tmpdir) / "resume.docx"
-                        tmp_pdf = Path(tmpdir) / "resume.pdf"
-                        tmp_docx.write_bytes(docx_bytes)
-                        converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
-                        if converted and tmp_pdf.exists():
-                            pdf_bytes = tmp_pdf.read_bytes()
-                            pdf_filename = filename[:-5] + ".pdf"
-                            return Response(
-                                content=pdf_bytes,
-                                media_type="application/pdf",
-                                headers={"Content-Disposition": f'inline; filename="{pdf_filename}"'},
-                            )
-                except Exception as exc:
-                    logger.warning("On-demand DOCX->PDF conversion failed for view (application %s): %s", application_id, exc)
-                    # Fall through to the presigned-URL/raw-bytes path below
-                    # as a safety net so View degrades instead of breaking.
         if not force_stream:
             from s3_service import generate_presigned_url
             presigned = generate_presigned_url(s3_key)
@@ -1051,28 +1004,6 @@ async def download_application_resume(
     else:
         with open(local_path, "rb") as f:
             body_bytes = f.read()
-        # Same on-demand conversion for a locally-stored (non-S3) docx —
-        # see the s3_key branch above for the full rationale.
-        if not force_stream and filename.lower().endswith(".docx"):
-            import tempfile
-            from phase6 import _convert_to_pdf
-            try:
-                with tempfile.TemporaryDirectory(prefix="view_convert_") as tmpdir:
-                    tmp_docx = Path(tmpdir) / "resume.docx"
-                    tmp_pdf = Path(tmpdir) / "resume.pdf"
-                    tmp_docx.write_bytes(body_bytes)
-                    converted = await asyncio.to_thread(_convert_to_pdf, tmp_docx, tmp_pdf)
-                    if converted and tmp_pdf.exists():
-                        pdf_filename = filename[:-5] + ".pdf"
-                        return Response(
-                            content=tmp_pdf.read_bytes(),
-                            media_type="application/pdf",
-                            headers={"Content-Disposition": f'inline; filename="{pdf_filename}"'},
-                        )
-            except Exception as exc:
-                logger.warning("On-demand DOCX->PDF conversion failed for view (application %s): %s", application_id, exc)
-                # Fall through — body_bytes (the raw docx) still gets
-                # served below via the normal inline response.
 
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
