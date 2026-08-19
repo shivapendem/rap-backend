@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from database import get_db
-from models import User
+from models import User, Consultant
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,35 @@ async def get_current_user(
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    if user.role in ("ADMIN", "RECRUITER") and not user.is_authorized:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+
+    # BUG FIX ("deactivating a consultant doesn't stop them from logging
+    # in"): this used to only check `is_authorized` for ADMIN/RECRUITER
+    # (`user.role in ("ADMIN", "RECRUITER") and not user.is_authorized`),
+    # excluding CONSULTANT entirely. Worse, it never checked
+    # Consultant.status at all, for any role. A JWT is a bearer token —
+    # once issued it stays valid for ACCESS_TOKEN_EXPIRE_HOURS regardless
+    # of anything that happens afterward, UNLESS something re-validates
+    # the account on every request. get_current_user runs on every single
+    # protected endpoint, so it's the one place that can actually catch
+    # this: an admin deactivating a consultant (either via User
+    # Management, which sets is_authorized=False, or via the Consultants
+    # page, which sets Consultant.status="INACTIVE") had zero effect on a
+    # consultant who was already logged in — they kept full access with
+    # their existing token until it expired, up to 24h later. The login
+    # endpoints (/auth/login, /auth/google/callback) already correctly
+    # block a *fresh* login attempt for a deactivated consultant, but
+    # that's not enough on its own to enforce "deactivated == no access."
+    # Check is_authorized for every role now, and additionally check
+    # Consultant.status for CONSULTANT — the same two checks
+    # /auth/login and /auth/google/callback already perform at login
+    # time — so deactivation takes effect on this user's very next
+    # request, not just their next login attempt.
+    if not user.is_authorized:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account is deactivated. Contact your administrator.")
+    if user.role == "CONSULTANT":
+        consultant_status_result = await db.execute(
+            select(Consultant.status).where(Consultant.user_id == user.id)
+        )
+        if consultant_status_result.scalar_one_or_none() == "INACTIVE":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account is deactivated. Contact your administrator.")
     return user
