@@ -1999,6 +1999,42 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 except Exception as deauth_err:
                     print(f"[email-queue] Failed to auto-deauthorize invalid token: {deauth_err}")
 
+            # BUG FIX ("Gmail API error 403: {raw JSON}" — same root
+            # cause as the equivalent fix in phase7.py's confirm_send):
+            # this is the queued-send counterpart of that same gap. The
+            # send_permission_granted pre-check earlier in this function
+            # only protects against a token correctly recorded as
+            # scope-less — it does nothing when that flag is stale/wrong
+            # (a row from the old auto-connect-on-login bug, or a scope
+            # revoked after being granted), so Gmail's real 403 rejection
+            # reaches here as a raw, unhandled exception, and status_text
+            # above already stores that raw JSON verbatim. Unlike the
+            # "unauthorized"/"invalid_grant" branch above (which deletes
+            # the token entirely — connection itself is broken), a
+            # scope-insufficient token is still a valid connection, just
+            # missing one permission — so only clear
+            # send_permission_granted, not the whole token. That makes
+            # the pre-check actually catch it next time, giving a clean
+            # "reconnect Gmail" message instead of this same raw Gmail
+            # error repeating on every retry.
+            if "GMAIL_SCOPE_INSUFFICIENT" in str(e):
+                try:
+                    from models import Consultant, ConsultantEmailToken
+                    tok_res = await session.execute(
+                        select(ConsultantEmailToken).where(
+                            ConsultantEmailToken.email_address == failed_item.from_email
+                        )
+                    )
+                    scope_tok = tok_res.scalars().first()
+                    if scope_tok:
+                        scope_tok.send_permission_granted = False
+                    failed_item.status_text = (
+                        "Gmail send permission not granted. Please reconnect Gmail and "
+                        "make sure to allow the 'Send email on your behalf' permission."
+                    )
+                except Exception as scope_fix_err:
+                    print(f"[email-queue] Failed to self-heal scope-insufficient token: {scope_fix_err}")
+
             if failed_item.requirement_id:
                 from models import Application
                 app_result = await session.execute(

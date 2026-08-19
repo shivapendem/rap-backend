@@ -224,6 +224,28 @@ def send_via_gmail_api(
                 "status": "sent",
             }
         else:
+            # BUG FIX ("Gmail API error 403: {raw JSON}" shown verbatim to
+            # the user instead of a clean, actionable message): this
+            # raised a bare Exception whose message was the whole raw
+            # Gmail error body — confirm_send's outer except Exception
+            # wraps str(e) straight into the HTTPException detail with no
+            # translation at all, so the user sees Gmail's internal JSON
+            # error shape directly. This can happen even when the
+            # send_permission_granted pre-check (phase7.py's
+            # confirm_send) passed, if that flag is stale/wrong for this
+            # token — e.g. a row created by the "Sign in with Google"
+            # auto-connect bug before that was fixed, or one that
+            # genuinely had the scope revoked after being granted. Flag
+            # this specific case with a recognizable prefix so the caller
+            # can detect it, give a clean message, AND self-heal the
+            # stale flag instead of leaving every future attempt to hit
+            # this exact same raw Gmail rejection again.
+            is_scope_error = response.status_code == 403 and (
+                "insufficientPermissions" in response.text
+                or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in response.text
+            )
+            if is_scope_error:
+                raise Exception(f"GMAIL_SCOPE_INSUFFICIENT: Gmail API error {response.status_code}: {response.text}")
             raise Exception(f"Gmail API error {response.status_code}: {response.text}")
 
     except ImportError:

@@ -639,6 +639,33 @@ async def confirm_send(
                 html_body=email_content["html_body"],
                 inline_images=email_content.get("inline_images"),
             )
+        except Exception as send_exc:
+            # BUG FIX ("Gmail API error 403: {raw JSON}" shown verbatim to
+            # the user): the send_permission_granted pre-check earlier in
+            # this function only protects against a token that was
+            # CORRECTLY recorded as scope-less — it does nothing when
+            # that flag is stale/wrong (e.g. a row created by the old
+            # "Sign in with Google" auto-connect bug before that was
+            # fixed, or a token whose scope was revoked after being
+            # granted), so Gmail's own real rejection could still reach
+            # this point and, uncaught here, get wrapped by the generic
+            # except Exception below into an HTTPException whose detail
+            # is literally Gmail's raw error JSON. Catch the specific
+            # marker send_via_gmail_api now raises for this case, give a
+            # clean actionable message instead, AND self-heal the token
+            # so it stops passing the earlier pre-check and every future
+            # attempt fails fast with the clean message instead of
+            # hitting Gmail directly again.
+            if "GMAIL_SCOPE_INSUFFICIENT" in str(send_exc):
+                if token:
+                    token.send_permission_granted = False
+                    await db.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Gmail send permission not granted. Please reconnect Gmail and "
+                           "make sure to allow the 'Send email on your behalf' permission.",
+                )
+            raise
         finally:
             if tmp_resume_path:
                 try:
