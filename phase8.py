@@ -524,7 +524,19 @@ async def list_errors(
     if date_filter:
         try:
             d = date.fromisoformat(date_filter)
-            start_dt = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+            # BUG FIX ("selecting the 11th shows the 12th's data"): this
+            # used to treat date_filter as a UTC calendar day, but the
+            # table renders occurred_at in the browser's local time
+            # (ErrorTable.tsx: new Date(...).toLocaleString() with no
+            # explicit UTC), and this app's admins are IST-based. UTC
+            # midnight is 5:30 AM IST, so the last ~5.5 hours of a UTC
+            # day are already "tomorrow" in IST — those rows got pulled
+            # into the wrong day's filter while displaying under the
+            # next date. Interpret the selected date as an IST calendar
+            # day instead, matching what's actually shown in the table.
+            IST_OFFSET = timedelta(hours=5, minutes=30)
+            start_local = datetime.combine(d, datetime.min.time())
+            start_dt = (start_local - IST_OFFSET).replace(tzinfo=timezone.utc)
             end_dt = start_dt + timedelta(days=1)
             filters.append(ProcessingError.occurred_at >= start_dt)
             filters.append(ProcessingError.occurred_at < end_dt)

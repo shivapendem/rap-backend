@@ -873,13 +873,12 @@ async def update_base_resume_text(
             ):
                 consultant.base_resume_file_path = key
         else:
-            # No file on record yet (text entered without ever uploading a
-            # file) — create one locally, same layout _save_resume_file uses.
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
+            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
+            if upload_file_to_s3(
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                consultant.base_resume_file_path = key
     except Exception as e:
         # Don't fail the save over a DOCX regen hiccup — base_resume_text
         # itself already committed below and still powers AI tailoring.
@@ -1307,11 +1306,12 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
             ):
                 consultant.base_resume_file_path = key
         else:
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
+            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
+            if upload_file_to_s3(
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                consultant.base_resume_file_path = key
         await db.commit()
     except Exception as e:
         print(f"Base resume DOCX regeneration (background sync) failed for consultant {consultant.id}: {e}")
