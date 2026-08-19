@@ -28,6 +28,29 @@ from phase3 import _extract_text_from_docx
 
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
+# BUG FIX ("View still says base resume is missing from storage even
+# after re-saving My Profile"): _regen_in_background below is launched
+# via asyncio.create_task() with nothing retaining the returned Task
+# object. Per Python's own asyncio docs, the event loop only holds a
+# *weak* reference to tasks — one with no other reference anywhere can
+# be garbage-collected at any point before it finishes, silently, with
+# no exception raised and nothing logged (since GC doesn't go through
+# the function's own try/except at all). That means the DOCX
+# rebuild + Spaces upload triggered by a My Profile save could simply
+# never finish, intermittently, leaving base_resume_file_path pointing
+# at whatever it was before — which is exactly what "still broken after
+# re-saving, nothing in the logs" looks like. Keeping a strong reference
+# in this module-level set (recommended pattern from the asyncio docs)
+# until each task completes prevents that.
+_background_tasks: set = set()
+
+
+def _run_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 class ResumeCreateRequest(BaseModel):
     title: str
     target_role: Optional[str] = None
@@ -604,13 +627,24 @@ async def upload_resume(
     # to rely on after upload_fileobj() consumes it.
     file_bytes = await file.read()
 
+    upload_error: list = []
     success = upload_file_to_s3(
         io.BytesIO(file_bytes),
         s3_key,
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _error_out=upload_error,
     )
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
+        # BUG FIX ("Failed to upload file to S3" with no way to diagnose
+        # without server logs): same real cause as the "Upload Failed"
+        # status on generated resumes — this uses the exact same
+        # "users/{owner_id}/resumes/..." key prefix, so whatever is
+        # blocking writes there is hitting both endpoints identically.
+        # Surface the real boto3/Spaces error in the response itself.
+        detail = "Failed to upload file to S3."
+        if upload_error:
+            detail += f" (Storage error: {upload_error[0]})"
+        raise HTTPException(status_code=500, detail=detail)
 
     # BUG FIX: manually-uploaded resumes previously had no extracted
     # content at all — `data` stayed the JSONB column's empty-dict default
@@ -873,12 +907,13 @@ async def update_base_resume_text(
             ):
                 consultant.base_resume_file_path = key
         else:
-            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
-            if upload_file_to_s3(
-                io.BytesIO(docx_bytes), key,
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ):
-                consultant.base_resume_file_path = key
+            # No file on record yet (text entered without ever uploading a
+            # file) — create one locally, same layout _save_resume_file uses.
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
     except Exception as e:
         # Don't fail the save over a DOCX regen hiccup — base_resume_text
         # itself already committed below and still powers AI tailoring.
@@ -1306,12 +1341,11 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
             ):
                 consultant.base_resume_file_path = key
         else:
-            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
-            if upload_file_to_s3(
-                io.BytesIO(docx_bytes), key,
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ):
-                consultant.base_resume_file_path = key
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
         await db.commit()
     except Exception as e:
         print(f"Base resume DOCX regeneration (background sync) failed for consultant {consultant.id}: {e}")
@@ -1365,8 +1399,7 @@ async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> Non
             bg_content = await build_base_resume_content(bg_session, bg_consultant)
             await _regenerate_base_resume_docx_file(bg_session, bg_consultant, bg_content)
 
-    import asyncio
-    asyncio.create_task(_regen_in_background(consultant_id))
+    _run_background(_regen_in_background(consultant_id))
 
 
 @router.get("/base/content", response_model=BaseResumeContentDTO)
@@ -2226,18 +2259,20 @@ async def download_resume(
             docx_path = resume_dir / "resume.docx"
             pdf_path = resume_dir / "resume.pdf"
 
+            upload_error: list = []
             try:
                 _generate_docx(resume.data, docx_path)
                 if _convert_to_pdf(docx_path, pdf_path):
                     s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
                     with open(pdf_path, "rb") as f:
-                        if upload_file_to_s3(f, s3_key, "application/pdf"):
+                        if upload_file_to_s3(f, s3_key, "application/pdf", _error_out=upload_error):
                             resume.s3_key = s3_key
                             resume.status = 'completed'
                             await db.commit()
                             await db.refresh(resume)
             except Exception as e:
                 print(f"Lazy PDF regeneration failed for resume {resume.id}: {e}")
+                upload_error = [str(e)]
                 from error_logger import log_db_error
                 await log_db_error(
                     stage="resume_lazy_pdf_regen",
@@ -2247,10 +2282,19 @@ async def download_resume(
                 )
 
         if not resume.s3_key:
-            raise HTTPException(
-                status_code=400,
-                detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
-            )
+            # BUG FIX ("View gives a generic 400 with no way to diagnose
+            # it without server log access"): the real reason (a boto3/
+            # Spaces error, most often a permissions issue scoped to a
+            # specific key prefix — this "users/" prefix is only ever
+            # used by resume generation, unlike prefixes used elsewhere
+            # in the app that may have broader write access) used to only
+            # ever reach a print() statement. Surfacing it in the 400
+            # detail itself makes this self-diagnosable from the browser
+            # alone.
+            detail = "This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
+            if upload_error:
+                detail += f" (Storage error: {upload_error[0]})"
+            raise HTTPException(status_code=400, detail=detail)
 
     # CHANGED (view now shows the actual DOCX, not a converted PDF): same
     # requirement as the Sent Applications resume-download endpoint

@@ -18,10 +18,20 @@ s3_client = boto3.client(
     region_name=DO_SPACES_REGION
 )
 
-def upload_file_to_s3(file_obj, s3_key: str, content_type: str = "application/pdf") -> bool:
-    """Uploads a file object to DigitalOcean Spaces."""
+def upload_file_to_s3(file_obj, s3_key: str, content_type: str = "application/pdf", _error_out: list = None) -> bool:
+    """Uploads a file object to DigitalOcean Spaces.
+
+    _error_out: optional list — when provided, the real failure reason
+    (bucket-not-configured message, or the boto3 exception) is appended
+    to it. Lets callers that want to surface *why* an upload failed (e.g.
+    in an API error response, so it's visible without server log access)
+    opt in, without changing the bool return value every existing caller
+    already relies on.
+    """
     if not DO_SPACES_BUCKET:
         print("DO Spaces bucket not configured")
+        if _error_out is not None:
+            _error_out.append("DO Spaces bucket not configured")
         return False
         
     try:
@@ -34,6 +44,8 @@ def upload_file_to_s3(file_obj, s3_key: str, content_type: str = "application/pd
         return True
     except (NoCredentialsError, ClientError) as e:
         print(f"Failed to upload to DO Spaces: {e}")
+        if _error_out is not None:
+            _error_out.append(str(e))
         return False
 
 def generate_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
