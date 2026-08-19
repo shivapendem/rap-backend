@@ -660,7 +660,8 @@ async def google_login(
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
 
-    # Real last-login tracking — see matching note in /auth/login.    user.last_login_at = datetime.now(timezone.utc)
+    # Real last-login tracking — see matching note in /auth/login.
+    user.last_login_at = datetime.now(timezone.utc)
 
     # Insert Login Notification
     new_notif = Notification(
@@ -674,7 +675,22 @@ async def google_login(
     # Gmail OAuth Token Capture (Role check commented for admin testing)
     # if user.role == "CONSULTANT":
     if True:
-        from models import Consultant, ConsultantEmailToken
+        # BUG FIX ("localhost:3000/login?error=server_error" on every
+        # CONSULTANT Google login): `Consultant` is already imported at
+        # module level (see the `from models import ... Consultant ...`
+        # at the top of this file) — re-importing it locally here made
+        # Python treat `Consultant` as a local variable for this
+        # function's ENTIRE body. The CONSULTANT-only inactive-check a
+        # few lines above (`select(Consultant.status).where(...)`) runs
+        # BEFORE this local import executes, so it tried to read that
+        # local `Consultant` before it was ever assigned, raising
+        # `UnboundLocalError: cannot access local variable 'Consultant'
+        # where it is not associated with a value` — an unhandled 500,
+        # which is exactly why this only ever broke CONSULTANT logins
+        # (ADMIN/RECRUITER skip that earlier check and never hit it).
+        # `ConsultantEmailToken` isn't imported at module level, so it
+        # still needs importing here — just not `Consultant` again.
+        from models import ConsultantEmailToken
         from gmail_send_service import encrypt_token
         
         access_token = token_data.get("access_token")
