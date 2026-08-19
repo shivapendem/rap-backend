@@ -1132,31 +1132,68 @@ async def download_queue_attachment(
     on-demand PDF conversion). Used by EmailDetailModal,
     ApplicationEmailPreviewModal, EmailPreviewModal, and the Email Queue
     list pages.
+
+    BUG FIX ("view directly downloads instead of previewing" for local
+    attachments): this endpoint is view-only for every caller (none of
+    it is a "download the original file" button), and the frontend's
+    openViewableAttachment only gets an actual in-browser preview for a
+    non-natively-viewable type like DOCX when it receives the
+    {url, filename, mimeType} JSON wrapper — that URL is a real, publicly
+    fetchable presigned link it can hand to Google's Docs Viewer, whose
+    own servers fetch it (browser CORS never applies there). A local
+    (non-Spaces) attachment used to skip straight to FileResponse —
+    real file bytes with no external-viewer routing at all — and a
+    browser has no built-in renderer for DOCX regardless of headers, so
+    "viewing" one just triggered a save/open-with-Word download prompt.
+    Upload the local bytes to Spaces on the fly (mirroring the same
+    self-heal-by-uploading pattern used elsewhere in this codebase) so
+    every attachment, local or not, gets a real presigned URL and goes
+    through the same in-browser preview path.
     """
-    from s3_service import generate_presigned_url, download_file_from_s3
-    from fastapi.responses import FileResponse
+    from s3_service import generate_presigned_url, download_file_from_s3, upload_file_to_s3
+    import io
 
     clean_ref = ref.strip()
     if not clean_ref:
         raise HTTPException(status_code=400, detail="ref is required")
 
+    import mimetypes as _mimetypes
+
     # 1. Try Spaces S3 presigned URL directly if ref is an S3 key
     if clean_ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX) or clean_ref.startswith("resumes/") or "/" in clean_ref:
         url = generate_presigned_url(clean_ref)
         if url:
-            return {"url": url}
+            basename = os.path.basename(clean_ref)
+            mime_type = _mimetypes.guess_type(basename)[0] or "application/octet-stream"
+            return {"url": url, "filename": basename, "mimeType": mime_type}
 
-    # 2. Try local file path if present
+    # 2. Try local file path if present — upload to Spaces on the fly so
+    # it gets a real presigned URL (see BUG FIX above) instead of being
+    # served as raw bytes with no viewer routing.
     filename = os.path.basename(clean_ref)
     local_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(local_path):
-        return FileResponse(local_path, filename=filename)
+        mime_type = _mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        with open(local_path, "rb") as f:
+            local_bytes = f.read()
+        temp_s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}view-temp/{uuid.uuid4().hex}/{filename}"
+        uploaded = await asyncio.to_thread(upload_file_to_s3, io.BytesIO(local_bytes), temp_s3_key, mime_type)
+        if uploaded:
+            url = generate_presigned_url(temp_s3_key)
+            if url:
+                return {"url": url, "filename": filename, "mimeType": mime_type}
+        # Upload failed for some reason — fall back to serving the raw
+        # file directly so viewing still degrades to a download rather
+        # than breaking outright.
+        from fastapi.responses import FileResponse
+        return FileResponse(local_path, filename=filename, media_type=mime_type)
 
     # 3. Try fallback with S3 prefix
     s3_key = f"{EMAIL_ATTACHMENT_S3_PREFIX}{filename}"
     url = generate_presigned_url(s3_key)
     if url:
-        return {"url": url}
+        mime_type = _mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return {"url": url, "filename": filename, "mimeType": mime_type}
 
     raise HTTPException(status_code=404, detail="Attachment file not found.")
 
@@ -1427,135 +1464,171 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
 
         access_token = None
 
-        if "savantis" in item.from_email.lower():
-            # Send using JSON (Service Account Domain Delegation)
-            sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
-            access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
-        else:
-            # Check with OAuth credentials from consultants
-            email_tok = None
+        # BUG FIX ("No OAuth token found ... and not a Savantis sender" —
+        # blocked ANY non-@savantis address from sending, even when that
+        # consultant had genuinely connected their own Gmail account):
+        # this used to gate the two send methods by a hardcoded
+        # "savantis" substring check on item.from_email — service-account
+        # domain delegation ONLY for savantis addresses, OAuth-token
+        # lookup ONLY for everything else, with no fallback either way.
+        # That's backwards from how confirm_send (phase7.py) already
+        # handles the exact same choice: try the consultant's own
+        # OAuth-connected token first (the correct "send as" mechanism
+        # for any address, not just @savantis ones), and only fall back
+        # to service-account delegation if no token exists. Removed the
+        # domain gate entirely — every sender now gets both attempts, in
+        # that order. Google's own domain-wide-delegation JWT (sub:
+        # impersonate_email, checked against the service account's
+        # authorized Workspace domain) already rejects impersonation for
+        # any address outside that Workspace on its own, so this doesn't
+        # let anything through that Google wouldn't otherwise allow — it
+        # just stops OUR code from pre-blocking legitimate senders (any
+        # Workspace-domain address, not only ones with "savantis"
+        # literally in them, plus any consultant who's connected their
+        # own Gmail) before Google ever gets a say.
+        email_tok = None
 
-            # First try looking up by the new email_address column
-            tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
-            email_tok = tok_res.scalars().first()
+        # First try looking up by the new email_address column
+        tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.email_address == item.from_email))
+        email_tok = tok_res.scalars().first()
 
-            # Fallback to the old method (User -> Consultant -> Token)
-            if not email_tok:
-                user_res = await session.execute(select(User).where(User.email == item.from_email))
-                from_user = user_res.scalars().first()
-                if from_user and from_user.role == "CONSULTANT":
-                    cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
-                    cons = cons_res.scalars().first()
-                    if cons:
-                        tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
-                        candidate_tok = tok_res.scalars().first()
-                        # BUG FIX ("email sent from an unrelated staff
-                        # member's real Gmail account instead of the
-                        # intended consultant" — e.g. Ram Babu's
-                        # application arriving from Jashwanth's inbox):
-                        # this fallback used to trust whatever token row
-                        # was linked to consultant_id with no check that
-                        # its own email_address actually matches
-                        # item.from_email. A mislinked/corrupted token row
-                        # (saved under the wrong consultant_id at
-                        # OAuth-connect time) was silently accepted and
-                        # used to authenticate the send — Gmail then sends
-                        # as whoever that token's real account is,
-                        # regardless of the requested From header, since
-                        # it has no "send as" alias for item.from_email.
-                        # Only use this fallback token when its own
-                        # email_address genuinely matches (or is unset,
-                        # for older rows saved before this column
-                        # existed) — otherwise treat it the same as "no
-                        # token found" rather than sending under the
-                        # wrong identity.
-                        if candidate_tok and (
-                            not candidate_tok.email_address
-                            or candidate_tok.email_address.strip().lower() == (item.from_email or "").strip().lower()
-                        ):
-                            email_tok = candidate_tok
-                        elif candidate_tok:
-                            print(
-                                f"[email-queue debug {item.id}] Refusing mismatched token: "
-                                f"consultant_id={cons.id} token.email_address={candidate_tok.email_address!r} "
-                                f"but item.from_email={item.from_email!r}"
+        # Fallback to the old method (User -> Consultant -> Token)
+        if not email_tok:
+            user_res = await session.execute(select(User).where(User.email == item.from_email))
+            from_user = user_res.scalars().first()
+            if from_user and from_user.role == "CONSULTANT":
+                cons_res = await session.execute(select(Consultant).where(Consultant.user_id == from_user.id))
+                cons = cons_res.scalars().first()
+                if cons:
+                    tok_res = await session.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == cons.id))
+                    candidate_tok = tok_res.scalars().first()
+                    # BUG FIX ("email sent from an unrelated staff
+                    # member's real Gmail account instead of the
+                    # intended consultant" — e.g. Ram Babu's
+                    # application arriving from Jashwanth's inbox):
+                    # this fallback used to trust whatever token row
+                    # was linked to consultant_id with no check that
+                    # its own email_address actually matches
+                    # item.from_email. A mislinked/corrupted token row
+                    # (saved under the wrong consultant_id at
+                    # OAuth-connect time) was silently accepted and
+                    # used to authenticate the send — Gmail then sends
+                    # as whoever that token's real account is,
+                    # regardless of the requested From header, since
+                    # it has no "send as" alias for item.from_email.
+                    # Only use this fallback token when its own
+                    # email_address genuinely matches (or is unset,
+                    # for older rows saved before this column
+                    # existed) — otherwise treat it the same as "no
+                    # token found" rather than sending under the
+                    # wrong identity.
+                    if candidate_tok and (
+                        not candidate_tok.email_address
+                        or candidate_tok.email_address.strip().lower() == (item.from_email or "").strip().lower()
+                    ):
+                        email_tok = candidate_tok
+                    elif candidate_tok:
+                        print(
+                            f"[email-queue debug {item.id}] Refusing mismatched token: "
+                            f"consultant_id={cons.id} token.email_address={candidate_tok.email_address!r} "
+                            f"but item.from_email={item.from_email!r}"
+                        )
+
+        if email_tok and email_tok.access_token_encrypted:
+            from datetime import datetime, timezone, timedelta
+            import httpx
+            from gmail_send_service import encrypt_token
+
+            now = datetime.now(timezone.utc)
+            # Check if token is expired or about to expire in next 5 mins
+            if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
+                if email_tok.refresh_token_encrypted:
+                    ref_token = decrypt_token(email_tok.refresh_token_encrypted)
+                    client_id = os.getenv("GOOGLE_CLIENT_ID")
+                    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+                    if client_id and client_secret:
+                        # BUG FIX (Cloudflare "invalid or incomplete
+                        # response" / origin timeout): this had no
+                        # explicit timeout at all, relying on httpx's
+                        # default — under load, or if Google's token
+                        # endpoint is slow, this call (plus the PDF
+                        # conversion and Gmail API call that follow it,
+                        # all now synchronous within a single request —
+                        # see the BUG FIX above this function) could run
+                        # long enough to blow past the proxy's timeout,
+                        # which drops the connection before this server
+                        # ever sends a response. A short, explicit
+                        # timeout means a hung/slow OAuth call fails
+                        # fast and cleanly instead.
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            res = await client.post(
+                                "https://oauth2.googleapis.com/token",
+                                data={
+                                    "client_id": client_id,
+                                    "client_secret": client_secret,
+                                    "refresh_token": ref_token,
+                                    "grant_type": "refresh_token"
+                                }
                             )
-
-            if email_tok and email_tok.access_token_encrypted:
-                from datetime import datetime, timezone, timedelta
-                import httpx
-                from gmail_send_service import encrypt_token
-
-                now = datetime.now(timezone.utc)
-                # Check if token is expired or about to expire in next 5 mins
-                if email_tok.token_expiry and now >= (email_tok.token_expiry - timedelta(minutes=5)):
-                    if email_tok.refresh_token_encrypted:
-                        ref_token = decrypt_token(email_tok.refresh_token_encrypted)
-                        client_id = os.getenv("GOOGLE_CLIENT_ID")
-                        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-                        if client_id and client_secret:
-                            # BUG FIX (Cloudflare "invalid or incomplete
-                            # response" / origin timeout): this had no
-                            # explicit timeout at all, relying on httpx's
-                            # default — under load, or if Google's token
-                            # endpoint is slow, this call (plus the PDF
-                            # conversion and Gmail API call that follow it,
-                            # all now synchronous within a single request —
-                            # see the BUG FIX above this function) could run
-                            # long enough to blow past the proxy's timeout,
-                            # which drops the connection before this server
-                            # ever sends a response. A short, explicit
-                            # timeout means a hung/slow OAuth call fails
-                            # fast and cleanly instead.
-                            async with httpx.AsyncClient(timeout=15.0) as client:
-                                res = await client.post(
-                                    "https://oauth2.googleapis.com/token",
-                                    data={
-                                        "client_id": client_id,
-                                        "client_secret": client_secret,
-                                        "refresh_token": ref_token,
-                                        "grant_type": "refresh_token"
-                                    }
+                            if res.status_code == 200:
+                                new_data = res.json()
+                                access_token = new_data["access_token"]
+                                email_tok.access_token_encrypted = encrypt_token(access_token)
+                                if "refresh_token" in new_data:
+                                    email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
+                                email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
+                                await session.commit()
+                            else:
+                                # BUG FIX ("reactivated the user, then
+                                # applying auto-deactivates them again"):
+                                # this ValueError's message is what the
+                                # auto-deauthorize check further below
+                                # matches against ("invalid_grant",
+                                # "unauthorized", "401", etc.) — a
+                                # revoked/expired refresh token (which
+                                # can happen while a user sits
+                                # deactivated for a while, independent
+                                # of the User Management authorized/
+                                # unauthorized flag) reliably reproduces
+                                # Google's real "invalid_grant" error
+                                # here. Re-authorizing the USER record
+                                # doesn't reconnect Gmail, so every
+                                # subsequent apply attempt hits this
+                                # same dead token and gets deauthorized
+                                # again — an admin needs a message that
+                                # actually says so, not a bare status
+                                # code and response body.
+                                raise ValueError(
+                                    f"Gmail authorization has expired or was revoked for this consultant "
+                                    f"(refresh_token rejected: status={res.status_code} body={res.text}). "
+                                    f"Reactivating the user account alone will not fix this — the consultant "
+                                    f"needs to reconnect their Gmail account before applying again."
                                 )
-                                if res.status_code == 200:
-                                    new_data = res.json()
-                                    access_token = new_data["access_token"]
-                                    email_tok.access_token_encrypted = encrypt_token(access_token)
-                                    if "refresh_token" in new_data:
-                                        email_tok.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
-                                    email_tok.token_expiry = now + timedelta(seconds=new_data.get("expires_in", 3599))
-                                    await session.commit()
-                                else:
-                                    # BUG FIX ("reactivated the user, then
-                                    # applying auto-deactivates them again"):
-                                    # this ValueError's message is what the
-                                    # auto-deauthorize check further below
-                                    # matches against ("invalid_grant",
-                                    # "unauthorized", "401", etc.) — a
-                                    # revoked/expired refresh token (which
-                                    # can happen while a user sits
-                                    # deactivated for a while, independent
-                                    # of the User Management authorized/
-                                    # unauthorized flag) reliably reproduces
-                                    # Google's real "invalid_grant" error
-                                    # here. Re-authorizing the USER record
-                                    # doesn't reconnect Gmail, so every
-                                    # subsequent apply attempt hits this
-                                    # same dead token and gets deauthorized
-                                    # again — an admin needs a message that
-                                    # actually says so, not a bare status
-                                    # code and response body.
-                                    raise ValueError(
-                                        f"Gmail authorization has expired or was revoked for this consultant "
-                                        f"(refresh_token rejected: status={res.status_code} body={res.text}). "
-                                        f"Reactivating the user account alone will not fix this — the consultant "
-                                        f"needs to reconnect their Gmail account before applying again."
-                                    )
-                else:
-                    access_token = decrypt_token(email_tok.access_token_encrypted)
+            else:
+                access_token = decrypt_token(email_tok.access_token_encrypted)
 
-            if not access_token:
-                raise ValueError(f"No OAuth token found for candidate/consultant ({item.from_email}) and not a Savantis sender")
+        if not access_token:
+            # No per-consultant OAuth token (or it had no send scope) —
+            # fall back to service-account domain delegation for ANY
+            # sender, not just @savantis addresses. This only actually
+            # succeeds for an address within our verified Google
+            # Workspace domain (Google's own token endpoint enforces
+            # that via the JWT "sub" claim), so a genuinely external
+            # personal address still fails here exactly as it should —
+            # it just now gets Google's real rejection reason instead of
+            # being blocked pre-emptively by our own narrow domain check.
+            try:
+                sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
+                access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
+            except Exception as sa_exc:
+                print(f"[email-queue debug {item.id}] Service-account fallback failed for {item.from_email!r}: {sa_exc}")
+
+        if not access_token:
+            raise ValueError(
+                f"No OAuth token found for candidate/consultant ({item.from_email}), and this address "
+                f"isn't part of the company's Google Workspace domain either, so no automatic send method "
+                f"is available. The consultant needs to connect their Gmail account before applying."
+            )
 
         print(f"[email-queue debug {item.id}] Token resolved successfully. Resolving attachments...")
 

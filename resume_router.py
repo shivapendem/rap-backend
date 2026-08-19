@@ -1843,10 +1843,31 @@ async def download_base_resume(
     # DOCX — no on-demand PDF conversion). force_stream still exists to
     # force real bytes through this same-origin endpoint for the actual
     # Download button, same as before.
+    #
+    # BUG FIX ("view directly downloads instead of previewing" for a
+    # local, pre-Spaces base resume): a local file has no presigned URL
+    # to hand to Google's Docs Viewer, and a browser has no built-in
+    # renderer for DOCX regardless of Content-Disposition, so serving it
+    # as raw bytes here always just triggered a download prompt — never
+    # an actual in-browser preview. Upload it to Spaces on the fly (view
+    # path only — force_stream/the real Download button below still
+    # gets the untouched original bytes) so it gets a real presigned URL
+    # and goes through the same viewer routing as an already-migrated
+    # base resume.
     try:
         if os.path.isfile(stored):
             with open(stored, "rb") as fh:
                 body = fh.read()
+            if not force_stream:
+                temp_s3_key = f"users/{target_user_id}/base-resume-view-temp/{uuid.uuid4().hex}{ext or '.docx'}"
+                uploaded = await asyncio.to_thread(upload_file_to_s3, io.BytesIO(body), temp_s3_key, media_type)
+                if uploaded:
+                    presigned = generate_presigned_url(temp_s3_key)
+                    if presigned:
+                        return {"url": presigned, "filename": display_name, "mimeType": media_type}
+                # Upload failed for some reason — fall through and serve
+                # the raw bytes below so viewing still degrades to a
+                # download rather than breaking outright.
             return Response(
                 content=body,
                 media_type=media_type,

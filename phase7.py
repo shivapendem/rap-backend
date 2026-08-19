@@ -1005,6 +1005,30 @@ async def download_application_resume(
         with open(local_path, "rb") as f:
             body_bytes = f.read()
 
+        # BUG FIX ("view directly downloads instead of previewing" for a
+        # local, pre-Spaces attachment): a local file has no presigned
+        # URL to hand to Google's Docs Viewer, and a browser has no
+        # built-in renderer for DOCX regardless of Content-Disposition,
+        # so serving it as raw bytes here always just triggered a
+        # download prompt — never an actual in-browser preview. Upload
+        # it to Spaces on the fly (view path only — force_stream/the
+        # real Download button still gets the untouched original bytes
+        # below) so it gets a real presigned URL and goes through the
+        # same viewer routing as an S3-stored resume.
+        if not force_stream:
+            from s3_service import generate_presigned_url, upload_file_to_s3
+            import io
+            import uuid as _uuid
+            temp_s3_key = f"applications/{application_id}/view-temp/{_uuid.uuid4().hex}/{filename}"
+            uploaded = await asyncio.to_thread(upload_file_to_s3, io.BytesIO(body_bytes), temp_s3_key, media_type)
+            if uploaded:
+                presigned = generate_presigned_url(temp_s3_key)
+                if presigned:
+                    return {"url": presigned, "filename": filename, "mimeType": media_type}
+            # Upload failed for some reason — fall through and serve the
+            # raw bytes below so viewing still degrades to a download
+            # rather than breaking outright.
+
     if not body_bytes:
         raise HTTPException(status_code=404, detail="Resume file could not be retrieved.")
 
