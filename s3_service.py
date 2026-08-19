@@ -1,6 +1,25 @@
 import os
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
+from dotenv import load_dotenv
+
+# BUG FIX ("DO Spaces bucket not configured" even though DO_SPACES_BUCKET
+# is set in .env): this file never called load_dotenv() itself — it read
+# every DO_SPACES_* env var directly at import time and just hoped some
+# OTHER module (database.py, claude_service.py, openai_service.py — the
+# only three files in this codebase that actually call load_dotenv())
+# had already run first and populated os.environ from .env. Module-level
+# code only executes once, on a module's FIRST import — if anything ever
+# imports s3_service before one of those three modules runs (a different
+# entrypoint, a changed import order, a future refactor), DO_SPACES_BUCKET
+# etc. read back as None permanently for that process's whole lifetime,
+# with no error at startup — it only surfaces later as this exact
+# "not configured" message the first time an upload is attempted. Calling
+# load_dotenv() here too (same one-line pattern already used by database.py
+# et al.) makes this file self-sufficient and immune to import order
+# entirely, matching how every other config-reading module in this
+# codebase is written.
+load_dotenv()
 
 # Configuration from environment variables
 DO_SPACES_KEY = os.getenv("DO_SPACES_KEY") or os.getenv("AWS_ACCESS_KEY_ID")
