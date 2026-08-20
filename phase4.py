@@ -836,11 +836,21 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     )
     experiences = exp_result.scalars().all()
 
-    req_ids = [r.id for r in requirements]
+    # BUG FIX ("the number of query arguments cannot exceed 32767"):
+    # this used to filter with RequirementConsultantMatch.requirement_id.in_(req_ids)
+    # alongside consultant_id == consultant_id. Once open requirements passed
+    # ~32,767 (Postgres/asyncpg's hard parameter limit), that IN clause alone
+    # blew the limit and the query failed outright with an InterfaceError,
+    # regardless of how few actual matches this consultant has. The
+    # requirement_id filter was never necessary for correctness — consultant_id
+    # is already an equality filter, so this returns every existing match row
+    # for this one consultant (a small, bounded set) with no per-row query
+    # parameters at all. Rows for requirements that are no longer open (not in
+    # the `requirements` list below) are simply never looked up in the loop,
+    # so keeping them in the dict is harmless.
     existing_result = await db.execute(
         select(RequirementConsultantMatch).where(
             RequirementConsultantMatch.consultant_id == consultant_id,
-            RequirementConsultantMatch.requirement_id.in_(req_ids),
         )
     )
     existing_by_req = {m.requirement_id: m for m in existing_result.scalars().all()}
