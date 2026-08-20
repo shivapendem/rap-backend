@@ -78,6 +78,21 @@ async def run_matching_for_requirement(
             experiences_by_consultant.setdefault(exp.consultant_id, []).append(exp)
 
     new_matches = 0
+    from phase4 import validate_match, _effective_role_text, _compute_requirement_skills
+    # PERFORMANCE FIX: compute the per-requirement values ONCE here, outside
+    # the consultant loop, instead of every consultant re-running the same
+    # regex cleanup + skill extraction on the exact same requirement inside
+    # validate_match()/score_match(). This is what was actually causing the
+    # "Run Matching Engine" timeout after the Bug 2 fix: roleless
+    # consultants used to fail validate_match's gate almost instantly and
+    # never reach score_match at all — now they correctly pass the gate and
+    # run the full scoring path, so the same redundant per-consultant work
+    # that was always here got hit far more often on datasets with a lot of
+    # consultants missing preferred_roles. Precomputing removes that
+    # redundancy regardless of how many consultants pass the gate.
+    effective_role = _effective_role_text(requirement)
+    requirement_skills = _compute_requirement_skills(requirement)
+
     for cons in consultants:
         if (requirement.id, cons.id) in existing_pairs:
             continue
@@ -85,11 +100,13 @@ async def run_matching_for_requirement(
         experiences = experiences_by_consultant.get(cons.id, [])
         
         # STRICT VALIDATION GATE
-        from phase4 import validate_match
-        if not validate_match(requirement, cons, experiences):
+        if not validate_match(requirement, cons, experiences, effective_role=effective_role):
             continue
 
-        result = score_match(requirement, cons, experiences)
+        result = score_match(
+            requirement, cons, experiences,
+            requirement_skills=requirement_skills, effective_role=effective_role,
+        )
         
         score = result["total"]
         if score > 0:  # Matches are already strictly validated, so just ensure it's > 0 or whatever minimum

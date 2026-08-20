@@ -427,13 +427,24 @@ def validate_match(
     requirement: Requirement,
     consultant: Consultant,
     experiences: List[ConsultantExperience],
+    *,
+    effective_role: Optional[str] = None,
 ) -> bool:
     """
     Strict step-by-step validation pipeline.
     A candidate must pass all gates to be considered for a match.
+
+    PERFORMANCE: effective_role can be precomputed ONCE per requirement by
+    the caller and passed in here, instead of every single consultant in
+    the loop re-running _effective_role_text() (regex cleanup + a JD skill
+    scan) on the exact same requirement. See the identical note on
+    score_match() below for why this matters now specifically — Bug 2's
+    fix means more consultants pass this gate than before and go on to the
+    full score_match() computation, so redundant per-consultant work here
+    costs more overall than it used to on the same dataset.
     """
     # 1. Title Validation
-    req_role = _effective_role_text(requirement)
+    req_role = effective_role if effective_role is not None else _effective_role_text(requirement)
 
     role_raw = score_role(req_role, consultant.preferred_roles, experiences)
     # BUG 2 FIX: role_raw is None when the consultant has no role signal at
@@ -505,21 +516,16 @@ def validate_match(
     return True
 
 
-def score_match(
-    requirement: Requirement,
-    consultant: Consultant,
-    experiences: List[ConsultantExperience],
-) -> dict:
+def _compute_requirement_skills(requirement: Requirement) -> List[str]:
     """
-    Combine all 6 factors per doc Task 1 weights:
-      skill 40%, role 20%, experience 15%, employment 10%, location 10%, auth 5%
-    Returns dict with total score, breakdown, matched/missing skills, and reason.
+    Canonical skill list for a requirement — pulled out of score_match() so
+    bulk callers (run_matching_for_requirement, match_requirement) can
+    compute it ONCE per requirement and reuse it across every consultant,
+    instead of every consultant in the loop re-deriving the identical list.
     """
-    # Prioritize tightly scoped skills extracted by parser.py (if any)
     requirement_skills = []
     if requirement.parsed_fields and requirement.parsed_fields.get("skills"):
         raw_skills = requirement.parsed_fields.get("skills")
-        # Map raw extracted skills to canonical names
         canonical_req = set()
         for raw_skill in raw_skills:
             lower = str(raw_skill).lower()
@@ -527,11 +533,45 @@ def score_match(
                 if any(alias in lower for alias in aliases) or lower == canonical:
                     canonical_req.add(canonical)
         requirement_skills = sorted(list(canonical_req))
-        
+
     if not requirement_skills:
-        # Fallback: scan JD, but restrict to first 1500 chars to avoid footer spam
         jd_text = (requirement.job_description or "")[:1500]
         requirement_skills = extract_skills(jd_text)
+
+    return requirement_skills
+
+
+def score_match(
+    requirement: Requirement,
+    consultant: Consultant,
+    experiences: List[ConsultantExperience],
+    *,
+    requirement_skills: Optional[List[str]] = None,
+    effective_role: Optional[str] = None,
+) -> dict:
+    """
+    Combine all 6 factors per doc Task 1 weights:
+      skill 40%, role 20%, experience 15%, employment 10%, location 10%, auth 5%
+    Returns dict with total score, breakdown, matched/missing skills, and reason.
+
+    PERFORMANCE: requirement_skills and effective_role are IDENTICAL for
+    every consultant scored against the same requirement (both are pure
+    functions of the requirement — canonical skill extraction from
+    parsed_fields/JD text, and the generic-role-vs-skills disambiguation).
+    Bulk callers (run_matching_for_requirement's per-requirement consultant
+    loop, match_requirement's per-requirement consultant loop) now compute
+    these ONCE and pass them in, instead of every consultant in the loop
+    silently re-running the same regex/JD scan. This got more expensive
+    per requirement after the Bug 2 fix specifically: roleless consultants
+    used to fail validate_match's gate almost immediately and never reach
+    this function at all — now they correctly pass the gate and land here,
+    so redundant per-consultant work in this function is hit more often
+    than it used to be on the same dataset. Both still default to None and
+    get computed internally when not supplied, so any other caller keeps
+    working unchanged.
+    """
+    if requirement_skills is None:
+        requirement_skills = _compute_requirement_skills(requirement)
 
     consultant_skills = _consultant_skills(consultant)
 
@@ -543,7 +583,9 @@ def score_match(
     # on "Python Developer" but still score a 100% role match here against
     # ANY consultant with "Developer" on file, Java-only consultants
     # included, since role is 50% of the total.
-    role_raw = score_role(_effective_role_text(requirement), consultant.preferred_roles, experiences)
+    if effective_role is None:
+        effective_role = _effective_role_text(requirement)
+    role_raw = score_role(effective_role, consultant.preferred_roles, experiences)
 
     # BUG 2 FIX: role_raw is None when the consultant has no role signal at
     # all (no preferred_roles, no experience role titles) — not the same as
@@ -673,11 +715,20 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
 
     assignment_count = 0
 
+    # PERFORMANCE FIX: same reasoning as run_matching_for_requirement in
+    # matching_router.py — compute once per requirement, reuse for every
+    # consultant instead of recomputing per iteration.
+    effective_role = _effective_role_text(requirement)
+    requirement_skills = _compute_requirement_skills(requirement)
+
     # ── Scoring loop — pure in-memory computation, zero DB round trips per iteration ──
     for consultant in consultants:
         experiences = experiences_by_consultant.get(consultant.id, [])
 
-        result = score_match(requirement, consultant, experiences)
+        result = score_match(
+            requirement, consultant, experiences,
+            requirement_skills=requirement_skills, effective_role=effective_role,
+        )
 
         if result["total"] < MATCH_THRESHOLD:
             continue
