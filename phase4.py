@@ -158,11 +158,59 @@ def score_skills(requirement_skills: List[str], consultant_skills: List[str]) ->
     return round(score, 2), matched, missing
 
 
+# ---------------------------------------------------------------------------
+# BUG 1 FIX: generic role titles ("Developer", "Engineer", "Consultant"...)
+# used to only get disambiguated with skills INSIDE validate_match()'s own
+# local req_role variable — score_match() (the function that actually
+# computes the 50%-weighted role score) always scored the bare, un-augmented
+# requirement.role instead. That meant a requirement titled bare "Software
+# Developer" could correctly pass the validate_match gate on an
+# augmented "Python Developer", but then still score a 100% role match in
+# score_match() against ANY consultant with "Developer" in their profile —
+# a Java-only consultant included — because score_role()'s single-token
+# exact-match shortcut doesn't know the requirement was really about
+# Python. Role is weighted 50% of the total score, so this alone was
+# enough to produce a false near-100% match regardless of actual skill
+# overlap. Moving this into one shared helper, called by BOTH the gate
+# and the scorer, guarantees they always agree on what "the role" means.
+# ---------------------------------------------------------------------------
+GENERIC_ROLE_TITLES = {
+    "developer", "engineer", "consultant", "analyst", "architect", "lead",
+    "manager", "expert", "programmer", "administrator", "specialist",
+    "tester", "qa", "scientist", "researcher", "admin", "dba", "ba",
+    "associate", "professional", "worker",
+    "data analyst", "data scientist", "business analyst",
+    "qa tester", "qa engineer", "software engineer", "software developer",
+    "ml engineer", "ai engineer"
+}
+
+
+def _effective_role_text(requirement: Requirement) -> str:
+    """
+    Return requirement.role, disambiguated with the requirement's own
+    extracted skills when the title alone is a bare generic word (e.g.
+    "Developer" -> "Python Developer"). See BUG 1 FIX above for why this
+    must be the single source of truth used everywhere role is scored.
+    """
+    req_role = requirement.role or ""
+    role_clean = re.sub(r'[^a-zA-Z0-9\s]', '', req_role).strip().lower()
+
+    if role_clean in GENERIC_ROLE_TITLES:
+        skills = requirement.parsed_fields.get("skills", []) if requirement.parsed_fields else []
+        if not skills:
+            jd_text = (requirement.job_description or "")[:1500]
+            skills = extract_skills(jd_text)
+        if skills:
+            req_role = f"{' '.join(skills[:2])} {req_role}"
+
+    return req_role
+
+
 def score_role(
     requirement_role: Optional[str],
     consultant_preferred_roles: Optional[str],
     experiences: Optional[List[ConsultantExperience]] = None,
-) -> float:
+) -> Optional[float]:
     """
     Role title token overlap — smarter token-based comparison.
 
@@ -170,6 +218,12 @@ def score_role(
     'contract') from the requirement role so that a consultant doesn't get heavily
     penalized just because the JD title string was noisy (e.g. "Sr. Java Developer
     (Remote) - 6 months" vs "Java Developer").
+
+    Returns None (not 0.0) when the CONSULTANT has no role signal at all —
+    no preferred_roles set and no experience entries with a role_title.
+    This is BUG 2's fix: that case is "no data", not "a mismatch", and
+    callers must be able to tell the two apart instead of both collapsing
+    to a hard-failing 0.0.
     """
     if not requirement_role:
         return 0.0
@@ -203,7 +257,12 @@ def score_role(
                 pref_tokens |= set(t_clean.split())
 
     if not pref_tokens:
-        return 0.0
+        # BUG 2 FIX: no preferred_roles AND no experience role titles on
+        # file for this consultant — there is nothing to compare against,
+        # which is different from comparing and finding no overlap.
+        # Signal "no data" via None so callers (validate_match, score_match)
+        # can treat this neutrally instead of a hard 0.0 fail.
+        return None
 
     overlap = req_tokens & pref_tokens
     
@@ -374,29 +433,18 @@ def validate_match(
     A candidate must pass all gates to be considered for a match.
     """
     # 1. Title Validation
-    req_role = requirement.role or ""
-    generic_roles = {
-        "developer", "engineer", "consultant", "analyst", "architect", "lead", 
-        "manager", "expert", "programmer", "administrator", "specialist",
-        "tester", "qa", "scientist", "researcher", "admin", "dba", "ba", 
-        "associate", "professional", "worker", 
-        "data analyst", "data scientist", "business analyst",
-        "qa tester", "qa engineer", "software engineer", "software developer",
-        "ml engineer", "ai engineer"
-    }
-    role_clean = re.sub(r'[^a-zA-Z0-9\s]', '', req_role).strip().lower()
-    
-    if role_clean in generic_roles:
-        # Get skills to make generic role more specific
-        skills = requirement.parsed_fields.get("skills", []) if requirement.parsed_fields else []
-        if not skills:
-            jd_text = (requirement.job_description or "")[:1500]
-            skills = extract_skills(jd_text)
-        if skills:
-            req_role = f"{' '.join(skills[:2])} {req_role}"
+    req_role = _effective_role_text(requirement)
 
     role_raw = score_role(req_role, consultant.preferred_roles, experiences)
-    if role_raw < 70.0:
+    # BUG 2 FIX: role_raw is None when the consultant has no role signal at
+    # all (no preferred_roles, no experience role titles) — that used to
+    # come back as the same 0.0 as a genuine mismatch and hard-fail this
+    # gate, silently excluding every roleless consultant from every
+    # requirement regardless of how well their skills matched, with no
+    # warning surfaced anywhere. Only fail the gate on an ACTUAL low-scoring
+    # mismatch; let a consultant with no role data on file through here and
+    # have score_match() reflect that neutrally in the total instead.
+    if role_raw is not None and role_raw < 70.0:
         return False
 
     # 2. Employment Type Validation
@@ -488,7 +536,28 @@ def score_match(
     consultant_skills = _consultant_skills(consultant)
 
     skill_raw, matched_skills, missing_skills = score_skills(requirement_skills, consultant_skills)
-    role_raw = score_role(requirement.role, consultant.preferred_roles, experiences)
+    # BUG 1 FIX: use the same skill-disambiguated role text validate_match's
+    # gate uses (see _effective_role_text) instead of the bare
+    # requirement.role. Previously this line scored the raw generic title,
+    # so a requirement titled bare "Software Developer" could pass the gate
+    # on "Python Developer" but still score a 100% role match here against
+    # ANY consultant with "Developer" on file, Java-only consultants
+    # included, since role is 50% of the total.
+    role_raw = score_role(_effective_role_text(requirement), consultant.preferred_roles, experiences)
+
+    # BUG 2 FIX: role_raw is None when the consultant has no role signal at
+    # all (no preferred_roles, no experience role titles) — not the same as
+    # a genuine mismatch. Previously that collapsed to 0.0, which zeroed
+    # out 50% of the total score AND tripped the "role_raw < 15" 80%
+    # penalty below, effectively burying a roleless-but-otherwise-strong
+    # match. Treat "no data" as neutral instead — same pattern already used
+    # by score_skills()/score_employment_type() for "nothing to compare
+    # against" — and surface it in match_reason so it's visible why the
+    # role factor didn't count either way.
+    role_has_data = role_raw is not None
+    if role_raw is None:
+        role_raw = 60.0  # neutral placeholder: won't trip the <15 penalty, won't hand out full credit either
+
     exp_raw = score_experience(requirement, consultant, experiences)
     employment_raw = score_employment_type(requirement.employment_types, consultant.preferred_employment_types)
     location_raw = score_location(requirement, consultant, experiences)
@@ -506,7 +575,9 @@ def score_match(
     # If the role match is extremely low, penalize the entire match.
     # We do not want to surface a 70% match just because skills/location match
     # when the role is completely wrong.
-    if role_raw < 15.0:
+    # BUG 2 FIX: never apply this penalty when role_raw is our neutral
+    # placeholder for "consultant has no role data" — it's not a mismatch.
+    if role_has_data and role_raw < 15.0:
         total = round(total * 0.2, 2)  # 80% penalty for completely missing the role
 
     reason_parts = []
@@ -516,7 +587,9 @@ def score_match(
         reason_parts.append(f"Missing skills: {', '.join(missing_skills)}")
     if employment_raw == 0:
         reason_parts.append("Employment type mismatch")
-    if role_raw > 0:
+    if not role_has_data:
+        reason_parts.append("No role data on file for consultant — matched by skills only")
+    elif role_raw > 0:
         reason_parts.append(f"Role title overlap: {role_raw}%")
 
     match_reason = "; ".join(reason_parts) if reason_parts else "No strong signals found"

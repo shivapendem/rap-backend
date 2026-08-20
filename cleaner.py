@@ -24,6 +24,23 @@ NOISE_PATTERNS = [
     r'(?is)confidentiality notice.*',
     r'(?is)this message.*intended only for.*',
     r'(?is)if you have received this.*in error.*',
+    # BUG FIX: nothing here ever stripped recruiter sign-offs / signature
+    # blocks ("Thanks & Regards, <name>, <company>, <phone>, <disclaimer>").
+    # That whole block flowed straight through into job_description, which
+    # is what jd_hash / dedup_key are built from AND what phase4.score_match
+    # scans (first 1500 chars) for skills — so short JDs regularly had a
+    # sender's name/company/phone number counted as part of the "job
+    # description" for hashing and matching purposes, exactly the "clean
+    # footer/thread text" step the parser pipeline is supposed to do before
+    # jd_hash creation. Matches a sign-off line (start of line, only the
+    # sign-off phrase + optional punctuation, nothing else) and removes it
+    # plus everything after — mirrors parser.py's own FIELD_BOUNDARIES
+    # sign-off words, but anchored to line boundaries so it doesn't eat "in
+    # regards to ..." or "thanks for the update" appearing mid-sentence.
+    r'(?ism)^[ \t]*(?:thanks\s*(?:&|and)?\s*(?:regards|best)|warm(?:est)?\s*regards|'
+    r'kind\s*regards|best\s*regards|regards|many\s+thanks|sincerely\s+yours|'
+    r'sincerely|yours\s+(?:truly|sincerely|faithfully)?|thank\s+you|thanks|best)'
+    r'\s*[,.:]*[ \t]*$\n?.*',
 ]
 
 

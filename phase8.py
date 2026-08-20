@@ -28,6 +28,7 @@ from sqlalchemy.future import select as fselect
 from database import get_db
 from auth import decode_access_token
 from models import (
+    Application,
     AuditLog,
     ProcessingError,
     ManualReviewQueue,
