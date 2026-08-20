@@ -891,7 +891,27 @@ def parse_requirement(
             )
         if dash_m:
             cand = clean_client(dash_m.group(1))
-            if cand and len(cand) <= 40 and not is_email_body(cand):
+            # BUG FIX: this fallback regex has no awareness of what role was
+            # already extracted above — it just grabs whatever capitalized
+            # phrase follows a dash anywhere in the body. When the role
+            # title itself gets restated near a dash elsewhere in the email
+            # (subject-line repeat, signature, etc.), this fallback was
+            # capturing the ROLE TEXT ITSELF as the "client" — producing
+            # rows where Client is character-for-character identical to
+            # Role (e.g. "Veeva Technical Architect" as both). Per spec,
+            # client should default to N/A/None when a real one can't be
+            # confidently found — a duplicate of the role is not a real
+            # client and is worse than leaving it blank, since it reads as
+            # legitimate data. Reject the candidate outright if it matches
+            # (or is a substring/superstring of) the already-extracted role.
+            role_lower = (role or '').strip().lower()
+            cand_lower = (cand or '').strip().lower()
+            is_role_echo = bool(cand_lower) and bool(role_lower) and (
+                cand_lower == role_lower
+                or cand_lower in role_lower
+                or role_lower in cand_lower
+            )
+            if cand and len(cand) <= 40 and not is_email_body(cand) and not is_role_echo:
                 client = cand
 
     # ── Location ──────────────────────────────────────────────────────────
