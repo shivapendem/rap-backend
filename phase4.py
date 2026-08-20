@@ -184,6 +184,18 @@ GENERIC_ROLE_TITLES = {
     "ml engineer", "ai engineer"
 }
 
+# BUG 1b FIX: individual words that make a TITLE TOKEN generic, derived by
+# splitting every entry in GENERIC_ROLE_TITLES above. Used by score_role()
+# below to detect when an overlapping title word (e.g. both sides say
+# "developer") is generic-only vs. an actual technology/specialty word
+# (e.g. both sides say "python" or "java"). See score_role()'s docstring
+# for why this distinction matters — _effective_role_text() only fixes this
+# when it can successfully extract skills from the requirement; when it
+# can't (skill not in SKILL_ALIASES, JD didn't mention it clearly, etc.)
+# the role stays a bare generic word and score_role() needs its own,
+# independent way to avoid handing out 100% for that alone.
+GENERIC_ROLE_WORDS = {w for phrase in GENERIC_ROLE_TITLES for w in phrase.split()}
+
 
 def _effective_role_text(requirement: Requirement) -> str:
     """
@@ -210,6 +222,9 @@ def score_role(
     requirement_role: Optional[str],
     consultant_preferred_roles: Optional[str],
     experiences: Optional[List[ConsultantExperience]] = None,
+    *,
+    requirement_skills: Optional[List[str]] = None,
+    consultant_skills: Optional[List[str]] = None,
 ) -> Optional[float]:
     """
     Role title token overlap — smarter token-based comparison.
@@ -224,6 +239,25 @@ def score_role(
     This is BUG 2's fix: that case is "no data", not "a mismatch", and
     callers must be able to tell the two apart instead of both collapsing
     to a hard-failing 0.0.
+
+    BUG 1b FIX: a title match built ENTIRELY out of generic words (both
+    sides say "Developer", "Engineer", "Consultant"...) is not real
+    evidence of fit — "Java Developer" and "Python Developer" share the
+    word "Developer" and nothing else, but the old logic treated a single
+    shared token as a 100% role match. _effective_role_text() disambiguates
+    the requirement side of this with its own skills BEFORE this function
+    ever runs, but that only helps when skill extraction succeeds; a
+    consultant's title can independently reduce to something generic too,
+    and skill extraction can fail to find anything (skill not in
+    SKILL_ALIASES, JD phrased it in a way extract_skills() doesn't catch).
+    So this needs its own, independent safety net: whenever the overlap
+    between requirement and consultant title tokens consists ONLY of
+    generic words, don't score the title match at face value — fall back
+    to actual skill overlap between what the requirement needs
+    (requirement_skills) and what the consultant has (consultant_skills)
+    to decide how much credit a generic-title-only match deserves. A
+    non-generic overlapping word ("python", "java", "aws"...) is real
+    signal and keeps the existing boost logic untouched.
     """
     if not requirement_role:
         return 0.0
@@ -265,18 +299,42 @@ def score_role(
         return None
 
     overlap = req_tokens & pref_tokens
-    
-    # Calculate ratio against meaningful tokens
-    ratio = len(overlap) / len(req_tokens)
-    
-    # Boost: if they matched the core technology (e.g. "java", "developer") which is usually 1-2 words.
-    # If they match 2+ tokens, it's usually a solid match.
-    if len(overlap) >= 2 and ratio < 0.8:
-        ratio = min(1.0, ratio + 0.3) # 30% boost for matching multiple core tokens
-        
-    # If it's a 1-token requirement and they matched it
-    if len(req_tokens) == 1 and len(overlap) == 1:
-        ratio = 1.0
+
+    # BUG 1b FIX: split the overlap into "specific" (real technology/
+    # specialty words — actual signal) vs "generic" (developer/engineer/
+    # consultant/etc — not real signal on its own).
+    specific_overlap = overlap - GENERIC_ROLE_WORDS
+
+    if overlap and not specific_overlap:
+        # Every overlapping word is generic — title alone can't tell these
+        # candidates apart (e.g. "Java Developer" vs "Python Developer").
+        # Fall back to real skill overlap between what the requirement
+        # needs and what this consultant actually has.
+        req_skill_set = set(requirement_skills or [])
+        cons_skill_set = set(consultant_skills or [])
+        if req_skill_set:
+            skill_overlap = req_skill_set & cons_skill_set
+            ratio = len(skill_overlap) / len(req_skill_set)
+        else:
+            # Neither side gives us anything better than the generic title
+            # word to go on — stay neutral rather than rewarding a
+            # coincidental "Developer" == "Developer" with full credit.
+            ratio = 0.5
+    else:
+        # Calculate ratio against meaningful tokens
+        ratio = len(overlap) / len(req_tokens)
+
+        # Boost: if they matched the core technology (e.g. "java", "developer") which is usually 1-2 words.
+        # If they match 2+ tokens, it's usually a solid match.
+        if len(overlap) >= 2 and ratio < 0.8:
+            ratio = min(1.0, ratio + 0.3) # 30% boost for matching multiple core tokens
+
+        # If it's a 1-token requirement and they matched it — only trust
+        # this shortcut when that one shared token is a SPECIFIC word
+        # (e.g. req_role reduced to just "Python"). A single generic word
+        # match was already routed into the skill-overlap branch above.
+        if len(req_tokens) == 1 and len(overlap) == 1 and specific_overlap:
+            ratio = 1.0
 
     return round(ratio * 100, 2)
 
@@ -429,24 +487,35 @@ def validate_match(
     experiences: List[ConsultantExperience],
     *,
     effective_role: Optional[str] = None,
+    requirement_skills: Optional[List[str]] = None,
 ) -> bool:
     """
     Strict step-by-step validation pipeline.
     A candidate must pass all gates to be considered for a match.
 
-    PERFORMANCE: effective_role can be precomputed ONCE per requirement by
-    the caller and passed in here, instead of every single consultant in
-    the loop re-running _effective_role_text() (regex cleanup + a JD skill
-    scan) on the exact same requirement. See the identical note on
-    score_match() below for why this matters now specifically — Bug 2's
-    fix means more consultants pass this gate than before and go on to the
-    full score_match() computation, so redundant per-consultant work here
-    costs more overall than it used to on the same dataset.
+    PERFORMANCE: effective_role and requirement_skills can be precomputed
+    ONCE per requirement by the caller and passed in here, instead of every
+    single consultant in the loop re-running _effective_role_text()/
+    _compute_requirement_skills() (regex cleanup + a JD skill scan) on the
+    exact same requirement. See the identical note on score_match() below
+    for why this matters now specifically — Bug 2's fix means more
+    consultants pass this gate than before and go on to the full
+    score_match() computation, so redundant per-consultant work here costs
+    more overall than it used to on the same dataset.
     """
     # 1. Title Validation
     req_role = effective_role if effective_role is not None else _effective_role_text(requirement)
+    req_skills = requirement_skills if requirement_skills is not None else _compute_requirement_skills(requirement)
 
-    role_raw = score_role(req_role, consultant.preferred_roles, experiences)
+    # BUG 1b FIX: pass skills through so score_role() can fall back to real
+    # skill overlap instead of trusting a generic-word-only title match
+    # (see score_role()'s docstring). Without this, a Java consultant could
+    # still pass this gate against a Python requirement whenever both
+    # titles reduce to just "Developer".
+    role_raw = score_role(
+        req_role, consultant.preferred_roles, experiences,
+        requirement_skills=req_skills, consultant_skills=_consultant_skills(consultant),
+    )
     # BUG 2 FIX: role_raw is None when the consultant has no role signal at
     # all (no preferred_roles, no experience role titles) — that used to
     # come back as the same 0.0 as a genuine mismatch and hard-fail this
@@ -585,7 +654,14 @@ def score_match(
     # included, since role is 50% of the total.
     if effective_role is None:
         effective_role = _effective_role_text(requirement)
-    role_raw = score_role(effective_role, consultant.preferred_roles, experiences)
+    # BUG 1b FIX: pass requirement_skills/consultant_skills through so
+    # score_role() can fall back to real skill overlap whenever the title
+    # overlap is generic-word-only (see score_role()'s docstring) — both
+    # are already computed above/passed in, no extra work here.
+    role_raw = score_role(
+        effective_role, consultant.preferred_roles, experiences,
+        requirement_skills=requirement_skills, consultant_skills=consultant_skills,
+    )
 
     # BUG 2 FIX: role_raw is None when the consultant has no role signal at
     # all (no preferred_roles, no experience role titles) — not the same as

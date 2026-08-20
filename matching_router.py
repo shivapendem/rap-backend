@@ -100,7 +100,10 @@ async def run_matching_for_requirement(
         experiences = experiences_by_consultant.get(cons.id, [])
         
         # STRICT VALIDATION GATE
-        if not validate_match(requirement, cons, experiences, effective_role=effective_role):
+        if not validate_match(
+            requirement, cons, experiences,
+            effective_role=effective_role, requirement_skills=requirement_skills,
+        ):
             continue
 
         result = score_match(
