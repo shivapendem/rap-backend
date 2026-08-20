@@ -104,50 +104,135 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
 # ── Profile ─────────────────────────────────────────────────────────────────
 
 class EducationEntryRequest(BaseModel):
-    degree: Optional[str] = None
-    institution: Optional[str] = None
-    year: Optional[str] = None
+    # BUG FIX: every field here was Optional with no validation, and
+    # ProfileUpdateRequest.education defaulted to [] with no min_length —
+    # matching the frontend's schema gap (see ProfileFormSchema.education
+    # in schemas/index.ts), so an empty education list, or an entry with
+    # blank degree/institution/year, always saved successfully with no
+    # server-side check at all, independent of whatever the UI did or
+    # didn't enforce.
+    degree: str = Field(..., min_length=1)
+    institution: str = Field(..., min_length=1)
+    year: str = Field(..., min_length=1)
     details: Optional[str] = None
 
 
 class ProfileUpdateRequest(BaseModel):
     fullName: str = Field(..., min_length=1, max_length=200)
-    location: Optional[str] = None
-    phone: Optional[str] = Field(None, max_length=30)
-    linkedInUrl: Optional[str] = None
-    primarySkills: List[str] = []
-    secondarySkills: List[str] = []
-    workAuth: Optional[str] = None
-    employmentTypes: List[str] = Field(default=["C2C"], min_length=1)
-    preferredRoles: Optional[str] = None
-    preferredLocations: Optional[str] = None
-    totalExperienceYears: Optional[float] = Field(None, ge=0, le=60)
+    # BUG FIX ("saving profile with empty Location/Phone/LinkedIn URL/
+    # Preferred Roles/Preferred Locations/Total Experience"): every one of
+    # these fields shows the required red asterisk in ProfileForm.tsx and
+    # already renders its own errors.<field> message correctly, but each
+    # was Optional here with no server-side validation at all — matching
+    # the same schema gap fixed on the frontend side (see
+    # ProfileFormSchema in schemas/index.ts) for phone, linkedInUrl,
+    # preferredRoles, preferredLocations, and totalExperienceYears, all of
+    # which had a `.or(z.literal(""))` (or equivalent) escape hatch there.
+    location: str = Field(..., min_length=2, max_length=100)
+    phone: str = Field(..., pattern=r"^\+?[\d\s\-().]{7,20}$")
+    # (education itself is declared further down in this class — see
+    # the min_length=1 added there, paired with EducationEntryRequest's
+    # own per-field requirements above.)
+    linkedInUrl: str = Field(..., min_length=1)
+    # BUG FIX ("saving profile with zero Primary/Secondary Skills, or with
+    # no Work Authorisation selected"): both skill sections show a
+    # required asterisk in SkillTagInput.tsx ("Primary Skills *" /
+    # "Secondary Skills *"), and Work Authorisation shows one in
+    # WorkAuthSelect.tsx — but neither component uses react-hook-form or
+    # any Zod schema at all (they call updateMutation.mutate(...) with a
+    # raw object directly), so the SkillsSchema/WorkAuthFormSchema exports
+    # in schemas/index.ts were never actually wired to either of them —
+    # dead code, not real enforcement. Unlike
+    # EmploymentTypeCheckboxGroup.tsx (which already self-guards with
+    # `if (updated.length === 0) return;` before ever calling mutate),
+    # SkillTagInput.tsx's removeSkill had no equivalent guard, and every
+    # OTHER component's auto-save (ProfileForm, WorkAuthSelect,
+    # EmploymentTypeCheckboxGroup) passes primarySkills/secondarySkills/
+    # workAuth straight through from the current profile prop unchanged
+    # — so a brand-new consultant who never touches Skills or Work
+    # Authorisation at all could still "successfully" save every other
+    # section indefinitely while silently carrying forward empty
+    # skills / a null work auth, with the UI's required asterisks never
+    # actually being enforced by anything.
+    primarySkills: List[str] = Field(..., min_length=1)
+    secondarySkills: List[str] = Field(..., min_length=1)
+    workAuth: str = Field(...)
+    # BUG FIX: default=["C2C"] was itself an now-invalid legacy value once
+    # the allowed set below was narrowed to FULL_TIME/CONTRACT — required
+    # here with no default, matching the pattern used for the other
+    # fields that were made required earlier (title, education, etc.).
+    employmentTypes: List[str] = Field(..., min_length=1)
+    preferredRoles: str = Field(..., min_length=1, max_length=200)
+    preferredLocations: str = Field(..., min_length=1, max_length=200)
+    totalExperienceYears: float = Field(..., ge=0, le=60)
     # BUG FIX: these three were never collectable anywhere — the
     # "Profile incomplete" check (resume_validation.py) has always
     # required them, but there was no form field, no request field, and
     # (for title/summary/education) no storage column at all. Stored in
     # User.resume_info (see update_own_profile below) rather than new
     # Consultant columns, to avoid a migration.
-    title: Optional[str] = None
+    # BUG FIX ("saving profile with empty Target Title/Role"): title was
+    # Optional with no validation, matching the frontend's schema gap
+    # (see ProfileFormSchema.title in schemas/index.ts) — an empty string
+    # always saved successfully with no server-side check, independent of
+    # the UI's required asterisk.
+    title: str = Field(..., min_length=2, max_length=150)
     summary: Optional[str] = None
-    education: List[EducationEntryRequest] = []
+    education: List[EducationEntryRequest] = Field(..., min_length=1)
     resumeRichText: Optional[str] = None
 
+    # BUG FIX: workAuth is now required (str, not Optional[str], above) —
+    # this validator's `v is not None` branch is unreachable now, since
+    # Pydantic rejects a missing/None value before this ever runs, but the
+    # membership check itself still matters (a required field isn't
+    # automatically a valid enum member).
     @field_validator("workAuth")
     @classmethod
     def validate_work_auth(cls, v):
-        if v is not None and v not in {"US_CITIZEN", "GC", "H1B", "OPT", "OTHER"}:
+        if v not in {"US_CITIZEN", "GC", "H1B", "OPT", "OTHER"}:
             raise ValueError(f"workAuth must be one of US_CITIZEN, GC, H1B, OPT, OTHER")
         return v
 
+    # BUG FIX: linkedInUrl is now required (min_length=1 above), but the
+    # frontend's additional check that it's actually a LinkedIn link
+    # (ProfileFormSchema's .refine(val.includes("linkedin.com"))) had no
+    # backend equivalent — any non-empty string, LinkedIn or not, saved
+    # successfully via a direct API call.
+    @field_validator("linkedInUrl")
+    @classmethod
+    def validate_linkedin_url(cls, v):
+        if not re.match(r"^https?://", v):
+            raise ValueError("linkedInUrl must be a valid URL")
+        if "linkedin.com" not in v:
+            raise ValueError("linkedInUrl must be a LinkedIn URL")
+        return v
+
+    # BUG FIX ("selecting Contract and hard-refreshing unselects it", then
+    # "every save fails with Invalid employmentTypes: ['C2C']"): narrowing
+    # the allowed set to just FULL_TIME/CONTRACT fixed Contract itself,
+    # but exposed a second bug — any consultant created via
+    # admin_create_consultant (whose own AdminConsultantCreateRequest
+    # still allows C2C/W2/1099/FULL_TIME/CONTRACT) already has one of
+    # those legacy values stored. Every other component on this page
+    # (ProfileForm, SkillTagInput, WorkAuthSelect,
+    # EmploymentTypeCheckboxGroup) re-sends the CURRENT employmentTypes
+    # array untouched alongside whatever field it's actually changing —
+    # so a hard reject here blocked every save on the entire page for
+    # that consultant, not just the Employment Type toggle. Filtering out
+    # unrecognized legacy values instead lets those other saves succeed
+    # normally and self-heals the stale data the next time employmentTypes
+    # itself is genuinely touched; only raise if nothing valid survives
+    # the filter, since it's still a required field.
     @field_validator("employmentTypes")
     @classmethod
     def validate_employment_types(cls, v):
-        allowed = {"C2C", "W2", "FULL_TIME"}
-        invalid = [t for t in v if t not in allowed]
-        if invalid:
-            raise ValueError(f"Invalid employmentTypes: {invalid}")
-        return list(dict.fromkeys(v))
+        allowed = {"FULL_TIME", "CONTRACT"}
+        cleaned = list(dict.fromkeys(t for t in v if t in allowed))
+        if not cleaned:
+            raise ValueError(
+                "employmentTypes must include at least one of: Full-Time, Contract"
+            )
+        return cleaned
 
 
 class ProfileResponse(BaseModel):
