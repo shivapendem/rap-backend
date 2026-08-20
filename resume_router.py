@@ -1636,6 +1636,16 @@ async def update_base_resume_content(
                 end_date=end_date,
                 is_present=is_present,
                 location=item.get("location"),
+                # BUG FIX ("Save Changes does nothing" when editing a role
+                # added from the Base Resume editor in the Work Experience
+                # drawer): this reconciler never set work_mode, leaving it
+                # NULL. The drawer's Zod schema requires workMode to be one
+                # of REMOTE/HYBRID/ONSITE with no null/optional case, and
+                # renders no error message for that field, so a NULL value
+                # failed validation silently on submit — the button click
+                # produced no visible feedback at all. Default to REMOTE
+                # here, matching the drawer's own "Add Experience" default.
+                work_mode="REMOTE",
                 technologies=technologies,
                 responsibilities=responsibilities,
                 achievements=achievements,
