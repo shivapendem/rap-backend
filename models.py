@@ -376,7 +376,7 @@ class RequirementConsultantMatch(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
-    VALID_STATUSES = {"ASSIGNED", "RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"}
+    VALID_STATUSES = {"ASSIGNED", "NEAR_MISS", "RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"}
 
     __table_args__ = (
         UniqueConstraint("requirement_id", "consultant_id", name="uq_requirement_consultant_match"),
