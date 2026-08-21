@@ -5,13 +5,14 @@
 # ---------------------------------------------------------------------------
 
 import math
+import re
 from typing import Optional, List, Any
 
 from fastapi import HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import User, Consultant, Application, Resume, ConsultantExperience
+from models import User, Consultant, Application, Resume, ConsultantExperience, RecruiterConsultant
 from phase_users_repository import (
     UserRepository, ConsultantRepository, RecruiterConsultantRepository,
 )
@@ -165,6 +166,155 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         total_resumes_generated=total_resumes_generated,
         completeness_pct=completeness,
     )
+
+
+async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consultant]) -> List[ConsultantAdminRowDTO]:
+    """
+    Batched version of _consultant_to_dto() for list endpoints.
+
+    BUG FIX ("consultant profile not loading" / GET /api/v1/admin/consultants
+    request stuck with zero response headers — never a 4xx/5xx, the browser
+    just never got a response at all): _consultant_to_dto() does up to 6
+    sequential DB queries per consultant (assigned recruiters, experience
+    count, linked-user lookup, resume count, applications-sent count,
+    latest ATS score). That's fine for looking up ONE consultant, but the
+    list endpoint ran it in a plain per-item loop — with the repository's
+    200-consultant cap, that's up to 1,200 sequential round trips for a
+    single page load. As the consultant roster grew over the course of
+    normal use, this endpoint got slower and slower until it finally
+    exceeded the request timeout entirely, which looks exactly like a
+    missing/deleted consultant profile from the frontend's point of view
+    (the request just never completes, so the UI's "not found" fallback
+    fires) even though nothing was actually deleted.
+
+    Every one of those lookups is batched here into ONE query total,
+    regardless of how many consultants are being rendered — the query
+    count for this function is now fixed (6 queries), not O(N).
+    """
+    if not consultants:
+        return []
+
+    cons_ids = [c.id for c in consultants]
+    user_ids = [c.user_id for c in consultants if c.user_id]
+
+    # 1. Assigned recruiters for ALL consultants in one query.
+    recruiters_by_cons: dict[int, list[User]] = {cid: [] for cid in cons_ids}
+    rec_rows = (await db.execute(
+        select(RecruiterConsultant.consultant_id, User)
+        .join(User, User.id == RecruiterConsultant.recruiter_id)
+        .where(
+            RecruiterConsultant.consultant_id.in_(cons_ids),
+            RecruiterConsultant.is_active == True,
+        )
+    )).all()
+    for cid, user in rec_rows:
+        recruiters_by_cons.setdefault(cid, []).append(user)
+
+    # 2. Experience row counts for ALL consultants in one grouped query.
+    exp_rows = (await db.execute(
+        select(ConsultantExperience.consultant_id, func.count())
+        .where(ConsultantExperience.consultant_id.in_(cons_ids))
+        .group_by(ConsultantExperience.consultant_id)
+    )).all()
+    exp_counts: dict[int, int] = {cid: cnt for cid, cnt in exp_rows}
+
+    # 3. Linked user's last_login_at + resume_info for ALL consultants in one query.
+    user_info: dict[int, tuple] = {}
+    if user_ids:
+        user_rows = (await db.execute(
+            select(User.id, User.last_login_at, User.resume_info).where(User.id.in_(user_ids))
+        )).all()
+        user_info = {uid: (last_login, resume_info) for uid, last_login, resume_info in user_rows}
+
+    # 4. Resume counts per user_id in one grouped query.
+    resume_counts: dict[int, int] = {}
+    if user_ids:
+        resume_rows = (await db.execute(
+            select(Resume.user_id, func.count())
+            .where(Resume.user_id.in_(user_ids))
+            .group_by(Resume.user_id)
+        )).all()
+        resume_counts = {uid: cnt for uid, cnt in resume_rows}
+
+    # 5. Applications-sent counts per consultant_id in one grouped query.
+    apps_rows = (await db.execute(
+        select(Application.consultant_id, func.count())
+        .where(Application.consultant_id.in_(cons_ids), Application.status == "SENT")
+        .group_by(Application.consultant_id)
+    )).all()
+    apps_counts: dict[int, int] = {cid: cnt for cid, cnt in apps_rows}
+
+    # 6. Latest non-null ATS score per user_id — fetch every scored resume
+    # for these users ordered newest-first, then keep only the first
+    # (most recent) one per user_id in Python. Bounded by however many
+    # scored resumes these consultants actually have, not by N x M.
+    latest_ats: dict[int, float] = {}
+    if user_ids:
+        ats_rows = (await db.execute(
+            select(Resume.user_id, Resume.ats_score, Resume.created_at)
+            .where(Resume.user_id.in_(user_ids), Resume.ats_score.isnot(None))
+            .order_by(Resume.created_at.desc())
+        )).all()
+        for uid, score, _created in ats_rows:
+            if uid not in latest_ats:
+                latest_ats[uid] = score
+
+    results: List[ConsultantAdminRowDTO] = []
+    for c in consultants:
+        recruiters = recruiters_by_cons.get(c.id, [])
+        experience_count = exp_counts.get(c.id, 0)
+        last_login_at, resume_info = user_info.get(c.user_id, (None, None)) if c.user_id else (None, None)
+        total_resumes_generated = resume_counts.get(c.user_id, 0) if c.user_id else 0
+        total_applications_sent = apps_counts.get(c.id, 0)
+        latest_ats_score = latest_ats.get(c.user_id) if c.user_id else None
+
+        completeness = 0
+        if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
+            completeness += 30
+        if experience_count > 0:
+            completeness += 25
+        if c.preferred_employment_types:
+            completeness += 20
+        if (c.work_authorization or "").strip():
+            completeness += 15
+        if len((c.current_location or "").strip()) >= 2:
+            completeness += 10
+
+        results.append(ConsultantAdminRowDTO(
+            id=str(c.id),
+            user_id=str(c.user_id) if c.user_id else "",
+            name=c.full_name or "",
+            email=c.email or "",
+            status=c.status,
+            primary_skills=c.primary_skills,
+            work_authorization=c.work_authorization,
+            preferred_employment_types=c.preferred_employment_types or [],
+            gmail_connected=c.gmail_connected,
+            assigned_recruiters=[
+                RecruiterRefDTO(id=str(r.id), name=r.full_name, email=r.email) for r in recruiters
+            ],
+            created_at=c.created_at.isoformat() if c.created_at else "",
+            phone=c.phone,
+            sales_recruiter_user_id=str(c.sales_recruiter_user_id) if c.sales_recruiter_user_id else None,
+            current_location=c.current_location,
+            preferred_locations=c.preferred_locations,
+            availability_status=c.availability_status,
+            total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
+            secondary_skills=c.secondary_skills,
+            preferred_roles=c.preferred_roles,
+            ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
+            linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
+            education=c.education or (resume_info or {}).get("education") or [],
+            resume_info=resume_info,
+            resume_rich_text=c.resume_rich_text,
+            updated_at=c.updated_at.isoformat() if c.updated_at else "",
+            has_resume=bool(c.base_resume_file_path or c.base_resume_text),
+            last_login_at=last_login_at.isoformat() if last_login_at else None,
+            total_applications_sent=total_applications_sent,
+            total_resumes_generated=total_resumes_generated,
+            completeness_pct=completeness,
+        ))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -388,12 +538,53 @@ class UserService:
 # distinction because it's also the value being cleared TO.
 RESUME_INFO_NOT_PROVIDED = object()
 
+_LABEL_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 /]{1,30}:\s*(.+)$")
+
+
+def _split_categorized_segment(segment: str) -> List[str]:
+    """Python port of SkillChipEditor.tsx's splitCategorized() — same
+    format, same parsing, so resume_info['skills'] shows the same clean
+    names the chip editor does rather than drifting from a different
+    parser. See that file for the full rationale."""
+    out: List[str] = []
+    for i, piece in enumerate(p.strip() for p in segment.split(",")):
+        if not piece:
+            continue
+        if i == 0:
+            m = _LABEL_PREFIX_RE.match(piece)
+            if m:
+                piece = m.group(1).strip()
+        piece = piece.lstrip("(").rstrip(")").strip()
+        if piece:
+            out.append(piece)
+    return out
+
+
+def _skills_to_list(value: Optional[str]) -> List[str]:
+    """Same categorized-format parsing as the frontend chip editor
+    (‖/| category separators, leftover 'Label:' prefixes, stray
+    parentheses), case-insensitively deduped."""
+    if not value or not value.strip():
+        return []
+    raw: List[str] = []
+    for segment in re.split(r"[‖|]", value):
+        raw.extend(_split_categorized_segment(segment))
+    seen = set()
+    deduped: List[str] = []
+    for item in raw:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
+
+
 class ConsultantAssignmentService:
 
     @staticmethod
     async def list_consultants(db: AsyncSession) -> List[ConsultantAdminRowDTO]:
         consultants = await ConsultantRepository.list_all(db)
-        return [await _consultant_to_dto(db, c) for c in consultants]
+        return await _consultants_to_dtos_bulk(db, consultants)
 
     @staticmethod
     async def get_consultant(db: AsyncSession, consultant_id: int) -> ConsultantAdminRowDTO:
@@ -469,6 +660,29 @@ class ConsultantAssignmentService:
             linked_user = user_result.scalars().first()
             if linked_user:
                 linked_user.resume_info = resume_info
+
+        # BUG FIX (resume_info["skills"] silently drifting out of sync):
+        # generate_resume() in resume_router.py only ever backfills
+        # resume_info["skills"] from consultant.primary_skills the FIRST
+        # time a resume is generated (`if not resume_info.get("skills")`).
+        # After that, nothing kept it in sync — editing Primary/Secondary
+        # Skills via the chip editors had no path to resume_info at all,
+        # so the JSON silently drifted from the consultant's actual
+        # skills the moment either field was edited post-generation.
+        # Only fires when skills actually changed AND this same request
+        # isn't ALSO explicitly overwriting resume_info wholesale (that
+        # takes precedence, handled above) — merges just the "skills" key
+        # into the linked User's EXISTING resume_info, leaving every
+        # other key (summary, experience, education, etc.) untouched.
+        elif (primary_skills is not None or secondary_skills is not None) and consultant.user_id:
+            user_result = await db.execute(select(User).where(User.id == consultant.user_id))
+            linked_user = user_result.scalars().first()
+            if linked_user:
+                combined = ", ".join(filter(None, [consultant.primary_skills, consultant.secondary_skills]))
+                skills_list = _skills_to_list(combined)
+                existing_info = dict(linked_user.resume_info or {})
+                existing_info["skills"] = skills_list
+                linked_user.resume_info = existing_info
 
         consultant = await ConsultantRepository.update(db, consultant)
 

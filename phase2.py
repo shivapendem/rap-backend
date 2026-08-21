@@ -659,6 +659,27 @@ async def reparse_email(
         try:
             from phase4 import match_requirement
             await match_requirement(db, requirement_id)
+
+            # COVERAGE GAP FIX (not a matching-condition change): this only
+            # ever ran Pipeline A above. Pipeline B — the JobMatch table
+            # that actually drives Pending Applications — never got
+            # refreshed after a manual reparse, so a role/skills/employment
+            # type correction made here was invisible on that screen until
+            # an admin separately clicked "Run Engine". Same call
+            # requirements_sync.py already makes for a brand-new
+            # requirement — applying it here too for a re-parsed one.
+            from models import Requirement, Consultant, JobMatch
+            from sqlalchemy.future import select
+            from matching_router import run_matching_for_requirement
+            req_res = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
+            req_obj = req_res.scalars().first()
+            if req_obj:
+                cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+                consultants = cons_res.scalars().all()
+                existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
+                existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
+                await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
+                await db.commit()
         except Exception as match_err:
             print(f"[reparse_email] auto-match FAILED for requirement_id={requirement_id}: {match_err}")
             from error_logger import log_db_error
