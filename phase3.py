@@ -223,16 +223,25 @@ class ProfileUpdateRequest(BaseModel):
     # normally and self-heals the stale data the next time employmentTypes
     # itself is genuinely touched; only raise if nothing valid survives
     # the filter, since it's still a required field.
+    #
+    # BUG FIX ("Failed to save — changes rolled back" on ANY profile edit
+    # for consultants with only legacy employmentTypes): rejecting here
+    # whenever nothing survives the filter looked right in isolation, but
+    # this validator has no DB access — it can't tell "the person just
+    # cleared Employment Type" from "ProfileForm/WorkAuthSelect/
+    # SkillTagInput re-sent the CURRENT value unchanged, and that value
+    # happens to be legacy-only (C2C/W2/1099 — still allowed by
+    # AdminConsultantCreateRequest, so plenty of existing consultants have
+    # exactly this)." The latter is the common case, and raising blocked
+    # every save on the page for those consultants, not just Employment
+    # Type. Just filter here; whether an empty result should overwrite
+    # the stored value is decided in the endpoint, which has the existing
+    # row and CAN tell the difference (see _resolve_employment_types).
     @field_validator("employmentTypes")
     @classmethod
     def validate_employment_types(cls, v):
         allowed = {"FULL_TIME", "CONTRACT"}
-        cleaned = list(dict.fromkeys(t for t in v if t in allowed))
-        if not cleaned:
-            raise ValueError(
-                "employmentTypes must include at least one of: Full-Time, Contract"
-            )
-        return cleaned
+        return list(dict.fromkeys(t for t in v if t in allowed))
 
 
 class ProfileResponse(BaseModel):
@@ -450,7 +459,7 @@ async def _get_consultant_for_user(db: AsyncSession, user: User) -> Consultant:
 
 
 async def _consultant_to_profile_response(
-    db: AsyncSession, c: Consultant, experience_count: int = 0
+    db: AsyncSession, c: Consultant, experience_count: int = 0, *, include_resume_size: bool = True
 ) -> ProfileResponse:
     # BUG FIX: title/summary/education/linkedin have no Consultant
     # column — read them from the linked User.resume_info JSON instead,
@@ -464,15 +473,35 @@ async def _consultant_to_profile_response(
     secondary = [s.strip() for s in (c.secondary_skills or "").split(",") if s.strip()]
     emp_types = c.preferred_employment_types or []
 
+    # PERF FIX ("taking long time to save"): base_resume_file_path is set
+    # for virtually every consultant — the background auto-regeneration in
+    # resume_router.py's sync_base_resume_text writes it on every profile
+    # save, not just a manual override upload. get_s3_file_metadata() calls
+    # boto3's SYNCHRONOUS head_object() with no await/thread offload —
+    # inside this async function that blocks the entire event loop for the
+    # duration of a real network round-trip to Spaces, on every profile
+    # fetch, and it was ALSO running as part of the save request itself
+    # (update_own_profile/update_consultant_by_id both build their response
+    # through this same function). Two fixes:
+    #   1. include_resume_size=False on the save endpoints below skips the
+    #      S3 call entirely — the person just saved, a moment-stale resume
+    #      size is fine, and this removes a whole network round-trip from
+    #      the save path (the biggest win for perceived save speed).
+    #   2. Everywhere else that still needs it (GET profile, list_consultants)
+    #      now runs it via asyncio.to_thread so it no longer blocks every
+    #      OTHER concurrent request while it waits on Spaces.
     resume = None
     if c.base_resume_file_path:
-        from s3_service import get_s3_file_metadata
         fname = Path(c.base_resume_file_path).name
-        size_bytes, _content_type = get_s3_file_metadata(c.base_resume_file_path)
+        size_bytes = 0
+        if include_resume_size:
+            from s3_service import get_s3_file_metadata
+            size_bytes, _content_type = await asyncio.to_thread(get_s3_file_metadata, c.base_resume_file_path)
+            size_bytes = size_bytes or 0
         resume = {
             "filename": fname,
             "uploadedAt": c.updated_at.isoformat() if c.updated_at else datetime.utcnow().isoformat(),
-            "sizeBytes": size_bytes or 0,
+            "sizeBytes": size_bytes,
         }
 
     # BUG FIX: was `float(c.ats_score or 0)` — Consultant.ats_score is a
@@ -773,6 +802,18 @@ def _detect_skills(text: str) -> list[str]:
     return [k for k, _ in sorted(found.items(), key=lambda x: x[1])]
 
 
+# See the BUG FIX note on ProfileUpdateRequest.validate_employment_types
+# above — `cleaned` has already been filtered to {FULL_TIME, CONTRACT} by
+# then. An empty result there is ambiguous (genuine clear vs. a legacy
+# value just being carried forward untouched); resolve that ambiguity
+# here, where we actually have the stored row: only a real, non-empty
+# selection overwrites it, otherwise leave whatever was already saved
+# alone. Shared by both the consultant self-update and the admin/
+# recruiter update endpoints below.
+def _resolve_employment_types(existing: Optional[List[str]], cleaned: List[str]) -> List[str]:
+    return cleaned if cleaned else (existing or [])
+
+
 # ---------------------------------------------------------------------------
 # Consultant Profile endpoints
 # ---------------------------------------------------------------------------
@@ -824,7 +865,9 @@ async def update_own_profile(
     # never showed up on the admin side. Write the real column too so both
     # directions stay in sync.
     consultant.linkedin_url = payload.linkedInUrl
-    consultant.preferred_employment_types = payload.employmentTypes
+    consultant.preferred_employment_types = _resolve_employment_types(
+        consultant.preferred_employment_types, payload.employmentTypes
+    )
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
@@ -900,7 +943,11 @@ async def update_own_profile(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
     )
     exp_count = count_result.scalar_one()
-    return await _consultant_to_profile_response(db, consultant, exp_count)
+    # PERF FIX: skip the S3 head_object round-trip on the save response
+    # itself — see _consultant_to_profile_response's include_resume_size
+    # note. A subsequent GET (page refresh, revisit) still returns the
+    # real size.
+    return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
 
 
 @router.get(
@@ -1036,7 +1083,9 @@ async def update_consultant_by_id(
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
     consultant.secondary_skills = ", ".join(payload.secondarySkills)
-    consultant.preferred_employment_types = payload.employmentTypes
+    consultant.preferred_employment_types = _resolve_employment_types(
+        consultant.preferred_employment_types, payload.employmentTypes
+    )
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
@@ -1051,7 +1100,9 @@ async def update_consultant_by_id(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant_id)
     )
     exp_count = count_result.scalar_one()
-    return await _consultant_to_profile_response(db, consultant, exp_count)
+    # PERF FIX: same as update_own_profile — skip the S3 round-trip on the
+    # save response itself.
+    return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
 
 
 @router.post(
@@ -1280,7 +1331,10 @@ async def get_own_resume(
         raise HTTPException(404, "No resume uploaded")
 
     from s3_service import get_s3_file_metadata
-    size_bytes, _content_type = get_s3_file_metadata(consultant.base_resume_file_path)
+    # PERF FIX: same blocking-boto3-call issue as _consultant_to_profile_
+    # response — thread-offload so this doesn't stall the event loop for
+    # every other concurrent request while it waits on Spaces.
+    size_bytes, _content_type = await asyncio.to_thread(get_s3_file_metadata, consultant.base_resume_file_path)
 
     return {
         "filename": Path(consultant.base_resume_file_path).name,
@@ -1508,9 +1562,6 @@ async def reorder_experience(
             )
             .values(sort_order=idx)
         )
-
-    from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant)

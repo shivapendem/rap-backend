@@ -452,7 +452,9 @@ async def generate_resume_from_template(
                     s3_key = f"resumes/{target_user_id}/{uuid.uuid4()}.pdf"
                     with open(pdf_path, "rb") as f:
                         file_bytes = f.read()
-                    success = upload_file_to_s3(file_bytes, s3_key, "application/pdf")
+                    # PERF FIX: blocking boto3 upload off the event loop —
+                    # same class of fix as _regenerate_base_resume_docx_file.
+                    success = await asyncio.to_thread(upload_file_to_s3, file_bytes, s3_key, "application/pdf")
                     if not success:
                         logger.error("Failed to upload template PDF to S3")
                         s3_key = None
@@ -593,7 +595,8 @@ async def generate_resume(
         if pdf_ok:
             s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.pdf"
             with open(pdf_path, "rb") as f:
-                if upload_file_to_s3(f, s3_key, "application/pdf"):
+                # PERF FIX: blocking boto3 upload off the event loop.
+                if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf"):
                     new_resume.s3_key = s3_key
                     new_resume.status = 'completed'
                 else:
@@ -611,7 +614,9 @@ async def generate_resume(
         try:
             docx_s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.docx"
             with open(docx_path, "rb") as f:
-                upload_file_to_s3(
+                # PERF FIX: blocking boto3 upload off the event loop.
+                await asyncio.to_thread(
+                    upload_file_to_s3,
                     f, docx_s3_key,
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
@@ -670,7 +675,8 @@ async def finalize_resume(
         if pdf_ok:
             s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
             with open(pdf_path, "rb") as f:
-                if upload_file_to_s3(f, s3_key, "application/pdf"):
+                # PERF FIX: blocking boto3 upload off the event loop.
+                if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf"):
                     resume.s3_key = s3_key
                     resume.status = 'completed'
                 else:
@@ -683,7 +689,9 @@ async def finalize_resume(
         try:
             docx_s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
             with open(docx_path, "rb") as f:
-                upload_file_to_s3(
+                # PERF FIX: blocking boto3 upload off the event loop.
+                await asyncio.to_thread(
+                    upload_file_to_s3,
                     f, docx_s3_key,
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
@@ -785,7 +793,9 @@ async def upload_resume(
     file_bytes = await file.read()
 
     upload_error: list = []
-    success = upload_file_to_s3(
+    # PERF FIX: blocking boto3 upload off the event loop.
+    success = await asyncio.to_thread(
+        upload_file_to_s3,
         io.BytesIO(file_bytes),
         s3_key,
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1058,7 +1068,9 @@ async def update_base_resume_text(
             # Re-upload under a .docx key so a pre-migration .pdf key
             # doesn't end up mislabeled the same way as the local case.
             key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
-            if upload_file_to_s3(
+            # PERF FIX: blocking boto3 upload off the event loop.
+            if await asyncio.to_thread(
+                upload_file_to_s3,
                 io.BytesIO(docx_bytes), key,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             ):
@@ -1492,10 +1504,27 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
             consultant.base_resume_file_path = str(new_path)
         elif stored:
             key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
-            if upload_file_to_s3(
+            # PERF FIX ("taking long time to save" / requests timing out at
+            # exactly the client's 30s timeout, unrelated endpoints like
+            # /api/notifications also stalling): this is the S3 key branch
+            # — the one actually hit in production, since base_resume_
+            # file_path there is an S3 key, not a real local path. This
+            # runs inside a background task (_regen_in_background, fired
+            # by sync_base_resume_text on EVERY profile save) that holds
+            # its own AsyncSessionLocal() session for the task's whole
+            # duration — with DB_POOL_SIZE=2/DB_MAX_OVERFLOW=0 per worker
+            # (see database.py), a synchronous, blocking upload_fileobj()
+            # call here (no await/thread offload) freezes the entire
+            # event loop AND occupies one of only 2 DB connections for
+            # however long the upload to Spaces takes — starving every
+            # other concurrent request on that worker, save-related or
+            # not. Same fix as get_s3_file_metadata's head_object call.
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
                 io.BytesIO(docx_bytes), key,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ):
+            )
+            if uploaded:
                 consultant.base_resume_file_path = key
         else:
             upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
@@ -1910,7 +1939,9 @@ async def update_resume_text(
             # extension-based media-type detection in the download
             # endpoints doesn't end up mislabeling the content.
             key = resume.s3_key if resume.s3_key.lower().endswith(".docx") else resume.s3_key.rsplit(".", 1)[0] + ".docx"
-            upload_file_to_s3(
+            # PERF FIX: blocking boto3 upload off the event loop.
+            await asyncio.to_thread(
+                upload_file_to_s3,
                 io.BytesIO(docx_bytes), key,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
@@ -2316,7 +2347,8 @@ async def update_resume(
             if _convert_to_pdf(docx_path, pdf_path):
                 s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
                 with open(pdf_path, "rb") as f:
-                    if upload_file_to_s3(f, s3_key, "application/pdf"):
+                    # PERF FIX: blocking boto3 upload off the event loop.
+                    if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf"):
                         resume.s3_key = s3_key
                         resume.status = 'completed'
                         await db.commit()
@@ -2405,7 +2437,8 @@ async def download_resume(
                 if _convert_to_pdf(docx_path, pdf_path):
                     s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
                     with open(pdf_path, "rb") as f:
-                        if upload_file_to_s3(f, s3_key, "application/pdf", _error_out=upload_error):
+                        # PERF FIX: blocking boto3 upload off the event loop.
+                        if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf", _error_out=upload_error):
                             resume.s3_key = s3_key
                             resume.status = 'completed'
                             await db.commit()
@@ -2460,7 +2493,8 @@ async def download_resume(
             try:
                 _generate_docx(resume.data, tmp_docx_path)
                 with open(tmp_docx_path, "rb") as f:
-                    if upload_file_to_s3(f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+                    # PERF FIX: blocking boto3 upload off the event loop.
+                    if await asyncio.to_thread(upload_file_to_s3, f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
                         docx_bytes = True  # just need to know it now exists
             except Exception as e:
                 print(f"View-time DOCX regeneration failed for resume {resume.id}: {e}")
@@ -2604,7 +2638,9 @@ async def download_resume_docx(
                 # this once rather than inventing a storage location.
                 if docx_key:
                     with open(docx_path, "rb") as f:
-                        upload_file_to_s3(
+                        # PERF FIX: blocking boto3 upload off the event loop.
+                        await asyncio.to_thread(
+                            upload_file_to_s3,
                             f, docx_key,
                             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         )
