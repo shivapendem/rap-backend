@@ -4,11 +4,46 @@ import re
 from typing import Optional
 from anthropic import Anthropic
 import logging
+import traceback
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+def get_working_anthropic_client():
+    """
+    Tries each configured Anthropic API key in order (ANTHROPIC_API_KEY,
+    ANTHROPIC_API_KEY_2, ANTHROPIC_API_KEY_3, ...) and returns the first
+    one that actually works — so a single expired/invalid/out-of-credits
+    key doesn't take down resume generation entirely when backup keys
+    are available.
+    Returns (client, api_key) tuple, or (None, None) if all keys fail
+    or none are configured.
+    """
+    keys_to_try = []
+    primary = os.getenv("ANTHROPIC_API_KEY")
+    if primary and not primary.startswith("your_"):
+        keys_to_try.append(primary)
+
+    i = 2
+    while True:
+        extra_key = os.getenv(f"ANTHROPIC_API_KEY_{i}")
+        if not extra_key:
+            break
+        keys_to_try.append(extra_key)
+        i += 1
+
+    for key in keys_to_try:
+        try:
+            client = Anthropic(api_key=key)
+            client.models.list()
+            return client, key
+        except Exception as e:
+            logger.warning(f"Anthropic API key ending in ...{key[-6:]} failed: {e}")
+            continue
+
+    return None, None
 
 
 # Category buckets for turning a flat skill list into the categorized

@@ -104,50 +104,144 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
 # ── Profile ─────────────────────────────────────────────────────────────────
 
 class EducationEntryRequest(BaseModel):
-    degree: Optional[str] = None
-    institution: Optional[str] = None
-    year: Optional[str] = None
+    # BUG FIX: every field here was Optional with no validation, and
+    # ProfileUpdateRequest.education defaulted to [] with no min_length —
+    # matching the frontend's schema gap (see ProfileFormSchema.education
+    # in schemas/index.ts), so an empty education list, or an entry with
+    # blank degree/institution/year, always saved successfully with no
+    # server-side check at all, independent of whatever the UI did or
+    # didn't enforce.
+    degree: str = Field(..., min_length=1)
+    institution: str = Field(..., min_length=1)
+    year: str = Field(..., min_length=1)
     details: Optional[str] = None
 
 
 class ProfileUpdateRequest(BaseModel):
     fullName: str = Field(..., min_length=1, max_length=200)
-    location: Optional[str] = None
-    phone: Optional[str] = Field(None, max_length=30)
-    linkedInUrl: Optional[str] = None
-    primarySkills: List[str] = []
-    secondarySkills: List[str] = []
-    workAuth: Optional[str] = None
-    employmentTypes: List[str] = Field(default=["C2C"], min_length=1)
-    preferredRoles: Optional[str] = None
-    preferredLocations: Optional[str] = None
-    totalExperienceYears: Optional[float] = Field(None, ge=0, le=60)
+    # BUG FIX ("saving profile with empty Location/Phone/LinkedIn URL/
+    # Preferred Roles/Preferred Locations/Total Experience"): every one of
+    # these fields shows the required red asterisk in ProfileForm.tsx and
+    # already renders its own errors.<field> message correctly, but each
+    # was Optional here with no server-side validation at all — matching
+    # the same schema gap fixed on the frontend side (see
+    # ProfileFormSchema in schemas/index.ts) for phone, linkedInUrl,
+    # preferredRoles, preferredLocations, and totalExperienceYears, all of
+    # which had a `.or(z.literal(""))` (or equivalent) escape hatch there.
+    location: str = Field(..., min_length=2, max_length=100)
+    phone: str = Field(..., pattern=r"^\+?[\d\s\-().]{7,20}$")
+    # (education itself is declared further down in this class — see
+    # the min_length=1 added there, paired with EducationEntryRequest's
+    # own per-field requirements above.)
+    linkedInUrl: str = Field(..., min_length=1)
+    # BUG FIX ("saving profile with zero Primary/Secondary Skills, or with
+    # no Work Authorisation selected"): both skill sections show a
+    # required asterisk in SkillTagInput.tsx ("Primary Skills *" /
+    # "Secondary Skills *"), and Work Authorisation shows one in
+    # WorkAuthSelect.tsx — but neither component uses react-hook-form or
+    # any Zod schema at all (they call updateMutation.mutate(...) with a
+    # raw object directly), so the SkillsSchema/WorkAuthFormSchema exports
+    # in schemas/index.ts were never actually wired to either of them —
+    # dead code, not real enforcement. Unlike
+    # EmploymentTypeCheckboxGroup.tsx (which already self-guards with
+    # `if (updated.length === 0) return;` before ever calling mutate),
+    # SkillTagInput.tsx's removeSkill had no equivalent guard, and every
+    # OTHER component's auto-save (ProfileForm, WorkAuthSelect,
+    # EmploymentTypeCheckboxGroup) passes primarySkills/secondarySkills/
+    # workAuth straight through from the current profile prop unchanged
+    # — so a brand-new consultant who never touches Skills or Work
+    # Authorisation at all could still "successfully" save every other
+    # section indefinitely while silently carrying forward empty
+    # skills / a null work auth, with the UI's required asterisks never
+    # actually being enforced by anything.
+    primarySkills: List[str] = Field(..., min_length=1)
+    secondarySkills: List[str] = Field(..., min_length=1)
+    workAuth: str = Field(...)
+    # BUG FIX: default=["C2C"] was itself an now-invalid legacy value once
+    # the allowed set below was narrowed to FULL_TIME/CONTRACT — required
+    # here with no default, matching the pattern used for the other
+    # fields that were made required earlier (title, education, etc.).
+    employmentTypes: List[str] = Field(..., min_length=1)
+    preferredRoles: str = Field(..., min_length=1, max_length=200)
+    preferredLocations: str = Field(..., min_length=1, max_length=200)
+    totalExperienceYears: float = Field(..., ge=0, le=60)
     # BUG FIX: these three were never collectable anywhere — the
     # "Profile incomplete" check (resume_validation.py) has always
     # required them, but there was no form field, no request field, and
     # (for title/summary/education) no storage column at all. Stored in
     # User.resume_info (see update_own_profile below) rather than new
     # Consultant columns, to avoid a migration.
-    title: Optional[str] = None
+    # BUG FIX ("saving profile with empty Target Title/Role"): title was
+    # Optional with no validation, matching the frontend's schema gap
+    # (see ProfileFormSchema.title in schemas/index.ts) — an empty string
+    # always saved successfully with no server-side check, independent of
+    # the UI's required asterisk.
+    title: str = Field(..., min_length=2, max_length=150)
     summary: Optional[str] = None
-    education: List[EducationEntryRequest] = []
+    education: List[EducationEntryRequest] = Field(..., min_length=1)
     resumeRichText: Optional[str] = None
 
+    # BUG FIX: workAuth is now required (str, not Optional[str], above) —
+    # this validator's `v is not None` branch is unreachable now, since
+    # Pydantic rejects a missing/None value before this ever runs, but the
+    # membership check itself still matters (a required field isn't
+    # automatically a valid enum member).
     @field_validator("workAuth")
     @classmethod
     def validate_work_auth(cls, v):
-        if v is not None and v not in {"US_CITIZEN", "GC", "H1B", "OPT", "OTHER"}:
+        if v not in {"US_CITIZEN", "GC", "H1B", "OPT", "OTHER"}:
             raise ValueError(f"workAuth must be one of US_CITIZEN, GC, H1B, OPT, OTHER")
         return v
 
+    # BUG FIX: linkedInUrl is now required (min_length=1 above), but the
+    # frontend's additional check that it's actually a LinkedIn link
+    # (ProfileFormSchema's .refine(val.includes("linkedin.com"))) had no
+    # backend equivalent — any non-empty string, LinkedIn or not, saved
+    # successfully via a direct API call.
+    @field_validator("linkedInUrl")
+    @classmethod
+    def validate_linkedin_url(cls, v):
+        if not re.match(r"^https?://", v):
+            raise ValueError("linkedInUrl must be a valid URL")
+        if "linkedin.com" not in v:
+            raise ValueError("linkedInUrl must be a LinkedIn URL")
+        return v
+
+    # BUG FIX ("selecting Contract and hard-refreshing unselects it", then
+    # "every save fails with Invalid employmentTypes: ['C2C']"): narrowing
+    # the allowed set to just FULL_TIME/CONTRACT fixed Contract itself,
+    # but exposed a second bug — any consultant created via
+    # admin_create_consultant (whose own AdminConsultantCreateRequest
+    # still allows C2C/W2/1099/FULL_TIME/CONTRACT) already has one of
+    # those legacy values stored. Every other component on this page
+    # (ProfileForm, SkillTagInput, WorkAuthSelect,
+    # EmploymentTypeCheckboxGroup) re-sends the CURRENT employmentTypes
+    # array untouched alongside whatever field it's actually changing —
+    # so a hard reject here blocked every save on the entire page for
+    # that consultant, not just the Employment Type toggle. Filtering out
+    # unrecognized legacy values instead lets those other saves succeed
+    # normally and self-heals the stale data the next time employmentTypes
+    # itself is genuinely touched; only raise if nothing valid survives
+    # the filter, since it's still a required field.
+    #
+    # BUG FIX ("Failed to save — changes rolled back" on ANY profile edit
+    # for consultants with only legacy employmentTypes): rejecting here
+    # whenever nothing survives the filter looked right in isolation, but
+    # this validator has no DB access — it can't tell "the person just
+    # cleared Employment Type" from "ProfileForm/WorkAuthSelect/
+    # SkillTagInput re-sent the CURRENT value unchanged, and that value
+    # happens to be legacy-only (C2C/W2/1099 — still allowed by
+    # AdminConsultantCreateRequest, so plenty of existing consultants have
+    # exactly this)." The latter is the common case, and raising blocked
+    # every save on the page for those consultants, not just Employment
+    # Type. Just filter here; whether an empty result should overwrite
+    # the stored value is decided in the endpoint, which has the existing
+    # row and CAN tell the difference (see _resolve_employment_types).
     @field_validator("employmentTypes")
     @classmethod
     def validate_employment_types(cls, v):
-        allowed = {"C2C", "W2", "FULL_TIME"}
-        invalid = [t for t in v if t not in allowed]
-        if invalid:
-            raise ValueError(f"Invalid employmentTypes: {invalid}")
-        return list(dict.fromkeys(v))
+        allowed = {"FULL_TIME", "CONTRACT"}
+        return list(dict.fromkeys(t for t in v if t in allowed))
 
 
 class ProfileResponse(BaseModel):
@@ -365,7 +459,7 @@ async def _get_consultant_for_user(db: AsyncSession, user: User) -> Consultant:
 
 
 async def _consultant_to_profile_response(
-    db: AsyncSession, c: Consultant, experience_count: int = 0
+    db: AsyncSession, c: Consultant, experience_count: int = 0, *, include_resume_size: bool = True
 ) -> ProfileResponse:
     # BUG FIX: title/summary/education/linkedin have no Consultant
     # column — read them from the linked User.resume_info JSON instead,
@@ -379,15 +473,35 @@ async def _consultant_to_profile_response(
     secondary = [s.strip() for s in (c.secondary_skills or "").split(",") if s.strip()]
     emp_types = c.preferred_employment_types or []
 
+    # PERF FIX ("taking long time to save"): base_resume_file_path is set
+    # for virtually every consultant — the background auto-regeneration in
+    # resume_router.py's sync_base_resume_text writes it on every profile
+    # save, not just a manual override upload. get_s3_file_metadata() calls
+    # boto3's SYNCHRONOUS head_object() with no await/thread offload —
+    # inside this async function that blocks the entire event loop for the
+    # duration of a real network round-trip to Spaces, on every profile
+    # fetch, and it was ALSO running as part of the save request itself
+    # (update_own_profile/update_consultant_by_id both build their response
+    # through this same function). Two fixes:
+    #   1. include_resume_size=False on the save endpoints below skips the
+    #      S3 call entirely — the person just saved, a moment-stale resume
+    #      size is fine, and this removes a whole network round-trip from
+    #      the save path (the biggest win for perceived save speed).
+    #   2. Everywhere else that still needs it (GET profile, list_consultants)
+    #      now runs it via asyncio.to_thread so it no longer blocks every
+    #      OTHER concurrent request while it waits on Spaces.
     resume = None
     if c.base_resume_file_path:
-        from s3_service import get_s3_file_metadata
         fname = Path(c.base_resume_file_path).name
-        size_bytes, _content_type = get_s3_file_metadata(c.base_resume_file_path)
+        size_bytes = 0
+        if include_resume_size:
+            from s3_service import get_s3_file_metadata
+            size_bytes, _content_type = await asyncio.to_thread(get_s3_file_metadata, c.base_resume_file_path)
+            size_bytes = size_bytes or 0
         resume = {
             "filename": fname,
             "uploadedAt": c.updated_at.isoformat() if c.updated_at else datetime.utcnow().isoformat(),
-            "sizeBytes": size_bytes or 0,
+            "sizeBytes": size_bytes,
         }
 
     # BUG FIX: was `float(c.ats_score or 0)` — Consultant.ats_score is a
@@ -688,6 +802,18 @@ def _detect_skills(text: str) -> list[str]:
     return [k for k, _ in sorted(found.items(), key=lambda x: x[1])]
 
 
+# See the BUG FIX note on ProfileUpdateRequest.validate_employment_types
+# above — `cleaned` has already been filtered to {FULL_TIME, CONTRACT} by
+# then. An empty result there is ambiguous (genuine clear vs. a legacy
+# value just being carried forward untouched); resolve that ambiguity
+# here, where we actually have the stored row: only a real, non-empty
+# selection overwrites it, otherwise leave whatever was already saved
+# alone. Shared by both the consultant self-update and the admin/
+# recruiter update endpoints below.
+def _resolve_employment_types(existing: Optional[List[str]], cleaned: List[str]) -> List[str]:
+    return cleaned if cleaned else (existing or [])
+
+
 # ---------------------------------------------------------------------------
 # Consultant Profile endpoints
 # ---------------------------------------------------------------------------
@@ -739,7 +865,9 @@ async def update_own_profile(
     # never showed up on the admin side. Write the real column too so both
     # directions stay in sync.
     consultant.linkedin_url = payload.linkedInUrl
-    consultant.preferred_employment_types = payload.employmentTypes
+    consultant.preferred_employment_types = _resolve_employment_types(
+        consultant.preferred_employment_types, payload.employmentTypes
+    )
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
@@ -815,7 +943,11 @@ async def update_own_profile(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
     )
     exp_count = count_result.scalar_one()
-    return await _consultant_to_profile_response(db, consultant, exp_count)
+    # PERF FIX: skip the S3 head_object round-trip on the save response
+    # itself — see _consultant_to_profile_response's include_resume_size
+    # note. A subsequent GET (page refresh, revisit) still returns the
+    # real size.
+    return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
 
 
 @router.get(
@@ -951,7 +1083,9 @@ async def update_consultant_by_id(
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
     consultant.secondary_skills = ", ".join(payload.secondarySkills)
-    consultant.preferred_employment_types = payload.employmentTypes
+    consultant.preferred_employment_types = _resolve_employment_types(
+        consultant.preferred_employment_types, payload.employmentTypes
+    )
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
@@ -966,7 +1100,9 @@ async def update_consultant_by_id(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant_id)
     )
     exp_count = count_result.scalar_one()
-    return await _consultant_to_profile_response(db, consultant, exp_count)
+    # PERF FIX: same as update_own_profile — skip the S3 round-trip on the
+    # save response itself.
+    return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
 
 
 @router.post(
@@ -1195,7 +1331,10 @@ async def get_own_resume(
         raise HTTPException(404, "No resume uploaded")
 
     from s3_service import get_s3_file_metadata
-    size_bytes, _content_type = get_s3_file_metadata(consultant.base_resume_file_path)
+    # PERF FIX: same blocking-boto3-call issue as _consultant_to_profile_
+    # response — thread-offload so this doesn't stall the event loop for
+    # every other concurrent request while it waits on Spaces.
+    size_bytes, _content_type = await asyncio.to_thread(get_s3_file_metadata, consultant.base_resume_file_path)
 
     return {
         "filename": Path(consultant.base_resume_file_path).name,
@@ -1423,9 +1562,6 @@ async def reorder_experience(
             )
             .values(sort_order=idx)
         )
-
-    from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant)
