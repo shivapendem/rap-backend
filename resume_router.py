@@ -332,6 +332,163 @@ async def get_resume_completeness(
     }
 
 
+@router.post("/generate-from-template", response_model=dict)
+async def generate_resume_from_template(
+    request: ResumeCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    import tempfile
+    import subprocess
+    import traceback
+    import logging
+    from pathlib import Path
+    
+    logger = logging.getLogger(__name__)
+
+    target_user_id, target_user = await _resolve_target_user(request.user_id, current_user, db)
+    resume_info = await _build_resume_info(target_user, db, request.experience_ids)
+    
+    # Get the rich text template
+    result = await db.execute(select(Consultant).where(Consultant.user_id == target_user_id))
+    consultant = result.scalar_one_or_none()
+    
+    if not consultant or not consultant.resume_rich_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Consultant does not have a rich text resume template. Please create one in the editor first."
+        )
+        
+    template_html = consultant.resume_rich_text
+
+    missing_fields = get_missing_resume_fields(resume_info)
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": missing_fields_message(missing_fields),
+                "missing_fields": missing_fields,
+            },
+        )
+
+    try:
+        from claude_service import generate_template_values
+        generated_data, rate_limits, usage_info = generate_template_values(resume_info, request.job_description or "General Role")
+        if rate_limits:
+            await save_claude_rate_limits(db, rate_limits)
+        if usage_info:
+            from phase8_ai_usage_service import log_ai_usage
+            await log_ai_usage(
+                db,
+                purpose="resume_generation_template",
+                model="claude-sonnet-4-6",
+                input_tokens=usage_info["input_tokens"],
+                output_tokens=usage_info["output_tokens"],
+                consultant_id=str(target_user_id),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Generation failed: {e}")
+
+    # Parse template with generated_data
+    parsed_html = template_html
+    
+    parsed_html = parsed_html.replace("{resume_full_name}", target_user.full_name or "")
+    parsed_html = parsed_html.replace("{job_role}", generated_data.get("summary", "") or "")
+    parsed_html = parsed_html.replace("{skills}", ", ".join(generated_data.get("skills", []) or []))
+    parsed_html = parsed_html.replace("{work_role}", consultant.preferred_roles or "")
+    
+    experiences = generated_data.get("experience", []) or []
+    for i, exp in enumerate(experiences):
+        n = i + 1
+        parsed_html = re.sub(r'\{job_title_' + str(n) + r'\}', exp.get("role", "") or "", parsed_html)
+        parsed_html = re.sub(r'\{company_' + str(n) + r'\}', exp.get("employer", "") or "", parsed_html)
+        
+        # Convert bullets to HTML
+        bullets = exp.get("bullets", []) or []
+        bullets_html = "<ul>" + "".join([f"<li>{b}</li>" for b in bullets]) + "</ul>" if bullets else ""
+        parsed_html = re.sub(r'\{role_' + str(n) + r'\}', bullets_html, parsed_html)
+
+    # Save to S3 and database
+    s3_key = None
+    if not request.draft:
+        try:
+            with tempfile.TemporaryDirectory(prefix="resume_template_") as tmpdir:
+                html_path = Path(tmpdir) / "resume.html"
+                pdf_path = Path(tmpdir) / "resume.pdf"
+                
+                # Wrap HTML to ensure it renders correctly
+                full_html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                    <title>{request.title}</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; }}
+                        .ql-align-center {{ text-align: center; }}
+                        .ql-align-right {{ text-align: right; }}
+                        .ql-align-justify {{ text-align: justify; }}
+                    </style>
+                </head>
+                <body>
+                    {parsed_html}
+                </body>
+                </html>
+                """
+                
+                html_path.write_text(full_html, encoding='utf-8')
+                
+                # Convert using libreoffice
+                with tempfile.TemporaryDirectory(prefix="lo_profile_") as profile_dir:
+                    result = subprocess.run(
+                        ["libreoffice", "--headless",
+                         f"-env:UserInstallation=file://{profile_dir}",
+                         "--convert-to", "pdf",
+                         "--outdir", str(pdf_path.parent), str(html_path)],
+                        capture_output=True, timeout=30, text=True,
+                    )
+                
+                if result.returncode == 0 and pdf_path.exists():
+                    s3_key = f"resumes/{target_user_id}/{uuid.uuid4()}.pdf"
+                    with open(pdf_path, "rb") as f:
+                        file_bytes = f.read()
+                    success = upload_file_to_s3(file_bytes, s3_key, "application/pdf")
+                    if not success:
+                        logger.error("Failed to upload template PDF to S3")
+                        s3_key = None
+                else:
+                    logger.error(f"LibreOffice HTML to PDF failed: {result.stderr}")
+        except Exception as e:
+            logger.error(f"Failed to generate or upload PDF: {e}")
+            logger.error(traceback.format_exc())
+
+    ats_score = math.floor(generated_data.get("ats_score", 0)) if generated_data.get("ats_score") else 85
+
+    new_resume = Resume(
+        user_id=target_user_id,
+        title=request.title,
+        job_description=request.job_description,
+        data=generated_data,
+        is_base=False,
+        is_draft=request.draft,
+        s3_key=s3_key,
+        ats_score=ats_score
+    )
+    db.add(new_resume)
+    await db.commit()
+    await db.refresh(new_resume)
+
+    return {
+        "id": new_resume.id,
+        "title": new_resume.title,
+        "is_draft": new_resume.is_draft,
+        "s3_url": generate_presigned_url(new_resume.s3_key) if new_resume.s3_key else None,
+        "ats_score": new_resume.ats_score,
+        "data": new_resume.data,
+        "parsed_html": parsed_html
+    }
+
+
 @router.post("/generate", response_model=ResumeResponse)
 async def generate_resume(
     request: ResumeCreateRequest,
