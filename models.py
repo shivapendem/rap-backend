@@ -376,7 +376,7 @@ class RequirementConsultantMatch(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
-    VALID_STATUSES = {"ASSIGNED", "RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"}
+    VALID_STATUSES = {"ASSIGNED", "NEAR_MISS", "INVALIDATED", "RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"}
 
     __table_args__ = (
         UniqueConstraint("requirement_id", "consultant_id", name="uq_requirement_consultant_match"),
@@ -521,11 +521,11 @@ class JobMatch(Base):
     match_score = Column(Numeric(5, 2), nullable=True)
     matching_info = JSONBColumn(nullable=True)
     match_reasoning = Column(Text, nullable=True)
-    status = Column(Text, nullable=False, default="PENDING", index=True) # PENDING, APPLIED, REJECTED
+    status = Column(Text, nullable=False, default="PENDING", index=True) # PENDING, NEAR_MISS, APPLIED, REJECTED, INVALIDATED
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
-    VALID_STATUSES = {"PENDING", "APPLIED", "REJECTED"}
+    VALID_STATUSES = {"PENDING", "NEAR_MISS", "APPLIED", "REJECTED", "INVALIDATED"}
 
     __table_args__ = (
         UniqueConstraint("requirement_id", "consultant_id", name="uq_job_match_req_cons"),

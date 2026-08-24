@@ -61,6 +61,26 @@ router = APIRouter()
 
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 
+# BUG FIX (Run Engine timing out at 300s): making the matching engine
+# re-validate every EXISTING row on every run — not just skip it via
+# existing_pairs the way it used to — was the right fix for stale rows
+# never getting caught, but it meant re-scoring the ENTIRE existing
+# dataset every single click, every single time, regardless of whether
+# anything actually changed. With thousands of requirements now in the
+# system, that's tens of thousands of full re-validations per click,
+# which is exactly what pushed past the request timeout.
+#
+# MATCHING_LOGIC_VERSION tags every row with the code version it was last
+# validated under (stored in the existing JSONB score_breakdown /
+# matching_info fields — no schema migration needed). A row already
+# tagged with the CURRENT version gets skipped fast, restoring the old
+# performance for the common case (nothing changed since the last run).
+# A row from before a logic change (untagged, or tagged with an older
+# version) still gets the full re-check exactly once — bump this string
+# whenever scoring/gate logic changes, and every affected row gets
+# re-validated on the next run, then stays skipped until the next bump.
+MATCHING_LOGIC_VERSION = "2026-08-22-data-generic-word-fix"
+
 # ---------------------------------------------------------------------------
 # Skill library — same alias-dictionary pattern as phase3.py's _detect_skills
 # Kept as its own copy here per Phase 4 doc Task 2's own code example
@@ -115,6 +135,30 @@ SKILL_ALIASES: dict[str, list[str]] = {
 }
 
 
+def _alias_matches(alias: str, text: str) -> bool:
+    """
+    Word-boundary-aware check for whether `alias` genuinely appears in
+    `text`, not just as a substring of a longer, unrelated word.
+
+    BUG FIX: extract_skills() used to check `alias in lower` — plain
+    substring containment — which meant a short alias could false-positive
+    match inside a completely different word: "java" (the alias for
+    canonical "java") is literally a substring of "JavaScript", and "ml"
+    (the alias for "machine learning") is a substring of "HTML"/"DHTML".
+    A consultant listing only JavaScript/HTML/DHTML — nothing Java or ML
+    related at all — would get credited with both skills, silently
+    inflating their skill-match score against completely unrelated
+    requirements. Using negative lookbehind/lookahead for alphanumeric
+    characters (rather than \\b, since some aliases contain characters
+    like "#" or "." where \\b's word-character definition gets murky)
+    ensures the alias is only counted when it's not glued to more letters
+    or digits on either side — "java" still matches "Core Java" or
+    "Java/Spring" fine, just not "JavaScript".
+    """
+    pattern = r'(?<![a-zA-Z0-9])' + re.escape(alias) + r'(?![a-zA-Z0-9])'
+    return re.search(pattern, text) is not None
+
+
 def extract_skills(text: Optional[str]) -> List[str]:
     """
     Rule/keyword dictionary skill extraction — per doc Task 2.
@@ -125,7 +169,7 @@ def extract_skills(text: Optional[str]) -> List[str]:
     lower = text.lower()
     found = set()
     for canonical, aliases in SKILL_ALIASES.items():
-        if any(alias in lower for alias in aliases):
+        if any(_alias_matches(alias, lower) for alias in aliases):
             found.add(canonical)
     return sorted(found)
 
@@ -134,6 +178,188 @@ def _consultant_skills(consultant: Consultant) -> List[str]:
     """Combine primary + secondary skills text into a single skill list."""
     combined = ", ".join(filter(None, [consultant.primary_skills, consultant.secondary_skills]))
     return extract_skills(combined)
+
+
+def _requirement_skills(requirement: Requirement) -> List[str]:
+    """
+    Canonical skill list for a requirement — shared by score_match() and
+    validate_match() so the extraction logic exists in exactly one place.
+    Prefers parser.py's tightly-scoped parsed_fields['skills'] (mapped
+    through SKILL_ALIASES to canonical names); falls back to scanning the
+    first 1500 chars of the raw JD when parsed_fields has nothing usable.
+    """
+    requirement_skills: List[str] = []
+    if requirement.parsed_fields and requirement.parsed_fields.get("skills"):
+        raw_skills = requirement.parsed_fields.get("skills")
+        canonical_req = set()
+        for raw_skill in raw_skills:
+            lower = str(raw_skill).lower()
+            for canonical, aliases in SKILL_ALIASES.items():
+                # BUG FIX: same substring-collision bug as extract_skills()
+                # (see _alias_matches() docstring) — a raw skill like
+                # "JavaScript" would false-match the "java" alias via
+                # plain substring containment. Reuses the same
+                # word-boundary-aware check.
+                if any(_alias_matches(alias, lower) for alias in aliases) or lower == canonical:
+                    canonical_req.add(canonical)
+        requirement_skills = sorted(canonical_req)
+
+    if not requirement_skills:
+        jd_text = (requirement.job_description or "")[:1500]
+        requirement_skills = extract_skills(jd_text)
+
+    return requirement_skills
+
+
+# ---------------------------------------------------------------------------
+# Role-matching vocabulary — role-matching-fix spec.
+#
+# GENERIC_ROLE_WORDS separates a role title into a "domain" (specialization)
+# part and a "generic" part, so score_role() can tell "Java Developer" vs
+# "Python Developer" apart instead of matching on the shared word "Developer"
+# alone. SYNONYMS expands common acronyms into their spelled-out words
+# BEFORE domain/generic tokens are compared, so e.g. "SRE" and "Site
+# Reliability Engineer" land on overlapping token sets. ADJACENT_ROLES is a
+# small, hand-curated, extendable table of role phrases treated as a partial
+# (60%) match for each other even with zero direct domain-word overlap.
+# ---------------------------------------------------------------------------
+
+GENERIC_ROLE_WORDS: set[str] = {
+    "developer", "engineer", "analyst", "consultant", "admin", "administrator",
+    "lead", "specialist", "manager", "architect", "coordinator", "associate",
+    "programmer", "tester", "dev",
+    # Merged from a parallel fix on this same file — same principle, a few
+    # more generic job-title nouns that carry no specialization signal on
+    # their own (e.g. "Data Scientist" vs "Research Scientist" sharing
+    # "scientist" alone shouldn't count as a domain match).
+    "professional", "expert", "scientist", "researcher",
+    # Structural/connector words — describe a JOB-TITLE PATTERN, not a
+    # technology or specialization, so they carry no real domain signal on
+    # their own. Without these, a consultant whose Preferred Roles field is
+    # a long multi-phrase list (a common real-world pattern — e.g. twenty
+    # Salesforce role variants, one of which happens to be "Salesforce Full
+    # Stack Developer") leaks "full"/"stack"/"web" into their token pool,
+    # which then falsely counts as domain overlap against a COMPLETELY
+    # unrelated posting like "Java Full Stack Developer" — these generic
+    # structural phrases are used identically across every tech stack, so
+    # sharing them proves nothing about actual specialization match.
+    "full", "stack", "web", "application", "platform", "integration",
+    "integrations", "customization", "implementation", "migration",
+    "support", "technical", "solution", "solutions",
+    # BUG FIX ("Data Analyst" consultant matched "Data Architect" at 100%
+    # role overlap): a broad category word like "data" appears across
+    # genuinely unrelated specializations — Data Analyst, Data Architect,
+    # Data Engineer, Data Scientist, Database Administrator are all
+    # different job functions that happen to share this one word. When a
+    # requirement's title reduces to JUST "data" after generic-stripping
+    # (e.g. "Data Architect" -> {"data"} once "architect" is stripped),
+    # req_domain has exactly one token — so any single shared word gives
+    # ratio = 1/1 = 100%, the same single-token-inflation bug the
+    # structural-connector-word fix above exists to prevent, just with a
+    # domain-sounding word instead of a structural one. Same principle:
+    # too broad on its own to signal real specialization.
+    "data",
+}
+
+# Bare single-letter language names that the length filter (len(t) > 1)
+# would otherwise silently drop — "C" and "R" are real, meaningful domain
+# tokens on their own, not noise.
+SHORT_DOMAIN_TOKENS: set[str] = {"c", "r"}
+
+SYNONYMS: dict[str, set[str]] = {
+    "qa": {"quality", "assurance"},
+    "sre": {"site", "reliability", "engineer"},
+    "etl": {"extract", "transform", "load"},
+    "ba": {"business", "analyst"},
+    "pm": {"project", "manager"},
+    "ui": {"user", "interface"},
+    "ux": {"user", "experience"},
+    "ml": {"machine", "learning"},
+    "ai": {"artificial", "intelligence"},
+    "devops": {"development", "operations"},
+}
+
+# Key phrase -> set of adjacent phrases considered partial matches for it.
+# Checked symmetrically (either side can hold the key phrase or an adjacent
+# phrase) inside _adjacent_role_credit().
+ADJACENT_ROLES: dict[str, set[str]] = {
+    "devops engineer": {"sre", "site reliability engineer", "platform engineer"},
+    "business analyst": {"data analyst", "systems analyst", "product analyst"},
+    "qa engineer": {"sdet", "test engineer"},
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Work Authorization batches (post-role-match filter pipeline spec)
+#
+#   Batch 1 = F1 / STEM OPT            (least restrictive requirement)
+#   Batch 2 = H1B
+#   Batch 3 = USC / GC / GC EAD / L1 / TN / U Visa   (most restrictive)
+#
+# Push rule: a requirement asking for Batch 1 or Batch 2 work auth pushes to
+# ALL consultants regardless of batch (everyone is eligible to be considered
+# for an F1- or H1B-friendly role). A requirement asking for a Batch 3 work
+# auth ONLY pushes to Batch 3 consultants — Batch 1/2 consultants are
+# filtered out, since USC/GC-only roles genuinely cannot take them.
+# ---------------------------------------------------------------------------
+
+WORK_AUTH_BATCH_1: set[str] = {"F1", "STEMOPT"}
+WORK_AUTH_BATCH_2: set[str] = {"H1B"}
+WORK_AUTH_BATCH_3: set[str] = {"USC", "GC", "GCEAD", "L1", "TN", "UVISA"}
+
+
+def get_batch(work_auth_value: Optional[str]) -> Optional[int]:
+    """Normalize a work-authorization string (spaces/hyphens stripped,
+    uppercased) and return its batch number (1/2/3), or None if it's
+    empty or doesn't map to a known batch."""
+    if not work_auth_value:
+        return None
+    v = work_auth_value.upper().replace(" ", "").replace("-", "")
+    if v in WORK_AUTH_BATCH_1:
+        return 1
+    if v in WORK_AUTH_BATCH_2:
+        return 2
+    if v in WORK_AUTH_BATCH_3:
+        return 3
+    return None
+
+
+def work_auth_passes(requirement_work_auth: Optional[str], consultant_work_auth: Optional[str]) -> tuple[bool, str]:
+    """
+    Stage 2 — Work Authorization push rule (batched, see module docstring
+    above). N/A/empty on EITHER side passes everyone for this field — same
+    wildcard rule as every other Stage 1-4 filter. Only the 3 defined
+    batches (F1/STEM OPT, H1B, USC/GC/GC EAD/L1/TN/U Visa) are recognized;
+    a value outside them fails rather than falling back to a guess, with a
+    warning logged so an unmapped value gets noticed instead of silently
+    matching one way or the other.
+    Returns (passes, reason) — reason is used for the stage-rejection audit
+    log in validate_match().
+    """
+    if not requirement_work_auth or requirement_work_auth.strip().upper() == "N/A":
+        return True, "requirement work_auth is N/A — passes all"
+
+    if not consultant_work_auth or consultant_work_auth.strip().upper() == "N/A":
+        return True, "consultant work_authorization is N/A — matches requirement"
+
+    req_batch = get_batch(requirement_work_auth)
+
+    if req_batch is None:
+        logger.warning(
+            "work_auth_passes: unmapped requirement work_auth value %r — treating as no match",
+            requirement_work_auth,
+        )
+        return False, f"unmapped requirement work_auth {requirement_work_auth!r} — no known batch, fails"
+
+    if req_batch in (1, 2):
+        return True, f"requirement work_auth is Batch {req_batch} — pushes to all batches"
+
+    # req_batch == 3 — only a consultant whose own value maps to Batch 3
+    # passes. No fallback for an unmapped-but-stated consultant value —
+    # only the 3 defined batches count.
+    cons_batch = get_batch(consultant_work_auth)
+    if cons_batch == 3:
+        return True, "requirement is Batch 3, consultant is Batch 3 — match"
+    return False, f"requirement requires Batch 3; consultant is Batch {cons_batch or 'unmapped'} ({consultant_work_auth!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -158,68 +384,260 @@ def score_skills(requirement_skills: List[str], consultant_skills: List[str]) ->
     return round(score, 2), matched, missing
 
 
+def _tokenize_role(text: Optional[str]) -> set[str]:
+    """
+    Clean punctuation, lowercase, split, strip the existing noise words
+    (remote/onsite/contract/h1b/senior/junior/etc — unchanged from before),
+    then expand any SYNONYMS acronym into its spelled-out words. The
+    original token is kept alongside its expansion (union, not replace) so
+    an exact acronym-to-acronym match still works on its own.
+
+    BUG FIX (single-char/symbol language names silently dropped): the
+    punctuation-stripping regex used to remove '#' and '+' entirely before
+    splitting, so "C#" became "c" and "C++" became "c" — then the length
+    filter (len(t) > 1) discarded that single leftover character, and bare
+    "C"/"R" (no symbol at all) were dropped outright too. A title whose
+    ONLY domain word was one of these ("C# Developer") lost its sole
+    specialization signal and fell through to score_role()'s bare-generic
+    branch. '#' and '+' are now preserved through the regex so "c#"/"c++"
+    survive as their own tokens, and SHORT_DOMAIN_TOKENS whitelists bare
+    single-letter language names past the length filter.
+    """
+    if not text:
+        return set()
+    clean = re.sub(r'[^a-zA-Z0-9\s#+]', ' ', text).lower()
+    raw_tokens = {
+        t for t in clean.split()
+        if not t.isdigit() and (len(t) > 1 or t in SHORT_DOMAIN_TOKENS)
+    }
+
+    noise_words = {
+        "remote", "onsite", "hybrid", "contract", "months", "years", "w2", "c2c",
+        "c2h", "h1b", "urgently", "urgent", "hiring", "immediate", "sr", "senior",
+        "jr", "junior", "mid", "level", "role", "position",
+    }
+    tokens = {t for t in raw_tokens if t not in noise_words}
+    # BUG FIX (all-noise titles used noise words as fake domain signal): a
+    # role field that was ENTIRELY noise words (e.g. "Senior Remote
+    # Contract") used to fall back to treating those noise words
+    # themselves as real domain tokens ("tokens = raw_tokens"). A
+    # consultant title also containing "remote" or "contract" would then
+    # register as genuine specialization overlap — meaningless signal
+    # masquerading as a real match. Removed: an all-noise title now
+    # correctly yields an empty set, which score_role()'s existing "no
+    # data" neutral branches already handle correctly on their own.
+
+    expanded = set(tokens)
+    for t in tokens:
+        if t in SYNONYMS:
+            expanded |= SYNONYMS[t]
+    return expanded
+
+
+def _adjacent_role_credit(req_tokens: set[str], pref_tokens: set[str]) -> bool:
+    """
+    Step 3(d) exception — hand-curated partial credit for role phrases that
+    describe closely related work even with zero direct domain-word overlap
+    (e.g. "DevOps Engineer" vs "SRE"). Checked symmetrically: either side
+    can hold the ADJACENT_ROLES key phrase.
+
+    The final overlap check is restricted to DOMAIN words only (generic
+    words stripped from both the adjacent phrase and the other side) —
+    without this, two unrelated roles that merely share a generic word
+    (e.g. "QA Engineer" and "Site Reliability Engineer" both containing
+    "Engineer") would trivially satisfy the adjacency check via
+    "Test Engineer" from the qa-engineer entry's own adjacent set, which
+    is exactly the kind of generic-word-only false match this whole
+    fix exists to eliminate.
+    """
+    for key_phrase, adjacent_set in ADJACENT_ROLES.items():
+        key_tokens = set(key_phrase.split())
+        for source_tokens, other_tokens in ((req_tokens, pref_tokens), (pref_tokens, req_tokens)):
+            if key_tokens.issubset(source_tokens):
+                other_domain = other_tokens - GENERIC_ROLE_WORDS
+                for adj_phrase in adjacent_set:
+                    adj_tokens = set(adj_phrase.split())
+                    for t in list(adj_tokens):
+                        if t in SYNONYMS:
+                            adj_tokens |= SYNONYMS[t]
+                    adj_domain = adj_tokens - GENERIC_ROLE_WORDS
+                    if adj_domain & other_domain:
+                        return True
+    return False
+
+
+def _known_generic_phrase_domain(req_tokens: set[str]) -> bool:
+    """
+    BUG FIX (generic-only titles like "Platform Engineer" always scored a
+    flat neutral 50): GENERIC_ROLE_WORDS strips "platform" as a structural
+    connector word, so a requirement titled exactly "Platform Engineer"
+    reduces to zero domain words (both tokens generic) — hitting
+    score_role()'s bare-generic branch and returning a flat neutral 50 for
+    every consultant, even though ADJACENT_ROLES already lists "platform
+    engineer" as a real, distinct specialization (adjacent to DevOps/SRE).
+    The adjacency table entry meant for exactly this case never got a
+    chance to fire, because the bare-generic branch returned before
+    _adjacent_role_credit() was ever consulted.
+
+    Checked before falling back to the neutral 50: does the WHOLE title's
+    token set exactly match a known phrase (either an ADJACENT_ROLES key
+    or one of its listed adjacent phrases)? If so, the phrase as a whole
+    is a real, known specialization — score_role() should treat it as
+    domain-bearing and let the normal domain-overlap / adjacency-credit
+    logic actually run, instead of giving up early.
+    """
+    for key_phrase, adjacent_set in ADJACENT_ROLES.items():
+        known_phrases = {key_phrase} | adjacent_set
+        for phrase in known_phrases:
+            if set(phrase.split()) == req_tokens:
+                return True
+    return False
+
+
+from disk_cache import PersistentDiskCache
+import json
+_ROLE_MATCH_CACHE = PersistentDiskCache("role_match_cache.json")
+
 def score_role(
     requirement_role: Optional[str],
     consultant_preferred_roles: Optional[str],
     experiences: Optional[List[ConsultantExperience]] = None,
+    requirement_skills: Optional[List[str]] = None,
+    consultant_skills: Optional[List[str]] = None,
 ) -> float:
     """
-    Role title token overlap — smarter token-based comparison.
+    Role title match — domain-word (specialization) aware, name-based only.
 
-    BUG FIX: filters out punctuation and common noise words (e.g. 'remote', 'senior',
-    'contract') from the requirement role so that a consultant doesn't get heavily
-    penalized just because the JD title string was noisy (e.g. "Sr. Java Developer
-    (Remote) - 6 months" vs "Java Developer").
+    BUG FIX: the old version treated a single shared GENERIC word (e.g. both
+    titles containing "Developer") as a near-100% match on its own, even
+    when the actual specialization was unrelated ("Java Developer" vs
+    "Python Developer") — since role is weighted 50% of the total score,
+    this alone was often enough to clear the match threshold regardless of
+    real skill fit. This version splits tokens into a domain (specialization)
+    part and a generic part (GENERIC_ROLE_WORDS) and only a genuine
+    domain-word overlap earns a high score (path c). A requirement that
+    states a domain word with NO overlap at all is a real mismatch signal,
+    not missing data, and scores 0 outright — with a small hand-curated
+    ADJACENT_ROLES exception for genuinely related specializations (path d).
+
+    BUG FIX #2: role matching must be based on the actual role NAME, never
+    substituted by a skill-overlap coincidence — skills and role are two
+    separate factors in score_match()'s blend for a reason. The previous
+    version fell back to comparing skill lists whenever there was no title
+    to compare (blank title, no consultant role data, or a bare-generic
+    title with no domain word) — removed. Every one of those cases below
+    (a/b/e) now returns a plain neutral 50 instead: genuinely unknown,
+    neither a confident pass nor fail, decided purely on whether a real
+    name comparison was even possible — never on skills.
+
+    requirement_skills/consultant_skills are still accepted for signature
+    compatibility with existing callers but are no longer used by this
+    function — role scoring is name-only. Callers may stop passing them
+    to score_role() specifically at any point without changing behavior;
+    they're still needed elsewhere (score_skills()'s own factor).
     """
-    if not requirement_role:
-        return 0.0
+    # (a) No requirement role text at all — no name to compare against,
+    # genuinely unknown either way.
+    if not requirement_role or not requirement_role.strip():
+        return 50.0
 
-    # Clean punctuation and split
-    req_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', requirement_role).lower()
-    raw_req_tokens = set(req_clean.split())
-    
-    # Filter noise for the denominator
-    noise_words = {
-        "remote", "onsite", "hybrid", "contract", "months", "years", "w2", "c2c",
-        "c2h", "h1b", "urgently", "urgent", "hiring", "immediate", "sr", "senior",
-        "jr", "junior", "mid", "level", "role", "position"
-    }
-    req_tokens = {t for t in raw_req_tokens if t not in noise_words and not t.isdigit() and len(t) > 1}
-    
-    if not req_tokens:
-        req_tokens = raw_req_tokens # Fallback if everything was noise
-        
-    if not req_tokens:
-        return 0.0
-
-    pref_tokens = set()
+    # Attempt AI evaluation first
+    raw_pref_roles = []
     if consultant_preferred_roles:
-        t_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', consultant_preferred_roles).lower()
-        pref_tokens |= set(t_clean.split())
+        raw_pref_roles.append(consultant_preferred_roles.strip())
     if experiences:
         for exp in experiences:
             if exp.role_title:
-                t_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', exp.role_title).lower()
-                pref_tokens |= set(t_clean.split())
+                raw_pref_roles.append(exp.role_title.strip())
 
-    if not pref_tokens:
-        return 0.0
-
-    overlap = req_tokens & pref_tokens
-    
-    # Calculate ratio against meaningful tokens
-    ratio = len(overlap) / len(req_tokens)
-    
-    # Boost: if they matched the core technology (e.g. "java", "developer") which is usually 1-2 words.
-    # If they match 2+ tokens, it's usually a solid match.
-    if len(overlap) >= 2 and ratio < 0.8:
-        ratio = min(1.0, ratio + 0.3) # 30% boost for matching multiple core tokens
+    if raw_pref_roles:
+        unique_roles = tuple(sorted(set(raw_pref_roles)))
+        req_role_clean = requirement_role.strip()
         
-    # If it's a 1-token requirement and they matched it
-    if len(req_tokens) == 1 and len(overlap) == 1:
-        ratio = 1.0
+        # Serialize to string for JSON dict keys
+        cache_key = json.dumps([req_role_clean, list(unique_roles)])
+        
+        cached_score = _ROLE_MATCH_CACHE.get(cache_key)
+        if cached_score is not None:
+            return cached_score
 
-    return round(ratio * 100, 2)
+        try:
+            from claude_service import evaluate_role_match_with_ai
+            ai_score = evaluate_role_match_with_ai(req_role_clean, list(unique_roles))
+            if ai_score is not None:
+                _ROLE_MATCH_CACHE.set(cache_key, ai_score)
+                return ai_score
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"AI role match failed: {e}")
+
+    # Build the consultant's role-token pool (preferred_roles + every
+    # experience row's role_title), same sources as before.
+    pref_tokens: set[str] = set()
+    if consultant_preferred_roles:
+        pref_tokens |= _tokenize_role(consultant_preferred_roles)
+    if experiences:
+        for exp in experiences:
+            if exp.role_title:
+                pref_tokens |= _tokenize_role(exp.role_title)
+
+    # (b) Consultant has no role data at all — no name to compare against
+    # on their side either, genuinely unknown.
+    if not pref_tokens:
+        return 50.0
+
+    req_tokens = _tokenize_role(requirement_role)
+    req_domain = req_tokens - GENERIC_ROLE_WORDS
+    req_generic = req_tokens & GENERIC_ROLE_WORDS
+
+    # (e) Requirement title is bare-generic (no domain word at all, e.g.
+    # just "Developer" or "Consultant") — no real specialization stated to
+    # compare a name against, genuinely unknown. EXCEPT: the whole title
+    # might still be a known, real specialization spelled entirely with
+    # words GENERIC_ROLE_WORDS treats as structural on their own (e.g.
+    # "Platform Engineer") — check that before giving up.
+    if not req_domain:
+        if req_tokens and _known_generic_phrase_domain(req_tokens):
+            req_domain = set(req_tokens)
+            req_generic = set()
+        else:
+            return 50.0
+
+    domain_overlap = req_domain & pref_tokens
+    generic_overlap = req_generic & pref_tokens
+
+    # (c) Real specialization overlap — score normally.
+    if domain_overlap:
+        ratio = len(domain_overlap) / len(req_domain)
+        generic_ratio = (len(generic_overlap) / len(req_generic)) if req_generic else 0.0
+        score = ratio * 85 + (generic_ratio * 15 if req_generic else 0.0)
+        # BUG FIX (test case #11, ETL Developer vs Extract Transform Load
+        # Engineer): requiring len(domain_overlap) >= 2 alone let a
+        # partial match (3 of 4 domain tokens, ratio=0.75, score=63.75)
+        # get boosted to 78.75 — crossing the 70 NEAR_MISS gate even
+        # though only 3/4 of the stated specialization actually matched.
+        # The boost is meant to reward a near-COMPLETE domain match, not
+        # just "2 or more tokens out of however many" — requiring
+        # ratio >= 0.8 too keeps it from being a threshold-crossing
+        # loophole for partial matches while still applying to every case
+        # it was originally meant for (verified: of the 12 role-matching
+        # spec test cases, this boost only ever fires for #11 either way).
+        if len(domain_overlap) >= 2 and ratio >= 0.8 and score < 80:
+            score = min(100.0, score + 15)
+        return round(min(score, 100.0), 2)
+
+    # (d) A stated domain word exists but nothing overlaps at all — a real
+    # specialization mismatch (Python Dev vs Java Dev). Do NOT fall back to
+    # skills here; a stated, different specialization is a real signal.
+    # Exception: a hand-curated adjacent-role match earns 60% partial credit
+    # instead of a hard 0.
+    if _adjacent_role_credit(req_tokens, pref_tokens):
+        # 60% of the domain component only (no generic-word bonus) — the
+        # adjacency substitutes for a direct domain-word match, it isn't a
+        # coincidental extra generic-word overlap on top of one.
+        return round(85.0 * 0.6, 2)
+
+    return 0.0
 
 
 def _calculate_total_experience_years(experiences: List[ConsultantExperience]) -> float:
@@ -300,8 +718,17 @@ def score_employment_type(requirement_types: Optional[List[str]], consultant_typ
     if not requirement_types or requirement_types == ["UNKNOWN"]:
         return 100.0
 
+    # BUG FIX (merged from a parallel fix on this same file): a consultant
+    # with NO stated employment-type preference at all used to fail this
+    # check outright (0.0) against every requirement that named a specific
+    # type — treated as a hard mismatch rather than "unspecified". That's
+    # inconsistent with how an unstated value is handled on the
+    # requirement side just above (and everywhere else in the Stage 0-4
+    # pipeline — see the N/A-wildcard handling in employment_type_passes()/
+    # work_auth_passes()/experience_passes()/location_passes()). Treat it
+    # the same way here: no preference stated = open to anything.
     if not consultant_types:
-        return 0.0
+        return 100.0
 
     req_set = set(t.upper() for t in requirement_types)
     cons_set = set(t.upper() for t in consultant_types)
@@ -364,138 +791,229 @@ def score_work_auth(requirement: Requirement, consultant: Consultant) -> float:
     return 100.0
 
 
+def employment_type_passes(
+    requirement_types: Optional[List[str]], consultant_types: Optional[List[str]]
+) -> tuple[bool, str]:
+    """
+    Stage 1 — Employment Type filter. requirement_types N/A/UNKNOWN matches
+    everyone. Reuses score_employment_type()'s existing intersection logic
+    unchanged, converted from a weighted score into a boolean pass/fail.
+    NOTE: score_employment_type() has no partial-credit path today — it only
+    ever returns 0.0 or 100.0 — so this conversion loses no information.
+    """
+    score = score_employment_type(requirement_types, consultant_types)
+    return score > 0, f"employment_type score={score}"
+
+
+def _requirement_work_auth_text(requirement: Requirement) -> Optional[str]:
+    """
+    The Requirement model has no explicit work-authorization column — the
+    JD's implied requirement is derived by scanning its text for keywords,
+    same regex patterns validate_match() already used inline. Returns a
+    representative batch label ("F1"/"H1B"/"USC") or None if the JD doesn't
+    mention work authorization at all (N/A — passes everyone).
+    """
+    jd = (requirement.job_description or "").lower()
+    # BUG FIX (merged from a parallel fix on this same file): bare "TN"
+    # (e.g. "Must have TN status") — the far more common way recruiters
+    # actually write it — was never detected, only the two-word phrase
+    # "tn visa" was, which real JDs rarely use. That silently misclassified
+    # these requirements as work-auth N/A (passes everyone) instead of
+    # correctly restricting to Batch 3. get_batch() already treats bare
+    # "TN" as Batch 3 on the consultant side — this brings the requirement
+    # side in line with that.
+    if re.search(r'\b(usc|gc|green card|us citizen|citizens only|citizen|gc ead|tn|tn visa|l1|u visa)\b', jd):
+        return "USC"
+    if re.search(r'\b(h1b|h1-b)\b', jd):
+        return "H1B"
+    if re.search(r'\b(f1|opt|cpt|stem opt)\b', jd):
+        return "F1"
+    return None
+
+
+def experience_passes(
+    requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]
+) -> tuple[bool, str]:
+    """
+    Stage 3 — Experience filter. N/A on EITHER side matches everyone —
+    same wildcard rule as every other Stage 1-4 filter. Otherwise the
+    consultant must be within -2 years of the stated minimum (inclusive
+    at the floor); no upper cap — an over-qualified consultant always
+    passes.
+    """
+    required_years = _parse_min_years_required(requirement)
+    if required_years is None or required_years <= 0:
+        return True, "requirement experience is N/A — passes all"
+
+    # Consultant-side N/A: truly no data on file (not a stated 0, which is
+    # a real value and still gets checked against the floor normally).
+    if consultant.total_experience_years is None and not experiences:
+        return True, "consultant experience is N/A — matches requirement"
+
+    years = float(consultant.total_experience_years or 0)
+    if years <= 0 and experiences:
+        years = _calculate_total_experience_years(experiences)
+
+    lower_bound = max(0, required_years - 2)
+    if years < lower_bound:
+        return False, f"consultant has {years}y, needs >= {lower_bound}y (required {required_years}y - 2)"
+    return True, f"consultant has {years}y, meets >= {lower_bound}y floor"
+
+
+def location_passes(
+    requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]
+) -> tuple[bool, str]:
+    """
+    Stage 4 — Location filter. N/A on EITHER side matches everyone — same
+    wildcard rule as every other Stage 1-4 filter. Otherwise reuses
+    score_location()'s existing remote/onsite/hybrid compatibility rules
+    unchanged, converted from a weighted score into a boolean pass/fail.
+    """
+    if not requirement.location or requirement.location.strip().upper() == "N/A":
+        return True, "requirement location is N/A — passes all"
+    if not consultant.preferred_locations or consultant.preferred_locations.strip().upper() == "N/A":
+        return True, "consultant location constraint is N/A — matches requirement"
+    score = score_location(requirement, consultant, experiences)
+    return score > 0, f"location score={score}"
+
+
 def validate_match(
     requirement: Requirement,
     consultant: Consultant,
     experiences: List[ConsultantExperience],
-) -> bool:
+    *,
+    requirement_skills: Optional[List[str]] = None,
+) -> dict:
     """
-    Strict step-by-step validation pipeline.
-    A candidate must pass all gates to be considered for a match.
+    Stage 0-4 eligibility pipeline.
+
+    Stage 0 (role/responsibilities) is the primary gate, via score_role()'s
+    domain-word decision tree — this is the single source of truth for
+    role matching; nothing else in this function duplicates that logic.
+    Stages 1-4 are sequential hard pass/fail filters that only run once
+    Stage 0 clears at all, short-circuiting at the first failure (no need
+    to evaluate later stages once one fails). Any requirement field that's
+    N/A/empty at a given stage matches every consultant for that field —
+    see each stage helper above for its own N/A handling.
+
+    PERFORMANCE (merged from a parallel fix on this same file):
+    requirement_skills is a pure function of the requirement alone —
+    identical for every consultant scored against it. Bulk callers
+    (match_requirement()'s per-consultant loop below) now compute it ONCE
+    via _requirement_skills() and pass it in here, instead of every single
+    consultant in the loop re-running the same parsed_fields/JD scan on
+    the exact same requirement. This is what caused a real timeout on a
+    dataset with 37,000+ open requirements. Still defaults to None and
+    gets computed internally when not supplied, so any other caller (or a
+    one-off call from outside a loop) keeps working unchanged.
+
+    Returns:
+      {
+        "eligible": bool,            # False only for a REJECTED tier
+        "tier": "REJECTED" | "NEAR_MISS_CANDIDATE" | "PASS",
+        "stage_failed": str | None,  # "role" / "employment_type" /
+                                      # "work_authorization" / "experience" /
+                                      # "location", or None if eligible
+        "role_raw": float,
+        "reason": str,               # human-readable, for the audit log
+      }
+
+    "NEAR_MISS_CANDIDATE" means Stage 0 was a soft (10-70%) role match, not
+    a hard reject and not a confident pass either — callers should still
+    run score_match() and only actually tag the result NEAR_MISS if the
+    FINAL blended score also lands below MATCH_THRESHOLD; if other factors
+    compensate for the imperfect role match, it's a genuine PASS instead.
     """
-    # 1. Title Validation
-    req_role = requirement.role or ""
-    generic_roles = {
-        "developer", "engineer", "consultant", "analyst", "architect", "lead", 
-        "manager", "expert", "programmer", "administrator", "specialist",
-        "tester", "qa", "scientist", "researcher", "admin", "dba", "ba", 
-        "associate", "professional", "worker", 
-        "data analyst", "data scientist", "business analyst",
-        "qa tester", "qa engineer", "software engineer", "software developer",
-        "ml engineer", "ai engineer"
-    }
-    role_clean = re.sub(r'[^a-zA-Z0-9\s]', '', req_role).strip().lower()
-    
-    if role_clean in generic_roles:
-        # Get skills to make generic role more specific
-        skills = requirement.parsed_fields.get("skills", []) if requirement.parsed_fields else []
-        if not skills:
-            jd_text = (requirement.job_description or "")[:1500]
-            skills = extract_skills(jd_text)
-        if skills:
-            req_role = f"{' '.join(skills[:2])} {req_role}"
+    if requirement_skills is None:
+        requirement_skills = _requirement_skills(requirement)
+    consultant_skills = _consultant_skills(consultant)
 
-    role_raw = score_role(req_role, consultant.preferred_roles, experiences)
-    if role_raw < 70.0:
-        return False
+    role_raw = score_role(
+        requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills
+    )
 
-    # 2. Employment Type Validation
-    req_types = [t.upper() for t in (requirement.employment_types or []) if t and t.upper() != "N/A"]
-    if req_types:
-        cons_types = [t.upper() for t in (consultant.preferred_employment_types or []) if t]
-        is_fulltime = "FULLTIME" in req_types
-        if not is_fulltime:
-            # Contract-based job: candidate must support C2C or C2B
-            if "C2C" not in cons_types and "C2B" not in cons_types:
-                return False
+    if role_raw < 10.0:
+        return {
+            "eligible": False, "tier": "REJECTED", "stage_failed": "role",
+            "role_raw": role_raw, "reason": f"role score {role_raw} < 10 (hard floor)",
+        }
 
-    # 3. Visa / Work Auth Validation
-    jd = (requirement.job_description or "").lower()
-    req_batch = 0 # 0 means N/A (passes all)
-    
-    # Simple regex/keyword scan for work auth in JD
-    if re.search(r'\b(usc|gc|green card|us citizen|citizens only|citizen|gc ead|tn visa|l1|u visa)\b', jd):
-        req_batch = 3
-    elif re.search(r'\b(h1b|h1-b)\b', jd):
-        req_batch = 2
-    elif re.search(r'\b(f1|opt|cpt|stem opt)\b', jd):
-        req_batch = 1
-        
-    if req_batch > 0:
-        cons_auth = (consultant.work_authorization or "").upper().replace(" ", "").replace("-", "")
-        cons_batch = 0
-        if cons_auth in ["F1", "OPT", "CPT", "STEMOPT", "F1OPT"]:
-            cons_batch = 1
-        elif cons_auth in ["H1B"]:
-            cons_batch = 2
-        elif cons_auth in ["USC", "USCITIZEN", "CITIZEN", "GC", "GREENCARD", "GCEAD", "L1", "TN", "UVISA"]:
-            cons_batch = 3
-        elif cons_auth:
-            # For unmapped known consultant auths, assume batch 3 (strictest/safest)
-            cons_batch = 3
-        
-        # If requirement needs F1 or H1B (1 or 2), it pushes to all batches (1, 2, 3)
-        # If requirement needs Batch 3, it only pushes to Batch 3 candidates.
-        if req_batch == 3 and cons_batch < 3:
-            return False
+    tier = "PASS" if role_raw >= 70.0 else "NEAR_MISS_CANDIDATE"
 
-    # 4. Experience Validation
-    required_years = _parse_min_years_required(requirement)
-    if required_years is not None and required_years > 0:
-        years = float(consultant.total_experience_years or 0)
-        if years <= 0 and experiences:
-            years = _calculate_total_experience_years(experiences)
-        
-        # Candidate must be within -2 years of requirement. N/A allows all.
-        lower_bound = max(0, required_years - 2)
-        if years < lower_bound:
-            return False
+    # Stage 1 — Employment Type
+    passed, reason = employment_type_passes(requirement.employment_types, consultant.preferred_employment_types)
+    if not passed:
+        return {"eligible": False, "tier": "REJECTED", "stage_failed": "employment_type", "role_raw": role_raw, "reason": reason}
 
-    # 5. Location Validation
-    # N/A defaults to passing all. (Skipped for now)
+    # Stage 2 — Work Authorization (batched push rule)
+    req_work_auth = _requirement_work_auth_text(requirement)
+    passed, reason = work_auth_passes(req_work_auth, consultant.work_authorization)
+    if not passed:
+        return {"eligible": False, "tier": "REJECTED", "stage_failed": "work_authorization", "role_raw": role_raw, "reason": reason}
 
-    return True
+    # Stage 3 — Experience (-2 years floor)
+    passed, reason = experience_passes(requirement, consultant, experiences)
+    if not passed:
+        return {"eligible": False, "tier": "REJECTED", "stage_failed": "experience", "role_raw": role_raw, "reason": reason}
+
+    # Stage 4 — Location
+    passed, reason = location_passes(requirement, consultant, experiences)
+    if not passed:
+        return {"eligible": False, "tier": "REJECTED", "stage_failed": "location", "role_raw": role_raw, "reason": reason}
+
+    return {"eligible": True, "tier": tier, "stage_failed": None, "role_raw": role_raw, "reason": "passed all stages"}
 
 
 def score_match(
     requirement: Requirement,
     consultant: Consultant,
     experiences: List[ConsultantExperience],
+    *,
+    requirement_skills: Optional[List[str]] = None,
 ) -> dict:
     """
     Combine all 6 factors per doc Task 1 weights:
       skill 40%, role 20%, experience 15%, employment 10%, location 10%, auth 5%
     Returns dict with total score, breakdown, matched/missing skills, and reason.
-    """
-    # Prioritize tightly scoped skills extracted by parser.py (if any)
-    requirement_skills = []
-    if requirement.parsed_fields and requirement.parsed_fields.get("skills"):
-        raw_skills = requirement.parsed_fields.get("skills")
-        # Map raw extracted skills to canonical names
-        canonical_req = set()
-        for raw_skill in raw_skills:
-            lower = str(raw_skill).lower()
-            for canonical, aliases in SKILL_ALIASES.items():
-                if any(alias in lower for alias in aliases) or lower == canonical:
-                    canonical_req.add(canonical)
-        requirement_skills = sorted(list(canonical_req))
-        
-    if not requirement_skills:
-        # Fallback: scan JD, but restrict to first 1500 chars to avoid footer spam
-        jd_text = (requirement.job_description or "")[:1500]
-        requirement_skills = extract_skills(jd_text)
 
+    CHANGE (not a bug fix — explicit instruction, scoped to this ranking
+    function ONLY): skill's weight moved from 0.20 -> 0.0, so it no longer
+    moves the total score; that 20% shifted onto role (0.50 -> 0.70).
+    skill_raw/matched_skills/missing_skills are still computed and
+    returned unchanged — kept for informational display, and because
+    downstream consumers still read those dict keys / DB columns
+    (RequirementConsultantMatch.skill_score in this file's own
+    match_requirement()/match_consultant(), and matching_router.py's
+    breakdown["skill"]["weighted"]).
+    New weights: role 70%, experience 10%, location 10%, employment 5%,
+    auth 5%. validate_match()'s Stage 0-4 eligibility gate (the hard
+    role_raw < 10.0 floor, the 70.0 tier threshold, employment/work-auth/
+    experience/location pass-fail checks) is UNCHANGED — this only
+    affects the ranking score of consultants who already passed that gate.
+
+    PERFORMANCE: requirement_skills is IDENTICAL for every consultant scored
+    against the same requirement — see the matching note on validate_match()
+    above. Bulk callers compute it once and pass it in; any other caller
+    still gets it computed automatically when omitted.
+    """
+    # Prioritize tightly scoped skills extracted by parser.py (if any) —
+    # shared with validate_match() via _requirement_skills() so this
+    # extraction logic exists in exactly one place.
+    if requirement_skills is None:
+        requirement_skills = _requirement_skills(requirement)
     consultant_skills = _consultant_skills(consultant)
 
     skill_raw, matched_skills, missing_skills = score_skills(requirement_skills, consultant_skills)
-    role_raw = score_role(requirement.role, consultant.preferred_roles, experiences)
+    role_raw = score_role(
+        requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills
+    )
     exp_raw = score_experience(requirement, consultant, experiences)
     employment_raw = score_employment_type(requirement.employment_types, consultant.preferred_employment_types)
     location_raw = score_location(requirement, consultant, experiences)
     auth_raw = score_work_auth(requirement, consultant)
 
-    skill_score = skill_raw * 0.20
-    role_score = role_raw * 0.50
+    skill_score = skill_raw * 0.0
+    role_score = role_raw * 0.70
     exp_score = exp_raw * 0.10
     employment_score = employment_raw * 0.05
     location_score = location_raw * 0.10
@@ -536,8 +1054,8 @@ def score_match(
         # show WHY a total came out a certain way, e.g. "Role: 100% (raw) →
         # 50.0 pts (weighted)", instead of just a single blended percentage.
         "score_breakdown": {
-            "skill": {"raw": round(skill_raw, 2), "weight": 0.20, "weighted": round(skill_score, 2)},
-            "role": {"raw": round(role_raw, 2), "weight": 0.50, "weighted": round(role_score, 2)},
+            "skill": {"raw": round(skill_raw, 2), "weight": 0.0, "weighted": round(skill_score, 2)},
+            "role": {"raw": round(role_raw, 2), "weight": 0.70, "weighted": round(role_score, 2)},
             "experience": {"raw": round(exp_raw, 2), "weight": 0.10, "weighted": round(exp_score, 2)},
             "employment": {"raw": round(employment_raw, 2), "weight": 0.05, "weighted": round(employment_score, 2)},
             "location": {"raw": round(location_raw, 2), "weight": 0.10, "weighted": round(location_score, 2)},
@@ -553,10 +1071,21 @@ def score_match(
 async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
     """
     Score all active consultants against one requirement.
-    Upserts into requirement_consultant_matches for scores >= MATCH_THRESHOLD.
+
+    Every consultant runs through validate_match()'s Stage 0-4 eligibility
+    pipeline first (role/responsibilities -> employment type -> work auth ->
+    experience -> location, each short-circuiting). Only consultants who
+    pass ALL stages get a RequirementConsultantMatch row at all — MATCH_THRESHOLD
+    is no longer a row-creation gate; score_match()'s weighted total is now
+    purely a RANKING signal among already-eligible consultants (it still
+    decides ASSIGNED vs NEAR_MISS for the narrow role-score band, see below).
     Rerunning does not duplicate — UNIQUE constraint on (requirement_id, consultant_id)
-    combined with explicit existence check ensures idempotency.
-    Returns count of assignments created or updated.
+    combined with explicit existence check ensures idempotency. A consultant
+    who used to qualify but no longer does on this rerun has their stale row
+    DELETED rather than left untouched (previously: stale rows were never
+    cleaned up, so a disqualified consultant kept passing the "is this
+    requirement assigned to them" existence check used elsewhere).
+    Returns count of ASSIGNED (non-NEAR_MISS) matches created or updated.
 
     PERFORMANCE: batches all per-consultant lookups into 2 queries total
     (experiences, existing matches) regardless of consultant count, instead of
@@ -599,17 +1128,83 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
     }
 
     assignment_count = 0
+    near_miss_count = 0
+
+    # PERFORMANCE (merged from a parallel fix on this same file): compute
+    # once per requirement, reuse for every consultant in the loop below —
+    # requirement_skills is a pure function of the requirement alone, so
+    # recomputing it per-consultant (as before) was pure waste that got
+    # worse the more consultants there were. See the note on
+    # validate_match()/score_match() above.
+    requirement_skills = _requirement_skills(requirement)
 
     # ── Scoring loop — pure in-memory computation, zero DB round trips per iteration ──
     for consultant in consultants:
         experiences = experiences_by_consultant.get(consultant.id, [])
+        existing = existing_matches_by_consultant.get(consultant.id)
 
-        result = score_match(requirement, consultant, experiences)
-
-        if result["total"] < MATCH_THRESHOLD:
+        # BUG FIX: this had no guard at all before validating/deleting an
+        # existing row — a match already advanced to RESUME_GENERATED,
+        # READY_TO_APPLY, APPLIED, or REJECTED could be silently DELETED
+        # outright if a rescore later decided it no longer qualifies
+        # (e.g. after a scoring-logic change). Same protective check
+        # already applied in matching_router.py's Pipeline B — only rows
+        # still owned by the matching engine itself (ASSIGNED, NEAR_MISS,
+        # or a previously INVALIDATED one) are ever re-evaluated.
+        if existing and existing.status in ("RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"):
+            if existing.status == "ASSIGNED":
+                assignment_count += 1
             continue
 
-        existing = existing_matches_by_consultant.get(consultant.id)
+        # PERFORMANCE (Run Engine/Match All timing out at 300s): skip the
+        # full validate_match()+score_match() recomputation for a row
+        # already checked under the CURRENT matching logic — see
+        # MATCHING_LOGIC_VERSION above. Only a row from before a logic
+        # change (untagged, or tagged with an older version) pays the
+        # full re-check cost; everything already up to date stays fast,
+        # restoring the old existing_pairs-skip performance for the
+        # common case where nothing has actually changed since last run.
+        if existing and existing.score_breakdown and existing.score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+            if existing.status == "NEAR_MISS":
+                near_miss_count += 1
+            elif existing.status == "ASSIGNED":
+                assignment_count += 1
+            continue
+
+        validation = validate_match(requirement, consultant, experiences, requirement_skills=requirement_skills)
+
+        if not validation["eligible"]:
+            logger.info(
+                "match_requirement: requirement_id=%s consultant_id=%s REJECTED at stage=%s (%s)",
+                requirement_id, consultant.id, validation["stage_failed"], validation["reason"],
+            )
+            # BUG FIX: match history is mandatory — never delete a row,
+            # mark it INVALIDATED instead so it drops out of the counted
+            # ASSIGNED/NEAR_MISS totals (and out of the admin Requirements
+            # page's ats_match_count) while the row and its original
+            # reasoning stay in the table. Same fix already applied to
+            # Pipeline B (matching_router.py).
+            if existing and existing.status != "INVALIDATED":
+                existing.status = "INVALIDATED"
+                existing.match_reason = (
+                    f"No longer eligible — failed at stage '{validation['stage_failed']}': {validation['reason']}"
+                )
+                await db.flush()
+            continue
+
+        result = score_match(requirement, consultant, experiences, requirement_skills=requirement_skills)
+        result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
+
+        # NEAR_MISS_CANDIDATE (soft 10-70% role match) only actually becomes
+        # a NEAR_MISS row if the final blended score ALSO misses threshold —
+        # if other factors compensated for the imperfect role match, it's a
+        # legitimate normal pass instead. A role tier of PASS (>=70%) is
+        # always a normal pass regardless of the final total, same as the
+        # role-matching-fix spec states.
+        if validation["tier"] == "NEAR_MISS_CANDIDATE" and result["total"] < MATCH_THRESHOLD:
+            new_status = "NEAR_MISS"
+        else:
+            new_status = "ASSIGNED"
 
         from sqlalchemy.exc import IntegrityError
         try:
@@ -626,6 +1221,12 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                     existing.missing_skills = result["missing_skills"]
                     existing.match_reason = result["match_reason"]
                     existing.score_breakdown = result["score_breakdown"]
+                    # Never clobber a workflow status an admin/recruiter has
+                    # already advanced (RESUME_GENERATED, READY_TO_APPLY,
+                    # APPLIED, REJECTED) — only move between the two
+                    # matching-engine-owned statuses themselves.
+                    if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
+                        existing.status = new_status
                 else:
                     db.add(RequirementConsultantMatch(
                         requirement_id=requirement_id,
@@ -641,7 +1242,7 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                         missing_skills=result["missing_skills"],
                         match_reason=result["match_reason"],
                         score_breakdown=result["score_breakdown"],
-                        status="ASSIGNED",
+                        status=new_status,
                     ))
                 await db.flush()
         except IntegrityError:
@@ -663,10 +1264,14 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                 existing.missing_skills = result["missing_skills"]
                 existing.match_reason = result["match_reason"]
                 existing.score_breakdown = result["score_breakdown"]
+                if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
+                    existing.status = new_status
                 await db.flush()
 
-
-        assignment_count += 1
+        if new_status == "NEAR_MISS":
+            near_miss_count += 1
+        else:
+            assignment_count += 1
 
     # BUG FIX: match_requirement() upserted rows into
     # requirement_consultant_matches correctly, but never wrote back to
@@ -674,14 +1279,15 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
     # table actually displays. Matching genuinely worked; the visible
     # count just never reflected it (stuck at whatever seed.py's random
     # demo value or the column default of 0 was). assignment_count here
-    # is exactly "consultants meeting MATCH_THRESHOLD in this run", which
-    # is the correct current match count for this requirement.
+    # counts only normal ASSIGNED matches (not NEAR_MISS) — NEAR_MISS rows
+    # are meant for a separate view/tab per the role-matching-fix spec, so
+    # they're deliberately kept out of the headline admin count.
     requirement.ats_match_count = assignment_count
 
     await db.commit()
     logger.info(
-        "Matched requirement_id=%s — %d consultants scored, %d assignments created/updated (3 total queries)",
-        requirement_id, len(consultants), assignment_count,
+        "Matched requirement_id=%s — %d consultants scored, %d ASSIGNED, %d NEAR_MISS (3 total queries)",
+        requirement_id, len(consultants), assignment_count, near_miss_count,
     )
     return assignment_count
 
@@ -722,13 +1328,53 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     existing_by_req = {m.requirement_id: m for m in existing_result.scalars().all()}
 
     match_count = 0
+    near_miss_count = 0
     for requirement in requirements:
-        result = score_match(requirement, consultant, experiences)
+        existing = existing_by_req.get(requirement.id)
 
-        if result["total"] < MATCH_THRESHOLD:
+        # BUG FIX: same protective guard as match_requirement() above —
+        # never touch a row already advanced to RESUME_GENERATED,
+        # READY_TO_APPLY, APPLIED, or REJECTED.
+        if existing and existing.status in ("RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"):
+            if existing.status == "ASSIGNED":
+                match_count += 1
             continue
 
-        existing = existing_by_req.get(requirement.id)
+        # PERFORMANCE: same version-tag skip as match_requirement() above —
+        # skip full re-validation for a row already checked under the
+        # current matching logic.
+        if existing and existing.score_breakdown and existing.score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+            if existing.status == "NEAR_MISS":
+                near_miss_count += 1
+            elif existing.status == "ASSIGNED":
+                match_count += 1
+            continue
+
+        validation = validate_match(requirement, consultant, experiences)
+
+        if not validation["eligible"]:
+            logger.info(
+                "match_consultant: consultant_id=%s requirement_id=%s REJECTED at stage=%s (%s)",
+                consultant_id, requirement.id, validation["stage_failed"], validation["reason"],
+            )
+            # BUG FIX: mark INVALIDATED instead of deleting — same fix
+            # already applied to match_requirement() above and to
+            # Pipeline B (matching_router.py). Match history is mandatory.
+            if existing and existing.status != "INVALIDATED":
+                existing.status = "INVALIDATED"
+                existing.match_reason = (
+                    f"No longer eligible — failed at stage '{validation['stage_failed']}': {validation['reason']}"
+                )
+                await db.flush()
+            continue
+
+        result = score_match(requirement, consultant, experiences)
+        result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
+
+        if validation["tier"] == "NEAR_MISS_CANDIDATE" and result["total"] < MATCH_THRESHOLD:
+            new_status = "NEAR_MISS"
+        else:
+            new_status = "ASSIGNED"
 
         from sqlalchemy.exc import IntegrityError
         try:
@@ -745,6 +1391,8 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                     existing.missing_skills = result["missing_skills"]
                     existing.match_reason = result["match_reason"]
                     existing.score_breakdown = result["score_breakdown"]
+                    if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
+                        existing.status = new_status
                 else:
                     db.add(RequirementConsultantMatch(
                         requirement_id=requirement.id,
@@ -760,7 +1408,7 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                         missing_skills=result["missing_skills"],
                         match_reason=result["match_reason"],
                         score_breakdown=result["score_breakdown"],
-                        status="ASSIGNED",
+                        status=new_status,
                     ))
                 await db.flush()
         except IntegrityError:
@@ -782,14 +1430,19 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                 existing.missing_skills = result["missing_skills"]
                 existing.match_reason = result["match_reason"]
                 existing.score_breakdown = result["score_breakdown"]
+                if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
+                    existing.status = new_status
                 await db.flush()
 
-        match_count += 1
+        if new_status == "NEAR_MISS":
+            near_miss_count += 1
+        else:
+            match_count += 1
 
     await db.commit()
     logger.info(
-        "Auto-matched consultant_id=%s across %d open requirements — %d matches",
-        consultant_id, len(requirements), match_count,
+        "Auto-matched consultant_id=%s across %d open requirements — %d ASSIGNED, %d NEAR_MISS",
+        consultant_id, len(requirements), match_count, near_miss_count,
     )
     return match_count
 

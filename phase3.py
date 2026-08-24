@@ -875,6 +875,16 @@ async def update_own_profile(
         try:
             async with AsyncSessionLocal() as bg_session:
                 await match_consultant(bg_session, cid)
+                # COVERAGE GAP FIX (not a matching-condition change): this
+                # only ever refreshed Pipeline A (the admin Requirements
+                # page's match count). Pending Applications (Pipeline B,
+                # the JobMatch table) never got refreshed when a
+                # consultant updated their profile — even when the update
+                # was specifically to fix a gap keeping them from
+                # matching something. Same session, same trigger, second
+                # pipeline.
+                from matching_router import run_matching_for_consultant
+                await run_matching_for_consultant(bg_session, cid)
         except Exception as e:
             logger.error("Background auto-match failed for consultant_id=%s: %s", cid, e)
             from error_logger import log_db_error

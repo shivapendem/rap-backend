@@ -864,87 +864,131 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # ── Role ──────────────────────────────────────────────────────────────
-    # Body-first to prevent subject-line poisoning.
-    raw_role = first_match(ROLE_PATTERNS, norm_body) or first_match(ROLE_PATTERNS, full_text)
-    role = clean_role(raw_role) or clean_role(role_from_subject(safe_subject))
-    if not role or is_email_body(role):
-        role = 'UNKNOWN'
+    # Attempt AI parsing first
+    try:
+        from claude_service import parse_requirement_text
+        ai_parsed = parse_requirement_text(safe_subject, safe_body)
+        if ai_parsed:
+            role = ai_parsed.get('role')
+            client = ai_parsed.get('client')
+            location = ai_parsed.get('location')
+            rate = ai_parsed.get('rate')
+            duration = ai_parsed.get('duration')
+            work_mode = ai_parsed.get('work_mode')
+            employment_types = ai_parsed.get('employment_types')
+            experience = ai_parsed.get('experience')
+            skills = ai_parsed.get('skills')
+            
+            # Use AI parsed fields directly.
+            # Vendor info is extracted locally using regex/headers below.
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"AI requirement parsing failed: {e}. Falling back to regex.")
+        ai_parsed = None
 
-    # ── Client ────────────────────────────────────────────────────────────
-    raw_client = first_match(CLIENT_PATTERNS, norm_body) or first_match(CLIENT_PATTERNS, full_text)
-    client = clean_client(raw_client)
-    if client and is_email_body(client):
-        client = None
-    # Infer client from "Role Title – ClientName" dash pattern when no label found
-    if not client:
-        dash_m = re.search(
-            r'(?i)(?:role|position|opening|title)\s*[:\-]\s*[^\n]+?'
-            r'[\-\u2013]\s*([A-Z][A-Za-z0-9&\s]{2,30}?)(?=\s*(?:Location|Client|Rate|\n|$))',
-            norm_body
-        )
-        if not dash_m:
+    if not ai_parsed:
+        # ── Role ──────────────────────────────────────────────────────────────
+        # Body-first to prevent subject-line poisoning.
+        raw_role = first_match(ROLE_PATTERNS, norm_body) or first_match(ROLE_PATTERNS, full_text)
+        role = clean_role(raw_role) or clean_role(role_from_subject(safe_subject))
+        if not role or is_email_body(role):
+            role = 'UNKNOWN'
+    
+        # ── Client ────────────────────────────────────────────────────────────
+        raw_client = first_match(CLIENT_PATTERNS, norm_body) or first_match(CLIENT_PATTERNS, full_text)
+        client = clean_client(raw_client)
+        if client and is_email_body(client):
+            client = None
+        # Infer client from "Role Title – ClientName" dash pattern when no label found
+        if not client:
             dash_m = re.search(
-                r'[A-Za-z ]{4,}\s+[\-\u2013]\s+([A-Z][A-Za-z0-9&\s]{2,30}?)'
-                r'(?=\s*(?:Location|Client|Rate|\n|$))',
+                r'(?i)(?:role|position|opening|title)\s*[:\-]\s*[^\n]+?'
+                r'[\-\u2013]\s*([A-Z][A-Za-z0-9&\s]{2,30}?)(?=\s*(?:Location|Client|Rate|\n|$))',
                 norm_body
             )
-        if dash_m:
-            cand = clean_client(dash_m.group(1))
-            if cand and len(cand) <= 40 and not is_email_body(cand):
-                client = cand
+            if not dash_m:
+                dash_m = re.search(
+                    r'[A-Za-z ]{4,}\s+[\-\u2013]\s+([A-Z][A-Za-z0-9&\s]{2,30}?)'
+                    r'(?=\s*(?:Location|Client|Rate|\n|$))',
+                    norm_body
+                )
+            if dash_m:
+                cand = clean_client(dash_m.group(1))
+                # BUG FIX: this fallback regex has no awareness of what role was
+                # already extracted above — it just grabs whatever capitalized
+                # phrase follows a dash anywhere in the body. When the role
+                # title itself gets restated near a dash elsewhere in the email
+                # (subject-line repeat, signature, etc.), this fallback was
+                # capturing the ROLE TEXT ITSELF as the "client" — producing
+                # rows where Client is character-for-character identical to
+                # Role (e.g. "Veeva Technical Architect" as both). Per spec,
+                # client should default to N/A/None when a real one can't be
+                # confidently found — a duplicate of the role is not a real
+                # client and is worse than leaving it blank, since it reads as
+                # legitimate data. Reject the candidate outright if it matches
+                # (or is a substring/superstring of) the already-extracted role.
+                role_lower = (role or '').strip().lower()
+                cand_lower = (cand or '').strip().lower()
+                is_role_echo = bool(cand_lower) and bool(role_lower) and (
+                    cand_lower == role_lower
+                    or cand_lower in role_lower
+                    or role_lower in cand_lower
+                )
+                if cand and len(cand) <= 40 and not is_email_body(cand) and not is_role_echo:
+                    client = cand
+    
+        # ── Location ──────────────────────────────────────────────────────────
+        raw_location = (
+            first_match(LOCATION_PATTERNS, norm_body)
+            or first_match(LOCATION_PATTERNS, full_text)
+        )
+        location = clean_location(raw_location)
+        if location and is_email_body(location):
+            location = None
+        if not location:
+            # Bare City/State fallback — reject sign-off lines like "Regards, VA"
+            location = find_city_state(norm_body, reject_first_words=_SIGNOFF_WORDS)
+    
+        # ── Rate ──────────────────────────────────────────────────────────────
+        raw_rate = first_match(RATE_PATTERNS, norm_body) or first_match(RATE_PATTERNS, full_text)
+        rate = clean_rate(raw_rate)
+        if rate and is_email_body(rate):
+            rate = None
+        if not rate:
+            # BUG FIX: BARE_RATE_PATTERN used to grab the FIRST bare $NNN/period
+            # string anywhere in the email with zero context check. Recruiter
+            # broadcast templates (ProHires and similar) often end with a
+            # subscription ad like "Hire our IT Recruiter at just $499/month" —
+            # that ad was being picked up as the requirement's rate on every
+            # single email from that template, since real rates are frequently
+            # unlabeled in these bodies and this fallback ran unconditionally.
+            # Now: walk every bare-rate match in order and skip any whose
+            # surrounding text looks like portal/subscription boilerplate
+            # rather than an actual client rate.
+            for bare_match in BARE_RATE_PATTERN.finditer(full_text):
+                window_start = max(0, bare_match.start() - 60)
+                window_end = min(len(full_text), bare_match.end() + 60)
+                context_window = full_text[window_start:window_end]
+                if _RATE_FALSE_POSITIVE_CONTEXT.search(context_window):
+                    continue
+                rate = bare_match.group(0).strip()
+                break
+    
+        # ── Duration ──────────────────────────────────────────────────────────
+        raw_duration = (
+            first_match(DURATION_PATTERNS, norm_body)
+            or first_match(DURATION_PATTERNS, full_text)
+        )
+        duration = clean_duration(raw_duration)
+        if duration and is_email_body(duration):
+            duration = None
 
-    # ── Location ──────────────────────────────────────────────────────────
-    raw_location = (
-        first_match(LOCATION_PATTERNS, norm_body)
-        or first_match(LOCATION_PATTERNS, full_text)
-    )
-    location = clean_location(raw_location)
-    if location and is_email_body(location):
-        location = None
-    if not location:
-        # Bare City/State fallback — reject sign-off lines like "Regards, VA"
-        location = find_city_state(norm_body, reject_first_words=_SIGNOFF_WORDS)
-
-    # ── Rate ──────────────────────────────────────────────────────────────
-    raw_rate = first_match(RATE_PATTERNS, norm_body) or first_match(RATE_PATTERNS, full_text)
-    rate = clean_rate(raw_rate)
-    if rate and is_email_body(rate):
-        rate = None
-    if not rate:
-        # BUG FIX: BARE_RATE_PATTERN used to grab the FIRST bare $NNN/period
-        # string anywhere in the email with zero context check. Recruiter
-        # broadcast templates (ProHires and similar) often end with a
-        # subscription ad like "Hire our IT Recruiter at just $499/month" —
-        # that ad was being picked up as the requirement's rate on every
-        # single email from that template, since real rates are frequently
-        # unlabeled in these bodies and this fallback ran unconditionally.
-        # Now: walk every bare-rate match in order and skip any whose
-        # surrounding text looks like portal/subscription boilerplate
-        # rather than an actual client rate.
-        for bare_match in BARE_RATE_PATTERN.finditer(full_text):
-            window_start = max(0, bare_match.start() - 60)
-            window_end = min(len(full_text), bare_match.end() + 60)
-            context_window = full_text[window_start:window_end]
-            if _RATE_FALSE_POSITIVE_CONTEXT.search(context_window):
-                continue
-            rate = bare_match.group(0).strip()
-            break
-
-    # ── Duration ──────────────────────────────────────────────────────────
-    raw_duration = (
-        first_match(DURATION_PATTERNS, norm_body)
-        or first_match(DURATION_PATTERNS, full_text)
-    )
-    duration = clean_duration(raw_duration)
-    if duration and is_email_body(duration):
-        duration = None
-
-    # ── Other fields ──────────────────────────────────────────────────────
-    work_mode = extract_work_mode(full_text)
-    employment_types = extract_employment_types(full_text)
-    experience = extract_experience(full_text)
-    skills = extract_skills(full_text)
+    if not ai_parsed:
+        # ── Other fields ──────────────────────────────────────────────────────
+        work_mode = extract_work_mode(full_text)
+        employment_types = extract_employment_types(full_text)
+        experience = extract_experience(full_text)
+        skills = extract_skills(full_text)
 
     # ── Vendor info ───────────────────────────────────────────────────────
     vendor_name = None
