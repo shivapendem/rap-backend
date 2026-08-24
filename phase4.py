@@ -494,6 +494,10 @@ def _known_generic_phrase_domain(req_tokens: set[str]) -> bool:
     return False
 
 
+from disk_cache import PersistentDiskCache
+import json
+_ROLE_MATCH_CACHE = PersistentDiskCache("role_match_cache.json")
+
 def score_role(
     requirement_role: Optional[str],
     consultant_preferred_roles: Optional[str],
@@ -536,6 +540,36 @@ def score_role(
     # genuinely unknown either way.
     if not requirement_role or not requirement_role.strip():
         return 50.0
+
+    # Attempt AI evaluation first
+    raw_pref_roles = []
+    if consultant_preferred_roles:
+        raw_pref_roles.append(consultant_preferred_roles.strip())
+    if experiences:
+        for exp in experiences:
+            if exp.role_title:
+                raw_pref_roles.append(exp.role_title.strip())
+
+    if raw_pref_roles:
+        unique_roles = tuple(sorted(set(raw_pref_roles)))
+        req_role_clean = requirement_role.strip()
+        
+        # Serialize to string for JSON dict keys
+        cache_key = json.dumps([req_role_clean, list(unique_roles)])
+        
+        cached_score = _ROLE_MATCH_CACHE.get(cache_key)
+        if cached_score is not None:
+            return cached_score
+
+        try:
+            from claude_service import evaluate_role_match_with_ai
+            ai_score = evaluate_role_match_with_ai(req_role_clean, list(unique_roles))
+            if ai_score is not None:
+                _ROLE_MATCH_CACHE.set(cache_key, ai_score)
+                return ai_score
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"AI role match failed: {e}")
 
     # Build the consultant's role-token pool (preferred_roles + every
     # experience row's role_title), same sources as before.

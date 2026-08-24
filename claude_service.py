@@ -1074,3 +1074,145 @@ Generate the tailored template JSON now.
         logger.error(f"Error calling Anthropic API for templates: {e}")
         logger.error(traceback.format_exc())
         return mock_fallback, {}, None
+
+
+PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
+Extract its content into this exact JSON schema.
+If a field is not present or cannot be confidently determined, leave it as null or an empty list.
+
+{
+  "role": "string (the job title)",
+  "client": "string (the end client or company, if explicitly mentioned)",
+  "location": "string (city, state, or Remote/Hybrid/Onsite)",
+  "rate": "string (the pay/bill rate or compensation)",
+  "duration": "string (e.g. 6 months, long term)",
+  "work_mode": "string (REMOTE, HYBRID, ONSITE, or UNKNOWN)",
+  "employment_types": ["string (C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN)"],
+  "experience": "string (e.g. 8+ years)",
+  "skills": ["string (key skills and technologies requested)"]
+}
+
+Return ONLY the JSON object, no markdown fences, no commentary.
+"""
+
+def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
+    """
+    Calls Anthropic API to parse the raw text of a job requirement email
+    into a structured JSON. Returns None if parsing fails.
+    """
+    import hashlib
+    try:
+        from disk_cache import PersistentDiskCache
+        _REQUIREMENT_CACHE = PersistentDiskCache("requirement_cache.json")
+    except ImportError:
+        _REQUIREMENT_CACHE = None
+
+    if _REQUIREMENT_CACHE:
+        content_hash = hashlib.md5(f"{subject}\\n{body}".encode("utf-8")).hexdigest()
+        cached = _REQUIREMENT_CACHE.get(content_hash)
+        if cached is not None:
+            return cached
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        logger.warning("ANTHROPIC_API_KEY not found, returning None for parse_requirement_text.")
+        return None
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key, timeout=15.0)
+        
+        user_prompt = f"SUBJECT:\\n{subject}\\n\\nBODY:\\n{body}\\n\\nExtract the JSON now."
+        
+        response = client.messages.with_raw_response.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=PARSE_REQUIREMENT_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        parsed_response = response.parse()
+        content = parsed_response.content[0].text
+        
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+            
+        result_json = json.loads(content.strip())
+        
+        # Ensure correct schema
+        final_dict = {
+            'role': result_json.get('role') or 'UNKNOWN',
+            'client': result_json.get('client'),
+            'location': result_json.get('location'),
+            'rate': result_json.get('rate'),
+            'duration': result_json.get('duration'),
+            'work_mode': result_json.get('work_mode') or 'UNKNOWN',
+            'employment_types': result_json.get('employment_types') or ['UNKNOWN'],
+            'experience': result_json.get('experience'),
+            'skills': result_json.get('skills') or []
+        }
+        if _REQUIREMENT_CACHE:
+            _REQUIREMENT_CACHE.set(content_hash, final_dict)
+        return final_dict
+    except Exception as e:
+        logger.warning(f"Error calling Claude API for requirement parsing: {e}")
+        return None
+
+
+ROLE_MATCH_SYSTEM_PROMPT = """You are an expert technical recruiter evaluating role match.
+Given a Requirement Role and a Consultant's Role History (a list of roles they've held or preferred), 
+evaluate how well the consultant's specialization matches the requirement.
+Consider domains and specializations (e.g., 'DevOps Engineer' matches 'Site Reliability Engineer', but 'Java Developer' does not match 'Python Developer' just because they both have 'Developer').
+Ignore seniority differences (e.g. 'Senior' or 'Lead').
+
+Return ONLY a valid JSON object with a single field 'score', which is an integer between 0 and 100 representing the match percentage.
+Example: {"score": 85}
+"""
+
+def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[str]) -> Optional[float]:
+    """
+    Calls Anthropic API to evaluate role match. Returns score 0.0-100.0, or None if it fails.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        return None
+    
+    if not consultant_roles:
+        return 50.0
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key, timeout=10.0)
+        
+        user_prompt = f"Requirement Role: {requirement_role}\\nConsultant Roles: {', '.join(consultant_roles)}\\nEvaluate the match."
+        
+        response = client.messages.with_raw_response.create(
+            model="claude-haiku-3-5", # Use a faster, cheaper model for evaluation
+            max_tokens=100,
+            system=ROLE_MATCH_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        parsed_response = response.parse()
+        content = parsed_response.content[0].text
+        
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+            
+        result_json = json.loads(content.strip())
+        score = float(result_json.get("score", 50.0))
+        return score
+    except Exception as e:
+        logger.warning(f"Error calling Claude API for role matching: {e}")
+        return None
