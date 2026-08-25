@@ -1167,23 +1167,49 @@ Generate the tailored template JSON now.
 
 
 PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
-Extract its content into this exact JSON schema.
-If a field is not present or cannot be confidently determined, leave it as null or an empty list.
-
-{
-  "role": "string (the job title)",
-  "client": "string (the end client or company, if explicitly mentioned)",
-  "location": "string (city, state, or Remote/Hybrid/Onsite)",
-  "rate": "string (the pay/bill rate or compensation)",
-  "duration": "string (e.g. 6 months, long term)",
-  "work_mode": "string (REMOTE, HYBRID, ONSITE, or UNKNOWN)",
-  "employment_types": ["string (C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN)"],
-  "experience": "string (e.g. 8+ years)",
-  "skills": ["string (key skills and technologies requested)"]
-}
-
-Return ONLY the JSON object, no markdown fences, no commentary.
+Extract its content using the extract_requirement tool.
+If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess.
 """
+
+# P0 fix: previously this asked the model to "return only JSON" and then
+# manually stripped ```json fences with string slicing before json.loads().
+# That silently broke (falling all the way back to the regex-only parser in
+# parser.py) any time the model added so much as a stray leading word or
+# used a different fence style. Forcing a tool call with an explicit
+# input_schema makes the API itself guarantee a parseable, schema-shaped
+# object — the tool_use block's `.input` is already a dict, no string
+# parsing at all.
+PARSE_REQUIREMENT_TOOL = {
+    "name": "extract_requirement",
+    "description": "Record the structured fields extracted from a job requirement email.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "role": {"type": ["string", "null"], "description": "The job title."},
+            "client": {"type": ["string", "null"], "description": "The end client or company, if explicitly mentioned."},
+            "location": {"type": ["string", "null"], "description": "City, state, or Remote/Hybrid/Onsite."},
+            "rate": {"type": ["string", "null"], "description": "The pay/bill rate or compensation."},
+            "duration": {"type": ["string", "null"], "description": "e.g. '6 months', 'long term'."},
+            "work_mode": {
+                "type": ["string", "null"],
+                "enum": ["REMOTE", "HYBRID", "ONSITE", "UNKNOWN", None],
+                "description": "REMOTE, HYBRID, ONSITE, or UNKNOWN."
+            },
+            "employment_types": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["C2C", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
+                "description": "One or more of C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN."
+            },
+            "experience": {"type": ["string", "null"], "description": "e.g. '8+ years'."},
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Key skills and technologies requested."
+            },
+        },
+        "required": ["role", "client", "location", "rate", "duration", "work_mode", "employment_types", "experience", "skills"],
+    },
+}
 
 def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
     """
@@ -1213,30 +1239,30 @@ def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
         from anthropic import Anthropic
         client = Anthropic(api_key=api_key, timeout=15.0)
         
-        user_prompt = f"SUBJECT:\\n{subject}\\n\\nBODY:\\n{body}\\n\\nExtract the JSON now."
+        user_prompt = f"SUBJECT:\\n{subject}\\n\\nBODY:\\n{body}\\n\\nExtract the requirement now."
         
         response = client.messages.with_raw_response.create(
             model="claude-sonnet-4-6",
             max_tokens=1500,
             system=PARSE_REQUIREMENT_SYSTEM_PROMPT,
+            tools=[PARSE_REQUIREMENT_TOOL],
+            tool_choice={"type": "tool", "name": "extract_requirement"},
             messages=[
                 {"role": "user", "content": user_prompt}
             ]
         )
-        
+
         parsed_response = response.parse()
-        content = parsed_response.content[0].text
-        
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-            
-        result_json = json.loads(content.strip())
-        
-        # Ensure correct schema
+        tool_use_block = next(
+            (b for b in parsed_response.content if b.type == "tool_use"), None
+        )
+        if tool_use_block is None:
+            logger.warning("Claude API returned no tool_use block for requirement parsing.")
+            return None
+        result_json = tool_use_block.input
+
+        # Ensure correct schema (also guards against a model omitting a
+        # field despite it being "required" in the tool schema above)
         final_dict = {
             'role': result_json.get('role') or 'UNKNOWN',
             'client': result_json.get('client'),
