@@ -328,7 +328,7 @@ async def get_resume_completeness(
         "missing_fields": missing_fields,
         "message": missing_fields_message(missing_fields) if missing_fields else None,
         "consultant_status": consultant_status,
-        "is_active": bool(target_user.is_active),
+        "is_active": bool(target_user.is_authorized),
     }
 
 

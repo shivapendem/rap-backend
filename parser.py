@@ -1039,3 +1039,152 @@ def parse_requirement(
             parsed[key] = None
 
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Multi-requirement support
+#
+# parse_requirement() above always treats the WHOLE email body as one
+# requirement: every field extractor independently scans the entire body
+# and keeps only the first match it finds. When an email actually
+# contains multiple distinct job postings, every field after the first
+# one is silently discarded, and — because Role/Client/Location/etc. each
+# search independently — the single row that IS produced can even mix
+# fields from different postings.
+#
+# parse_requirement() itself is intentionally left untouched (its
+# docstring already states its signature/behavior must not change, and
+# every existing caller/test depends on that). This section adds a
+# strictly additive wrapper instead: split the body into candidate
+# requirement blocks only when there's strong, unambiguous evidence of
+# more than one posting, then run the existing, unmodified
+# parse_requirement() on each block independently. Whenever that
+# evidence isn't there, it falls straight through to exactly what
+# parse_requirement() already returns today — so single-requirement
+# emails (the overwhelming majority) are completely unaffected.
+# ---------------------------------------------------------------------------
+
+# Minimum character distance between two accepted anchors before a
+# same-text repeat is treated as a restatement (e.g. subject echoed right
+# after a "Role:" line) rather than a second posting.
+_ANCHOR_MIN_GAP = 120
+
+
+def _find_role_label_anchors(text: str) -> List[tuple]:
+    """Find every labeled role occurrence (e.g. "Job Title:", "Role:") in
+    `text`, in document order. Reuses ROLE_PATTERNS — the same labels
+    first_match() looks for — since those already require an explicit
+    trailing ':' or '-', so a bare mention of the word "role" or
+    "position" in a sentence never matches. That keeps false-positive
+    anchors low without any new pattern list to maintain separately.
+
+    Returns a list of (match_start, line_start, captured_value) tuples.
+    """
+    anchors = []
+    for pattern in ROLE_PATTERNS:
+        for m in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            captured = m.group(1).split('\n', 1)[0]
+            value = sanitize_text(captured)
+            if not value:
+                continue
+            value = crop_at_next_field(value)
+            if not value or is_email_body(value) or len(value) > 200:
+                continue
+            line_start = text.rfind('\n', 0, m.start()) + 1
+            anchors.append((m.start(), line_start, value))
+    anchors.sort(key=lambda a: a[0])
+    return anchors
+
+
+def split_into_requirement_segments(body_text: str, max_segments: int = 10) -> List[str]:
+    """Best-effort detection of multiple distinct job postings inside one
+    email body.
+
+    Deliberately conservative — returns [body_text] (i.e. "don't split,
+    treat as a single requirement") unless there are at least two
+    clearly distinct role-labeled blocks. A false-positive split (cutting
+    one real posting into pieces) is worse than the existing
+    under-splitting behavior this exists to fix, so anything ambiguous
+    defers to the current single-block behavior untouched.
+    """
+    if not body_text or not body_text.strip():
+        return [body_text]
+
+    raw_anchors = _find_role_label_anchors(body_text)
+    if len(raw_anchors) < 2:
+        return [body_text]
+
+    accepted: list = []
+    for pos, line_start, value in raw_anchors:
+        if accepted:
+            prev_pos, _prev_line_start, prev_value = accepted[-1]
+            if pos - prev_pos < _ANCHOR_MIN_GAP and value.strip().lower() == prev_value.strip().lower():
+                # Same role restated close together — not a second posting.
+                continue
+        accepted.append((pos, line_start, value))
+
+    if len(accepted) < 2:
+        return [body_text]
+
+    accepted = accepted[:max_segments]
+
+    segments = []
+    for i, (_, line_start, _value) in enumerate(accepted):
+        seg_end = accepted[i + 1][1] if i + 1 < len(accepted) else len(body_text)
+        segment = body_text[line_start:seg_end].strip()
+        if segment:
+            segments.append(segment)
+
+    return segments if len(segments) >= 2 else [body_text]
+
+
+def parse_requirements(
+    subject: str,
+    body: str,
+    headers: Dict[str, Any]
+) -> List[tuple]:
+    """
+    Multi-requirement-aware wrapper around parse_requirement().
+
+    Existing callers that only ever expect a single requirement per email
+    should keep calling parse_requirement() directly — unchanged, same
+    behavior as always. Callers that want every requirement an email
+    actually contains (not just whichever one's fields happened to match
+    first) should call this instead.
+
+    Splits `body` into candidate blocks (see
+    split_into_requirement_segments) and runs the existing, unmodified
+    parse_requirement() on each block independently, so per-field
+    extraction quality for each requirement is identical to today's
+    single-requirement path — this only changes HOW MANY times that
+    logic runs, never what it does. Falls straight through to exactly
+    what parse_requirement() itself would return whenever segmentation
+    doesn't find strong evidence of more than one posting, or when none
+    of the split pieces individually look like a real requirement (e.g.
+    a false split inside one JD) — never returns fewer requirements than
+    the existing single-call path would have for the same email.
+
+    Returns a list of (parsed_dict, segment_text) tuples. segment_text is
+    the slice of `body` that produced parsed_dict — callers should clean
+    and hash THAT (not the full original body) when saving each row, so
+    job_description/jd_hash reflect that specific posting rather than the
+    whole multi-posting email repeated identically on every row. In the
+    no-split/fallback cases segment_text is the original `body` itself,
+    matching exactly what today's single-call sites already do.
+    """
+    safe_body = body or ''
+    segments = split_into_requirement_segments(safe_body)
+
+    if len(segments) <= 1:
+        return [(parse_requirement(subject, safe_body, headers), safe_body)]
+
+    results = []
+    for segment in segments:
+        parsed = parse_requirement(subject, segment, headers)
+        if parsed.get('is_likely_requirement'):
+            results.append((parsed, segment))
+
+    if not results:
+        return [(parse_requirement(subject, safe_body, headers), safe_body)]
+
+    return results

@@ -38,7 +38,7 @@
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from parser import parse_requirement, is_reply_email
+from parser import parse_requirements, is_reply_email
 from cleaner import clean_requirement_text, html_to_text
 from dedup import save_requirement
 
@@ -108,36 +108,114 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 skipped_not_a_requirement += 1
                 continue
 
-            parsed = parse_requirement(subject, body, headers)
+            # MULTI-REQUIREMENT FIX: an email can contain more than one
+            # distinct job posting. parse_requirements() (plural) splits
+            # the body into candidate blocks only when there's strong
+            # evidence of more than one posting — otherwise it returns
+            # exactly the single (parsed, body) pair parse_requirement()
+            # alone would have, so single-requirement emails (the
+            # overwhelming majority) behave identically to before. See
+            # parser.py for the segmentation logic.
+            parsed_items = parse_requirements(subject, body, headers)
 
-            # Gate on the parser's own confidence instead of the external
-            # classifier — this IS the "auto-reparse every gmail" behavior:
-            # every email gets run through the parser automatically, but
-            # only ones it's actually confident are job postings become
-            # Requirement rows. Non-matches are simply skipped and marked 'Parsed - NR'.
-            if not parsed.get("is_likely_requirement"):
-                skipped_not_a_requirement += 1
-                await db.execute(
-                    text("UPDATE gmail_emails SET status_desc = 'Parsed - NR' WHERE id = :id"),
-                    {"id": row["id"]}
+            any_likely = False
+            any_saved = False
+            any_duplicate = False
+
+            for parsed, segment_text in parsed_items:
+                # Gate on the parser's own confidence instead of the
+                # external classifier — this IS the "auto-reparse every
+                # gmail" behavior: every email gets run through the
+                # parser automatically, but only pieces it's actually
+                # confident are job postings become Requirement rows.
+                if not parsed.get("is_likely_requirement"):
+                    continue
+                any_likely = True
+
+                # Clean/hash THIS requirement's own segment text, not the
+                # whole (possibly multi-posting) email body — so
+                # job_description and jd_hash reflect just this posting,
+                # and dedup correctly distinguishes it from any other
+                # requirement pulled from the same email.
+                cleaned_jd = clean_requirement_text(segment_text)
+
+                save_result = await save_requirement(
+                    db=db,
+                    parsed=parsed,
+                    cleaned_jd=cleaned_jd,
+                    raw_email_id=row["id"],       # gmail_emails.id -- matches the real FK
+                    received_date=row["date"],
                 )
-                await db.commit()
-                continue
 
-            cleaned_jd = clean_requirement_text(body)
+                if save_result["status"] == "saved":
+                    any_saved = True
+                    saved += 1
+                    # BUG FIX: nothing ever called match_requirement() for
+                    # requirements created here — only the manual admin
+                    # "Rematch"/"Match All" buttons did. That left
+                    # ats_match_count stuck at its column default of 0 for
+                    # every auto-synced requirement forever, since this loop
+                    # is the only path that creates new Requirement rows on
+                    # an ongoing basis. Local import avoids a top-level
+                    # circular import between this module and phase4.
+                    try:
+                        from phase4 import match_requirement
+                        await match_requirement(db, save_result["id"])
 
-            save_result = await save_requirement(
-                db=db,
-                parsed=parsed,
-                cleaned_jd=cleaned_jd,
-                raw_email_id=row["id"],       # gmail_emails.id -- matches the real FK
-                received_date=row["date"],
-            )
+                        # Also run the JobMatch engine to populate Pending Applications
+                        from models import Requirement, Consultant, JobMatch
+                        from sqlalchemy.future import select
+                        from matching_router import run_matching_for_requirement
+                        req_res = await db.execute(select(Requirement).where(Requirement.id == save_result["id"]))
+                        req_obj = req_res.scalars().first()
+                        if req_obj:
+                            # BUG FIX: run_matching_for_requirement now takes the
+                            # active consultant roster and existing-match pairs
+                            # as arguments instead of re-querying them itself
+                            # (that redundant per-call query was fine for this
+                            # single-requirement call site, but was the source
+                            # of a real N+1 timeout on the bulk /matching/run
+                            # endpoint, which loops this over every open
+                            # requirement in one request — fixed there by
+                            # fetching both once per run instead of once per
+                            # requirement). One email can now yield several
+                            # requirements via the multi-requirement split
+                            # above, so this still runs once per SAVED
+                            # requirement, same as before per-item.
+                            cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+                            consultants = cons_res.scalars().all()
+                            existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
+                            existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
+                            await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
+                            await db.commit()
 
-            # Update the status_desc based on the result
-            if save_result["status"] == "saved":
+                    except Exception as match_err:
+                        # Don't let a matching failure undo the successful
+                        # requirement save above — log and move on.
+                        print(f"[requirements_sync] auto-match FAILED for requirement_id={save_result['id']}: {match_err}")
+                        from error_logger import log_db_error
+                        await log_db_error(
+                            stage="requirements_sync_automatch",
+                            error=match_err,
+                            source_type="requirement",
+                            source_id=save_result["id"],
+                        )
+                elif save_result["status"] == "duplicate":
+                    any_duplicate = True
+                    duplicates += 1
+
+            # Update the source email's status_desc ONCE per email, after
+            # every requirement pulled from it has been attempted —
+            # mirrors the original single-requirement status semantics:
+            # nothing likely at all -> "Parsed - NR"; at least one row
+            # actually saved -> "Parsed"; only duplicates, nothing new
+            # -> "Parsed - Dup".
+            if not any_likely:
+                skipped_not_a_requirement += 1
+                final_status = "Parsed - NR"
+            elif any_saved:
                 final_status = "Parsed"
-            elif save_result["status"] == "duplicate":
+            elif any_duplicate:
                 final_status = "Parsed - Dup"
             else:
                 final_status = "Parsed"
@@ -147,59 +225,6 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 {"status": final_status, "id": row["id"]}
             )
             await db.commit()
-
-            if save_result["status"] == "saved":
-                saved += 1
-                # BUG FIX: nothing ever called match_requirement() for
-                # requirements created here — only the manual admin
-                # "Rematch"/"Match All" buttons did. That left
-                # ats_match_count stuck at its column default of 0 for
-                # every auto-synced requirement forever, since this loop
-                # is the only path that creates new Requirement rows on
-                # an ongoing basis. Local import avoids a top-level
-                # circular import between this module and phase4.
-                try:
-                    from phase4 import match_requirement
-                    await match_requirement(db, save_result["id"])
-                    
-                    # Also run the JobMatch engine to populate Pending Applications
-                    from models import Requirement, Consultant, JobMatch
-                    from sqlalchemy.future import select
-                    from matching_router import run_matching_for_requirement
-                    req_res = await db.execute(select(Requirement).where(Requirement.id == save_result["id"]))
-                    req_obj = req_res.scalars().first()
-                    if req_obj:
-                        # BUG FIX: run_matching_for_requirement now takes the
-                        # active consultant roster and existing-match pairs
-                        # as arguments instead of re-querying them itself
-                        # (that redundant per-call query was fine for this
-                        # single-requirement call site, but was the source
-                        # of a real N+1 timeout on the bulk /matching/run
-                        # endpoint, which loops this over every open
-                        # requirement in one request — fixed there by
-                        # fetching both once per run instead of once per
-                        # requirement). This call site still only handles
-                        # one requirement, so fetching both here is fine.
-                        cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
-                        consultants = cons_res.scalars().all()
-                        existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
-                        existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
-                        await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
-                        await db.commit()
-                        
-                except Exception as match_err:
-                    # Don't let a matching failure undo the successful
-                    # requirement save above — log and move on.
-                    print(f"[requirements_sync] auto-match FAILED for requirement_id={save_result['id']}: {match_err}")
-                    from error_logger import log_db_error
-                    await log_db_error(
-                        stage="requirements_sync_automatch",
-                        error=match_err,
-                        source_type="requirement",
-                        source_id=save_result["id"],
-                    )
-            elif save_result["status"] == "duplicate":
-                duplicates += 1
 
         except Exception as e:
             await db.rollback()

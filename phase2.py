@@ -548,7 +548,19 @@ async def reparse_email(
                 # target for requirements.raw_email_id) — must be passed through
                 # explicitly, or process_email() would fall back to NULL and
                 # this requirement would end up unlinked from its raw email.
-                save_result = await process_email(db, gmail_msg, raw_email_id=source_gmail_emails_id)
+                #
+                # create_requirements=False: this call exists ONLY to create
+                # the missing `emails` bookkeeping row above — the actual
+                # parse + Requirement save for THIS reparse happens explicitly
+                # below (Step 3), which assumes at most one Requirement row
+                # per raw_email_id and updates it in place. An email can now
+                # yield multiple Requirement rows via parse_requirements()
+                # (see parser.py) — letting this call ALSO create rows would
+                # leave any extra ones orphaned: uncounted here, and never
+                # revisited by a future reparse of "this" row.
+                save_result = await process_email(
+                    db, gmail_msg, raw_email_id=source_gmail_emails_id, create_requirements=False
+                )
                 email_result = await db.execute(
                     select(Email).where(Email.gmail_message_id == gmail_message_id)
                 )

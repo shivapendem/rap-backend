@@ -3,6 +3,7 @@
 # Handles consultant email queue management
 # ---------------------------------------------------------------------------
 import os
+import traceback
 import uuid
 import math
 import asyncio

@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gmail_reader import save_raw_email
-from parser import parse_requirement
+from parser import parse_requirements
 from cleaner import clean_requirement_text, html_to_text
 from dedup import create_jd_hash, save_requirement
 
@@ -16,6 +16,7 @@ async def process_email(
     db: AsyncSession,
     gmail_msg: dict,
     raw_email_id: Optional[int] = None,
+    create_requirements: bool = True,
 ) -> dict:
     """
     Main pipeline function.
@@ -39,11 +40,29 @@ async def process_email(
     the column allows NULL (ON DELETE SET NULL) — rather than guessing
     wrong and crashing the whole save.
 
+    create_requirements:
+    Some callers (see phase2.py's reparse_email) invoke this function
+    ONLY to create the missing `emails` bookkeeping row for an email
+    that's about to be parsed and saved separately, by their OWN
+    explicit parse_requirement()-based logic further down. That
+    downstream logic assumes at most one Requirement row exists per
+    raw_email_id — true when this function could only ever create 0 or
+    1 row itself. Since parse_requirements() (plural — see parser.py)
+    can now produce several Requirement rows for one email, letting
+    THIS call also create rows in that scenario would leave extra rows
+    orphaned: uncounted in the caller's response, and never touched by
+    that caller's own update-or-insert-by-raw_email_id logic again.
+    Callers in that situation should pass create_requirements=False —
+    this function still saves the `emails` row and returns normally,
+    it just skips parsing/saving Requirement rows entirely.
+
     Returns:
     {
         "email_status": "saved" | "already_exists",
         "requirement_status": "saved" | "duplicate" | "skipped",
-        "requirement_id": id or None
+        "requirement_id": id or None,
+        "all_requirement_ids": [id, ...],
+        "requirement_count": int
     }
     """
     # ---------------------------------------------------------------------------
@@ -58,6 +77,17 @@ async def process_email(
             "email_status": "already_exists",
             "requirement_status": "skipped",
             "requirement_id": None,
+            "all_requirement_ids": [],
+            "requirement_count": 0,
+        }
+
+    if not create_requirements:
+        return {
+            "email_status": email_status,
+            "requirement_status": "skipped",
+            "requirement_id": None,
+            "all_requirement_ids": [],
+            "requirement_count": 0,
         }
 
     # ---------------------------------------------------------------------------
@@ -86,28 +116,51 @@ async def process_email(
 
     # Use plain text if available, else convert HTML
     body = body_text or html_to_text(body_html)
-    parsed = parse_requirement(subject, body, headers)
+
+    # MULTI-REQUIREMENT FIX: an email can contain more than one distinct
+    # job posting. parse_requirements() (plural) splits the body into
+    # candidate blocks only when there's strong evidence of more than one
+    # posting — otherwise it returns exactly the single (parsed, body)
+    # pair parse_requirement() alone would have, so single-requirement
+    # emails behave identically to before. See parser.py for details.
+    parsed_items = parse_requirements(subject, body, headers)
 
     # ---------------------------------------------------------------------------
-    # Task 4: Clean the JD text
-    # ---------------------------------------------------------------------------
-    cleaned_jd = clean_requirement_text(body)
-
-    # ---------------------------------------------------------------------------
-    # Task 5: Dedup and save requirement
+    # Task 4/5: Clean each requirement's own JD text and save it
     # ---------------------------------------------------------------------------
     # Use the caller-supplied gmail_emails.id if we have it. Do NOT fall back
-    # to emails.id here — that was the source of the FK violation.
-    result = await save_requirement(
-        db=db,
-        parsed=parsed,
-        cleaned_jd=cleaned_jd,
-        raw_email_id=raw_email_id,
-        received_date=gmail_msg.get("received_at"),  # BUG FIX: was never passed through — column stayed NULL forever
-    )
+    # to emails.id here — that was the source of the FK violation. Every
+    # requirement pulled from this email shares the same raw_email_id —
+    # there's no unique constraint on that column (dedup is keyed on
+    # vendor_email|role|jd_hash instead), so multiple rows per email are
+    # already safe to create.
+    saved_results = []
+    for parsed, segment_text in parsed_items:
+        cleaned_jd = clean_requirement_text(segment_text)
+        result = await save_requirement(
+            db=db,
+            parsed=parsed,
+            cleaned_jd=cleaned_jd,
+            raw_email_id=raw_email_id,
+            received_date=gmail_msg.get("received_at"),  # BUG FIX: was never passed through — column stayed NULL forever
+        )
+        saved_results.append(result)
+
+    # BACKWARD COMPATIBILITY: existing callers of process_email() (see
+    # phase2.py's /api/pipeline/process-email) read result["requirement_status"]
+    # and result["requirement_id"] as singular values. For the overwhelmingly
+    # common single-requirement case (len(saved_results) == 1) these fields
+    # behave exactly as before. When an email really did contain multiple
+    # postings, requirement_status/requirement_id reflect the FIRST one
+    # saved (so nothing downstream breaks or crashes on an unexpected
+    # shape), and the full set is additionally available under
+    # "all_requirement_ids" for any caller that wants to know about the rest.
+    first_result = saved_results[0] if saved_results else {"status": "skipped", "id": None}
 
     return {
         "email_status": email_status,
-        "requirement_status": result["status"],
-        "requirement_id": result["id"],
+        "requirement_status": first_result["status"],
+        "requirement_id": first_result["id"],
+        "all_requirement_ids": [r["id"] for r in saved_results if r.get("id") is not None],
+        "requirement_count": len(saved_results),
     }
