@@ -128,6 +128,26 @@ class Consultant(Base):
     # base_resume_file_path) keep working unchanged.
     base_resume_content = JSONBColumn(nullable=True)
     resume_rich_text = Column(Text, nullable=True)
+    # MIGRATION REQUIRED — ALTER TABLE consultants ADD COLUMN last_profile_write_seq BIGINT;
+    # BUG FIX ("switching quickly between Work Auth options sometimes ends
+    # up on the wrong one"): WorkAuthSelect.tsx's AbortController logic
+    # (and the identical pattern in ProfileForm/SkillTagInput/
+    # EmploymentTypeCheckboxGroup) only cancels the CLIENT's interest in a
+    # superseded request's response — it does not, and cannot, guarantee
+    # the backend stops processing a request already in flight, or that
+    # requests are received/committed in the same order they were sent.
+    # Three rapid PUT /api/consultant/profile calls can genuinely finish
+    # their DB writes out of order (ordinary network jitter is enough),
+    # so the request for an EARLIER click can commit AFTER the request for
+    # the LATEST click, silently leaving the DB (and the next profile
+    # load) on the wrong value even though the abort logic worked exactly
+    # as designed. Each request now carries a client-generated, strictly
+    # increasing sequence number (Date.now() at click time); the server
+    # only applies a write if it's newer than the last one it committed,
+    # so an out-of-order late arrival is dropped instead of clobbering a
+    # newer value. See ProfileUpdateRequest.clientWriteSeq / 
+    # update_own_profile below.
+    last_profile_write_seq = Column(BigInteger, nullable=True)
     gmail_connected = Column(Boolean, nullable=False, default=False)
     ats_score = Column(Numeric(5, 2), default=0)
     status = Column(Text, nullable=False, default="ACTIVE")

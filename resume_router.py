@@ -51,6 +51,22 @@ def _run_background(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
+# PERMANENT FIX ("QueuePool limit ... connection timed out" under rapid
+# repeated saves): sync_base_resume_text fires a NEW background DOCX-
+# regen task — its own DB session, held open for the whole build+upload
+# — on every single profile/experience save, with nothing to stop
+# several of these stacking up concurrently for the same consultant if
+# they save a few times in quick succession (exactly what happened
+# across this session's heavy testing). Only the LATEST save's data
+# actually matters — a still-running regen will pick up whatever's most
+# recently committed by the time it queries anyway — so N rapid saves
+# only ever need at most one more regen after the last one, not N
+# separate overlapping ones each holding their own connection. Tracking
+# which consultant_ids currently have a regen in flight lets a redundant
+# trigger skip cleanly instead of piling on and exhausting the pool.
+_regen_in_flight: set[int] = set()
+
+
 class ResumeCreateRequest(BaseModel):
     title: str
     target_role: Optional[str] = None
@@ -1414,13 +1430,27 @@ def _build_base_career_objective(consultant: Consultant) -> str:
     return " ".join(p for p in (line_a, line_b, line_c) if p)
 
 
-async def build_base_resume_content(db: AsyncSession, consultant: Consultant) -> dict:
+async def build_base_resume_content(
+    db: AsyncSession,
+    consultant: Consultant,
+    resume_info: Optional[dict] = None,
+) -> dict:
     """Overlay the profile-derived fields (Skills, Experience, Education,
     Name/Phone/Location/LinkedIn) fresh from Consultant/ConsultantExperience/
     User.resume_info onto whatever resume-only extras (Certifications,
     career objective wording, etc.) were previously saved. This is the
     single source of truth both GET /base/content and the auto-sync below
-    use — nothing here is ever read from a stale cached blob."""
+    use — nothing here is ever read from a stale cached blob.
+
+    PERF FIX ("saving profile takes a long time"): callers that already
+    have the just-written resume_info in hand (phase3.py's
+    update_own_profile sets current_user.resume_info a few lines before
+    calling this, in the same request) can now pass it directly instead
+    of this function re-querying User.resume_info from the database —
+    a full extra DB round-trip on every single profile save for data the
+    caller already has in memory. Callers without it in hand (the
+    background regen task in sync_base_resume_text below, GET
+    /base/content) simply omit it and get the old DB-fetch behavior."""
     extra_content = dict(consultant.base_resume_content or {})
     for _stale_key in (
         "name", "email", "phone", "location", "linkedin",
@@ -1429,10 +1459,11 @@ async def build_base_resume_content(db: AsyncSession, consultant: Consultant) ->
     ):
         extra_content.pop(_stale_key, None)
 
-    resume_info: dict = {}
-    if consultant.user_id:
-        info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
-        resume_info = info_result.scalar_one_or_none() or {}
+    if resume_info is None:
+        resume_info = {}
+        if consultant.user_id:
+            info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
+            resume_info = info_result.scalar_one_or_none() or {}
     summary_text = resume_info.get("summary") or _build_base_career_objective(consultant)
 
     technical_proficiencies = []
@@ -1544,7 +1575,11 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
         )
 
 
-async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> None:
+async def sync_base_resume_text(
+    db: AsyncSession,
+    consultant: Consultant,
+    resume_info: Optional[dict] = None,
+) -> None:
     """Regenerate and stage consultant.base_resume_text from CURRENT
     profile fields — called by phase3.py whenever Skills, Experience,
     Education, or contact info changes on My Profile, so base_resume_text
@@ -1552,6 +1587,14 @@ async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> Non
     scoring) never sits stale waiting for someone to manually open and
     save the Base Resume editor. Stages the change on consultant only —
     caller still owns db.commit().
+
+    PERF FIX ("saving profile takes a long time"): accepts the caller's
+    already-in-hand resume_info (see build_base_resume_content above) so
+    the synchronous save path skips a redundant DB round-trip. Passed
+    through only to the foreground build below — the background regen
+    task re-fetches its own consultant row from a separate session
+    anyway, so it re-queries resume_info there rather than trying to
+    carry this dict across sessions.
 
     BUG FIX ("edit Full Name on My Profile, View still shows the old
     name"): this used to only update base_resume_text (the flat text used
@@ -1568,24 +1611,56 @@ async def sync_base_resume_text(db: AsyncSession, consultant: Consultant) -> Non
     shouldn't have to wait on synchronously, same reasoning already
     applied to the re-matching background task in phase3.py's
     update_own_profile."""
-    content = await build_base_resume_content(db, consultant)
+    content = await build_base_resume_content(db, consultant, resume_info)
     consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
 
     consultant_id = consultant.id
 
     async def _regen_in_background(cid: int):
-        from database import AsyncSessionLocal
-        async with AsyncSessionLocal() as bg_session:
-            bg_consultant_result = await bg_session.execute(
-                select(Consultant).where(Consultant.id == cid)
+        # BUG FIX ("Task exception was never retrieved" / unhandled
+        # sqlalchemy.exc.TimeoutError crashing this fire-and-forget task
+        # silently): _regenerate_base_resume_docx_file already wraps ITS
+        # own logic in a try/except, but that only covers the DOCX
+        # build/upload step — the very first line here (opening the
+        # session and fetching the consultant) was completely
+        # unprotected. Nothing awaits or checks the result of this task
+        # (see _run_background above), so any exception at that first
+        # step — a connection-pool timeout under load, a transient DB
+        # blip, anything — propagated all the way up unhandled and only
+        # ever surfaced as an opaque asyncio "Task exception was never
+        # retrieved" warning with no entry in error_logger, instead of
+        # being logged the same way every other background failure in
+        # this codebase already is.
+        try:
+            from database import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_session:
+                bg_consultant_result = await bg_session.execute(
+                    select(Consultant).where(Consultant.id == cid)
+                )
+                bg_consultant = bg_consultant_result.scalars().first()
+                if not bg_consultant:
+                    return
+                bg_content = await build_base_resume_content(bg_session, bg_consultant)
+                await _regenerate_base_resume_docx_file(bg_session, bg_consultant, bg_content)
+        except Exception as e:
+            print(f"Background base resume regen failed to even start for consultant {cid}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="base_resume_docx_regen_background_setup",
+                error=e,
+                source_type="consultant",
+                source_id=str(cid),
             )
-            bg_consultant = bg_consultant_result.scalars().first()
-            if not bg_consultant:
-                return
-            bg_content = await build_base_resume_content(bg_session, bg_consultant)
-            await _regenerate_base_resume_docx_file(bg_session, bg_consultant, bg_content)
+        finally:
+            _regen_in_flight.discard(cid)
 
-    _run_background(_regen_in_background(consultant_id))
+    # PERMANENT FIX ("QueuePool limit ... connection timed out" under
+    # rapid repeated saves): see _regen_in_flight's definition above —
+    # skip firing a redundant overlapping regen for a consultant who
+    # already has one in flight, rather than stacking DB sessions.
+    if consultant_id not in _regen_in_flight:
+        _regen_in_flight.add(consultant_id)
+        _run_background(_regen_in_background(consultant_id))
 
 
 @router.get("/base/content", response_model=BaseResumeContentDTO)

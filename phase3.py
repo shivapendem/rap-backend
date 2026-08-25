@@ -180,6 +180,13 @@ class ProfileUpdateRequest(BaseModel):
     summary: Optional[str] = None
     education: List[EducationEntryRequest] = Field(..., min_length=1)
     resumeRichText: Optional[str] = None
+    # BUG FIX ("switching quickly between Work Auth options sometimes
+    # ends up on the wrong one"): client-generated, strictly increasing
+    # write sequence (Date.now() at click time) — see
+    # Consultant.last_profile_write_seq in models.py for why this exists.
+    # Optional so any caller that doesn't send it just skips the
+    # staleness check (old behavior).
+    clientWriteSeq: Optional[int] = None
 
     # BUG FIX: workAuth is now required (str, not Optional[str], above) —
     # this validator's `v is not None` branch is unreachable now, since
@@ -852,6 +859,25 @@ async def update_own_profile(
     _require_role(current_user, "CONSULTANT")
     consultant = await _get_consultant_for_user(db, current_user)
 
+    # BUG FIX ("switching quickly between Work Auth options sometimes
+    # ends up on the wrong one"): see Consultant.last_profile_write_seq in
+    # models.py. If this request's sequence number is older than the last
+    # one this consultant's row actually committed, a later click's
+    # request already won — applying this one now would silently revert
+    # that newer value just because this slower request happened to
+    # arrive last. Drop it and hand back the current (already-newer)
+    # state instead of overwriting it.
+    if (
+        payload.clientWriteSeq is not None
+        and consultant.last_profile_write_seq is not None
+        and payload.clientWriteSeq <= consultant.last_profile_write_seq
+    ):
+        count_result = await db.execute(
+            select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
+        )
+        exp_count = count_result.scalar_one()
+        return await _consultant_to_profile_response(db, consultant, exp_count)
+
     consultant.full_name = payload.fullName
     consultant.current_location = payload.location
     consultant.phone = payload.phone
@@ -899,11 +925,23 @@ async def update_own_profile(
     })
     current_user.resume_info = existing_info
 
+    # Record this request as the newest committed write for the
+    # out-of-order-write guard above, so any still-in-flight OLDER
+    # request that lands after this one gets dropped instead of
+    # reverting this value.
+    if payload.clientWriteSeq is not None:
+        consultant.last_profile_write_seq = payload.clientWriteSeq
+
     # Regenerate base_resume_text right away — matching_router.py and the
     # completeness check both read it, and neither should have to wait
     # for a manual visit to the Base Resume editor to see this save.
+    # PERF FIX ("saving profile takes a long time"): pass existing_info
+    # (the resume_info we just built above) straight through instead of
+    # letting sync_base_resume_text re-query User.resume_info from the
+    # DB — we already have it in memory, so that query was pure wasted
+    # round-trip latency on every save.
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, existing_info)
 
     await db.commit()
     await db.refresh(consultant)

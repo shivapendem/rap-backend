@@ -1,8 +1,9 @@
 import os
 import json
 import re
+import time
 from typing import Optional
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError, BadRequestError, PermissionDeniedError
 import logging
 import traceback
 from dotenv import load_dotenv
@@ -10,6 +11,60 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# PERF/BUG FIX ("saving profile takes a long time" / "Failed to save —
+# changes rolled back", root cause traced to a stuck ANTHROPIC_API_KEY):
+# update_own_profile's background re-matching task (see phase3.py) calls
+# evaluate_role_match_with_ai / parse_requirement_text below ONCE PER
+# consultant/requirement pair being compared. When the API key is invalid,
+# the account is out of credits, or a bad model name is configured, every
+# single one of those calls still makes a real network round-trip to
+# Anthropic before failing — dozens or hundreds of them per matching run,
+# each with its own latency. That background task holds one of only 2
+# available DB connections per worker open for its ENTIRE duration (see
+# database.py's DB_POOL_SIZE), so a matching run stretched out by a wall
+# of doomed API calls can starve the connection pool for everything else
+# running concurrently — including the actual profile-save request
+# itself, which is how an unrelated, purely-cosmetic "AI matching"
+# background feature ended up causing "Work Auth save" to hang for 20+
+# seconds and roll back.
+#
+# A bad key/credits/model doesn't fix itself between one call and the
+# next a few milliseconds later — so once ANY call hits one of these
+# specific, unambiguous "this key/account/config cannot currently make
+# calls" errors, skip every further Claude call for a cooldown window
+# instead of retrying each one individually. Falls back to whatever the
+# caller already does on a None/failed result (these are all "best
+# effort, degrade gracefully" call sites), so behavior on a genuinely
+# broken key is unchanged except for speed — it now fails fast instead
+# of failing slow, hundreds of times in a row.
+_CLAUDE_CIRCUIT_BROKEN_UNTIL: float = 0.0
+_CLAUDE_CIRCUIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+
+def _claude_circuit_is_open() -> bool:
+    return time.monotonic() < _CLAUDE_CIRCUIT_BROKEN_UNTIL
+
+
+def _trip_claude_circuit(reason: str) -> None:
+    global _CLAUDE_CIRCUIT_BROKEN_UNTIL
+    _CLAUDE_CIRCUIT_BROKEN_UNTIL = time.monotonic() + _CLAUDE_CIRCUIT_COOLDOWN_SECONDS
+    logger.warning(
+        "Anthropic API circuit breaker tripped (%s) — skipping further "
+        "Claude calls for %ss instead of retrying each one individually.",
+        reason, _CLAUDE_CIRCUIT_COOLDOWN_SECONDS,
+    )
+
+
+def _is_hard_claude_failure(exc: Exception) -> bool:
+    """True for errors that mean 'this key/account cannot make calls right
+    now', not a one-off network blip — auth failures, and the specific
+    invalid_request_error Anthropic returns for an empty credit balance."""
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return True
+    if isinstance(exc, BadRequestError):
+        return "credit balance" in str(exc).lower()
+    return False
 
 def get_working_anthropic_client():
     """
@@ -1151,6 +1206,8 @@ def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
     if not api_key or api_key.startswith("your_"):
         logger.warning("ANTHROPIC_API_KEY not found, returning None for parse_requirement_text.")
         return None
+    if _claude_circuit_is_open():
+        return None
 
     try:
         from anthropic import Anthropic
@@ -1195,7 +1252,10 @@ def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
             _REQUIREMENT_CACHE.set(content_hash, final_dict)
         return final_dict
     except Exception as e:
-        logger.warning(f"Error calling Claude API for requirement parsing: {e}")
+        if _is_hard_claude_failure(e):
+            _trip_claude_circuit(f"requirement parsing: {e}")
+        else:
+            logger.warning(f"Error calling Claude API for requirement parsing: {e}")
         return None
 
 
@@ -1216,7 +1276,9 @@ def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[st
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key or api_key.startswith("your_"):
         return None
-    
+    if _claude_circuit_is_open():
+        return None
+
     if not consultant_roles:
         return 50.0
 
@@ -1227,7 +1289,16 @@ def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[st
         user_prompt = f"Requirement Role: {requirement_role}\\nConsultant Roles: {', '.join(consultant_roles)}\\nEvaluate the match."
         
         response = client.messages.with_raw_response.create(
-            model="claude-haiku-3-5", # Use a faster, cheaper model for evaluation
+            # BUG FIX ("Error calling Claude API for role matching: 404 -
+            # model: claude-haiku-3-5"): this model ID was never valid —
+            # not a deprecated/renamed model, a plain typo/placeholder
+            # that 404'd on every single call, every time this ran (which
+            # is every profile save's background re-matching — see
+            # phase3.py's update_own_profile). The current Haiku model ID
+            # requires its full date suffix (a bare "claude-haiku-4-5"
+            # also 404s) — this restores the original "faster, cheaper
+            # model" intent rather than falling back to Sonnet.
+            model="claude-haiku-4-5-20251001",
             max_tokens=100,
             system=ROLE_MATCH_SYSTEM_PROMPT,
             messages=[
@@ -1244,10 +1315,24 @@ def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[st
             content = content[3:]
         if content.endswith("```"):
             content = content[:-3]
-            
-        result_json = json.loads(content.strip())
+
+        # BUG FIX ("Error calling Claude API for role matching: Extra
+        # data: line 2 column 1"): json.loads() requires the ENTIRE
+        # string to be nothing but the JSON object — it fails the moment
+        # anything else follows it, even a trailing newline plus a short
+        # aside. Despite the system prompt saying "Return ONLY a valid
+        # JSON object", claude-haiku-4-5-20251001 sometimes appends a
+        # short line after the JSON anyway. JSONDecoder.raw_decode()
+        # parses just the first valid JSON value starting at position 0
+        # and ignores whatever comes after it, so a well-formed
+        # {"score": N} followed by extra text still parses successfully
+        # instead of failing outright.
+        result_json, _ = json.JSONDecoder().raw_decode(content.strip())
         score = float(result_json.get("score", 50.0))
         return score
     except Exception as e:
-        logger.warning(f"Error calling Claude API for role matching: {e}")
+        if _is_hard_claude_failure(e):
+            _trip_claude_circuit(f"role matching: {e}")
+        else:
+            logger.warning(f"Error calling Claude API for role matching: {e}")
         return None
