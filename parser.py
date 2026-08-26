@@ -1045,6 +1045,11 @@ def extract_vendor_contact(
                         vendor_name = vendor_name.split(',')[0].strip()
                 elif '@' not in from_header:
                     vendor_name = from_header.strip().strip('"\'').split(',')[0].strip()
+                
+                if not vendor_name and vendor_email:
+                    domain_match = re.search(r'@([^.]+)\.', vendor_email)
+                    if domain_match:
+                        vendor_name = domain_match.group(1).capitalize()
     phone = None
     if body:
         phone_match = PHONE_PATTERN.search(body)
@@ -1072,16 +1077,19 @@ def calculate_confidence(parsed: Dict[str, Any]) -> float:
     """
     if not parsed:
         return 0.0
-    important_fields = ['client', 'location', 'rate', 'employment_types', 'role']
+    
+    important_fields = ['client', 'location', 'rate', 'employment_types', 'role', 'must_have_skills']
     valid_fields = 0
+    
     for field in important_fields:
         value = parsed.get(field)
-        if field == 'employment_types':
-            if value and value != ['UNKNOWN']:
+        if field == 'employment_types' or field == 'must_have_skills':
+            if value and isinstance(value, list) and value != ['UNKNOWN']:
                 valid_fields += 1
         else:
             if value and value != 'UNKNOWN' and not is_email_body(str(value)):
                 valid_fields += 1
+                
     if parsed.get('role') and parsed['role'] != 'UNKNOWN':
         if valid_fields >= 1:
             return min(round(valid_fields / len(important_fields), 2), 1.0)
@@ -1199,14 +1207,9 @@ def clean_location(location: Optional[str]) -> Optional[str]:
                 if mode_idx != -1 and mode_idx < pref_m.start() and (city_idx == -1 or city_idx >= pref_m.start()):
                     return f"{mode} (pref: {city_state})"
         return city_state
-    # Keyword fallbacks — only reached when no city was found
-    low = location_no_paren.lower()
-    if 'remote' in low:
-        return 'Remote'
-    if 'hybrid' in low:
-        return 'Hybrid'
-    if 'onsite' in low or 'on-site' in low or 'on site' in low:
-        return 'Onsite'
+    # If it contains a keyword but no city was found, we still want to 
+    # return the original location string to retain extra details (e.g. 
+    # 'Hybrid - New Jersey') instead of collapsing it to just 'Hybrid'.
     if len(location) > 50:
         location = location[:47] + '...'
     return location or None
@@ -1524,6 +1527,12 @@ def parse_requirement(
                 vendor_name = vendor_name.split(',')[0].strip()
         elif '@' not in from_header:
             vendor_name = from_header.strip().strip('"\'').split(',')[0].strip()
+
+    # Fallback: if missed from header, extract from email domain (never the body)
+    if not vendor_name and vendor_email:
+        domain_match = re.search(r'@([^.]+)\.', vendor_email)
+        if domain_match:
+            vendor_name = domain_match.group(1).capitalize()
 
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email

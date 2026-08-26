@@ -250,6 +250,7 @@ CRITICAL STANDARDS & INSTRUCTIONS:
      Incorrect: "...expertise in Spring Boot, microservices, AWS, and Kubernetes." — AWS and Kubernetes aren't supported by the profile and must not be claimed.
 
    Also strategically align experience role titles (`role`) and bullet points so they reflect the target domain while keeping authentic company names and dates unchanged.
+   **IMPORTANT FOR JOB TITLES**: Do NOT use the exact same job title for every single experience. Vary the job titles dynamically (e.g. Senior Software Engineer, Lead Developer, Software Engineer, Backend Developer) based on the target role and the progression of the candidate's actual experience. Ensure they are relevant but distinct so they do not all look identical.
 
 3. DETAILED CONTEXT & STRICT TRUTHFULNESS (applies to every section, not just Career Objective):
    - Generate detailed bullet points following: [Action Verb] + [Specific Tech Stack / Frameworks] + [Business / System Context] + [Quantified Impact Metric].

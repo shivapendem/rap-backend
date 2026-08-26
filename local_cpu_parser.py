@@ -135,10 +135,14 @@ def parse_requirement_local(subject: str, body: str) -> Optional[dict]:
     logger.info(f"Local CPU parser succeeded! Title: {title}, Skills: {len(skills)}")
 
     return {
-        "title": title,
-        "skills": skills,
+        "role": title,
+        "client": None,
         "location": location,
-        "employment_type": emp_type,
-        "work_mode": work_mode,
-        "experience_years_required": exp_years
+        "rate": None,
+        "duration": None,
+        "work_mode": work_mode.upper() if work_mode else None,
+        "employment_types": [emp_type.upper()] if emp_type else [],
+        "experience_years_required": exp_years,
+        "must_have_skills": skills,
+        "good_to_have_skills": []
     }
