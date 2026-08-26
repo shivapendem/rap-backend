@@ -1073,3 +1073,4 @@ LEFT OUTER JOIN requirements r ON r.id = a.requirement_id
 LEFT OUTER JOIN consultants c ON c.id = a.consultant_id
 LEFT OUTER JOIN users u ON u.id = a.recruiter_id;
 
+CREATE INDEX concurrently IF NOT EXISTS idx_requirements_received_date ON requirements (received_date DESC);

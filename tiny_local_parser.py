@@ -66,22 +66,19 @@ def parse_requirement_tiny(subject: str, body: str) -> Optional[dict]:
     try:
         user_prompt = f"SUBJECT: {subject}\n\nBODY: {body}"
         
-        # We format it in ChatML for Qwen
-        prompt = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
-        
-        response = llm(
-            prompt,
-            max_tokens=1500, # Increased tokens to prevent JSON truncation
-            temperature=0.1,
-            stop=["<|im_end|>"]
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={
+                "type": "json_object",
+            },
+            max_tokens=1500,
+            temperature=0.1
         )
         
-        content = response["choices"][0]["text"].strip()
-        
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
+        content = response["choices"][0]["message"]["content"].strip()
             
         parsed = json.loads(content)
         parsed["parsing_model"] = f"Tiny Local LLM (Qwen 0.5B)"

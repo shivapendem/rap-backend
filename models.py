@@ -290,7 +290,7 @@ class Requirement(Base):
     parse_confidence = Column(Numeric(5, 2), default=0)
     ats_match_count = Column(Integer, default=0)
     status = Column(Text, nullable=False, default="NEW")
-    received_date = Column(TIMESTAMP(timezone=True), nullable=True)
+    received_date = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

@@ -961,6 +961,9 @@ async def get_requirements(
             )
         )
 
+    if not date_from:
+        date_from = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+
     if date_from:
         try:
             from datetime import time
