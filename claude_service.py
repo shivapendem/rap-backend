@@ -243,6 +243,7 @@ CRITICAL STANDARDS & INSTRUCTIONS:
      (c) Name the 2-3 top matching skills identified in Step 4 — skills that exist in BOTH the candidate's profile AND the JD.
      (d) Close with one sentence on the specific value the candidate brings, tied to a goal or pain point evident in the JD (e.g. reliability, delivery speed, scale, cost, quality) — grounded in what the candidate's profile actually supports, not a generic claim.
    Keep it ATS-friendly and professional: no fluff, no generic filler phrases ("highly motivated", "team player", "results-oriented"), no keyword stuffing. Do not simply copy sentences from the JD — understand it and incorporate relevant requirements naturally.
+   Vary sentence structure and word choice across different candidates/JDs — do not default to the same opening pattern (e.g. always "[Title] with [N]+ years of experience...") every single time. Write it the way a specific, genuine person in this exact role would describe themselves for this exact opportunity, not a template with fields swapped in.
 
    TRUTHFULNESS RULE: only use skills, experience, technologies, responsibilities, projects, and achievements the candidate's actual profile supports. If the JD wants a skill the profile doesn't have: do NOT claim it, do NOT add it to the objective, do NOT invent experience with it, do NOT inflate years of experience.
      Example — JD wants: Java, Spring Boot, AWS, Kubernetes. Profile has: Java, Spring Boot, Microservices.
@@ -676,6 +677,23 @@ def _extract_role_hint(job_description: str) -> Optional[str]:
     return role[:80] if role else None
 
 
+def _pick_index(seed_text: str, pool_size: int) -> int:
+    """Deterministically picks one of `pool_size` equivalent phrasing
+    options from a hash of `seed_text` (e.g. the JD + matched skills).
+    Deterministic (not random) so re-generating the same resume for the
+    same requirement is stable/reproducible, while different JDs or
+    different candidates land on different phrasing — avoiding the
+    "every fallback objective reads like a copy-pasted template" problem
+    without introducing actual randomness into a code path that's
+    otherwise fully deterministic.
+    """
+    import hashlib
+    if pool_size <= 1:
+        return 0
+    digest = hashlib.md5(seed_text.encode("utf-8")).hexdigest()
+    return int(digest, 16) % pool_size
+
+
 def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str:
     """Appends a short, factual line tying the Career Objective to THIS
     specific job requirement — so it's never byte-identical to the base
@@ -692,6 +710,12 @@ def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str
     real requirement data, not a fabrication, and differs per requirement
     by construction. Only returns "" if neither is available at all.
 
+    Sentence wording is picked from a small pool of equivalent phrasings
+    (deterministically, via a hash of the skills+JD) rather than always
+    using the same fixed sentence — so two different requirements for the
+    same candidate don't read as a copy-pasted template even when the
+    matched skills are similar.
+
     The returned sentence is wrapped in _MARK_OPEN/_MARK_CLOSE — this is
     the only actually-new text being appended to an existing stored
     summary, so it's the only part that should render highlighted.
@@ -702,11 +726,22 @@ def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str
     overlapping = [s for s in (real_skills or []) if s and s.lower() in jd_lower]
     if overlapping:
         top = overlapping[:5]
-        sentence = f"This experience directly aligns with the target role's emphasis on {', '.join(top)}."
+        skills_str = ", ".join(top)
+        templates = [
+            f"This experience directly aligns with the target role's emphasis on {skills_str}.",
+            f"These strengths map closely to what this position requires, particularly {skills_str}.",
+            f"Well positioned for this opportunity given hands-on depth in {skills_str}.",
+        ]
+        sentence = templates[_pick_index(job_description + skills_str, len(templates))]
         return _MARK_OPEN + _bold_terms(sentence, top) + _MARK_CLOSE
     role_hint = _extract_role_hint(job_description)
     if role_hint:
-        sentence = f"Excited to bring this background to the {role_hint} opportunity."
+        templates = [
+            f"Excited to bring this background to the {role_hint} opportunity.",
+            f"Looking forward to applying this experience to the {role_hint} role.",
+            f"A strong fit for the {role_hint} opening based on this track record.",
+        ]
+        sentence = templates[_pick_index(job_description + role_hint, len(templates))]
         return _MARK_OPEN + _bold_terms(sentence, [role_hint]) + _MARK_CLOSE
     # Last resort: neither a skill overlap nor a "Role:"-style line was
     # found. Rather than give up and leave the objective frozen, quote a
@@ -757,37 +792,108 @@ def _match_skills_against_jd(real_skills: list, job_description: str) -> tuple[l
     return exact, related
 
 
+def _compute_missing_jd_skills(real_skills: list, job_description: str, limit: int = 8) -> list:
+    """Returns JD-requested skills the candidate's real skill list doesn't
+    have — for the resume's separate `missing_skills` gap-analysis box,
+    never for the `skills`/`technical_proficiencies` box itself. This
+    never claims the candidate has these skills; it's the opposite — an
+    honest list of what's asked for and absent, using phase4.py's own
+    JD skill extractor (best-effort; returns [] if that's unavailable).
+    """
+    if not job_description:
+        return []
+    try:
+        from phase4 import extract_skills as _extract_jd_skills
+        jd_all = [s for s in _extract_jd_skills(job_description) if s]
+    except Exception:
+        return []
+    real_lower = {s.lower() for s in (real_skills or []) if s}
+    missing, seen = [], set()
+    for s in jd_all:
+        key = s.strip().lower()
+        if key and key not in real_lower and key not in seen:
+            seen.add(key)
+            missing.append(s.strip())
+    return missing[:limit]
+
+
+def _join_natural(items: list) -> str:
+    """Joins a list into 'A, B, and C' / 'A and B' / 'A' — natural prose
+    joining instead of a bare comma list, used for skills mentioned
+    inside a flowing paragraph rather than a bullet-style field."""
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _find_best_matching_experience(experience: list, jd_skills_lower: set) -> Optional[dict]:
+    """Picks whichever real experience entry's role/description/bullets
+    overlap the JD's matched skills the most, so the paragraph anchors
+    on the job actually most relevant to this JD. Falls back to the
+    most recent entry (index 0) when no entry has any overlap — never
+    invents an experience, only selects among what's genuinely in the
+    candidate's own profile."""
+    if not experience:
+        return None
+    best, best_score = None, -1
+    for exp in experience:
+        if not isinstance(exp, dict):
+            continue
+        text = " ".join([
+            str(exp.get("role") or exp.get("title") or ""),
+            str(exp.get("description") or ""),
+            " ".join(str(b) for b in (exp.get("bullets") or [])),
+        ]).lower()
+        score = sum(1 for skill in jd_skills_lower if skill in text)
+        if score > best_score:
+            best_score, best = score, exp
+    if best_score > 0:
+        return best
+    first = experience[0]
+    return first if isinstance(first, dict) else None
+
+
 def _build_factual_career_objective(
     resume_info: dict, real_skills: list, job_description: str, target_role: Optional[str] = None
 ) -> str:
-    """Constructs a plain, factual 2-3 line career objective from only real
-    profile data (title, years of experience, domain, real skills) — used
-    when there's no stored summary AND the AI call itself failed (so
-    there's no real tailored objective either). Never invents a job title,
-    employer, or achievement the profile doesn't actually have; only
-    states facts already present in resume_info / target_role, same
-    anti-fabrication rule the rest of this fallback already follows.
+    """Constructs a single flowing paragraph career objective from only
+    real profile data — no AI call, pure deterministic templating — used
+    when there's no stored summary AND the real Claude call itself
+    failed. Never invents a job title, employer, or achievement the
+    profile doesn't actually have.
 
-    Follows the same 4-part structure the AI prompt is instructed to use:
-    (a) exact JD designation/title, (b) years of experience + core domain
-    — now drawn from the candidate's actual work experience (most recent
-    role/employer) when resume_info doesn't have an explicit domain field,
-    not just a bare years count, (c) top skills that exist in BOTH the
-    profile and the JD — both exact matches AND skills in the same
-    technology family (e.g. "Azure Data Factory" counts as related to a
-    JD asking for "ETL", via phase4.py's same SKILL_ALIASES groups used
-    for real matching), (d) one value-proposition line. `target_role` —
-    the requirement's actual title field — is authoritative when
-    supplied; only falls back to sniffing a "Role:"-style line out of the
-    free-text JD when it isn't.
+    Follows a fixed 5-part paragraph structure (the same shape approved
+    for the "Case 1" example):
+      1) Opener — role + years of experience
+      2) Anchor — one concrete, real fact pulled from whichever actual
+         experience entry best overlaps this JD's matched skills (falls
+         back to the most recent entry when nothing overlaps)
+      3) JD-matched skills named explicitly, in natural prose — both
+         exact matches and same-technology-family related skills (via
+         phase4.py's SKILL_ALIASES, same grouping the real matching
+         engine uses)
+      4) An honest gap clause naming up to 2 JD-requested skills the
+         candidate's own profile doesn't have — never hidden or glossed
+         over — only added when there IS a real skill match to sit
+         alongside it, so it reads as an honest caveat, not a standalone
+         admission
+      5) Closing line tying the above back to this specific role
+
+    Each line is chosen from a small pool of equivalent phrasings (via
+    _pick_index, deterministic per candidate+JD) so the paragraph reads
+    as genuinely written rather than one fixed template with fields
+    swapped in, while staying fully reproducible for the same pair.
     """
     years = resume_info.get("years_experience") or resume_info.get("total_experience_years")
     domain = resume_info.get("domain") or resume_info.get("core_domain")
     all_skills = [s for s in (real_skills or []) if s]
 
     exact_matched, related_matched = _match_skills_against_jd(all_skills, job_description)
-    # Exact matches lead (they're the strongest signal); related ones fill
-    # out the remainder, capped so the objective stays 2-3 lines.
     top_skills = (exact_matched + [s for s in related_matched if s not in exact_matched])[:5]
 
     years_str = None
@@ -799,52 +905,81 @@ def _build_factual_career_objective(
             years_str = None
 
     role = target_role or _extract_role_hint(job_description)
-
-    # Line (a) + (b): title, years, domain — falls back to the candidate's
-    # most recent real work experience (role + employer) when no explicit
-    # domain field is stored, so the objective reflects actual experience
-    # instead of just a bare years count.
-    recent_role_context = None
     experience = resume_info.get("experience") or []
-    if not domain and experience:
-        recent = experience[0] if isinstance(experience, list) else None
-        if recent:
-            recent_title = recent.get("role") or recent.get("title")
-            recent_employer = recent.get("company") or recent.get("client")
-            if recent_title and recent_employer:
-                recent_role_context = f"most recently as {recent_title} at {recent_employer}"
-            elif recent_title:
-                recent_role_context = f"most recently as {recent_title}"
+    jd_skills_lower = {s.lower() for s in top_skills}
+    anchor_exp = _find_best_matching_experience(experience, jd_skills_lower)
 
-    opener_bits = []
-    if role:
-        opener_bits.append(role)
-    if years_str:
-        opener_bits.append(f"with {years_str} of experience" if role else f"Technology professional with {years_str} of experience")
-    if domain:
-        opener_bits.append(f"in {domain}")
-    elif recent_role_context:
-        opener_bits.append(recent_role_context)
-    if opener_bits:
-        line_a = " ".join(opener_bits).strip() + "."
+    seed = f"{role}|{years_str}|{domain}|{','.join(top_skills)}|{job_description[:200]}"
+
+    # --- 1) Opener ---
+    if role and years_str:
+        opener_templates = [
+            f"{role} with {years_str} of experience designing and delivering {domain or 'production'} systems.",
+            f"Experienced {role} with {years_str} of hands-on delivery in {domain or 'software engineering'}.",
+        ]
+    elif role:
+        opener_templates = [f"{role} with hands-on professional experience."]
+    elif years_str:
+        opener_templates = [f"Technology professional with {years_str} of experience in {domain or 'software engineering'}."]
     else:
-        line_a = "Technology professional."
+        opener_templates = ["Technology professional with hands-on delivery experience."]
+    line_1 = opener_templates[_pick_index(seed + "1", len(opener_templates))]
 
-    # Line (c): top matching skills — exact + related — only if there's
-    # real overlap.
-    line_b = f"Skilled in {', '.join(top_skills)}." if top_skills else ""
+    # --- 2) Anchor — real company + a real bullet/role, preferring a
+    # bullet that itself mentions one of the matched skills ---
+    line_2 = ""
+    if anchor_exp:
+        company = anchor_exp.get("client") or anchor_exp.get("company") or ""
+        bullets = anchor_exp.get("bullets") or []
+        achievement = next(
+            (b for b in bullets if any(skill in str(b).lower() for skill in jd_skills_lower)),
+            bullets[0] if bullets else None,
+        )
+        if company and achievement:
+            rest = str(achievement).strip().rstrip(".")
+            rest = (rest[0].lower() + rest[1:]) if rest else rest
+            line_2 = f"At {company}, {rest}."
+        elif company:
+            exp_role = anchor_exp.get("role") or anchor_exp.get("title") or ""
+            line_2 = f"At {company}, worked as {exp_role}." if exp_role else f"Brings direct experience from time spent at {company}."
 
-    # Line (d): one factual value-proposition sentence — never a generic
-    # unsupported claim, tied only to skills the candidate actually has.
+    # --- 3) JD-matched skills, named explicitly in prose (bolded) ---
+    line_3 = ""
     if top_skills:
-        line_c = f"Brings hands-on experience with {', '.join(top_skills)} directly relevant to this role's requirements."
+        skills_str = _join_natural([f"**{s}**" for s in top_skills])
+        match_templates = [
+            f"Matches this role's core requirements directly — hands-on expertise in {skills_str}, gained through real production work rather than isolated projects.",
+            f"Brings direct, production-level experience with {skills_str}, closely aligned with what this role requires.",
+        ]
+        line_3 = match_templates[_pick_index(seed + "3", len(match_templates))]
     elif all_skills:
-        line_c = f"Brings hands-on experience with {', '.join(all_skills[:3])} applicable to this role."
-    else:
-        line_c = ""
+        skills_str = _join_natural([f"**{s}**" for s in all_skills[:3]])
+        line_3 = f"Brings related hands-on experience with {skills_str} applicable to this role."
 
-    objective = " ".join(p for p in (line_a, line_b, line_c) if p)
-    return _MARK_OPEN + _bold_terms(objective, top_skills) + _MARK_CLOSE
+    # --- 4) Honest gap clause — only named JD-requested skills the
+    # candidate genuinely doesn't have, never hidden ---
+    gap_clause = ""
+    if top_skills:
+        try:
+            from phase4 import extract_skills as _extract_jd_skills
+            jd_all = [s for s in _extract_jd_skills(job_description) if s]
+            real_lower = {s.lower() for s in all_skills}
+            missing = [s for s in jd_all if s.lower() not in real_lower][:2]
+            if missing:
+                verb = "falls" if len(missing) == 1 else "fall"
+                gap_clause = f" {_join_natural(missing)} {verb} outside this background so far."
+        except Exception:
+            pass
+
+    # --- 5) Closing ---
+    closing_templates = [
+        "Comfortable owning services end-to-end, from design through production support, and brings that same depth of ownership directly to this position's requirements.",
+        "Approaches this opportunity with the same ownership and technical rigor demonstrated throughout that experience.",
+    ]
+    line_5 = closing_templates[_pick_index(seed + "5", len(closing_templates))]
+
+    paragraph = " ".join(p for p in (line_1, line_2, (line_3 + gap_clause).strip(), line_5) if p)
+    return _MARK_OPEN + paragraph + _MARK_CLOSE
 
 
 def generate_tailored_resume(
@@ -980,7 +1115,7 @@ def generate_tailored_resume(
         "summary": real_summary,
         "technical_proficiencies": real_tech_proficiencies,
         "skills": real_skills,
-        "missing_skills": [],
+        "missing_skills": _compute_missing_jd_skills(real_skills, job_description),
         "experience": _tailor_experience_for_jd(
             [
                 {
@@ -1170,9 +1305,126 @@ Generate the tailored template JSON now.
         return mock_fallback, {}, None
 
 
-# NOTE: job-requirement (job posting) email parsing — PARSE_REQUIREMENT_SYSTEM_PROMPT,
-# PARSE_REQUIREMENT_TOOL, parse_requirement_text() — moved to claude_parsing_service.py.
-# parser.py now imports parse_requirement_text from there.
+PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
+Extract its content using the extract_requirement tool.
+If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess.
+"""
+
+# P0 fix: previously this asked the model to "return only JSON" and then
+# manually stripped ```json fences with string slicing before json.loads().
+# That silently broke (falling all the way back to the regex-only parser in
+# parser.py) any time the model added so much as a stray leading word or
+# used a different fence style. Forcing a tool call with an explicit
+# input_schema makes the API itself guarantee a parseable, schema-shaped
+# object — the tool_use block's `.input` is already a dict, no string
+# parsing at all.
+PARSE_REQUIREMENT_TOOL = {
+    "name": "extract_requirement",
+    "description": "Record the structured fields extracted from a job requirement email.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "role": {"type": ["string", "null"], "description": "The job title."},
+            "client": {"type": ["string", "null"], "description": "The end client or company, if explicitly mentioned."},
+            "location": {"type": ["string", "null"], "description": "City, state, or Remote/Hybrid/Onsite."},
+            "rate": {"type": ["string", "null"], "description": "The pay/bill rate or compensation."},
+            "duration": {"type": ["string", "null"], "description": "e.g. '6 months', 'long term'."},
+            "work_mode": {
+                "type": ["string", "null"],
+                "enum": ["REMOTE", "HYBRID", "ONSITE", "UNKNOWN", None],
+                "description": "REMOTE, HYBRID, ONSITE, or UNKNOWN."
+            },
+            "employment_types": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["C2C", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
+                "description": "One or more of C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN."
+            },
+            "experience": {"type": ["string", "null"], "description": "e.g. '8+ years'."},
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Key skills and technologies requested."
+            },
+        },
+        "required": ["role", "client", "location", "rate", "duration", "work_mode", "employment_types", "experience", "skills"],
+    },
+}
+
+def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
+    """
+    Calls Anthropic API to parse the raw text of a job requirement email
+    into a structured JSON. Returns None if parsing fails.
+    """
+    import hashlib
+    try:
+        from disk_cache import PersistentDiskCache
+        _REQUIREMENT_CACHE = PersistentDiskCache("requirement_cache.json")
+    except ImportError:
+        _REQUIREMENT_CACHE = None
+
+    if _REQUIREMENT_CACHE:
+        content_hash = hashlib.md5(f"{subject}\\n{body}".encode("utf-8")).hexdigest()
+        cached = _REQUIREMENT_CACHE.get(content_hash)
+        if cached is not None:
+            return cached
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        logger.warning("ANTHROPIC_API_KEY not found, returning None for parse_requirement_text.")
+        return None
+    if _claude_circuit_is_open():
+        return None
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key, timeout=15.0)
+        
+        user_prompt = f"SUBJECT:\\n{subject}\\n\\nBODY:\\n{body}\\n\\nExtract the requirement now."
+        
+        response = client.messages.with_raw_response.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=PARSE_REQUIREMENT_SYSTEM_PROMPT,
+            tools=[PARSE_REQUIREMENT_TOOL],
+            tool_choice={"type": "tool", "name": "extract_requirement"},
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+
+        parsed_response = response.parse()
+        tool_use_block = next(
+            (b for b in parsed_response.content if b.type == "tool_use"), None
+        )
+        if tool_use_block is None:
+            logger.warning("Claude API returned no tool_use block for requirement parsing.")
+            return None
+        result_json = tool_use_block.input
+
+        # Ensure correct schema (also guards against a model omitting a
+        # field despite it being "required" in the tool schema above)
+        final_dict = {
+            'role': result_json.get('role') or 'UNKNOWN',
+            'client': result_json.get('client'),
+            'location': result_json.get('location'),
+            'rate': result_json.get('rate'),
+            'duration': result_json.get('duration'),
+            'work_mode': result_json.get('work_mode') or 'UNKNOWN',
+            'employment_types': result_json.get('employment_types') or ['UNKNOWN'],
+            'experience': result_json.get('experience'),
+            'skills': result_json.get('skills') or [],
+            'parsing_model': "Claude 3.5 Sonnet"
+        }
+        if _REQUIREMENT_CACHE:
+            _REQUIREMENT_CACHE.set(content_hash, final_dict)
+        return final_dict
+    except Exception as e:
+        if _is_hard_claude_failure(e):
+            _trip_claude_circuit(f"requirement parsing: {e}")
+        else:
+            logger.warning(f"Error calling Claude API for requirement parsing: {e}")
+        return None
+
 
 ROLE_MATCH_SYSTEM_PROMPT = """You are an expert technical recruiter evaluating role match.
 Given a Requirement Role and a Consultant's Role History (a list of roles they've held or preferred), 

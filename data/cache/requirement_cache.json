@@ -2349,5 +2349,83 @@
       "java"
     ],
     "good_to_have_skills": []
+  },
+  "c0f2dcf480f72c29907489870780cc91": {
+    "role": "Microsoft 365 Admin with Azure",
+    "client": null,
+    "location": "Irving, TX",
+    "rate": null,
+    "duration": "12 months",
+    "work_mode": "HYBRID",
+    "employment_types": [
+      "CONTRACT"
+    ],
+    "experience": "5+ years",
+    "skills": [
+      "Microsoft 365",
+      "Azure",
+      "Exchange Online",
+      "Microsoft Teams",
+      "SharePoint Online",
+      "OneDrive",
+      "Microsoft Entra ID (Azure AD)",
+      "Power Automate",
+      "PowerShell",
+      "Microsoft Graph API",
+      "Microsoft Purview",
+      "Power BI",
+      "Conditional Access",
+      "Identity Governance",
+      "M365 Security & Compliance",
+      "ServiceNow",
+      "AvePoint",
+      "Keepit",
+      "SysKit Point",
+      "Microsoft Copilot",
+      "Copilot Studio",
+      "eDiscovery",
+      "CMMC",
+      "SOX",
+      "Teams Premium",
+      "Automatic Call Recording (ACR)",
+      "Google Workspace Migration"
+    ],
+    "parsing_model": "Claude 3.5 Sonnet"
+  },
+  "69fc0dc03e7bc775a9a9b3071e786361": {
+    "role": "Automation Tester + GCP",
+    "client": null,
+    "location": "Phoenix, AZ",
+    "rate": null,
+    "duration": null,
+    "work_mode": "UNKNOWN",
+    "employment_types": [
+      "UNKNOWN"
+    ],
+    "experience": null,
+    "skills": [
+      "Automation Testing",
+      "Selenium",
+      "Java",
+      "TestNG",
+      "Cucumber",
+      "API Testing",
+      "Postman",
+      "REST Assured",
+      "SDLC",
+      "STLC",
+      "Agile",
+      "CI/CD",
+      "Git",
+      "Jenkins",
+      "GCP",
+      "BigQuery",
+      "Cloud Storage",
+      "GKE",
+      "Microservices Architecture",
+      "Cloud-based Testing",
+      "SQL"
+    ],
+    "parsing_model": "Claude 3.5 Sonnet"
   }
 }
