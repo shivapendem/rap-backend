@@ -47,7 +47,7 @@ def _get_llm():
             logger.info("Loading tiny GGUF model into RAM...")
             _llm = Llama(
                 model_path=MODEL_PATH,
-                n_ctx=1024,          # Lower context window to save RAM
+                n_ctx=4096,          # Increased context window to prevent token errors
                 n_threads=2,         # Fewer threads to prevent CPU spikes
                 verbose=False
             )
