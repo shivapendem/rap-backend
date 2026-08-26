@@ -571,22 +571,6 @@ def score_role(
             import logging
             logging.getLogger(__name__).warning(f"AI role match failed: {e}")
 
-        # FEATURE: Claude unavailable (no API key, tripped circuit
-        # breaker, or a hard failure above) -- before dropping all the
-        # way to the plain token-overlap heuristic below, try a local
-        # HF transformers embedding model. Runs on CPU, no external API
-        # call or per-call cost. Cached the same way as a Claude score
-        # so a repeat lookup does not re-embed.
-        try:
-            from local_cpu_parser import evaluate_role_match_local
-            local_score = evaluate_role_match_local(req_role_clean, list(unique_roles))
-            if local_score is not None:
-                _ROLE_MATCH_CACHE.set(cache_key, local_score)
-                return local_score
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"Local HF role match failed: {e}")
-
     # Build the consultant's role-token pool (preferred_roles + every
     # experience row's role_title), same sources as before.
     pref_tokens: set[str] = set()
