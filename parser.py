@@ -1343,20 +1343,39 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. This is a MERGE, not a switch: every field
-    # below tries the AI's value first and falls back to the regex/heuristic
-    # extractor for THAT FIELD ONLY if the AI left it null/empty/UNKNOWN.
-    # (P0 fix — previously, if the AI call succeeded but returned even one
-    # low-confidence null field, the ENTIRE regex path was skipped and that
-    # field came back empty even though regex might have found it.)
+    # Attempt AI parsing first. We will try Hugging Face (local_cpu_parser) -> Claude -> Regex fallback
+    # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
+    parsing_log = []
+    
     try:
-        from claude_service import parse_requirement_text
-        ai_parsed = parse_requirement_text(safe_subject, safe_body)
+        from local_cpu_parser import parse_requirement_local
+        ai_parsed = parse_requirement_local(safe_subject, safe_body)
+        if ai_parsed:
+            parsing_log.append("Hugging Face / Torch: Success")
+        else:
+            parsing_log.append("Hugging Face / Torch: Failed confidence gate (missing title/skills) or model error.")
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"AI requirement parsing failed: {e}. Falling back to regex.")
+        parsing_log.append(f"Hugging Face / Torch: Exception - {e}")
         ai_parsed = None
+
+    if not ai_parsed:
+        try:
+            from claude_service import parse_requirement_text
+            ai_parsed = parse_requirement_text(safe_subject, safe_body)
+            if ai_parsed:
+                parsing_log.append("Claude 3.5 Sonnet: Success")
+            else:
+                parsing_log.append("Claude 3.5 Sonnet: Failed or returned None.")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"AI requirement parsing failed: {e}. Falling back to regex.")
+            parsing_log.append(f"Claude 3.5 Sonnet: Exception (API Key / Subscription / Error) - {e}")
+            ai_parsed = None
+            
+    if not ai_parsed:
+        parsing_log.append("Regex Fallback: Executing due to AI model failures.")
+
     ai_parsed = ai_parsed or {}
 
     def _ai_field(key: str, unknown_value=None):
@@ -1552,6 +1571,7 @@ def parse_requirement(
         'experience': experience,
         'skills': skills,
         'parsing_model': _ai_field('parsing_model') or "Regex Parser",
+        'parsing_log': parsing_log,
     }
 
     parsed['parse_confidence'] = calculate_confidence(parsed)

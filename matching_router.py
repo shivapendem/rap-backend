@@ -212,6 +212,7 @@ async def run_matching_for_requirement(
                 "employment":breakdown["employment"]["weighted"],
                 "auth": breakdown["auth"]["weighted"],
                 "parsing_model": requirement.parsed_fields.get("parsing_model", "Regex Parser") if requirement.parsed_fields else "Regex Parser",
+                "parsing_log": requirement.parsed_fields.get("parsing_log", []) if requirement.parsed_fields else [],
                 "_version": MATCHING_LOGIC_VERSION,
             }
             # BUG FIX (NEAR_MISS tagging missing on this pipeline):
@@ -532,7 +533,11 @@ async def get_pending_matches(
             "consultant_name": row["consultant_name"],
             "consultant_email": row["consultant_email"],
             "match_score": _safe_float(row["match_score"]),
-            "matching_info": {**(row["matching_info"] or {}), "parsing_model": (row["matching_info"] or {}).get("parsing_model", "Regex Parser")},
+            "matching_info": {
+                **(row["matching_info"] or {}), 
+                "parsing_model": (row["matching_info"] or {}).get("parsing_model", "Regex Parser"),
+                "parsing_log": (row["matching_info"] or {}).get("parsing_log", [])
+            },
             "match_reasoning": row["match_reasoning"],
             "status": row["status"],
             "created_at": row["created_at"],
