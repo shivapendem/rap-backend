@@ -1343,7 +1343,7 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. We will try Local LLM (Qwen) -> Claude -> OpenAI -> SpaCy -> Regex fallback
+    # Attempt AI parsing first. We will try Local LLM (Qwen) -> OpenAI -> Claude -> SpaCy -> Regex fallback
     # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
     parsing_log = []
@@ -1362,6 +1362,18 @@ def parse_requirement(
 
     if not ai_parsed:
         try:
+            from openai_parser import parse_requirement_openai
+            ai_parsed = parse_requirement_openai(safe_subject, safe_body)
+            if ai_parsed:
+                parsing_log.append("OpenAI (gpt-4o-mini): Success")
+            else:
+                parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
+        except Exception as e:
+            parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
+            ai_parsed = None
+
+    if not ai_parsed:
+        try:
             from claude_service import parse_requirement_text
             ai_parsed = parse_requirement_text(safe_subject, safe_body)
             if ai_parsed:
@@ -1372,18 +1384,6 @@ def parse_requirement(
             import logging
             logging.getLogger(__name__).warning(f"AI requirement parsing failed: {e}. Falling back to regex.")
             parsing_log.append(f"Claude 3.5 Sonnet: Exception (API Key / Subscription / Error) - {e}")
-            ai_parsed = None
-
-    if not ai_parsed:
-        try:
-            from openai_parser import parse_requirement_openai
-            ai_parsed = parse_requirement_openai(safe_subject, safe_body)
-            if ai_parsed:
-                parsing_log.append("OpenAI (gpt-4o-mini): Success")
-            else:
-                parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
-        except Exception as e:
-            parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
             ai_parsed = None
 
     if not ai_parsed:
