@@ -1150,6 +1150,26 @@ def clean_client(client: Optional[str]) -> Optional[str]:
         return None
     client = crop_at_next_field(client)
     client = re.sub(r'(?i)^\s*(?:is|the|our|a|for|at|with)\s+', '', client).strip()
+    # BUG FIX: HTML tables (e.g. bulk hotlist/broadcast emails) render
+    # header cells like <td>Client:</td><td>Requirements & Resumes From:</td>
+    # with only a space between them (td/th deliberately aren't treated as
+    # line breaks in html_to_text — see cleaner.py's HTMLToTextParser docstring
+    # for the identical "TrintechLocation:" fusion problem). That flattens
+    # to "Client: Requirements & Resumes From: ..." in plain text, and
+    # CLIENT_PATTERNS then grabs "Requirements & Resumes From" as if it were
+    # a real client name -- it's actually the NEXT column's header, not a
+    # value at all. A real client/company name never starts with generic
+    # staffing nouns like this, so reject on sight rather than accept
+    # boilerplate as if it were a company name.
+    _GENERIC_NON_CLIENT_LEAD_WORDS = (
+        'requirement', 'requirements', 'resume', 'resumes', 'resource',
+        'resources', 'candidate', 'candidates', 'consultant', 'consultants',
+        'submit', 'submission', 'submissions', 'send', 'share', 'kindly',
+        'please',
+    )
+    first_word = client.split()[0].lower().strip('.,:;') if client.split() else ''
+    if first_word in _GENERIC_NON_CLIENT_LEAD_WORDS:
+        return None
     # ROLE-SPECIFIC PARSING: real client/company names are short (2-10 words).
     # Same runaway-text problem as role — cap word count before falling
     # back to a blunt character truncation.
