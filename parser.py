@@ -1343,33 +1343,20 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. We will try Tiny Local LLM -> OpenAI -> Claude -> SpaCy -> Regex fallback
+    # Attempt AI parsing first. We will try OpenAI -> Claude -> SpaCy -> Regex fallback
     # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
     parsing_log = []
-    
     try:
-        from tiny_local_parser import parse_requirement_tiny
-        ai_parsed = parse_requirement_tiny(safe_subject, safe_body)
+        from openai_parser import parse_requirement_openai
+        ai_parsed = parse_requirement_openai(safe_subject, safe_body)
         if ai_parsed:
-            parsing_log.append("Tiny Local LLM (Qwen 0.5B): Success")
+            parsing_log.append("OpenAI (gpt-4o-mini): Success")
         else:
-            parsing_log.append("Tiny Local LLM (Qwen 0.5B): Failed or returned None.")
+            parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
     except Exception as e:
-        parsing_log.append(f"Tiny Local LLM (Qwen 0.5B): Exception - {e}")
+        parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
         ai_parsed = None
-
-    if not ai_parsed:
-        try:
-            from openai_parser import parse_requirement_openai
-            ai_parsed = parse_requirement_openai(safe_subject, safe_body)
-            if ai_parsed:
-                parsing_log.append("OpenAI (gpt-4o-mini): Success")
-            else:
-                parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
-        except Exception as e:
-            parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
-            ai_parsed = None
 
     if not ai_parsed:
         try:
