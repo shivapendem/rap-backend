@@ -1349,15 +1349,15 @@ def parse_requirement(
     parsing_log = []
     
     try:
-            from openai_parser import parse_requirement_openai
-            ai_parsed = parse_requirement_openai(safe_subject, safe_body)
-            if ai_parsed:
-                parsing_log.append("OpenAI (gpt-4o-mini): Success")
-            else:
-                parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
-        except Exception as e:
-            parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
-            ai_parsed = None
+        from openai_parser import parse_requirement_openai
+        ai_parsed = parse_requirement_openai(safe_subject, safe_body)
+        if ai_parsed:
+            parsing_log.append("OpenAI (gpt-4o-mini): Success")
+        else:
+            parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
+    except Exception as e:
+        parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
+        ai_parsed = None
 
     if not ai_parsed:
         try:
