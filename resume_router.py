@@ -413,16 +413,48 @@ async def generate_resume_from_template(
     parsed_html = parsed_html.replace("{skills}", ", ".join(generated_data.get("skills", []) or []))
     parsed_html = parsed_html.replace("{work_role}", consultant.preferred_roles or "")
     
+    parsed_html = parsed_html.replace("{phone}", target_user.mobile_number or consultant.phone or "")
+    parsed_html = parsed_html.replace("{email}", target_user.email or consultant.email or "")
+    parsed_html = parsed_html.replace("{linkedin}", target_user.linkedin_url or consultant.linkedin_url or "")
+    parsed_html = parsed_html.replace("{location}", consultant.current_location or "")
+    parsed_html = parsed_html.replace("{secondary_skills}", consultant.secondary_skills or "")
+    
+    education = resume_info.get("education", []) or []
+    ed_str = ", ".join([f"{e.get('degree','')} from {e.get('institution','')}" for e in education if e.get('degree') or e.get('institution')])
+    parsed_html = parsed_html.replace("{education}", ed_str)
+    
+    base_experiences = resume_info.get("experience", []) or []
     experiences = generated_data.get("experience", []) or []
+    
     for i, exp in enumerate(experiences):
         n = i + 1
-        parsed_html = re.sub(r'\{job_title_' + str(n) + r'\}', exp.get("role", "") or "", parsed_html)
-        parsed_html = re.sub(r'\{company_' + str(n) + r'\}', exp.get("employer", "") or "", parsed_html)
-        
-        # Convert bullets to HTML
-        bullets = exp.get("bullets", []) or []
-        bullets_html = "<ul>" + "".join([f"<li>{b}</li>" for b in bullets]) + "</ul>" if bullets else ""
-        parsed_html = re.sub(r'\{role_' + str(n) + r'\}', bullets_html, parsed_html)
+        short_id = None
+        if i < len(base_experiences):
+            base_exp_id = base_experiences[i].get("id", "")
+            if base_exp_id:
+                short_id = str(base_exp_id).split("-")[0]
+                
+        tags_to_replace = [str(n)]
+        if short_id:
+            tags_to_replace.append(short_id)
+            
+        for tag in tags_to_replace:
+            parsed_html = re.sub(r'\{job_title_' + tag + r'\}', exp.get("role", "") or "", parsed_html)
+            parsed_html = re.sub(r'\{company_' + tag + r'\}', exp.get("employer", "") or exp.get("client", "") or "", parsed_html)
+            
+            start_date = exp.get("start") or (base_experiences[i].get("start_date", "") if i < len(base_experiences) else "")
+            end_date = exp.get("end") or (base_experiences[i].get("end_date", "Present") if i < len(base_experiences) else "Present")
+            duration_str = f"{start_date} to {end_date}"
+            parsed_html = re.sub(r'\{duration_' + tag + r'\}', duration_str, parsed_html)
+            parsed_html = re.sub(r'\{dates_' + tag + r'\}', duration_str, parsed_html)
+            
+            bullets = exp.get("bullets", []) or []
+            bullets_html = "<ul>" + "".join([f"<li>{b}</li>" for b in bullets]) + "</ul>" if bullets else ""
+            parsed_html = re.sub(r'\{role_' + tag + r'\}', bullets_html, parsed_html)
+            
+            base_achievements = base_experiences[i].get("achievements", "") if i < len(base_experiences) else ""
+            achievements_html = "<ul>" + "".join([f"<li>{b.strip()}</li>" for b in base_achievements.split('\n') if b.strip()]) + "</ul>" if base_achievements else ""
+            parsed_html = re.sub(r'\{achievements_' + tag + r'\}', achievements_html, parsed_html)
 
     # Save to S3 and database
     s3_key = None

@@ -272,6 +272,7 @@ class ProfileResponse(BaseModel):
     preferredRoles: Optional[str] = None
     preferredLocations: Optional[str] = None
     totalExperienceYears: Optional[float] = None
+    resume_info: Optional[dict] = None
     availabilityStatus: Optional[str] = None
     createdAt: Optional[str] = None
     # BUG FIX: previously missing — recruiter roster grid (ConsultantCard)
@@ -585,6 +586,7 @@ async def _consultant_to_profile_response(
         status=c.status,
         preferredRoles=c.preferred_roles,
         preferredLocations=c.preferred_locations,
+        resume_info=resume_info,
         title=resume_info.get("title"),
         summary=resume_info.get("summary"),
         # Prefer the real Consultant.education column (what admin now
@@ -1814,3 +1816,32 @@ async def set_recruiters_for_consultant(
         "message": f"Updated recruiter assignments for {consultant_label}.",
         "assigned_recruiters": assigned_recruiters,
     }
+
+
+class UpdateResumeRichTextPayload(BaseModel):
+    resumeRichText: Optional[str] = None
+
+@router.patch("/api/consultants/{consultant_id}/resume-rich-text", response_model=ProfileResponse)
+async def update_consultant_resume_rich_text(
+    consultant_id: int,
+    payload: UpdateResumeRichTextPayload,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "RECRUITER", "ADMIN")
+    if current_user.role == "RECRUITER":
+        await _assert_recruiter_mapped(db, current_user.id, consultant_id)
+
+    consultant = await _get_consultant_by_id(db, consultant_id)
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant not found")
+
+    consultant.resume_rich_text = payload.resumeRichText
+    await db.commit()
+    await db.refresh(consultant)
+
+    count_result = await db.execute(
+        select(func.count()).where(ConsultantExperience.consultant_id == consultant_id)
+    )
+    exp_count = count_result.scalar_one()
+    return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
