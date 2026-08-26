@@ -1343,25 +1343,12 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. We will try Local LLM (Qwen) -> OpenAI -> Claude -> SpaCy -> Regex fallback
+    # Attempt AI parsing first. We will try OpenAI -> Claude -> SpaCy -> Regex fallback
     # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
     parsing_log = []
     
     try:
-        from local_llm_parser import parse_requirement_local
-        ai_parsed = parse_requirement_local(safe_subject, safe_body)
-        if ai_parsed:
-            parsing_log.append("Local CPU (Qwen2.5-1.5B): Success")
-        else:
-            parsing_log.append("Local CPU (Qwen2.5-1.5B): Failed or returned None.")
-    except Exception as e:
-        parsing_log.append(f"Local CPU (Qwen2.5-1.5B): Exception - {e}")
-        ai_parsed = None
-
-
-    if not ai_parsed:
-        try:
             from openai_parser import parse_requirement_openai
             ai_parsed = parse_requirement_openai(safe_subject, safe_body)
             if ai_parsed:
