@@ -1,5 +1,5 @@
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import asyncio
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -277,8 +277,12 @@ async def _run_matching_engine_background():
     global _matching_run_state
     try:
         async with AsyncSessionLocal() as db:
+            since = datetime.now(timezone.utc) - timedelta(days=1)
             reqs_res = await db.execute(
-                select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+                select(Requirement).where(
+                    Requirement.status.notin_(["CLOSED", "REJECTED"]),
+                    Requirement.created_at >= since,
+                )
             )
             requirements = reqs_res.scalars().all()
 

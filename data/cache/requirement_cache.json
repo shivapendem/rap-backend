@@ -2297,5 +2297,57 @@
       "Workday Cloud Connect",
       "Workday Compensation Management"
     ]
+  },
+  "8ffe80ff1617b5dfb86823a66160e541": {
+    "role": "Mentor architects",
+    "client": null,
+    "location": "*Woodland Hills",
+    "rate": null,
+    "duration": null,
+    "work_mode": "HYBRID",
+    "employment_types": [],
+    "experience_years_required": 15,
+    "must_have_skills": [
+      "salesforce",
+      "machine learning",
+      "kubernetes",
+      "aws",
+      "azure",
+      "gcp",
+      "airflow"
+    ],
+    "good_to_have_skills": []
+  },
+  "fe362a2069bd6d54d9dc1a03494b19ab": {
+    "role": "Senior IAM Engineer, Architect",
+    "client": null,
+    "location": "Canton",
+    "rate": null,
+    "duration": null,
+    "work_mode": null,
+    "employment_types": [],
+    "experience_years_required": 12,
+    "must_have_skills": [
+      "python",
+      "azure",
+      "c#"
+    ],
+    "good_to_have_skills": []
+  },
+  "4e48a0b2e813531cd7d31d010f3cbf56": {
+    "role": "Responsible for designing, implementing, and maintaining Java/Spring jobs",
+    "client": null,
+    "location": "San Antonio",
+    "rate": null,
+    "duration": null,
+    "work_mode": null,
+    "employment_types": [],
+    "experience_years_required": null,
+    "must_have_skills": [
+      "kafka",
+      "ci/cd",
+      "java"
+    ],
+    "good_to_have_skills": []
   }
 }

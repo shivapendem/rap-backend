@@ -785,7 +785,14 @@ def score_work_auth(requirement: Requirement, consultant: Consultant) -> float:
     req_types = set((requirement.employment_types or []))
     auth = consultant.work_authorization.upper()
 
-    if "FULLTIME" in req_types and auth not in {"US_CITIZEN", "GREEN_CARD", "GC"}:
+# BUG FIX: consultant self-service My Profile now saves "USC" (not
+    # "US_CITIZEN") — see phase3.py's validate_work_auth. Keeping
+    # US_CITIZEN/GREEN_CARD here too so any consultant row saved under
+    # the OLD dropdown before this change still passes correctly until
+    # they resave. GC EAD (a pending green-card case's work permit, not
+    # actual permanent residency) is deliberately NOT included — it's
+    # not treated as equivalent to USC/GC for a direct full-time hire.
+    if "FULLTIME" in req_types and auth not in {"USC", "US_CITIZEN", "GC", "GREEN_CARD"}:
         return 0.0
 
     return 100.0

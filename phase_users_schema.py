@@ -83,7 +83,7 @@ class CreateUserRequestDTO(BaseModel):
     linkedin_url: Optional[str] = None
     designation: Optional[str] = Field(None, max_length=100)
 
-    @field_validator("role")
+      @field_validator("role")
     @classmethod
     def validate_role(cls, v: str) -> str:
         if v not in VALID_ROLES:
@@ -94,6 +94,40 @@ class CreateUserRequestDTO(BaseModel):
     @classmethod
     def normalize_email(cls, v: str) -> str:
         return v.lower().strip()
+
+    # BUG FIX: this write model had no validation on work_authorization at
+    # all — any string saved successfully and then silently failed to
+    # match any batch in phase4.py's WORK_AUTH_BATCH_1/2/3 during
+    # matching, with only a logged warning and no visible error anywhere.
+    # Mirrors phase3.py's consultant self-service validate_work_auth, but
+    # Optional-aware since this field isn't required here.
+    @field_validator("work_authorization")
+    @classmethod
+    def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
+        return v
+
+
+    # BUG FIX: this write model had no validation on work_authorization at
+    # all — any string saved successfully and then silently failed to
+    # match any batch in phase4.py's WORK_AUTH_BATCH_1/2/3 during
+    # matching, with only a logged warning and no visible error anywhere.
+    # Mirrors phase3.py's consultant self-service validate_work_auth, but
+    # Optional-aware since this field isn't required here.
+    @field_validator("work_authorization")
+    @classmethod
+    def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
+        return v
+
 
     @field_validator("password")
     @classmethod
@@ -141,7 +175,7 @@ class EditUserRequestDTO(BaseModel):
     linkedin_url: Optional[str] = None
     designation: Optional[str] = Field(None, max_length=100)
 
-    @field_validator("role")
+     @field_validator("role")
     @classmethod
     def validate_role(cls, v: str) -> str:
         if v not in VALID_ROLES:
@@ -152,6 +186,23 @@ class EditUserRequestDTO(BaseModel):
     @classmethod
     def normalize_email(cls, v: str) -> str:
         return v.lower().strip()
+
+    # BUG FIX: this write model had no validation on work_authorization at
+    # all — any string saved successfully and then silently failed to
+    # match any batch in phase4.py's WORK_AUTH_BATCH_1/2/3 during
+    # matching, with only a logged warning and no visible error anywhere.
+    # Mirrors phase3.py's consultant self-service validate_work_auth, but
+    # Optional-aware since this field isn't required here.
+    @field_validator("work_authorization")
+    @classmethod
+    def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
+        return v
+
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +309,34 @@ class UpdateConsultantRequestDTO(BaseModel):
     phone: Optional[str] = None
     current_location: Optional[str] = None
     preferred_locations: Optional[str] = None
+
+    # BUG FIX: same gap as EditUserRequestDTO above — this is the write
+    # model UserDetailPage.tsx / ConsultantDetailPage.tsx's Work Auth
+    # field actually saves through. Without this, any string was accepted
+    # and silently broke matching later instead of failing loudly here.
+    @field_validator("work_authorization")
+    @classmethod
+    def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
+        return v
+
+    # BUG FIX: same gap as EditUserRequestDTO above — this is the write
+    # model UserDetailPage.tsx / ConsultantDetailPage.tsx's Work Auth
+    # field actually saves through. Without this, any string was accepted
+    # and silently broke matching later instead of failing loudly here.
+    @field_validator("work_authorization")
+    @classmethod
+    def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
+        return v
     total_experience_years: Optional[float] = None
     secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None

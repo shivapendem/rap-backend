@@ -196,8 +196,14 @@ class ProfileUpdateRequest(BaseModel):
     @field_validator("workAuth")
     @classmethod
     def validate_work_auth(cls, v):
-        if v not in {"US_CITIZEN", "GC", "H1B", "OPT", "OTHER"}:
-            raise ValueError(f"workAuth must be one of US_CITIZEN, GC, H1B, OPT, OTHER")
+        # BUG FIX: these exact strings (once normalized) must line up with
+        # phase4.py's WORK_AUTH_BATCH_1/2/3 sets — get_batch() only strips
+        # spaces and hyphens before comparing, so an underscore-separated
+        # value here would silently fail to match any batch and get every
+        # consultant wrongly rejected at Stage 2 of validate_match().
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"workAuth must be one of {', '.join(sorted(valid))}")
         return v
 
     # BUG FIX: linkedInUrl is now required (min_length=1 above), but the
