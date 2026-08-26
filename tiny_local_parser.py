@@ -71,7 +71,7 @@ def parse_requirement_tiny(subject: str, body: str) -> Optional[dict]:
         
         response = llm(
             prompt,
-            max_tokens=500, # Less tokens required
+            max_tokens=1500, # Increased tokens to prevent JSON truncation
             temperature=0.1,
             stop=["<|im_end|>"]
         )
