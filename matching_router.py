@@ -211,6 +211,7 @@ async def run_matching_for_requirement(
                 "experience": breakdown["experience"]["weighted"],
                 "employment":breakdown["employment"]["weighted"],
                 "auth": breakdown["auth"]["weighted"],
+                "parsing_model": requirement.parsed_fields.get("parsing_model") if requirement.parsed_fields else None,
                 "_version": MATCHING_LOGIC_VERSION,
             }
             # BUG FIX (NEAR_MISS tagging missing on this pipeline):

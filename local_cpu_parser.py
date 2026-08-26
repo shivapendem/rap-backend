@@ -144,5 +144,6 @@ def parse_requirement_local(subject: str, body: str) -> Optional[dict]:
         "employment_types": [emp_type.upper()] if emp_type else [],
         "experience_years_required": exp_years,
         "must_have_skills": skills,
-        "good_to_have_skills": []
+        "good_to_have_skills": [],
+        "parsing_model": "Hugging Face DistilBERT"
     }

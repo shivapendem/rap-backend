@@ -1551,6 +1551,7 @@ def parse_requirement(
         'vendor_contact': vendor_contact,
         'experience': experience,
         'skills': skills,
+        'parsing_model': _ai_field('parsing_model') or "Regex Parser",
     }
 
     parsed['parse_confidence'] = calculate_confidence(parsed)

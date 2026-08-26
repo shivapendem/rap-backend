@@ -1284,7 +1284,8 @@ def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
             'work_mode': result_json.get('work_mode') or 'UNKNOWN',
             'employment_types': result_json.get('employment_types') or ['UNKNOWN'],
             'experience': result_json.get('experience'),
-            'skills': result_json.get('skills') or []
+            'skills': result_json.get('skills') or [],
+            'parsing_model': "Claude 3.5 Sonnet"
         }
         if _REQUIREMENT_CACHE:
             _REQUIREMENT_CACHE.set(content_hash, final_dict)
