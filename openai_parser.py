@@ -8,13 +8,13 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# DeepSeek Chat model is excellent for JSON extraction
-MODEL_NAME = "deepseek-chat"
+# We use a cheap and fast model for parsing
+OPENAI_MODEL = os.getenv("OPENAI_PARSER_MODEL", "gpt-4o-mini")
 
 PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
-Extract its content using the exact JSON schema provided.
+Extract its content using the extract_requirement JSON schema.
 If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess.
 """
 
@@ -52,23 +52,19 @@ PARSE_REQUIREMENT_SCHEMA = {
     },
 }
 
-def parse_requirement_deepseek(subject: str, body: str) -> Optional[dict]:
-    if not DEEPSEEK_API_KEY:
-        logger.warning("DEEPSEEK_API_KEY not found, skipping DeepSeek parser.")
+def parse_requirement_openai(subject: str, body: str) -> Optional[dict]:
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY not found, skipping OpenAI parser.")
         return None
 
     try:
         from openai import OpenAI
-        # DeepSeek provides an OpenAI-compatible API endpoint
-        client = OpenAI(
-            base_url="https://api.deepseek.com",
-            api_key=DEEPSEEK_API_KEY
-        )
+        client = OpenAI(api_key=OPENAI_API_KEY)
         
         user_prompt = f"SUBJECT: {subject}\n\nBODY: {body}"
         
         response = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": PARSE_REQUIREMENT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
@@ -81,7 +77,7 @@ def parse_requirement_deepseek(subject: str, body: str) -> Optional[dict]:
         if message.tool_calls:
             arguments = message.tool_calls[0].function.arguments
             parsed = json.loads(arguments)
-            parsed["parsing_model"] = f"DeepSeek ({MODEL_NAME})"
+            parsed["parsing_model"] = f"OpenAI ({OPENAI_MODEL})"
             
             # Convert nulls in work_mode/employment_types if any sneaked in
             if not parsed.get("work_mode"):
@@ -92,6 +88,6 @@ def parse_requirement_deepseek(subject: str, body: str) -> Optional[dict]:
             return parsed
             
     except Exception as e:
-        logger.warning(f"Error calling DeepSeek API for parsing: {e}")
+        logger.warning(f"Error calling OpenAI API for parsing: {e}")
         
     return None

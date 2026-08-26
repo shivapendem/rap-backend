@@ -1343,7 +1343,7 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. We will try Hugging Face (local_cpu_parser) -> Claude -> Regex fallback
+    # Attempt AI parsing first. We will try Local LLM (Qwen) -> Claude -> OpenAI -> SpaCy -> Regex fallback
     # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
     parsing_log = []
@@ -1359,17 +1359,6 @@ def parse_requirement(
         parsing_log.append(f"Local CPU (Qwen2.5-1.5B): Exception - {e}")
         ai_parsed = None
 
-    if not ai_parsed:
-        try:
-            from deepseek_parser import parse_requirement_deepseek
-            ai_parsed = parse_requirement_deepseek(safe_subject, safe_body)
-            if ai_parsed:
-                parsing_log.append("DeepSeek (deepseek-chat): Success")
-            else:
-                parsing_log.append("DeepSeek (deepseek-chat): Failed or returned None.")
-        except Exception as e:
-            parsing_log.append(f"DeepSeek (deepseek-chat): Exception (API Key / Error) - {e}")
-            ai_parsed = None
 
     if not ai_parsed:
         try:
@@ -1383,6 +1372,30 @@ def parse_requirement(
             import logging
             logging.getLogger(__name__).warning(f"AI requirement parsing failed: {e}. Falling back to regex.")
             parsing_log.append(f"Claude 3.5 Sonnet: Exception (API Key / Subscription / Error) - {e}")
+            ai_parsed = None
+
+    if not ai_parsed:
+        try:
+            from openai_parser import parse_requirement_openai
+            ai_parsed = parse_requirement_openai(safe_subject, safe_body)
+            if ai_parsed:
+                parsing_log.append("OpenAI (gpt-4o-mini): Success")
+            else:
+                parsing_log.append("OpenAI (gpt-4o-mini): Failed or returned None.")
+        except Exception as e:
+            parsing_log.append(f"OpenAI (gpt-4o-mini): Exception - {e}")
+            ai_parsed = None
+
+    if not ai_parsed:
+        try:
+            from spacy_parser import parse_requirement_spacy
+            ai_parsed = parse_requirement_spacy(safe_subject, safe_body)
+            if ai_parsed:
+                parsing_log.append("SpaCy NLP: Success (Partial Extractor)")
+            else:
+                parsing_log.append("SpaCy NLP: Failed or returned None.")
+        except Exception as e:
+            parsing_log.append(f"SpaCy NLP: Exception - {e}")
             ai_parsed = None
             
     if not ai_parsed:
