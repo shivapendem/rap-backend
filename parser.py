@@ -1343,21 +1343,33 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. We will try Hugging Face (local_cpu_parser) -> Claude -> Regex fallback
+    # Attempt AI parsing first. We will try Qwen (HelixCipher) -> DeepSeek -> Claude -> Regex fallback
     # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
     parsing_log = []
     
     try:
-        from local_cpu_parser import parse_requirement_local
-        ai_parsed = parse_requirement_local(safe_subject, safe_body)
+        from qwen_parser import parse_requirement_qwen
+        ai_parsed = parse_requirement_qwen(safe_subject, safe_body)
         if ai_parsed:
-            parsing_log.append("Hugging Face / Torch: Success")
+            parsing_log.append("Qwen (HelixCipher): Success")
         else:
-            parsing_log.append("Hugging Face / Torch: Failed confidence gate (missing title/skills) or model error.")
+            parsing_log.append("Qwen (HelixCipher): Failed or returned None.")
     except Exception as e:
-        parsing_log.append(f"Hugging Face / Torch: Exception - {e}")
+        parsing_log.append(f"Qwen (HelixCipher): Exception - {e}")
         ai_parsed = None
+
+    if not ai_parsed:
+        try:
+            from deepseek_parser import parse_requirement_deepseek
+            ai_parsed = parse_requirement_deepseek(safe_subject, safe_body)
+            if ai_parsed:
+                parsing_log.append("DeepSeek (deepseek-chat): Success")
+            else:
+                parsing_log.append("DeepSeek (deepseek-chat): Failed or returned None.")
+        except Exception as e:
+            parsing_log.append(f"DeepSeek (deepseek-chat): Exception (API Key / Error) - {e}")
+            ai_parsed = None
 
     if not ai_parsed:
         try:
