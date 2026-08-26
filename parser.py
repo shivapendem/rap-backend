@@ -1343,7 +1343,7 @@ def parse_requirement(
             'is_likely_requirement': False
         }
 
-    # Attempt AI parsing first. We will try Local LLM (Qwen) -> DeepSeek -> Claude -> Regex fallback
+    # Attempt AI parsing first. We will try Hugging Face (local_cpu_parser) -> Claude -> Regex fallback
     # We will track the reasons for fallback in parsing_log for debugging
     ai_parsed = None
     parsing_log = []
