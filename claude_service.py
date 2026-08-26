@@ -1007,7 +1007,10 @@ def generate_tailored_resume(
         return _normalize_resume_data(mock_fallback, resume_info), {}, None
 
     try:
-        client = Anthropic(api_key=api_key)
+        client, working_key = get_working_anthropic_client()
+        if client is None:
+            logger.warning("No working Anthropic API key found (primary + backups all failed).")
+            return _normalize_resume_data(mock_fallback, resume_info), {}, None
         
         target_role_line = (
             f"\nTARGET ROLE (authoritative — use this exact title verbatim in the Career Objective, per Step 1):\n{target_role}\n"

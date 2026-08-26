@@ -319,10 +319,35 @@ async def _run_matching_engine_background():
 
             new_matches = 0
             for req in requirements:
-                new_matches += await run_matching_for_requirement(
-                    db, req, consultants, existing_pairs,
-                    experiences_by_consultant=experiences_by_consultant
-                )
+                # BUG FIX: no per-requirement isolation here — one bad
+                # requirement raised straight to the outer except, which
+                # flipped the WHOLE run to "failed" and stopped every
+                # remaining requirement, even the ones after it. Pipeline
+                # A (phase4.py's match_all_requirements) already isolates
+                # per-requirement with try/except+rollback+continue; this
+                # brings Pipeline B's background run in line with that.
+                try:
+                    new_matches += await run_matching_for_requirement(
+                        db, req, consultants, existing_pairs,
+                        experiences_by_consultant=experiences_by_consultant
+                    )
+                except Exception as req_err:
+                    await db.rollback()
+                    logger.error(
+                        "[JobMatch] Skipping requirement_id=%s (failed): %s",
+                        req.id, req_err,
+                    )
+                    try:
+                        from error_logger import log_db_error
+                        await log_db_error(
+                            stage="matching_batch_requirement",
+                            error=req_err,
+                            source_type="requirement",
+                            source_id=req.id,
+                        )
+                    except Exception:
+                        pass
+                    continue
                 _matching_run_state["processed_requirements"] += 1
                 # Commit incrementally rather than one giant transaction
                 # at the very end — a crash partway through still keeps
