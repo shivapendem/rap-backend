@@ -1228,6 +1228,17 @@ def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
         cached = _REQUIREMENT_CACHE.get(content_hash)
         if cached is not None:
             return cached
+
+    # Attempt local CPU parsing first to save API credits
+    try:
+        from local_cpu_parser import parse_requirement_local
+        local_result = parse_requirement_local(subject, body)
+        if local_result:
+            if _REQUIREMENT_CACHE:
+                _REQUIREMENT_CACHE.set(content_hash, local_result)
+            return local_result
+    except Exception as e:
+        logger.warning(f"Local CPU parsing failed, falling back to Claude: {e}")
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key or api_key.startswith("your_"):
         logger.warning("ANTHROPIC_API_KEY not found, returning None for parse_requirement_text.")
