@@ -13,6 +13,7 @@
 # ---------------------------------------------------------------------------
 
 from typing import Optional, List, Any
+import re
 from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
@@ -290,15 +291,109 @@ class UpdateConsultantRequestDTO(BaseModel):
     resume_info: Optional[Any] = None
     resume_rich_text: Optional[str] = None
 
+    # BUG FIX (consistency with consultant's own "My Profile" screen):
+    # ProfileFormSchema (features/consultant/profile/schemas) requires
+    # non-empty values for these fields, but nothing on the backend
+    # enforced that — the API accepted an empty string for any of them,
+    # so a request that bypassed the admin UI's own client-side checks
+    # (a different screen, a script, a direct API call) could still blank
+    # out required consultant data.
+    #
+    # Every field here is Optional with a None default because this PUT
+    # is used for PARTIAL updates — each inline edit on the admin screens
+    # sends only the one field being changed, leaving every other field
+    # absent from the request body entirely. Pydantic v2 does not run a
+    # field's validator when that field is omitted and falls back to its
+    # declared default (validate_default=False, the default setting) — it
+    # only runs when the field is explicitly present in the request, even
+    # if the explicit value is empty. That is exactly the behavior these
+    # validators rely on: "field omitted" (this save didn't touch it)
+    # silently passes through as None untouched, while "field explicitly
+    # sent as empty" (someone tried to clear a required value) is
+    # rejected. No model_fields_set bookkeeping needed for that reason.
+    @field_validator(
+        "primary_skills", "secondary_skills", "current_location",
+        "preferred_locations", "preferred_roles",
+    )
+    @classmethod
+    def validate_required_text_fields(cls, v: Optional[str], info) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError(f"{info.field_name} is required and cannot be cleared")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("phone is required and cannot be cleared")
+        # Same pattern as ProfileFormSchema's phone regex.
+        if not re.match(r"^\+?[\d\s\-().]{7,20}$", v.strip()):
+            raise ValueError("Enter a valid phone number")
+        return v
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def validate_linkedin_url_required(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("linkedin_url is required and cannot be cleared")
+        if "linkedin.com" not in v.strip().lower():
+            raise ValueError("linkedin_url must include linkedin.com")
+        return v
+
+    @field_validator("total_experience_years")
+    @classmethod
+    def validate_total_experience_years(cls, v: Optional[float]) -> Optional[float]:
+        # An explicit `null` here (field present in the request body with
+        # a null value) means "clear it" — reject that the same as an
+        # empty string on a text field. Omitting the key entirely (the
+        # normal case for every save that isn't touching this field)
+        # never reaches this validator at all, per the class docstring
+        # above.
+        if v is None:
+            raise ValueError("total_experience_years is required and cannot be cleared")
+        if v < 0 or v > 60:
+            raise ValueError("total_experience_years must be between 0 and 60")
+        return v
+
+    @field_validator("preferred_employment_types")
+    @classmethod
+    def validate_preferred_employment_types(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is not None and len(v) == 0:
+            raise ValueError("Select at least one employment preference")
+        return v
+
+    @field_validator("education")
+    @classmethod
+    def validate_education(cls, v: Optional[List[EducationEntryDTO]]) -> Optional[List[EducationEntryDTO]]:
+        if v is None:
+            return v
+        if len(v) == 0:
+            raise ValueError("At least one education entry is required")
+        for entry in v:
+            if not (entry.degree or "").strip() or not (entry.institution or "").strip() or not (entry.year or "").strip():
+                raise ValueError("Degree, institution, and year are all required for each education entry")
+        return v
+
     # BUG FIX: same gap as EditUserRequestDTO above — this is the write
     # model UserDetailPage.tsx / ConsultantDetailPage.tsx's Work Auth
     # field actually saves through. Without this, any string was accepted
     # and silently broke matching later instead of failing loudly here.
+    #
+    # BUG FIX (consistency with "My Profile"): previously allowed v == ""
+    # through unchanged, so an explicit clear of Work Authorization
+    # silently succeeded — now rejected the same way an empty string on
+    # any other required field above is.
     @field_validator("work_authorization")
     @classmethod
     def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
-        if v is None or v == "":
+        if v is None:
             return v
+        if v == "":
+            raise ValueError("work_authorization is required and cannot be cleared")
         valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
         if v not in valid:
             raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")

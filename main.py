@@ -294,10 +294,35 @@ async def _email_queue_worker_loop():
                     print(f"[email-queue] notify failed: {notif_err}")
         await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
 
+async def _connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
+    """
+    The initial DB connection during startup has been observed to
+    intermittently hang during the TLS handshake (asyncpg start_tls)
+    against the remote Postgres server, then time out — while the very
+    same code succeeds moments later with no changes. This looks like
+    a network-layer flake (packet loss on the client's Wi-Fi affecting
+    the larger TLS handshake packets specifically, since plain TCP
+    connects instantly and reliably) rather than a real config problem.
+    Rather than let one bad handshake kill the whole app on startup,
+    retry a few times with a short backoff before giving up for real.
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            return
+        except Exception as e:
+            last_err = e
+            print(f"[startup] DB connect attempt {attempt}/{max_attempts} failed: {e!r}")
+            if attempt < max_attempts:
+                await asyncio.sleep(base_delay * attempt)
+    raise RuntimeError(f"Could not connect to database after {max_attempts} attempts") from last_err
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await _connect_with_retry()
 
     # Insert-if-not-exists keyed by email — never touches rows that already exist
     async with AsyncSessionLocal() as session:

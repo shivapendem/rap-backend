@@ -684,6 +684,23 @@ class ConsultantAssignmentService:
                 existing_info["skills"] = skills_list
                 linked_user.resume_info = existing_info
 
+        # BUG FIX ("admin edits a consultant's profile from User
+        # Management/Consultant view, but View on the consultant's own
+        # My Profile still shows the old base resume"): this is the exact
+        # same class of bug already fixed once for the consultant's own
+        # save path (see sync_base_resume_text's docstring in
+        # resume_router.py — "edit Full Name on My Profile, View still
+        # shows the old name") — phase3.py's update_own_profile calls
+        # sync_base_resume_text on every save, but this admin-side update
+        # path never did, so any admin edit to Skills, Education, contact
+        # info, or experience left base_resume_text/base_resume_file_path
+        # stale until the consultant happened to open and re-save their
+        # own profile. Same fix, same call, same place in the flow —
+        # right before commit, after every field mutation above has
+        # already been staged on `consultant`.
+        from resume_router import sync_base_resume_text
+        await sync_base_resume_text(db, consultant)
+
         consultant = await ConsultantRepository.update(db, consultant)
 
         await log_action(
