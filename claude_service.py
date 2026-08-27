@@ -176,6 +176,29 @@ SKILL_CATEGORIES: list[tuple[str, list[str]]] = [
 ]
 
 
+def categorize_skills_with_tier(primary: list[str], secondary: list[str]) -> list[dict]:
+    """Same category-by-technology-type grouping as categorize_skills(),
+    built from a consultant's primary (expert) and secondary
+    (familiar/exposure) skill tiers combined. A skill listed in both
+    tiers is only counted once.
+
+    BUG FIX ("remove * from base resume and generated resume"): this
+    used to wrap primary-tier skills in markdown **bold** to visually
+    distinguish them in the table. The frontend's technical proficiencies
+    table renders skill text as plain strings — it doesn't parse
+    markdown — so those asterisks showed up literally in the UI instead
+    of rendering as bold. Returns plain skill strings now; no tier
+    markup in this table.
+    """
+    primary_clean = [s.strip() for s in (primary or []) if s and s.strip()]
+    primary_lower = {s.lower() for s in primary_clean}
+    secondary_clean = [
+        s.strip() for s in (secondary or [])
+        if s and s.strip() and s.strip().lower() not in primary_lower
+    ]
+    return categorize_skills(primary_clean + secondary_clean)
+
+
 def categorize_skills(skills: list[str]) -> list[dict]:
     """Groups a flat skill list into {category, skills} buckets for the
     TECHNICAL PROFICIENCIES table, using keyword matching. Anything that
@@ -412,6 +435,17 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
     # returned skills but skipped (or malformed) the category breakdown,
     # rebuild the table from the flat list so the section still renders as
     # a table instead of silently vanishing.
+    #
+    # BUG FIX ("remove * from base resume and generated resume"): skill
+    # strings sometimes carry literal markdown **bold** markers — either
+    # from an older stored resume with them already baked in, or from an
+    # AI response that added them despite the table not rendering
+    # markdown. Stripped here, at the single choke point every
+    # technical_proficiencies table passes through, so it's cleaned
+    # regardless of source.
+    def _strip_bold_markers(s: str) -> str:
+        return s.replace("**", "").strip() if isinstance(s, str) else s
+
     skills = _as_list(resume_data.get("skills"))
     tech_profs = resume_data.get("technical_proficiencies")
     if not (isinstance(tech_profs, list) and tech_profs):
@@ -429,6 +463,8 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
                 tp_skills = [s.strip() for s in tp_skills.split(",") if s.strip()]
             cleaned_profs.append({"category": cat, "skills": _as_list(tp_skills)})
         tech_profs = cleaned_profs
+    for tp in tech_profs:
+        tp["skills"] = [_strip_bold_markers(s) for s in tp.get("skills", [])]
     normalized["technical_proficiencies"] = tech_profs
     normalized["skills"] = skills
     normalized["missing_skills"] = _as_list(resume_data.get("missing_skills"))
@@ -714,7 +750,15 @@ def _pick_index(seed_text: str, pool_size: int) -> int:
 
 
 def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str:
-    """Appends a short, factual line tying the Career Objective to THIS
+    """NOT CURRENTLY CALLED — kept for reference only. This was used by
+    generate_tailored_resume's earlier "reuse the stored summary as-is,
+    append this short addendum" path; that path was removed (see
+    _build_factual_career_objective's docstring) once every generation
+    started building the objective fresh regardless of whether a stored
+    summary existed. Safe to delete if nothing calls it by the time this
+    is next touched.
+
+    Appends a short, factual line tying the Career Objective to THIS
     specific job requirement — so it's never byte-identical to the base
     resume's objective, and never identical across two different
     requirements either.
@@ -998,7 +1042,7 @@ def _build_factual_career_objective(
     line_5 = closing_templates[_pick_index(seed + "5", len(closing_templates))]
 
     paragraph = " ".join(p for p in (line_1, line_2, (line_3 + gap_clause).strip(), line_5) if p)
-    return _MARK_OPEN + paragraph + _MARK_CLOSE
+    return paragraph
 
 
 def generate_tailored_resume(
@@ -1028,13 +1072,6 @@ def generate_tailored_resume(
     # when resume_info doesn't have it. It's a straight passthrough of
     # real data, not an AI-tailored resume — generation_notes says so
     # explicitly so this is distinguishable from a real generation.
-    real_summary = (
-        resume_info.get("summary")
-        or resume_info.get("career_objective")
-        or resume_info.get("professional_summary")
-        or resume_info.get("objective")
-        or ""
-    )
     real_skills = (
         resume_info.get("skills")
         or resume_info.get("tech_stack", {}).get("expert", [])
@@ -1042,60 +1079,41 @@ def generate_tailored_resume(
         or []
     )
     # BUG FIX ("career objective missing" — reported for a candidate whose
-    # DB profile has no stored summary field): when there's no summary to
-    # pass through AND the code has reached this fallback (meaning the
-    # real AI call — which would otherwise generate a genuinely tailored
-    # objective — failed or is unavailable), real_summary used to just
-    # stay "" and the Career Objective section vanished entirely (the
-    # frontend only renders it when non-empty). Build a plain, factual
-    # sentence from data that IS real (years of experience, actual
-    # skills) instead of leaving it blank — still never invents a title,
-    # employer, or achievement, consistent with this fallback's existing
-    # no-fabrication rule.
-    #
-    # BUG FIX ("every new requirement should generate a new career
-    # objective — this one is identical to the base resume, and would
-    # stay identical for every other job too"): when resume_info DOES
-    # have a stored summary, this used to pass it through completely
-    # unchanged regardless of which job requirement generation was
-    # running for — so Base Resume and Generated Resume showed the exact
-    # same text, and regenerating for a totally different JD produced
-    # that same frozen text again. The stored summary is kept as the
-    # primary content (it's real, specific, and already states years of
-    # experience), but a short JD-relevance line now gets appended
-    # naming whichever of the candidate's real skills this specific JD
-    # actually asks for — so the objective genuinely varies per
-    # requirement instead of being static, without inventing anything
-    # the stored summary or profile doesn't already support.
-    if not real_summary:
-        real_summary = _build_factual_career_objective(resume_info, real_skills, job_description, target_role)
-    else:
-        # Bold whichever of the candidate's real skills are both in their
-        # stored summary AND in this JD, so the summary visually reads as
-        # tailored to this requirement (matches the bold-keyword style of
-        # a hand-tailored resume) without changing a single word of it.
-        jd_lower = (job_description or "").lower()
-        overlapping_in_summary = [s for s in real_skills if s and s.lower() in jd_lower]
-        real_summary = _bold_terms(real_summary, overlapping_in_summary)
-        addendum = _build_jd_relevance_addendum(real_skills, job_description)
-        if addendum:
-            real_summary = real_summary.rstrip() + " " + addendum
+    # BUG FIX ("Generated Resume still shows old data / Career Objective
+    # not updating"): this used to reuse resume_info's stored summary
+    # VERBATIM whenever one existed (only bolding + appending a short
+    # addendum), so the Generated Resume pane looked nearly identical to
+    # the Base Resume pane no matter what JD it was generated for — the
+    # exact symptom reported. The whole point of this function is a
+    # JD-tailored objective, so it now always runs the experience-anchored
+    # paragraph builder, for every generation, regardless of whether a
+    # stored summary exists. The stored summary is NOT discarded — it's
+    # still shown as-is on the Base Resume pane elsewhere; this only
+    # changes what the *Generated* (tailored) pane shows.
+    real_summary = _build_factual_career_objective(resume_info, real_skills, job_description, target_role)
     # TECHNICAL PROFICIENCIES table: prefer resume_info's own categorized
     # list if it has one, otherwise build one from the full tech_stack
     # (expert + exposure/intermediate + familiar tiers merged) so the
     # table isn't limited to just the "expert" tier used for `skills`
     # above. Most stored profiles (like this one) only have a flat
     # tech_stack, not pre-categorized technical_proficiencies.
+    #
+    # BUG FIX: consultants have primary_skills/secondary_skills (via
+    # phase6.py's tech_stack={"expert": primary, "familiar": secondary}) —
+    # this used to flatten both tiers together before categorizing, so the
+    # table showed every skill the same way with no way to tell a
+    # consultant's primary (expert) skills apart from secondary ones once
+    # grouped by technology type. categorize_skills_with_tier() keeps that
+    # distinction — primary skills bold, secondary plain — within each
+    # category row, instead of a separate flat "Primary Skills" /
+    # "Secondary Skills" split that ignores technology type.
     tech_stack = resume_info.get("tech_stack") or {}
-    all_tech_skills = [
-        *tech_stack.get("expert", []),
-        *tech_stack.get("exposure", []),
-        *tech_stack.get("intermediate", []),
-        *tech_stack.get("familiar", []),
-    ]
+    tier_primary = tech_stack.get("expert", [])
+    tier_secondary = [*tech_stack.get("exposure", []), *tech_stack.get("intermediate", []), *tech_stack.get("familiar", [])]
+    all_tech_skills = [*tier_primary, *tier_secondary]
     real_tech_proficiencies = (
         resume_info.get("technical_proficiencies")
-        or (categorize_skills(all_tech_skills) if all_tech_skills else None)
+        or (categorize_skills_with_tier(tier_primary, tier_secondary) if all_tech_skills else None)
         or (categorize_skills(real_skills) if real_skills else None)
     )
     # BUG FIX ("any skill missing in TECHNICAL PROFICIENCIES add those
@@ -1108,6 +1126,18 @@ def generate_tailored_resume(
     # ones matched/related to this JD) that isn't already present in any
     # category, instead of only using the fuller list when the table was
     # completely absent.
+    #
+    # BUG FIX ("JD-mentioned skill add in their category, don't create
+    # separate category"): this used to dump every missing skill into one
+    # new "Additional Skills" bucket regardless of what kind of skill it
+    # was — Kubernetes and Excel side by side in a meaningless catch-all
+    # category. Missing skills are now categorized the same way as
+    # everything else (categorize_skills, same SKILL_CATEGORIES/keywords)
+    # and merged into whichever EXISTING row already has that category
+    # name (e.g. a new Cloud Platforms skill joins the existing Cloud
+    # Platforms row); only a genuinely new category not already present
+    # gets added as its own row, under its real technology-type name —
+    # never a generic "Additional Skills" label.
     if real_tech_proficiencies:
         already_listed = set()
         for cat in real_tech_proficiencies:
@@ -1119,10 +1149,20 @@ def generate_tailored_resume(
         candidate_pool = list(dict.fromkeys([*real_skills, *all_tech_skills, *jd_exact, *jd_related]))
         missing = [s for s in candidate_pool if s and s.strip().lower() not in already_listed]
         if missing:
-            real_tech_proficiencies = [
-                *real_tech_proficiencies,
-                {"category": "Additional Skills", "skills": missing},
-            ]
+            missing_categorized = categorize_skills(missing)
+            existing_by_category = {cat.get("category"): cat for cat in real_tech_proficiencies}
+            for mc in missing_categorized:
+                existing_cat = existing_by_category.get(mc["category"])
+                if existing_cat is not None:
+                    existing_skills = existing_cat.get("skills")
+                    existing_list = (
+                        existing_skills if isinstance(existing_skills, list)
+                        else [s.strip() for s in str(existing_skills or "").split(",") if s.strip()]
+                    )
+                    existing_cat["skills"] = existing_list + mc["skills"]
+                else:
+                    real_tech_proficiencies.append(mc)
+                    existing_by_category[mc["category"]] = mc
     real_education = resume_info.get("education") or resume_info.get("educational_background") or []
     real_certifications = resume_info.get("certifications") or []
 

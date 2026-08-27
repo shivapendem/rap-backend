@@ -157,10 +157,6 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         # real column going forward, so this only matters for old rows.
         linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
         education=c.education or (resume_info or {}).get("education") or [],
-        resume_info=resume_info,
-        resume_rich_text=c.resume_rich_text,
-        updated_at=c.updated_at.isoformat() if c.updated_at else "",
-        has_resume=bool(c.base_resume_file_path or c.base_resume_text),
         last_login_at=last_login_at.isoformat() if last_login_at else None,
         total_applications_sent=total_applications_sent,
         total_resumes_generated=total_resumes_generated,
@@ -305,10 +301,6 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
             ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
             linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
             education=c.education or (resume_info or {}).get("education") or [],
-            resume_info=resume_info,
-            resume_rich_text=c.resume_rich_text,
-            updated_at=c.updated_at.isoformat() if c.updated_at else "",
-            has_resume=bool(c.base_resume_file_path or c.base_resume_text),
             last_login_at=last_login_at.isoformat() if last_login_at else None,
             total_applications_sent=total_applications_sent,
             total_resumes_generated=total_resumes_generated,
@@ -661,27 +653,43 @@ class ConsultantAssignmentService:
             if linked_user:
                 linked_user.resume_info = resume_info
 
-        # BUG FIX (resume_info["skills"] silently drifting out of sync):
-        # generate_resume() in resume_router.py only ever backfills
-        # resume_info["skills"] from consultant.primary_skills the FIRST
-        # time a resume is generated (`if not resume_info.get("skills")`).
-        # After that, nothing kept it in sync — editing Primary/Secondary
-        # Skills via the chip editors had no path to resume_info at all,
-        # so the JSON silently drifted from the consultant's actual
-        # skills the moment either field was edited post-generation.
-        # Only fires when skills actually changed AND this same request
-        # isn't ALSO explicitly overwriting resume_info wholesale (that
-        # takes precedence, handled above) — merges just the "skills" key
-        # into the linked User's EXISTING resume_info, leaving every
-        # other key (summary, experience, education, etc.) untouched.
-        elif (primary_skills is not None or secondary_skills is not None) and consultant.user_id:
+        # BUG FIX (resume_info JSON silently drifting out of sync): this
+        # used to merge ONLY "skills" into the linked User's resume_info
+        # when primary/secondary skills changed — every other field this
+        # admin screen edits (education, phone, current_location,
+        # linkedin_url, total_experience_years, preferred_roles) updated
+        # the real Consultant column but never touched resume_info at
+        # all, so the raw "Resume Info (JSON)" field kept showing stale
+        # data (e.g. a newly-added Education row missing from the JSON)
+        # until something else happened to trigger a resync. Merges
+        # whichever of these fields actually changed in THIS request into
+        # the linked User's EXISTING resume_info, leaving every other key
+        # (summary, experience, etc.) untouched — same one-field-at-a-time
+        # merge shape skills already used, just no longer skills-only.
+        elif consultant.user_id and (
+            primary_skills is not None or secondary_skills is not None or education is not None
+            or phone is not None or current_location is not None or linkedin_url is not None
+            or total_experience_years is not None or preferred_roles is not None
+        ):
             user_result = await db.execute(select(User).where(User.id == consultant.user_id))
             linked_user = user_result.scalars().first()
             if linked_user:
-                combined = ", ".join(filter(None, [consultant.primary_skills, consultant.secondary_skills]))
-                skills_list = _skills_to_list(combined)
                 existing_info = dict(linked_user.resume_info or {})
-                existing_info["skills"] = skills_list
+                if primary_skills is not None or secondary_skills is not None:
+                    combined = ", ".join(filter(None, [consultant.primary_skills, consultant.secondary_skills]))
+                    existing_info["skills"] = _skills_to_list(combined)
+                if education is not None:
+                    existing_info["education"] = education
+                if phone is not None:
+                    existing_info["phone"] = phone
+                if current_location is not None:
+                    existing_info["location"] = current_location
+                if linkedin_url is not None:
+                    existing_info["linkedin"] = linkedin_url
+                if total_experience_years is not None:
+                    existing_info["years_experience"] = total_experience_years
+                if preferred_roles is not None:
+                    existing_info["title"] = preferred_roles
                 linked_user.resume_info = existing_info
 
         # BUG FIX ("admin edits a consultant's profile from User
@@ -702,6 +710,20 @@ class ConsultantAssignmentService:
         await sync_base_resume_text(db, consultant)
 
         consultant = await ConsultantRepository.update(db, consultant)
+
+        # BUG FIX ("admin edit and consultant profile edit — both changes
+        # saved in both screens"): consultant's OWN profile edits
+        # (phase3.py) all call sync_base_resume_text after saving, which
+        # rebuilds base_resume_content/base_resume_text from the just-
+        # updated real columns — that's what keeps the consultant's own
+        # "My Profile" > Base Resume card in sync with their edits. This
+        # admin endpoint changes the exact same columns (phone, location,
+        # skills, education, linkedin, etc.) but never called that sync at
+        # all, so an admin's edit updated the Consultant row correctly but
+        # left the consultant's Base Resume showing stale content until
+        # the consultant happened to save their own profile again.
+        from resume_router import sync_base_resume_text
+        await sync_base_resume_text(db, consultant)
 
         await log_action(
             db, "USER_UPDATED",
