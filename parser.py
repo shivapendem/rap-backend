@@ -8,6 +8,143 @@ import re
 import html
 from typing import Optional, List, Dict, Any, Tuple, Union
 
+
+# ─── Claude requirement-parsing (merged in from claude_parsing_service.py) ──
+# This was previously a separate file, split out from claude_service.py so
+# resume-generation edits couldn't accidentally break parsing. Per request,
+# merged directly into parser.py instead — this is the only file that calls
+# it, so there's no real benefit to it living elsewhere. The shared circuit
+# breaker still lives in claude_service.py (imported below) so one bad/
+# expired/out-of-credit API key still trips a single breaker across
+# parsing, resume generation, AND role matching — not an independent one
+# just for this file.
+
+PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
+Extract its content using the extract_requirement tool.
+If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess.
+"""
+
+# P0 fix: previously this asked the model to "return only JSON" and then
+# manually stripped ```json fences with string slicing before json.loads().
+# That silently broke (falling all the way back to the regex-only parser
+# below) any time the model added so much as a stray leading word or used
+# a different fence style. Forcing a tool call with an explicit
+# input_schema makes the API itself guarantee a parseable, schema-shaped
+# object — the tool_use block's `.input` is already a dict, no string
+# parsing at all.
+PARSE_REQUIREMENT_TOOL = {
+    "name": "extract_requirement",
+    "description": "Record the structured fields extracted from a job requirement email.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "role": {"type": ["string", "null"], "description": "The job title."},
+            "client": {"type": ["string", "null"], "description": "The end client or company, if explicitly mentioned."},
+            "location": {"type": ["string", "null"], "description": "City, state, or Remote/Hybrid/Onsite."},
+            "rate": {"type": ["string", "null"], "description": "The pay/bill rate or compensation."},
+            "duration": {"type": ["string", "null"], "description": "e.g. '6 months', 'long term'."},
+            "work_mode": {
+                "type": ["string", "null"],
+                "enum": ["REMOTE", "HYBRID", "ONSITE", "UNKNOWN", None],
+                "description": "REMOTE, HYBRID, ONSITE, or UNKNOWN."
+            },
+            "employment_types": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["C2C", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
+                "description": "One or more of C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN."
+            },
+            "experience": {"type": ["string", "null"], "description": "e.g. '8+ years'."},
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Key skills and technologies requested."
+            },
+        },
+        "required": ["role", "client", "location", "rate", "duration", "work_mode", "employment_types", "experience", "skills"],
+    },
+}
+
+
+def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
+    """
+    Calls Anthropic API to parse the raw text of a job requirement email
+    into a structured JSON. Returns None if parsing fails.
+    """
+    import os
+    import hashlib
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        from disk_cache import PersistentDiskCache
+        _REQUIREMENT_CACHE = PersistentDiskCache("requirement_cache.json")
+    except ImportError:
+        _REQUIREMENT_CACHE = None
+
+    if _REQUIREMENT_CACHE:
+        content_hash = hashlib.md5(f"{subject}\n{body}".encode("utf-8")).hexdigest()
+        cached = _REQUIREMENT_CACHE.get(content_hash)
+        if cached is not None:
+            return cached
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        logger.warning("ANTHROPIC_API_KEY not found, returning None for parse_requirement_text.")
+        return None
+
+    from claude_service import _claude_circuit_is_open, _trip_claude_circuit, _is_hard_claude_failure
+    if _claude_circuit_is_open():
+        return None
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key, timeout=15.0)
+
+        user_prompt = f"SUBJECT:\n{subject}\n\nBODY:\n{body}\n\nExtract the requirement now."
+
+        response = client.messages.with_raw_response.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=PARSE_REQUIREMENT_SYSTEM_PROMPT,
+            tools=[PARSE_REQUIREMENT_TOOL],
+            tool_choice={"type": "tool", "name": "extract_requirement"},
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+
+        parsed_response = response.parse()
+        tool_use_block = next(
+            (b for b in parsed_response.content if b.type == "tool_use"), None
+        )
+        if tool_use_block is None:
+            logger.warning("Claude API returned no tool_use block for requirement parsing.")
+            return None
+        result_json = tool_use_block.input
+
+        final_dict = {
+            'role': result_json.get('role') or 'UNKNOWN',
+            'client': result_json.get('client'),
+            'location': result_json.get('location'),
+            'rate': result_json.get('rate'),
+            'duration': result_json.get('duration'),
+            'work_mode': result_json.get('work_mode') or 'UNKNOWN',
+            'employment_types': result_json.get('employment_types') or ['UNKNOWN'],
+            'experience': result_json.get('experience'),
+            'skills': result_json.get('skills') or [],
+            'parsing_model': "Claude 3.5 Sonnet"
+        }
+        if _REQUIREMENT_CACHE:
+            _REQUIREMENT_CACHE.set(content_hash, final_dict)
+        return final_dict
+    except Exception as e:
+        if _is_hard_claude_failure(e):
+            _trip_claude_circuit(f"requirement parsing: {e}")
+        else:
+            logger.warning(f"Error calling Claude API for requirement parsing: {e}")
+        return None
+# ─── end merged-in Claude parsing ────────────────────────────────────────
+
 # ---------------------------------------------------------------------------
 # Constants - Stop Words and Patterns
 # ---------------------------------------------------------------------------
@@ -1380,7 +1517,8 @@ def parse_requirement(
 
     if not ai_parsed:
         try:
-            from claude_service import parse_requirement_text
+            # parse_requirement_text now defined locally in this file (merged
+            # in from claude_parsing_service.py — see top of file)
             ai_parsed = parse_requirement_text(safe_subject, safe_body)
             if ai_parsed:
                 parsing_log.append("Claude 3.5 Sonnet: Success")

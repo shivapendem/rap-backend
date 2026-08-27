@@ -1,3 +1,20 @@
+# --- Windows/asyncpg fix ---------------------------------------------------
+# The default ProactorEventLoop on Windows does not reliably complete the
+# SSL/TLS upgrade (start_tls) that asyncpg performs when connecting to a
+# Postgres server that requires SSL. This surfaces as:
+#   asyncio.exceptions.CancelledError  (inside start_tls)
+#   -> TimeoutError                     (raised by asyncpg's connect timeout)
+# on every app startup. Switching to the SelectorEventLoop fixes it. This
+# MUST run before any other import that might create an event loop or
+# import asyncio-dependent modules (database, asyncpg, etc.), so it's the
+# very first thing in the file.
+import sys
+import asyncio as _asyncio
+
+if sys.platform.startswith("win"):
+    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+# ---------------------------------------------------------------------------
+
 from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, func, update

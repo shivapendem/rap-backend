@@ -117,6 +117,29 @@ class EducationEntryRequest(BaseModel):
     details: Optional[str] = None
 
 
+class EducationEntryResponse(BaseModel):
+    """BUG FIX (GET /api/consultants 500 — 'education.1.institution:
+    String should have at least 1 character'): ProfileResponse.education
+    used to be typed List[EducationEntryRequest] — reusing the STRICT
+    request-validation class (min_length=1 on every field, meant to
+    reject an incomplete save from the consultant's own profile form) as
+    the response schema too. Real stored data doesn't carry that
+    guarantee — e.g. an education row added through the admin editor
+    with institution left blank — so building the response for any
+    consultant with one such row threw a validation error and 500'd the
+    ENTIRE list endpoint, not just that consultant. Response serialization
+    should describe what the data actually is, not what a future write
+    must satisfy; those are different concerns even though the shape
+    looks identical. Every field optional here, matching
+    phase_users_schema.py's EducationEntryDTO (the admin-side equivalent
+    response schema, which never had this problem for the same reason).
+    """
+    degree: Optional[str] = None
+    institution: Optional[str] = None
+    year: Optional[str] = None
+    details: Optional[str] = None
+
+
 class ProfileUpdateRequest(BaseModel):
     fullName: str = Field(..., min_length=1, max_length=200)
     # BUG FIX ("saving profile with empty Location/Phone/LinkedIn URL/
@@ -290,7 +313,7 @@ class ProfileResponse(BaseModel):
     # BUG FIX: read back from User.resume_info — see ProfileUpdateRequest.
     title: Optional[str] = None
     summary: Optional[str] = None
-    education: List[EducationEntryRequest] = []
+    education: List[EducationEntryResponse] = []
     resumeRichText: Optional[str] = None
 
 
@@ -925,6 +948,7 @@ async def update_own_profile(
         "email": current_user.email,
         "phone": payload.phone,
         "linkedin": payload.linkedInUrl,
+        "location": payload.location,
         "title": payload.title,
         "summary": payload.summary,
         "years_experience": payload.totalExperienceYears,

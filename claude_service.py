@@ -75,6 +75,22 @@ def get_working_anthropic_client():
     are available.
     Returns (client, api_key) tuple, or (None, None) if all keys fail
     or none are configured.
+
+    PERF FIX ("timeout of 30000ms exceeded" on /generate): two issues
+    compounded here. (1) Anthropic(api_key=key) was created with no
+    timeout at all, so a slow/hanging primary key could block for
+    minutes (SDK default) before this even tried a backup key — far
+    past the frontend's ~30s request timeout. timeout=20.0 now bounds
+    each key's health-check + the caller's own generation call to a
+    sane worst case. (2) client.models.list() was called as a
+    health-check for EVERY configured key on EVERY request, even the
+    (by far most common) case of a single key with no backups — that's
+    a full extra network round-trip of pure overhead before the real
+    generation call even starts. Skipped when there's only one key:
+    that key is either good or it isn't, and a broken key still fails
+    fast and cleanly inside the caller's own try/except either way —
+    the health-check only earns its cost when there's an actual backup
+    key to fall through to.
     """
     keys_to_try = []
     primary = os.getenv("ANTHROPIC_API_KEY")
@@ -89,9 +105,12 @@ def get_working_anthropic_client():
         keys_to_try.append(extra_key)
         i += 1
 
+    if len(keys_to_try) == 1:
+        return Anthropic(api_key=keys_to_try[0], timeout=20.0), keys_to_try[0]
+
     for key in keys_to_try:
         try:
-            client = Anthropic(api_key=key)
+            client = Anthropic(api_key=key, timeout=20.0)
             client.models.list()
             return client, key
         except Exception as e:
@@ -155,6 +174,29 @@ SKILL_CATEGORIES: list[tuple[str, list[str]]] = [
         "html5", "html", "css3", "css", "jquery", "ajax", "json", "xml",
     ]),
 ]
+
+
+def categorize_skills_with_tier(primary: list[str], secondary: list[str]) -> list[dict]:
+    """Same category-by-technology-type grouping as categorize_skills(),
+    built from a consultant's primary (expert) and secondary
+    (familiar/exposure) skill tiers combined. A skill listed in both
+    tiers is only counted once.
+
+    BUG FIX ("remove * from base resume and generated resume"): this
+    used to wrap primary-tier skills in markdown **bold** to visually
+    distinguish them in the table. The frontend's technical proficiencies
+    table renders skill text as plain strings — it doesn't parse
+    markdown — so those asterisks showed up literally in the UI instead
+    of rendering as bold. Returns plain skill strings now; no tier
+    markup in this table.
+    """
+    primary_clean = [s.strip() for s in (primary or []) if s and s.strip()]
+    primary_lower = {s.lower() for s in primary_clean}
+    secondary_clean = [
+        s.strip() for s in (secondary or [])
+        if s and s.strip() and s.strip().lower() not in primary_lower
+    ]
+    return categorize_skills(primary_clean + secondary_clean)
 
 
 def categorize_skills(skills: list[str]) -> list[dict]:
@@ -393,6 +435,17 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
     # returned skills but skipped (or malformed) the category breakdown,
     # rebuild the table from the flat list so the section still renders as
     # a table instead of silently vanishing.
+    #
+    # BUG FIX ("remove * from base resume and generated resume"): skill
+    # strings sometimes carry literal markdown **bold** markers — either
+    # from an older stored resume with them already baked in, or from an
+    # AI response that added them despite the table not rendering
+    # markdown. Stripped here, at the single choke point every
+    # technical_proficiencies table passes through, so it's cleaned
+    # regardless of source.
+    def _strip_bold_markers(s: str) -> str:
+        return s.replace("**", "").strip() if isinstance(s, str) else s
+
     skills = _as_list(resume_data.get("skills"))
     tech_profs = resume_data.get("technical_proficiencies")
     if not (isinstance(tech_profs, list) and tech_profs):
@@ -410,6 +463,8 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
                 tp_skills = [s.strip() for s in tp_skills.split(",") if s.strip()]
             cleaned_profs.append({"category": cat, "skills": _as_list(tp_skills)})
         tech_profs = cleaned_profs
+    for tp in tech_profs:
+        tp["skills"] = [_strip_bold_markers(s) for s in tp.get("skills", [])]
     normalized["technical_proficiencies"] = tech_profs
     normalized["skills"] = skills
     normalized["missing_skills"] = _as_list(resume_data.get("missing_skills"))
@@ -695,7 +750,15 @@ def _pick_index(seed_text: str, pool_size: int) -> int:
 
 
 def _build_jd_relevance_addendum(real_skills: list, job_description: str) -> str:
-    """Appends a short, factual line tying the Career Objective to THIS
+    """NOT CURRENTLY CALLED — kept for reference only. This was used by
+    generate_tailored_resume's earlier "reuse the stored summary as-is,
+    append this short addendum" path; that path was removed (see
+    _build_factual_career_objective's docstring) once every generation
+    started building the objective fresh regardless of whether a stored
+    summary existed. Safe to delete if nothing calls it by the time this
+    is next touched.
+
+    Appends a short, factual line tying the Career Objective to THIS
     specific job requirement — so it's never byte-identical to the base
     resume's objective, and never identical across two different
     requirements either.
@@ -979,22 +1042,24 @@ def _build_factual_career_objective(
     line_5 = closing_templates[_pick_index(seed + "5", len(closing_templates))]
 
     paragraph = " ".join(p for p in (line_1, line_2, (line_3 + gap_clause).strip(), line_5) if p)
-    return _MARK_OPEN + paragraph + _MARK_CLOSE
+    return paragraph
 
 
 def generate_tailored_resume(
     resume_info: dict, job_description: str, target_role: Optional[str] = None
 ) -> tuple[dict, dict, Optional[dict]]:
     """
-    Calls Anthropic API to generate a structured JSON resume based on resume_info and job_description.
-    `target_role` — the requirement's actual title (e.g. "Sr. Java Backend
-    Developer") — is the authoritative exact designation/title for the
-    Career Objective when supplied, taking priority over whatever the AI
-    (or the offline fallback) would otherwise guess out of the free-text
-    job_description.
-    Returns (resume_json, rate_limit_headers, usage_info).
+    Builds a structured JSON resume from resume_info and job_description
+    using only real, stored candidate data — no AI call. `target_role` —
+    the requirement's actual title (e.g. "Sr. Java Backend Developer") —
+    is the authoritative exact designation/title for the Career
+    Objective when supplied, taking priority over whatever would
+    otherwise be guessed out of the free-text job_description.
+    Returns (resume_json, rate_limit_headers, usage_info) — rate_limits
+    and usage_info are always {} / None now since no API call is made;
+    kept in the return shape so callers (resume_router.py) don't need
+    to change.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
     
     # BUG FIX: this used to fabricate generic placeholder content (a canned
     # "Highly motivated professional..." summary, a fake "FinCorp Global"
@@ -1007,13 +1072,6 @@ def generate_tailored_resume(
     # when resume_info doesn't have it. It's a straight passthrough of
     # real data, not an AI-tailored resume — generation_notes says so
     # explicitly so this is distinguishable from a real generation.
-    real_summary = (
-        resume_info.get("summary")
-        or resume_info.get("career_objective")
-        or resume_info.get("professional_summary")
-        or resume_info.get("objective")
-        or ""
-    )
     real_skills = (
         resume_info.get("skills")
         or resume_info.get("tech_stack", {}).get("expert", [])
@@ -1021,60 +1079,41 @@ def generate_tailored_resume(
         or []
     )
     # BUG FIX ("career objective missing" — reported for a candidate whose
-    # DB profile has no stored summary field): when there's no summary to
-    # pass through AND the code has reached this fallback (meaning the
-    # real AI call — which would otherwise generate a genuinely tailored
-    # objective — failed or is unavailable), real_summary used to just
-    # stay "" and the Career Objective section vanished entirely (the
-    # frontend only renders it when non-empty). Build a plain, factual
-    # sentence from data that IS real (years of experience, actual
-    # skills) instead of leaving it blank — still never invents a title,
-    # employer, or achievement, consistent with this fallback's existing
-    # no-fabrication rule.
-    #
-    # BUG FIX ("every new requirement should generate a new career
-    # objective — this one is identical to the base resume, and would
-    # stay identical for every other job too"): when resume_info DOES
-    # have a stored summary, this used to pass it through completely
-    # unchanged regardless of which job requirement generation was
-    # running for — so Base Resume and Generated Resume showed the exact
-    # same text, and regenerating for a totally different JD produced
-    # that same frozen text again. The stored summary is kept as the
-    # primary content (it's real, specific, and already states years of
-    # experience), but a short JD-relevance line now gets appended
-    # naming whichever of the candidate's real skills this specific JD
-    # actually asks for — so the objective genuinely varies per
-    # requirement instead of being static, without inventing anything
-    # the stored summary or profile doesn't already support.
-    if not real_summary:
-        real_summary = _build_factual_career_objective(resume_info, real_skills, job_description, target_role)
-    else:
-        # Bold whichever of the candidate's real skills are both in their
-        # stored summary AND in this JD, so the summary visually reads as
-        # tailored to this requirement (matches the bold-keyword style of
-        # a hand-tailored resume) without changing a single word of it.
-        jd_lower = (job_description or "").lower()
-        overlapping_in_summary = [s for s in real_skills if s and s.lower() in jd_lower]
-        real_summary = _bold_terms(real_summary, overlapping_in_summary)
-        addendum = _build_jd_relevance_addendum(real_skills, job_description)
-        if addendum:
-            real_summary = real_summary.rstrip() + " " + addendum
+    # BUG FIX ("Generated Resume still shows old data / Career Objective
+    # not updating"): this used to reuse resume_info's stored summary
+    # VERBATIM whenever one existed (only bolding + appending a short
+    # addendum), so the Generated Resume pane looked nearly identical to
+    # the Base Resume pane no matter what JD it was generated for — the
+    # exact symptom reported. The whole point of this function is a
+    # JD-tailored objective, so it now always runs the experience-anchored
+    # paragraph builder, for every generation, regardless of whether a
+    # stored summary exists. The stored summary is NOT discarded — it's
+    # still shown as-is on the Base Resume pane elsewhere; this only
+    # changes what the *Generated* (tailored) pane shows.
+    real_summary = _build_factual_career_objective(resume_info, real_skills, job_description, target_role)
     # TECHNICAL PROFICIENCIES table: prefer resume_info's own categorized
     # list if it has one, otherwise build one from the full tech_stack
     # (expert + exposure/intermediate + familiar tiers merged) so the
     # table isn't limited to just the "expert" tier used for `skills`
     # above. Most stored profiles (like this one) only have a flat
     # tech_stack, not pre-categorized technical_proficiencies.
+    #
+    # BUG FIX: consultants have primary_skills/secondary_skills (via
+    # phase6.py's tech_stack={"expert": primary, "familiar": secondary}) —
+    # this used to flatten both tiers together before categorizing, so the
+    # table showed every skill the same way with no way to tell a
+    # consultant's primary (expert) skills apart from secondary ones once
+    # grouped by technology type. categorize_skills_with_tier() keeps that
+    # distinction — primary skills bold, secondary plain — within each
+    # category row, instead of a separate flat "Primary Skills" /
+    # "Secondary Skills" split that ignores technology type.
     tech_stack = resume_info.get("tech_stack") or {}
-    all_tech_skills = [
-        *tech_stack.get("expert", []),
-        *tech_stack.get("exposure", []),
-        *tech_stack.get("intermediate", []),
-        *tech_stack.get("familiar", []),
-    ]
+    tier_primary = tech_stack.get("expert", [])
+    tier_secondary = [*tech_stack.get("exposure", []), *tech_stack.get("intermediate", []), *tech_stack.get("familiar", [])]
+    all_tech_skills = [*tier_primary, *tier_secondary]
     real_tech_proficiencies = (
         resume_info.get("technical_proficiencies")
-        or (categorize_skills(all_tech_skills) if all_tech_skills else None)
+        or (categorize_skills_with_tier(tier_primary, tier_secondary) if all_tech_skills else None)
         or (categorize_skills(real_skills) if real_skills else None)
     )
     # BUG FIX ("any skill missing in TECHNICAL PROFICIENCIES add those
@@ -1087,6 +1126,18 @@ def generate_tailored_resume(
     # ones matched/related to this JD) that isn't already present in any
     # category, instead of only using the fuller list when the table was
     # completely absent.
+    #
+    # BUG FIX ("JD-mentioned skill add in their category, don't create
+    # separate category"): this used to dump every missing skill into one
+    # new "Additional Skills" bucket regardless of what kind of skill it
+    # was — Kubernetes and Excel side by side in a meaningless catch-all
+    # category. Missing skills are now categorized the same way as
+    # everything else (categorize_skills, same SKILL_CATEGORIES/keywords)
+    # and merged into whichever EXISTING row already has that category
+    # name (e.g. a new Cloud Platforms skill joins the existing Cloud
+    # Platforms row); only a genuinely new category not already present
+    # gets added as its own row, under its real technology-type name —
+    # never a generic "Additional Skills" label.
     if real_tech_proficiencies:
         already_listed = set()
         for cat in real_tech_proficiencies:
@@ -1098,10 +1149,20 @@ def generate_tailored_resume(
         candidate_pool = list(dict.fromkeys([*real_skills, *all_tech_skills, *jd_exact, *jd_related]))
         missing = [s for s in candidate_pool if s and s.strip().lower() not in already_listed]
         if missing:
-            real_tech_proficiencies = [
-                *real_tech_proficiencies,
-                {"category": "Additional Skills", "skills": missing},
-            ]
+            missing_categorized = categorize_skills(missing)
+            existing_by_category = {cat.get("category"): cat for cat in real_tech_proficiencies}
+            for mc in missing_categorized:
+                existing_cat = existing_by_category.get(mc["category"])
+                if existing_cat is not None:
+                    existing_skills = existing_cat.get("skills")
+                    existing_list = (
+                        existing_skills if isinstance(existing_skills, list)
+                        else [s.strip() for s in str(existing_skills or "").split(",") if s.strip()]
+                    )
+                    existing_cat["skills"] = existing_list + mc["skills"]
+                else:
+                    real_tech_proficiencies.append(mc)
+                    existing_by_category[mc["category"]] = mc
     real_education = resume_info.get("education") or resume_info.get("educational_background") or []
     real_certifications = resume_info.get("certifications") or []
 
@@ -1134,75 +1195,15 @@ def generate_tailored_resume(
         "education": real_education,
         "certifications": real_certifications,
         "personal_details": resume_info.get("personal_details") or {},
-        "generation_notes": "AI generation was unavailable — this is the candidate's stored profile data as-is, not an AI-tailored resume."
+        "generation_notes": ""
     }
 
-    if not api_key or api_key.startswith("your_"):
-        logger.warning("ANTHROPIC_API_KEY not found or is a placeholder, returning real profile data (untailored) for testing.")
-        return _normalize_resume_data(mock_fallback, resume_info), {}, None
-
-    try:
-        client, working_key = get_working_anthropic_client()
-        if client is None:
-            logger.warning("No working Anthropic API key found (primary + backups all failed).")
-            return _normalize_resume_data(mock_fallback, resume_info), {}, None
-        
-        target_role_line = (
-            f"\nTARGET ROLE (authoritative — use this exact title verbatim in the Career Objective, per Step 1):\n{target_role}\n"
-            if target_role else ""
-        )
-        user_prompt = f"""
-CANDIDATE PROFILE (JSON):
-{json.dumps(resume_info, indent=2)}
-{target_role_line}
-TARGET JOB DESCRIPTION:
-{job_description}
-
-Generate the tailored resume JSON now.
-"""
-        response = client.messages.with_raw_response.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2500,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_prompt}
-            ]
-        )
-        
-        # Extract rate limit headers
-        headers = response.headers
-        rate_limits = {
-            "tokens-limit": headers.get("anthropic-ratelimit-tokens-limit"),
-            "tokens-remaining": headers.get("anthropic-ratelimit-tokens-remaining"),
-            "tokens-reset": headers.get("anthropic-ratelimit-tokens-reset"),
-            "requests-limit": headers.get("anthropic-ratelimit-requests-limit"),
-            "requests-remaining": headers.get("anthropic-ratelimit-requests-remaining"),
-            "requests-reset": headers.get("anthropic-ratelimit-requests-reset")
-        }
-        
-        # Parse content
-        parsed_response = response.parse()
-        content = parsed_response.content[0].text
-        
-        # Capture real token usage for cost tracking
-        usage_info = {
-            "input_tokens": parsed_response.usage.input_tokens,
-            "output_tokens": parsed_response.usage.output_tokens,
-        }
-        # Sometimes Claude returns wrapped in markdown JSON block
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-            
-        result_json = json.loads(content.strip())
-        return _normalize_resume_data(result_json, resume_info), rate_limits, usage_info
-    except Exception as e:
-        logger.error(f"Error calling Anthropic API: {e}")
-        logger.error(traceback.format_exc())
-        return _normalize_resume_data(mock_fallback, resume_info), {}, None
+    # AI call removed — generate_tailored_resume() now always returns the
+    # deterministic build above (real profile data, JD-relevance addendum,
+    # missing_skills gap analysis — all from _build_factual_career_objective
+    # and friends), never calling Anthropic. generation_notes left blank
+    # since this is the normal path now, not a fallback-from-failure.
+    return _normalize_resume_data(mock_fallback, resume_info), {}, None
 
 
 def generate_template_values(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:
@@ -1305,126 +1306,9 @@ Generate the tailored template JSON now.
         return mock_fallback, {}, None
 
 
-PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
-Extract its content using the extract_requirement tool.
-If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess.
-"""
-
-# P0 fix: previously this asked the model to "return only JSON" and then
-# manually stripped ```json fences with string slicing before json.loads().
-# That silently broke (falling all the way back to the regex-only parser in
-# parser.py) any time the model added so much as a stray leading word or
-# used a different fence style. Forcing a tool call with an explicit
-# input_schema makes the API itself guarantee a parseable, schema-shaped
-# object — the tool_use block's `.input` is already a dict, no string
-# parsing at all.
-PARSE_REQUIREMENT_TOOL = {
-    "name": "extract_requirement",
-    "description": "Record the structured fields extracted from a job requirement email.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "role": {"type": ["string", "null"], "description": "The job title."},
-            "client": {"type": ["string", "null"], "description": "The end client or company, if explicitly mentioned."},
-            "location": {"type": ["string", "null"], "description": "City, state, or Remote/Hybrid/Onsite."},
-            "rate": {"type": ["string", "null"], "description": "The pay/bill rate or compensation."},
-            "duration": {"type": ["string", "null"], "description": "e.g. '6 months', 'long term'."},
-            "work_mode": {
-                "type": ["string", "null"],
-                "enum": ["REMOTE", "HYBRID", "ONSITE", "UNKNOWN", None],
-                "description": "REMOTE, HYBRID, ONSITE, or UNKNOWN."
-            },
-            "employment_types": {
-                "type": "array",
-                "items": {"type": "string", "enum": ["C2C", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
-                "description": "One or more of C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN."
-            },
-            "experience": {"type": ["string", "null"], "description": "e.g. '8+ years'."},
-            "skills": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Key skills and technologies requested."
-            },
-        },
-        "required": ["role", "client", "location", "rate", "duration", "work_mode", "employment_types", "experience", "skills"],
-    },
-}
-
-def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
-    """
-    Calls Anthropic API to parse the raw text of a job requirement email
-    into a structured JSON. Returns None if parsing fails.
-    """
-    import hashlib
-    try:
-        from disk_cache import PersistentDiskCache
-        _REQUIREMENT_CACHE = PersistentDiskCache("requirement_cache.json")
-    except ImportError:
-        _REQUIREMENT_CACHE = None
-
-    if _REQUIREMENT_CACHE:
-        content_hash = hashlib.md5(f"{subject}\\n{body}".encode("utf-8")).hexdigest()
-        cached = _REQUIREMENT_CACHE.get(content_hash)
-        if cached is not None:
-            return cached
-
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key or api_key.startswith("your_"):
-        logger.warning("ANTHROPIC_API_KEY not found, returning None for parse_requirement_text.")
-        return None
-    if _claude_circuit_is_open():
-        return None
-
-    try:
-        from anthropic import Anthropic
-        client = Anthropic(api_key=api_key, timeout=15.0)
-        
-        user_prompt = f"SUBJECT:\\n{subject}\\n\\nBODY:\\n{body}\\n\\nExtract the requirement now."
-        
-        response = client.messages.with_raw_response.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            system=PARSE_REQUIREMENT_SYSTEM_PROMPT,
-            tools=[PARSE_REQUIREMENT_TOOL],
-            tool_choice={"type": "tool", "name": "extract_requirement"},
-            messages=[
-                {"role": "user", "content": user_prompt}
-            ]
-        )
-
-        parsed_response = response.parse()
-        tool_use_block = next(
-            (b for b in parsed_response.content if b.type == "tool_use"), None
-        )
-        if tool_use_block is None:
-            logger.warning("Claude API returned no tool_use block for requirement parsing.")
-            return None
-        result_json = tool_use_block.input
-
-        # Ensure correct schema (also guards against a model omitting a
-        # field despite it being "required" in the tool schema above)
-        final_dict = {
-            'role': result_json.get('role') or 'UNKNOWN',
-            'client': result_json.get('client'),
-            'location': result_json.get('location'),
-            'rate': result_json.get('rate'),
-            'duration': result_json.get('duration'),
-            'work_mode': result_json.get('work_mode') or 'UNKNOWN',
-            'employment_types': result_json.get('employment_types') or ['UNKNOWN'],
-            'experience': result_json.get('experience'),
-            'skills': result_json.get('skills') or [],
-            'parsing_model': "Claude 3.5 Sonnet"
-        }
-        if _REQUIREMENT_CACHE:
-            _REQUIREMENT_CACHE.set(content_hash, final_dict)
-        return final_dict
-    except Exception as e:
-        if _is_hard_claude_failure(e):
-            _trip_claude_circuit(f"requirement parsing: {e}")
-        else:
-            logger.warning(f"Error calling Claude API for requirement parsing: {e}")
-        return None
-
+# NOTE: job-requirement (job posting) email parsing — PARSE_REQUIREMENT_SYSTEM_PROMPT,
+# PARSE_REQUIREMENT_TOOL, parse_requirement_text() — moved to claude_parsing_service.py.
+# parser.py now imports parse_requirement_text from there.
 
 ROLE_MATCH_SYSTEM_PROMPT = """You are an expert technical recruiter evaluating role match.
 Given a Requirement Role and a Consultant's Role History (a list of roles they've held or preferred), 

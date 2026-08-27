@@ -18,7 +18,7 @@ from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3
-from claude_service import generate_tailored_resume
+from claude_service import generate_tailored_resume, categorize_skills_with_tier
 from phase8_ai_usage_service import save_claude_rate_limits
 from resume_validation import get_missing_resume_fields, missing_fields_message
 from phase3 import _extract_text_from_docx
@@ -270,44 +270,47 @@ async def _build_resume_info(
     # Prepend profile experiences so they are processed as most relevant/recent
     resume_info["experience"] = manual_exp_entries + resume_info["experience"]
 
-    # BUG FIX: this function fetched `consultant` above but only ever used
-    # it for ConsultantExperience rows — it never merged the consultant's
-    # own real profile columns (linkedin_url, phone, total_experience_years,
-    # primary_skills, preferred_roles) into resume_info at all. Those
-    # columns are what the consultant profile screen actually reads/writes
-    # (see phase3.py, phase_users_service.py); resume_info is a separate
-    # JSON blob that only ever reflects whatever was parsed/imported at
-    # signup. So a consultant who filled in LinkedIn (or phone, years of
-    # experience, skills, target role) through their profile after that
-    # initial import still failed the completeness check below and the
-    # AI generation call itself never saw those fields — "Add LinkedIn to
-    # the profile" fired even though it genuinely was on file, just not in
-    # this blob. Backfill every field this checks against from the real
-    # Consultant row, same "real column wins over resume_info fallback"
-    # priority already used elsewhere (see phase3.py's linkedInUrl
-    # resolution) — but only filling gaps, so a richer resume_info value
-    # (e.g. a fuller skills list) is never clobbered by a thinner one.
+    # BUG FIX ("admin edit and consultant profile edit — every change
+    # should update the json too"): this used to only ever BACKFILL a gap
+    # — if resume_info's stored blob (frozen from initial signup/import)
+    # already had ANY non-blank value for a field, an edit made afterward
+    # through either the admin's User Management screen or the
+    # consultant's own profile screen (both of which write the real
+    # Consultant/User columns, never this blob directly) was silently
+    # invisible to AI-tailored resume generation — same bug already fixed
+    # for full_name below, now applied consistently to every identity/
+    # contact field the real Consultant/User row is the source of truth
+    # for. `location` was missing from this sync entirely — admin editing
+    # "Current Location" never reached resume_info at all, at any point,
+    # gap or not.
+    #
+    # title/preferred_roles and skills are intentionally left as
+    # fill-gap-only: resume_info.title can be a deliberate per-resume
+    # override of the broader preferred_roles field, and skills are
+    # already kept in sync separately (phase_users_service.py merges
+    # primary/secondary skill edits into resume_info["skills"] directly
+    # at admin-save time).
     if consultant:
         def _blank(key: str) -> bool:
             val = resume_info.get(key)
             return val is None or (isinstance(val, str) and not val.strip())
 
-        if _blank("linkedin") and consultant.linkedin_url:
+        if consultant.linkedin_url:
             resume_info["linkedin"] = consultant.linkedin_url
-        if _blank("phone") and consultant.phone:
+        if consultant.phone:
             resume_info["phone"] = consultant.phone
-        if _blank("full_name") and consultant.full_name:
+        if consultant.full_name:
             resume_info["full_name"] = consultant.full_name
-        if _blank("email") and consultant.email:
+        if consultant.email:
             resume_info["email"] = consultant.email
+        if consultant.current_location:
+            resume_info["location"] = consultant.current_location
+        if consultant.education:
+            resume_info["education"] = consultant.education
+        if consultant.total_experience_years is not None:
+            resume_info["years_experience"] = float(consultant.total_experience_years)
         if _blank("title") and _blank("target_role") and _blank("target_title") and consultant.preferred_roles:
             resume_info["title"] = consultant.preferred_roles
-        if (
-            resume_info.get("years_experience") in (None, "")
-            and resume_info.get("total_experience_years") in (None, "")
-            and consultant.total_experience_years is not None
-        ):
-            resume_info["years_experience"] = float(consultant.total_experience_years)
         if not resume_info.get("skills") and not resume_info.get("tech_stack") and not resume_info.get("technical_proficiencies") and consultant.primary_skills:
             resume_info["skills"] = [s.strip() for s in consultant.primary_skills.split(",") if s.strip()]
 
@@ -1498,11 +1501,23 @@ async def build_base_resume_content(
             resume_info = info_result.scalar_one_or_none() or {}
     summary_text = resume_info.get("summary") or _build_base_career_objective(consultant)
 
-    technical_proficiencies = []
-    if (consultant.primary_skills or "").strip():
-        technical_proficiencies.append({"category": "Primary Skills", "skills": consultant.primary_skills})
-    if (consultant.secondary_skills or "").strip():
-        technical_proficiencies.append({"category": "Secondary Skills", "skills": consultant.secondary_skills})
+    # BUG FIX ("technical proficiencies want category type, not a flat
+    # Primary/Secondary split"): this used to emit exactly two rows —
+    # "Primary Skills" and "Secondary Skills" — each with ALL of that
+    # tier's skills dumped in one unsorted blob, with no grouping by
+    # technology type at all (Java and PostgreSQL sitting in the same
+    # "Primary Skills" cell). Also: `skills` here was the raw
+    # comma-separated STRING column, not a list, inconsistent with the
+    # {"category": str, "skills": string[]} shape used everywhere else.
+    # Now grouped by technology type (same categories/keywords as
+    # generate_tailored_resume's table) with primary skills bolded within
+    # each row, matching the categorized format used there.
+    primary_list = [s.strip().replace("**", "") for s in (consultant.primary_skills or "").split(",") if s.strip()]
+    secondary_list = [s.strip().replace("**", "") for s in (consultant.secondary_skills or "").split(",") if s.strip()]
+    technical_proficiencies = (
+        categorize_skills_with_tier(primary_list, secondary_list)
+        if (primary_list or secondary_list) else []
+    )
 
     exp_rows_result = await db.execute(
         select(ConsultantExperience)
