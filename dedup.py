@@ -5,11 +5,25 @@
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import func
 from models import Requirement
+
+# BUG FIX (duplicate requirements not caught by exact dedup_key match):
+# jd_hash is an exact SHA256 of the JD text, so it only catches
+# byte-for-byte identical re-sends. In practice, vendors very commonly
+# "bump"/resend the same job with a tiny wording change (an added
+# "URGENT", an updated line, a fresh timestamp in the signature) — the
+# hash changes completely even though it's the same job, so it silently
+# created a second Requirement row. Two independent match rows then get
+# scored against every candidate, and rejecting one match has zero
+# effect on the other since they belong to unrelated requirement_ids.
+# This window catches "same vendor + same role, arrived close together
+# in time" as a duplicate too, even when the JD text isn't identical.
+NEAR_DUPLICATE_WINDOW_HOURS = 72
 
 
 def normalize_text(value: str) -> str:
@@ -41,17 +55,53 @@ async def is_duplicate(
     vendor_email: str,
     role: str,
     jd_hash: str,
+    received_date=None,
 ) -> bool:
     """
     Check if requirement already exists in database.
     Returns True if duplicate, False if new.
+
+    Two checks, either of which counts as a duplicate:
+      1. Exact match: identical vendor_email + role + jd_hash (byte-for-byte
+         same JD text). Catches true re-sends/forwards.
+      2. Near match: same vendor_email + role arriving within
+         NEAR_DUPLICATE_WINDOW_HOURS of an existing requirement, even if
+         the JD text differs slightly. Catches the much more common case
+         of a vendor bumping/resending the same job with minor wording
+         changes.
     """
     dedup_key = build_dedup_key(vendor_email, role, jd_hash)
 
     result = await db.execute(
         select(Requirement).where(Requirement.dedup_key == dedup_key)
     )
-    return result.scalars().first() is not None
+    if result.scalars().first() is not None:
+        return True
+
+    norm_vendor = normalize_text(vendor_email)
+    norm_role = normalize_text(role)
+    # Don't near-match on missing/placeholder values — that would risk
+    # merging genuinely different jobs that both failed to parse a
+    # vendor or role, which is a worse outcome than an occasional
+    # uncaught duplicate.
+    if not norm_vendor or norm_vendor == "unknown@unknown.com" or not norm_role or norm_role == "unknown":
+        return False
+
+    anchor_time = received_date if isinstance(received_date, datetime) else datetime.now(timezone.utc)
+    if anchor_time.tzinfo is None:
+        anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+    window_start = anchor_time - timedelta(hours=NEAR_DUPLICATE_WINDOW_HOURS)
+    window_end = anchor_time + timedelta(hours=NEAR_DUPLICATE_WINDOW_HOURS)
+
+    near_result = await db.execute(
+        select(Requirement.id).where(
+            func.lower(func.trim(Requirement.vendor_email)) == norm_vendor,
+            func.lower(func.trim(Requirement.role)) == norm_role,
+            Requirement.created_at >= window_start,
+            Requirement.created_at <= window_end,
+        ).limit(1)
+    )
+    return near_result.scalars().first() is not None
 
 
 async def save_requirement(
@@ -74,18 +124,21 @@ async def save_requirement(
     # Build dedup key
     dedup_key = build_dedup_key(vendor_email, role, jd_hash)
 
-    # Check for duplicate
-    duplicate = await is_duplicate(db, vendor_email, role, jd_hash)
-    if duplicate:
-        return {"status": "duplicate", "id": None}
-
     # received_date may arrive as an ISO string (from JSON payloads) or a
-    # datetime already (from gmail_emails.date) — normalize to datetime or None
+    # datetime already (from gmail_emails.date) — normalize to datetime or
+    # None. Moved ahead of the duplicate check (was previously done after)
+    # so is_duplicate's near-duplicate time-window check gets a real
+    # datetime to anchor on instead of always falling back to "now".
     if isinstance(received_date, str):
         try:
             received_date = datetime.fromisoformat(received_date.replace("Z", "+00:00"))
         except ValueError:
             received_date = None
+
+    # Check for duplicate
+    duplicate = await is_duplicate(db, vendor_email, role, jd_hash, received_date=received_date)
+    if duplicate:
+        return {"status": "duplicate", "id": None}
 
     # Save new requirement — persist jd_hash and dedup_key so future duplicate checks work
     new_req = Requirement(

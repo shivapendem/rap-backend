@@ -2,7 +2,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 import asyncio
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -378,7 +378,8 @@ async def _run_matching_engine_background():
 
 
 @router.post("/run")
-async def run_matching_engine(
+async def trigger_matching_run(
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user)
 ):
     """
@@ -402,7 +403,7 @@ async def run_matching_engine(
         "new_matches": 0,
         "error": None,
     })
-    asyncio.create_task(_run_matching_engine_background())
+    background_tasks.add_task(_run_matching_engine_background)
     return {"success": True, "started": True, **_matching_run_state}
 
 

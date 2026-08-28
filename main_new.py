@@ -1,20 +1,3 @@
-# --- Windows/asyncpg fix ---------------------------------------------------
-# The default ProactorEventLoop on Windows does not reliably complete the
-# SSL/TLS upgrade (start_tls) that asyncpg performs when connecting to a
-# Postgres server that requires SSL. This surfaces as:
-#   asyncio.exceptions.CancelledError  (inside start_tls)
-#   -> TimeoutError                     (raised by asyncpg's connect timeout)
-# on every app startup. Switching to the SelectorEventLoop fixes it. This
-# MUST run before any other import that might create an event loop or
-# import asyncio-dependent modules (database, asyncpg, etc.), so it's the
-# very first thing in the file.
-import sys
-import asyncio as _asyncio
-
-if sys.platform.startswith("win"):
-    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
-# ---------------------------------------------------------------------------
-
 from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, func, update
@@ -178,151 +161,10 @@ _DEFAULT_USERS = [
 ]
 
 
-GMAIL_SYNC_INTERVAL_SECONDS = int(os.getenv("GMAIL_SYNC_INTERVAL_SECONDS", "300"))  # default: every 5 min
-
-
-async def _gmail_to_requirements_loop():
-    """
-    Background loop: periodically bridges new gmail_emails rows into
-    requirements. Runs for the lifetime of the app so IMAP-synced emails
-    are turned into requirements without any manual/cron step.
-    """
-    while True:
-        try:
-            async with AsyncSessionLocal() as session:
-                summary = await sync_pending_emails(session)
-                if summary["total"]:
-                    print(f"[gmail-sync] {summary}")
-        except Exception as e:
-            print(f"[gmail-sync] loop error: {e}")
-            from error_logger import log_db_error
-            await log_db_error(stage="gmail_to_requirements_loop", error=e)
-            try:
-                from notification_helper import notify_by_role
-                async with AsyncSessionLocal() as notif_session:
-                    await notify_by_role(notif_session, roles=["ADMIN"], title="Email sync failed", body=f"Gmail-to-requirements sync failed: {e}")
-            except Exception as notif_err:
-                print(f"[gmail-sync] notify failed: {notif_err}")
-        await asyncio.sleep(GMAIL_SYNC_INTERVAL_SECONDS)
-
-
-EMAIL_QUEUE_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_QUEUE_SYNC_INTERVAL_SECONDS", "15"))
-
-async def _email_queue_worker_loop():
-    """
-    Background loop: periodically checks EmailQueue for QUEUED items whose scheduled_at <= now()
-    and sends them via consultant's Gmail API token.
-
-    Per-item send/attachment/Application-upsert logic lives in
-    email_queue.process_single_email_queue_item — shared with the
-    send-now endpoint used by the Apply-to-Requirement page, so both
-    paths behave identically instead of risking two diverging copies.
-    """
-    from models import EmailQueue
-    from email_queue import process_single_email_queue_item
-    from datetime import datetime, timezone
-    from sqlalchemy import or_, func
-
-    print("[email-queue] worker loop task initialized and started")
-    # Self-healing: reset any stuck PROCESSING items back to QUEUED on startup
-    try:
-        async with AsyncSessionLocal() as session:
-            from sqlalchemy import update
-            claim_reset = await session.execute(
-                update(EmailQueue)
-                .where(EmailQueue.status == "PROCESSING")
-                .values(status="QUEUED")
-            )
-            await session.commit()
-            if claim_reset.rowcount > 0:
-                print(f"[email-queue] self-healing: reset {claim_reset.rowcount} stuck PROCESSING items back to QUEUED")
-    except Exception as sh_err:
-        print(f"[email-queue] self-healing failed: {sh_err}")
-    while True:
-        try:
-            async with AsyncSessionLocal() as session:
-                now_utc = datetime.now(timezone.utc)
-                result = await session.execute(
-                    select(EmailQueue)
-                    .where(
-                        EmailQueue.status == "QUEUED",
-                        or_(EmailQueue.scheduled_at == None, EmailQueue.scheduled_at <= now_utc)
-                    )
-                    .order_by(
-                        func.coalesce(EmailQueue.scheduled_at, EmailQueue.created_at).asc(),
-                        EmailQueue.id.asc()
-                    )
-                )
-                queued_items = result.scalars().all()
-                # RACE FIX: send_email_now() (email_queue.py) can process the
-                # same item this loop just selected, in the window between
-                # this query and the loop's own send attempt below — both
-                # paths would then call the Gmail API for the same item,
-                # causing duplicate sends and slower total processing time
-                # (which can push send_email_now's caller past its own
-                # timeout). Atomically claim each item by flipping its status
-                # to PROCESSING right here; if 0 rows are affected, another
-                # caller already claimed it, so skip it in this cycle.
-                claimed_items = []
-                for qi in queued_items:
-                    claim_result = await session.execute(
-                        update(EmailQueue)
-                        .where(EmailQueue.id == qi.id, EmailQueue.status == "QUEUED")
-                        .values(status="PROCESSING")
-                    )
-                    if claim_result.rowcount > 0:
-                        claimed_items.append(qi)
-                await session.commit()
-                queued_items = claimed_items
-                if queued_items:
-                    print(f"[email-queue] processing {len(queued_items)} eligible items")
-                for item in queued_items:
-                    await process_single_email_queue_item(session, item)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "connection was closed" in err_str or "connection does not exist" in err_str:
-                print(f"[email-queue] transient connection drop: {e}")
-            else:
-                print(f"[email-queue] loop error: {e}")
-                from error_logger import log_db_error
-                await log_db_error(stage="email_queue_worker_loop", error=e)
-                try:
-                    from notification_helper import notify_by_role
-                    async with AsyncSessionLocal() as notif_session:
-                        await notify_by_role(notif_session, roles=["ADMIN"], title="Email queue sync failed", body=f"Email queue worker loop failed: {e}")
-                except Exception as notif_err:
-                    print(f"[email-queue] notify failed: {notif_err}")
-        await asyncio.sleep(EMAIL_QUEUE_SYNC_INTERVAL_SECONDS)
-
-async def _connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
-    """
-    The initial DB connection during startup has been observed to
-    intermittently hang during the TLS handshake (asyncpg start_tls)
-    against the remote Postgres server, then time out — while the very
-    same code succeeds moments later with no changes. This looks like
-    a network-layer flake (packet loss on the client's Wi-Fi affecting
-    the larger TLS handshake packets specifically, since plain TCP
-    connects instantly and reliably) rather than a real config problem.
-    Rather than let one bad handshake kill the whole app on startup,
-    retry a few times with a short backoff before giving up for real.
-    """
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            return
-        except Exception as e:
-            last_err = e
-            print(f"[startup] DB connect attempt {attempt}/{max_attempts} failed: {e!r}")
-            if attempt < max_attempts:
-                await asyncio.sleep(base_delay * attempt)
-    raise RuntimeError(f"Could not connect to database after {max_attempts} attempts") from last_err
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await _connect_with_retry()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     # Insert-if-not-exists keyed by email — never touches rows that already exist
     async with AsyncSessionLocal() as session:
@@ -373,6 +215,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await email_queue_task
+    except asyncio.CancelledError:
+        pass
 
     # Dispose database engine and close all connection pool sockets on shutdown
     try:

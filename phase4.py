@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -1306,18 +1307,39 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     Called automatically when a consultant updates their profile so their
     matches reflect the new skills/roles/etc. without an admin re-run.
     Returns the number of requirements where they now meet MATCH_THRESHOLD.
+
+    PERFORMANCE FIX (root cause of "saving one field on My Profile takes
+    8+ seconds / freezes the whole app"): match_requirement() above scales
+    with ACTIVE CONSULTANT count (typically small), but this function
+    scales with OPEN REQUIREMENT count — 44,000+ in production. The old
+    version pulled every open Requirement as a FULL ORM object (every
+    column, including large JSON/text fields) and looked up existing
+    matches via `.in_(req_ids)` with all 44,000+ ids as literal SQL
+    parameters — on every single save, even though the very next check
+    (the MATCHING_LOGIC_VERSION tag) was about to skip almost all of them
+    anyway.
+
+    Fix: a first lightweight JOIN fetches only (id, status,
+    score_breakdown) — no large columns, no giant IN-list — to cheaply
+    decide which requirements actually need (re)scoring, still reading
+    the version tag out of score_breakdown's JSON exactly as before (no
+    schema change). Full Requirement objects are then hydrated ONLY for
+    that smaller subset. Skip/count semantics are unchanged — same
+    protected-status guard, same version-tag skip, same counting — this
+    only changes what gets fetched, and how much of it.
+
+    A second, separate fix below (the periodic `await asyncio.sleep(0)`)
+    addresses a related but distinct problem: validate_match()/
+    score_match() are synchronous CPU-bound Python with few or no
+    `await` points inside a long run of rejections. Since Python's
+    asyncio event loop is single-threaded, a long uninterrupted stretch
+    of that work blocks EVERYTHING else on the process — including
+    sending back the HTTP response for the save that triggered this
+    background task — not just this task itself.
     """
     cons_result = await db.execute(select(Consultant).where(Consultant.id == consultant_id))
     consultant = cons_result.scalars().first()
     if not consultant or consultant.status != "ACTIVE":
-        return 0
-
-    # Open requirements only — skip terminal states.
-    reqs_result = await db.execute(
-        select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
-    )
-    requirements = reqs_result.scalars().all()
-    if not requirements:
         return 0
 
     exp_result = await db.execute(
@@ -1325,37 +1347,93 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     )
     experiences = exp_result.scalars().all()
 
-    req_ids = [r.id for r in requirements]
-    existing_result = await db.execute(
-        select(RequirementConsultantMatch).where(
-            RequirementConsultantMatch.consultant_id == consultant_id,
-            RequirementConsultantMatch.requirement_id.in_(req_ids),
+    # Lightweight pass: which open requirements actually need scoring?
+    # LEFT JOIN so a requirement with no existing match row for this
+    # consultant still comes back (status/score_breakdown as NULL/None),
+    # matching the original "existing = None" case exactly.
+    lightweight_result = await db.execute(
+        select(
+            Requirement.id,
+            RequirementConsultantMatch.status,
+            RequirementConsultantMatch.score_breakdown,
         )
+        .select_from(Requirement)
+        .outerjoin(
+            RequirementConsultantMatch,
+            (RequirementConsultantMatch.requirement_id == Requirement.id)
+            & (RequirementConsultantMatch.consultant_id == consultant_id),
+        )
+        .where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
     )
-    existing_by_req = {m.requirement_id: m for m in existing_result.scalars().all()}
+    lightweight_rows = lightweight_result.all()
+    if not lightweight_rows:
+        await db.commit()
+        return 0
 
     match_count = 0
     near_miss_count = 0
-    for requirement in requirements:
-        existing = existing_by_req.get(requirement.id)
+    ids_needing_scoring: list[int] = []
 
+    for req_id, existing_status, existing_score_breakdown in lightweight_rows:
         # BUG FIX: same protective guard as match_requirement() above —
         # never touch a row already advanced to RESUME_GENERATED,
-        # READY_TO_APPLY, APPLIED, or REJECTED.
-        if existing and existing.status in ("RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"):
-            if existing.status == "ASSIGNED":
+        # READY_TO_APPLY, APPLIED, or REJECTED. (Identical to the
+        # original per-row check — just evaluated here, before deciding
+        # whether a full Requirement object is even needed.)
+        if existing_status in ("RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"):
+            if existing_status == "ASSIGNED":
                 match_count += 1
             continue
 
         # PERFORMANCE: same version-tag skip as match_requirement() above —
         # skip full re-validation for a row already checked under the
         # current matching logic.
-        if existing and existing.score_breakdown and existing.score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
-            if existing.status == "NEAR_MISS":
+        if existing_score_breakdown and existing_score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+            if existing_status == "NEAR_MISS":
                 near_miss_count += 1
-            elif existing.status == "ASSIGNED":
+            elif existing_status == "ASSIGNED":
                 match_count += 1
             continue
+
+        ids_needing_scoring.append(req_id)
+
+    if not ids_needing_scoring:
+        await db.commit()
+        logger.info(
+            "Auto-matched consultant_id=%s — all %d open requirements already up to date, nothing to rescore",
+            consultant_id, len(lightweight_rows),
+        )
+        return match_count
+
+    # Full Requirement objects ONLY for the (typically much smaller)
+    # subset that genuinely needs scoring — this is the expensive fetch,
+    # now scoped to a delta instead of every open requirement.
+    reqs_result = await db.execute(select(Requirement).where(Requirement.id.in_(ids_needing_scoring)))
+    requirements = reqs_result.scalars().all()
+
+    existing_result = await db.execute(
+        select(RequirementConsultantMatch).where(
+            RequirementConsultantMatch.consultant_id == consultant_id,
+            RequirementConsultantMatch.requirement_id.in_(ids_needing_scoring),
+        )
+    )
+    existing_by_req = {m.requirement_id: m for m in existing_result.scalars().all()}
+
+    for i, requirement in enumerate(requirements):
+        # PERFORMANCE FIX (root cause of "the whole app stalls during a
+        # save"): validate_match()/score_match() are plain synchronous
+        # CPU-bound Python — no `await` inside them — and a rejected
+        # requirement with no existing row to touch skips db.flush()
+        # entirely, so a long run of those has NO yield points at all.
+        # Yielding briefly every 50 items costs nothing measurable (this
+        # loop is now typically just the delta needing rescoring) but
+        # lets the event loop interleave other pending work — like
+        # finishing an HTTP response — instead of freezing everything
+        # else for the loop's entire duration.
+        if i % 50 == 0:
+            await asyncio.sleep(0)
+
+        existing = existing_by_req.get(requirement.id)
 
         validation = validate_match(requirement, consultant, experiences)
 
@@ -1364,9 +1442,6 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                 "match_consultant: consultant_id=%s requirement_id=%s REJECTED at stage=%s (%s)",
                 consultant_id, requirement.id, validation["stage_failed"], validation["reason"],
             )
-            # BUG FIX: mark INVALIDATED instead of deleting — same fix
-            # already applied to match_requirement() above and to
-            # Pipeline B (matching_router.py). Match history is mandatory.
             if existing and existing.status != "INVALIDATED":
                 existing.status = "INVALIDATED"
                 existing.match_reason = (

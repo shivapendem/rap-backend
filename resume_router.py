@@ -7,9 +7,9 @@ import asyncio
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime, timezone, date
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body, BackgroundTasks
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import func, or_
@@ -28,27 +28,6 @@ from phase3 import _extract_text_from_docx
 
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
-# BUG FIX ("View still says base resume is missing from storage even
-# after re-saving My Profile"): _regen_in_background below is launched
-# via asyncio.create_task() with nothing retaining the returned Task
-# object. Per Python's own asyncio docs, the event loop only holds a
-# *weak* reference to tasks — one with no other reference anywhere can
-# be garbage-collected at any point before it finishes, silently, with
-# no exception raised and nothing logged (since GC doesn't go through
-# the function's own try/except at all). That means the DOCX
-# rebuild + Spaces upload triggered by a My Profile save could simply
-# never finish, intermittently, leaving base_resume_file_path pointing
-# at whatever it was before — which is exactly what "still broken after
-# re-saving, nothing in the logs" looks like. Keeping a strong reference
-# in this module-level set (recommended pattern from the asyncio docs)
-# until each task completes prevents that.
-_background_tasks: set = set()
-
-
-def _run_background(coro) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
 
 
 # PERMANENT FIX ("QueuePool limit ... connection timed out" under rapid
@@ -1119,13 +1098,16 @@ async def update_base_resume_text(
             old_path = Path(stored)
             new_path = old_path.with_suffix(".docx")
             new_path.parent.mkdir(parents=True, exist_ok=True)
-            new_path.write_bytes(docx_bytes)
+            # BUG FIX: same lock-window race as _regenerate_base_resume_docx_file
+            # / download_base_resume — write to a temp sibling file, then an
+            # atomic rename, instead of holding a lock on the real path for
+            # the full write duration.
+            tmp_path = new_path.with_name(f".{new_path.stem}.{uuid.uuid4().hex}.tmp")
+            tmp_path.write_bytes(docx_bytes)
+            os.replace(tmp_path, new_path)
             if new_path != old_path and old_path.exists():
                 old_path.unlink()
             consultant.base_resume_file_path = str(new_path)
-        elif stored:
-            # Not a local path -> a Spaces/S3 object key (mirrors the same
-            # local-vs-Spaces branching download_base_resume already does).
             # Re-upload under a .docx key so a pre-migration .pdf key
             # doesn't end up mislabeled the same way as the local case.
             key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
@@ -1166,6 +1148,105 @@ class BaseResumeContentDTO(BaseModel):
 
 class BaseResumeContentUpdateRequest(BaseModel):
     content: dict
+
+    # BUG FIX (consistency with the consultant's own "My Profile" screen
+    # and the admin's Consultant Detail / User Detail screens): this
+    # endpoint writes Full Name, Phone, LinkedIn URL, and Education
+    # straight into the same Consultant row those screens edit (see
+    # update_base_resume_content below), but `content` was a completely
+    # open, untyped dict with no validation at all — every required-field
+    # rule enforced everywhere else could be silently bypassed just by
+    # saving from this screen instead (delete every Education entry,
+    # blank Phone/LinkedIn, save — no error, no warning).
+    #
+    # Unlike the partial-update DTOs elsewhere (UpdateConsultantRequestDTO
+    # in phase_users_schema.py), this screen's Save button always submits
+    # the FULL current form state in one shot, not a single changed
+    # field — so there's no "field omitted vs explicitly cleared"
+    # ambiguity to preserve here. These checks apply unconditionally
+    # whenever this endpoint is called at all.
+    #
+    # Deliberately narrow: only validates the specific keys that map to
+    # required profile fields. Every other key in `content`
+    # (technical_proficiencies, experience, career_objective,
+    # certifications, etc.) is left exactly as permissive as before —
+    # none of those are required anywhere else in the system, so nothing
+    # here should start rejecting them.
+    @field_validator("content")
+    @classmethod
+    def validate_required_profile_fields(cls, v: dict) -> dict:
+        if not isinstance(v, dict):
+            return v
+
+        name = str(v.get("name") or "").strip()
+        if not name:
+            raise ValueError("Full Name is required and cannot be cleared")
+
+        phone = str(v.get("phone") or "").strip()
+        if not phone:
+            raise ValueError("Phone is required and cannot be cleared")
+        if not re.match(r"^\+?[\d\s\-().]{7,20}$", phone):
+            raise ValueError("Enter a valid phone number")
+
+        linkedin = str(v.get("linkedin") or "").strip()
+        if not linkedin:
+            raise ValueError("LinkedIn is required and cannot be cleared")
+        if "linkedin.com" not in linkedin.lower():
+            raise ValueError("LinkedIn must include linkedin.com")
+
+        education = v.get("education")
+        if not isinstance(education, list) or len(education) == 0:
+            raise ValueError("At least one education entry is required")
+        for entry in education:
+            if not isinstance(entry, dict):
+                raise ValueError("Each education entry must be an object")
+            degree = str(entry.get("degree") or "").strip()
+            institution = str(entry.get("institution") or "").strip()
+            year = str(entry.get("year") or "").strip()
+            if not degree or not institution or not year:
+                raise ValueError("Degree, institution, and year are all required for each education entry")
+
+        # BUG FIX (consistency with "My Profile"): Primary and Secondary
+        # Skills are both required there (SkillTagInput.tsx — at least one
+        # skill each) — this screen has no dedicated Primary/Secondary
+        # Skills fields of its own, but its Technical Proficiencies rows
+        # are exactly what update_base_resume_content below buckets into
+        # those same two Consultant columns, keyed off whether "primary"
+        # appears anywhere in a row's Category text (anything else,
+        # including a blank category, falls through to secondary — same
+        # rule as the bucketing logic further down this file). Mirrored
+        # here rather than centralized only because that logic lives in
+        # the endpoint body, not a place a Pydantic validator can share
+        # directly — kept the exact same "primary" substring rule so the
+        # two can't drift apart.
+        tech_rows = v.get("technical_proficiencies")
+        tech_rows = tech_rows if isinstance(tech_rows, list) else []
+
+        def _row_has_skills(row: dict) -> bool:
+            skills_val = row.get("skills")
+            skills_str = ", ".join(skills_val) if isinstance(skills_val, list) else str(skills_val or "")
+            return bool(skills_str.strip())
+
+        has_primary = any(
+            isinstance(row, dict) and "primary" in str(row.get("category") or "").strip().lower() and _row_has_skills(row)
+            for row in tech_rows
+        )
+        has_secondary = any(
+            isinstance(row, dict) and "primary" not in str(row.get("category") or "").strip().lower() and _row_has_skills(row)
+            for row in tech_rows
+        )
+        if not has_primary:
+            raise ValueError(
+                'Add at least one Technical Proficiencies row with "Primary" in the Category '
+                '(e.g. "Primary Skills") and at least one skill listed'
+            )
+        if not has_secondary:
+            raise ValueError(
+                'Add at least one more Technical Proficiencies row (any category without "Primary" in it) '
+                "with at least one skill listed"
+            )
+
+        return v
 
 
 _HEURISTIC_SECTION_HEADERS = [
@@ -1586,7 +1667,17 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
             old_path = Path(stored)
             new_path = old_path.with_suffix(".docx")
             new_path.parent.mkdir(parents=True, exist_ok=True)
-            new_path.write_bytes(docx_bytes)
+            # BUG FIX (race with concurrent "View" reads -- see the matching
+            # BUG FIX comment in download_base_resume): writing bytes
+            # directly to new_path holds a Windows file lock on it for the
+            # entire write. Writing to a sibling temp file first and then
+            # atomically replacing the real path with os.replace() shrinks
+            # that lock window from "however long the write takes" down to
+            # "a near-instant rename", making the race far less likely to
+            # ever be hit in the first place.
+            tmp_path = new_path.with_name(f".{new_path.stem}.{uuid.uuid4().hex}.tmp")
+            tmp_path.write_bytes(docx_bytes)
+            os.replace(tmp_path, new_path)
             if new_path != old_path and old_path.exists():
                 old_path.unlink()
             consultant.base_resume_file_path = str(new_path)
@@ -1636,6 +1727,7 @@ async def sync_base_resume_text(
     db: AsyncSession,
     consultant: Consultant,
     resume_info: Optional[dict] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> None:
     """Regenerate and stage consultant.base_resume_text from CURRENT
     profile fields — called by phase3.py whenever Skills, Experience,
@@ -1717,7 +1809,14 @@ async def sync_base_resume_text(
     # already has one in flight, rather than stacking DB sessions.
     if consultant_id not in _regen_in_flight:
         _regen_in_flight.add(consultant_id)
-        _run_background(_regen_in_background(consultant_id))
+        if background_tasks:
+            background_tasks.add_task(_regen_in_background, consultant_id)
+        else:
+            # Fallback if no background_tasks provided (should not happen in normal flows)
+            # We must use asyncio.create_task here but we warn about it.
+            import logging
+            logging.getLogger(__name__).warning("sync_base_resume_text called without BackgroundTasks!")
+            asyncio.create_task(_regen_in_background(consultant_id))
 
 
 @router.get("/base/content", response_model=BaseResumeContentDTO)
@@ -2162,6 +2261,7 @@ async def download_base_resume(
         raise HTTPException(status_code=404, detail="No base resume uploaded yet.")
 
     stored = consultant.base_resume_file_path
+    print(f"[base-resume-view-debug] stored={stored!r} isfile={os.path.isfile(stored) if stored else 'N/A'}")
     ext = os.path.splitext(stored)[1].lower()
     media_type = (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -2186,15 +2286,70 @@ async def download_base_resume(
     # base resume.
     try:
         if os.path.isfile(stored):
-            with open(stored, "rb") as fh:
-                body = fh.read()
+            # BUG FIX ("View works, then intermittently fails with 'file not
+            # available'"): every profile save fires a BACKGROUND task
+            # (sync_base_resume_text -> _regen_in_background) that rewrites
+            # this exact local file. If a View request's read landed while
+            # that background write was in progress, Windows raises a
+            # PermissionError (an OSError) because the file is locked by
+            # the other process. That was being silently swallowed by the
+            # bare `except OSError: pass` below, which then fell through
+            # to `generate_presigned_url(stored)` -- but `stored` here is a
+            # LOCAL FILESYSTEM PATH, not an S3 key. generate_presigned_url
+            # doesn't verify the object exists; it happily signs a URL for
+            # a Spaces object that was NEVER uploaded, and that broken URL
+            # got returned as if it were legitimate. Google's viewer then
+            # 404s trying to fetch it, which is exactly the "file wasn't
+            # available on site" error being seen.
+            # Fix: retry the local read a few times (the concurrent write
+            # is brief) instead of silently misreading a local path as a
+            # remote object key.
+            body = None
+            for attempt in range(4):
+                try:
+                    with open(stored, "rb") as fh:
+                        body = fh.read()
+                    break
+                except OSError:
+                    if attempt < 3:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+            if body is None:
+                # Still locked after retrying -- tell the frontend to try
+                # again shortly rather than returning a URL for an object
+                # that doesn't exist.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Your resume is being updated — please try View again in a moment.",
+                )
             if not force_stream:
                 temp_s3_key = f"users/{target_user_id}/base-resume-view-temp/{uuid.uuid4().hex}{ext or '.docx'}"
-                uploaded = await asyncio.to_thread(upload_file_to_s3, io.BytesIO(body), temp_s3_key, media_type)
-                if uploaded:
-                    presigned = generate_presigned_url(temp_s3_key)
-                    if presigned:
-                        return {"url": presigned, "filename": display_name, "mimeType": media_type}
+                # BUG FIX ("View works once, then fails / 'file not available'
+                # on the next click"): this upload is an outbound HTTPS call
+                # to DigitalOcean Spaces, same as every other network call in
+                # this app — a single transient network hiccup (the same
+                # Wi-Fi-related TLS flakiness already seen on the Postgres
+                # connection) made upload_file_to_s3 return False just once,
+                # which silently fell through to raw DOCX bytes below. The
+                # browser has no built-in DOCX renderer, so that always
+                # LOOKS like a broken/missing file even though nothing is
+                # actually missing — it's just an unretried network blip.
+                # Retrying a couple of times before giving up costs at most
+                # a second or two and matches the retry approach already
+                # used for the DB connection at startup.
+                uploaded = False
+                presigned = ""
+                for attempt in range(3):
+                    uploaded = await asyncio.to_thread(upload_file_to_s3, io.BytesIO(body), temp_s3_key, media_type)
+                    print(f"[base-resume-view-debug] attempt={attempt} temp_s3_key={temp_s3_key} uploaded={uploaded}")
+                    if uploaded:
+                        presigned = generate_presigned_url(temp_s3_key)
+                        print(f"[base-resume-view-debug] presigned_url={presigned!r}")
+                        if presigned:
+                            break
+                    if attempt < 2:
+                        await asyncio.sleep(0.75 * (attempt + 1))
+                if presigned:
+                    return {"url": presigned, "filename": display_name, "mimeType": media_type}
                 # Upload failed for some reason — fall through and serve
                 # the raw bytes below so viewing still degrades to a
                 # download rather than breaking outright.
@@ -2203,11 +2358,19 @@ async def download_base_resume(
                 media_type=media_type,
                 headers={"Content-Disposition": f'inline; filename="{display_name}"'},
             )
+    except HTTPException:
+        raise
     except OSError:
         pass
 
+    # NOTE: this fallback path is only reached when `stored` was never a
+    # local file to begin with (os.path.isfile(stored) was False from the
+    # start, e.g. it's a genuine Spaces object key) -- NOT for a local
+    # file that failed to read, which is now handled above and never
+    # falls through to here.
     if not force_stream:
         presigned = generate_presigned_url(stored)
+        print(f"[base-resume-view-debug] (S3-key branch) stored={stored!r} presigned_url={presigned!r}")
         if presigned:
             return {"url": presigned, "filename": display_name, "mimeType": media_type}
 

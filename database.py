@@ -1,4 +1,3 @@
-
 import os
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -51,7 +50,11 @@ if not DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {
         "server_settings": {
             "timezone": "UTC"
-        }
+        },
+        # Fail fast (default is much longer) so a hung TLS handshake
+        # doesn't stall startup for ages — pairs with the retry loop
+        # in main.py's lifespan, which reattempts on failure.
+        "timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "8")),
     }
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
@@ -114,4 +117,3 @@ async def get_db():
             raise
         finally:
             await session.close()
- 

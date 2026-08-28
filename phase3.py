@@ -54,7 +54,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status, BackgroundTasks
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -83,6 +83,12 @@ from s3_service import upload_file_to_s3, delete_file_from_s3
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Per-consultant background-rematch coalescing guard — see
+# _rematch_in_background in update_own_profile below. Per-process only;
+# would need a DB/Redis-backed lock for a multi-worker deployment.
+_rematch_in_progress: set[int] = set()
+_rematch_dirty: set[int] = set()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -883,6 +889,7 @@ async def get_own_profile(
 )
 async def update_own_profile(
     payload: ProfileUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -973,7 +980,7 @@ async def update_own_profile(
     # DB — we already have it in memory, so that query was pure wasted
     # round-trip latency on every save.
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant, existing_info)
+    await sync_base_resume_text(db, consultant, existing_info, background_tasks)
 
     await db.commit()
     await db.refresh(consultant)
@@ -981,23 +988,53 @@ async def update_own_profile(
     # Re-run matching for this consultant so their requirement matches reflect
     # the just-saved profile. Runs in the background with its own DB session so
     # it never blocks or fails the profile save.
+    #
+    # BUG FIX ("saving one field on My Profile takes 8+ seconds, and a
+    # second save right after sits stuck pending"): with 44,000+ open
+    # requirements in the system, one rematch pass loops over all of
+    # them for this consultant — genuinely takes several seconds. Every
+    # field-level auto-save (Work Auth, Skills, Employment Type, etc.)
+    # used to independently fire its OWN full rematch via
+    # asyncio.create_task. Editing more than one field within a few
+    # seconds — completely normal usage — spawned multiple overlapping
+    # background tasks for the SAME consultant, all trying to upsert
+    # into the same RequirementConsultantMatch rows at once, so they
+    # serialized against each other via Postgres row locks instead of
+    # Python ever noticing they overlapped. Same coalescing shape as the
+    # existing base-resume-sync fix and the Gmail sync mutex fix: track
+    # whether a rematch is already running for this consultant; if a new
+    # save lands mid-run, don't start a second one — just flag that one
+    # more pass is needed once the current one finishes, so N rapid
+    # saves cost at most 2 rematch passes instead of N concurrent ones.
+    # NOTE: this in-memory guard is per-process — fine for a single
+    # uvicorn worker, but would need a DB- or Redis-backed lock instead
+    # if this ever runs multi-worker.
     consultant_id = consultant.id
+
     async def _rematch_in_background(cid: int):
         from database import AsyncSessionLocal
         from phase4 import match_consultant
+        from matching_router import run_matching_for_consultant
         try:
-            async with AsyncSessionLocal() as bg_session:
-                await match_consultant(bg_session, cid)
-                # COVERAGE GAP FIX (not a matching-condition change): this
-                # only ever refreshed Pipeline A (the admin Requirements
-                # page's match count). Pending Applications (Pipeline B,
-                # the JobMatch table) never got refreshed when a
-                # consultant updated their profile — even when the update
-                # was specifically to fix a gap keeping them from
-                # matching something. Same session, same trigger, second
-                # pipeline.
-                from matching_router import run_matching_for_consultant
-                await run_matching_for_consultant(bg_session, cid)
+            while True:
+                _rematch_dirty.discard(cid)
+                async with AsyncSessionLocal() as bg_session:
+                    await match_consultant(bg_session, cid)
+                    # COVERAGE GAP FIX (not a matching-condition change):
+                    # this only ever refreshed Pipeline A (the admin
+                    # Requirements page's match count). Pending
+                    # Applications (Pipeline B, the JobMatch table) never
+                    # got refreshed when a consultant updated their
+                    # profile — even when the update was specifically to
+                    # fix a gap keeping them from matching something.
+                    # Same session, same trigger, second pipeline.
+                    await run_matching_for_consultant(bg_session, cid)
+                # If another save landed while this pass was running, do
+                # exactly one more pass to pick up its latest data — this
+                # pass started with whatever was saved BEFORE it began,
+                # so it can't have already covered that save.
+                if cid not in _rematch_dirty:
+                    break
         except Exception as e:
             logger.error("Background auto-match failed for consultant_id=%s: %s", cid, e)
             from error_logger import log_db_error
@@ -1007,7 +1044,18 @@ async def update_own_profile(
                 source_type="consultant",
                 source_id=str(cid),
             )
-    asyncio.create_task(_rematch_in_background(consultant_id))
+        finally:
+            _rematch_in_progress.discard(cid)
+
+    if consultant_id in _rematch_in_progress:
+        # A rematch is already running for this consultant — just mark
+        # that it needs one more pass when it's done, instead of
+        # spawning a second task that would fight the first one over
+        # the same rows.
+        _rematch_dirty.add(consultant_id)
+    else:
+        _rematch_in_progress.add(consultant_id)
+        asyncio.create_task(_rematch_in_background(consultant_id))
 
     count_result = await db.execute(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
@@ -1137,7 +1185,8 @@ async def get_consultant_by_id(
 )
 async def update_consultant_by_id(
     consultant_id: int,
-    payload: ProfileUpdateRequest,
+    payload: AdminConsultantUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1153,15 +1202,18 @@ async def update_consultant_by_id(
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
     consultant.secondary_skills = ", ".join(payload.secondarySkills)
+    consultant.linkedin_url = payload.linkedInUrl
     consultant.preferred_employment_types = _resolve_employment_types(
         consultant.preferred_employment_types, payload.employmentTypes
     )
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
+    consultant.education = [e.model_dump() for e in payload.education]
+    consultant.resume_rich_text = payload.resumeRichText
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     await db.refresh(consultant)
@@ -1199,7 +1251,7 @@ async def admin_create_consultant(
         raise HTTPException(409, f"A user with email '{payload.email}' already exists")
     existing_consultant = await db.execute(select(Consultant).where(Consultant.email == payload.email))
     if existing_consultant.scalars().first():
-        raise HTTPException(409, f"Consultant with email '{payload.email}' already exists")
+        raise HTTPException(409, "Consultant with email '{payload.email}' already exists")
 
     recruiter_id_int: Optional[int] = None
     if payload.recruiter_id:
@@ -1469,6 +1521,7 @@ async def list_own_experience(
 )
 async def create_experience(
     payload: ExperienceRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1511,7 +1564,7 @@ async def create_experience(
     await db.flush()
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     await db.refresh(exp)
@@ -1526,6 +1579,7 @@ async def create_experience(
 async def update_experience(
     experience_id: int,
     payload: ExperienceRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1557,7 +1611,7 @@ async def update_experience(
     exp.sort_order = payload.sortOrder
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     await db.refresh(exp)
@@ -1571,6 +1625,7 @@ async def update_experience(
 )
 async def delete_experience(
     experience_id: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1596,7 +1651,7 @@ async def delete_experience(
     await db.delete(exp)
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
 
@@ -1607,6 +1662,7 @@ async def delete_experience(
 )
 async def reorder_experience(
     payload: ReorderRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1634,7 +1690,7 @@ async def reorder_experience(
         )
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     return {"message": f"Reordered {len(payload.orderedIds)} entries"}
