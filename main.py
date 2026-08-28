@@ -25,6 +25,7 @@ from sqlalchemy import or_
 from passlib.context import CryptContext
 import jwt
 import os
+import time
 from contextlib import asynccontextmanager
 import httpx
 import math
@@ -172,6 +173,9 @@ class ConsultantResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 # Default users seeded on startup — keyed by email so restarts never duplicate or wipe data.
+# SECURITY: only seeds when SEED_DEMO_USERS=true is explicitly set (local/dev use only).
+# Never enable this in production.
+_SEED_DEMO_USERS = os.getenv("SEED_DEMO_USERS", "false").lower() == "true"
 _DEFAULT_USERS = [
     {"email": "admin@rap.io",     "full_name": "Admin User",     "role": "ADMIN"},
     {"email": "recruiter@rap.io", "full_name": "Recruiter User", "role": "RECRUITER"},
@@ -324,19 +328,30 @@ async def _connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
 async def lifespan(app: FastAPI):
     await _connect_with_retry()
 
-    # Insert-if-not-exists keyed by email — never touches rows that already exist
+    # Insert-if-not-exists keyed by email — never touches rows that already exist.
+    # SECURITY FIX: this used to unconditionally create admin@rap.io /
+    # recruiter@rap.io with a hardcoded password ("password123!") on every
+    # single app startup, forever — a permanent default-credential backdoor
+    # into ADMIN. Now it's opt-in (SEED_DEMO_USERS=true, local/dev only) and
+    # generates a random password printed once to the server console instead
+    # of a fixed, publicly-guessable one. `session` stays created
+    # unconditionally — the gmail_connected sync block right after this one
+    # reuses the same session/async-with and would break without it.
     async with AsyncSessionLocal() as session:
-        for u in _DEFAULT_USERS:
-            result = await session.execute(select(User).where(User.email == u["email"]))
-            if not result.scalars().first():
-                session.add(User(
-                    email=u["email"],
-                    full_name=u["full_name"],
-                    role=u["role"],
-                    password_hash=get_password_hash("password123!"),
-                ))
-                print(f"Seeded default user: {u['email']}")
-        await session.commit()
+        if _SEED_DEMO_USERS:
+            import secrets
+            for u in _DEFAULT_USERS:
+                result = await session.execute(select(User).where(User.email == u["email"]))
+                if not result.scalars().first():
+                    temp_password = secrets.token_urlsafe(12)
+                    session.add(User(
+                        email=u["email"],
+                        full_name=u["full_name"],
+                        role=u["role"],
+                        password_hash=get_password_hash(temp_password),
+                    ))
+                    print(f"Seeded default user: {u['email']} — TEMP PASSWORD: {temp_password} (change on first login)")
+            await session.commit()
 
         # BUG FIX ("authorize a candidate, restart the backend, they're back
         # to Unauthorized"): this used to also run an unconditional UPDATE
@@ -541,6 +556,38 @@ app.include_router(matching_router, prefix="/api/matching", tags=["matching"])
 # ---------------------------------------------------------------------------
 
 
+# SECURITY FIX: /auth/login had no brute-force protection at all — no
+# rate limit, lockout, or CAPTCHA — so a scripted attacker could try
+# passwords indefinitely. This is an in-memory, per-process guard (same
+# pattern as the existing _rematch_in_progress coalescing in phase3.py):
+# fine for a single uvicorn worker; move to Redis if this ever scales to
+# multiple workers, since counts wouldn't be shared across processes.
+# As a side effect this also caps the existing "Failed login attempt"
+# admin notification to at most _LOGIN_MAX_ATTEMPTS per window per email,
+# since the 429 below returns before that notification code ever runs.
+_LOGIN_ATTEMPT_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_ATTEMPTS = 5
+_login_failed_attempts: dict[str, list[float]] = {}
+
+
+def _check_login_rate_limit(email: str) -> None:
+    now = time.time()
+    attempts = [t for t in _login_failed_attempts.get(email, []) if now - t < _LOGIN_ATTEMPT_WINDOW_SECONDS]
+    _login_failed_attempts[email] = attempts
+    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Please try again in a few minutes.",
+        )
+
+
+def _record_failed_login(email: str) -> None:
+    _login_failed_attempts.setdefault(email, []).append(time.time())
+
+
+def _clear_failed_logins(email: str) -> None:
+    _login_failed_attempts.pop(email, None)
+
 
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(
@@ -548,11 +595,14 @@ async def login(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    _check_login_rate_limit(request.email)
+
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalars().first()
 
     # BUG FIX: avoid user enumeration — same error for bad user or bad password
     if not user or not user.password_hash or not verify_password(request.password, user.password_hash):
+        _record_failed_login(request.email)
         try:
             from notification_helper import notify_by_role
             await notify_by_role(db, roles=["ADMIN"], title="Failed login attempt", body=f"Failed login attempt for email: {request.email}")
@@ -577,6 +627,8 @@ async def login(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is deactivated. Contact your administrator.",
             )
+
+    _clear_failed_logins(user.email)
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     set_session_cookies(response, token)
@@ -1258,6 +1310,45 @@ async def get_company_banner():
     return Response(content=body, media_type=media_type)
 
 
+# SECURITY FIX: both image-upload endpoints below used to accept anything
+# whose client-supplied Content-Type header started with "image/" — a
+# header the client fully controls. That also let image/svg+xml through,
+# which is XML and can carry an executable <script>, unlike a real raster
+# image. This decodes the actual bytes with Pillow so only genuine
+# PNG/JPEG/GIF/WEBP data is ever accepted, and returns the REAL detected
+# content-type so a spoofed header can't cause a mismatched Content-Type
+# on download either.
+_IMAGE_EXT_BY_CONTENT_TYPE = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+
+def _validate_and_normalize_image_upload(file_bytes: bytes) -> str:
+    from PIL import Image
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(file_bytes))
+        fmt = (img.format or "").upper()
+        img.verify()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="File is not a valid image (SVG and other non-raster formats aren't supported).",
+        )
+
+    allowed_formats = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif", "WEBP": "image/webp"}
+    if fmt not in allowed_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported image format: {fmt or 'unknown'}. Use PNG, JPG, GIF, or WEBP.",
+        )
+    return allowed_formats[fmt]
+
+
 @app.post("/api/v1/admin/settings/company-banner")
 async def upload_company_banner(
     file: UploadFile = File(...),
@@ -1275,13 +1366,14 @@ async def upload_company_banner(
     if current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Only admins can change the company banner.")
 
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload an image file (PNG, JPG, etc.).")
+    file_bytes = await file.read()
+    detected_content_type = _validate_and_normalize_image_upload(file_bytes)
+    file.file.seek(0)
 
     from email_template import COMPANY_BANNER_S3_KEY
     from s3_service import upload_file_to_s3
 
-    success = upload_file_to_s3(file.file, COMPANY_BANNER_S3_KEY, content_type=file.content_type)
+    success = upload_file_to_s3(file.file, COMPANY_BANNER_S3_KEY, content_type=detected_content_type)
     if not success:
         raise HTTPException(
             status_code=502,
@@ -1320,16 +1412,17 @@ async def upload_signature_image(
     each upload gets its own key (unlike the company banner's one fixed
     key) since a signature can hold more than one image and different
     users' signatures must never collide."""
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload an image file (PNG, JPG, etc.).")
+    file_bytes = await file.read()
+    detected_content_type = _validate_and_normalize_image_upload(file_bytes)
+    file.file.seek(0)
 
     import uuid as _uuid
     from s3_service import upload_file_to_s3
 
-    ext = os.path.splitext(file.filename or "")[1] or ".png"
+    ext = _IMAGE_EXT_BY_CONTENT_TYPE.get(detected_content_type, ".png")
     s3_key = f"{SIGNATURE_IMAGE_S3_PREFIX}{current_user.id}/{_uuid.uuid4()}{ext}"
 
-    success = upload_file_to_s3(file.file, s3_key, content_type=file.content_type)
+    success = upload_file_to_s3(file.file, s3_key, content_type=detected_content_type)
     if not success:
         raise HTTPException(
             status_code=502,
