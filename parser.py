@@ -1530,12 +1530,22 @@ def parse_requirement(
             parsing_log.append(f"Claude 3.5 Sonnet: Exception (API Key / Subscription / Error) - {e}")
             ai_parsed = None
 
+    # OPTIMIZATION: track which stage actually produced ai_parsed. SpaCy's
+    # NER is the weakest signal in this chain for client/location (it's
+    # guessing from unlabeled entities, not reading a labeled field the
+    # way OpenAI/Claude or a "Client:"/"Location:" regex match do) — this
+    # flag lets the client/location blocks below give a labeled regex
+    # match priority over a SpaCy guess specifically, instead of treating
+    # every ai_parsed source as equally trustworthy.
+    ai_source_is_spacy = False
+
     if not ai_parsed:
         try:
             from spacy_parser import parse_requirement_spacy
             ai_parsed = parse_requirement_spacy(safe_subject, safe_body)
             if ai_parsed:
                 parsing_log.append("SpaCy NLP: Success (Partial Extractor)")
+                ai_source_is_spacy = True
             else:
                 parsing_log.append("SpaCy NLP: Failed or returned None.")
         except Exception as e:
@@ -1577,7 +1587,19 @@ def parse_requirement(
         role = 'UNKNOWN'
 
     # ── Client ────────────────────────────────────────────────────────────
-    client = clean_client(_ai_field('client'))
+    # OPTIMIZATION: when SpaCy produced ai_parsed, check for a labeled
+    # regex match FIRST — a "Client:" label is a much stronger signal
+    # than an unlabeled NER guess, so it should win even though SpaCy
+    # technically ran first in the fallback chain and would otherwise
+    # short-circuit this block via _ai_field('client').
+    client = None
+    if ai_source_is_spacy:
+        raw_client_early = first_match(CLIENT_PATTERNS, norm_body) or first_match(CLIENT_PATTERNS, full_text)
+        client = clean_client(raw_client_early)
+        if client and is_email_body(client):
+            client = None
+    if not client:
+        client = clean_client(_ai_field('client'))
     if client and is_email_body(client):
         client = None
     if not client:
@@ -1624,7 +1646,19 @@ def parse_requirement(
                     client = cand
 
     # ── Location ──────────────────────────────────────────────────────────
-    location = clean_location(_ai_field('location'))
+    # OPTIMIZATION: same reasoning as Client above — a labeled
+    # "Location:"/"City:" regex match beats SpaCy's unlabeled GPE guess.
+    location = None
+    if ai_source_is_spacy:
+        raw_location_early = (
+            first_match(LOCATION_PATTERNS, norm_body)
+            or first_match(LOCATION_PATTERNS, full_text)
+        )
+        location = clean_location(raw_location_early)
+        if location and is_email_body(location):
+            location = None
+    if not location:
+        location = clean_location(_ai_field('location'))
     if location and is_email_body(location):
         location = None
     if not location:

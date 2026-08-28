@@ -266,4 +266,4 @@ if __name__ == "__main__":
             summary = await sync_pending_emails(db)
             print(summary)
 
-    asyncio.run(_run())
+    asyncio.run(_run())           

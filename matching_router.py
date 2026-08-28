@@ -277,11 +277,27 @@ async def _run_matching_engine_background():
     global _matching_run_state
     try:
         async with AsyncSessionLocal() as db:
-            since = datetime.now(timezone.utc) - timedelta(days=1)
+            # OPTIMIZATION / BUG FIX: this used to filter to
+            # Requirement.created_at >= (now - 1 day), so any requirement
+            # older than 24h — even if still OPEN — was permanently
+            # excluded from this scheduled run. A requirement posted last
+            # week never got re-scored again here, no matter how many new
+            # consultants joined or how many matching-logic bugs got
+            # fixed afterward. Pipeline A (phase4.py's
+            # match_all_requirements) has no such window — it scores
+            # every requirement every run. Dropping the created_at filter
+            # brings this pipeline in line with that.
+            #
+            # This is safe at scale because run_matching_for_requirement()
+            # already fast-skips any row whose matching_info["_version"]
+            # matches the current MATCHING_LOGIC_VERSION (see the
+            # PERFORMANCE comment above) — so widening this to ALL open
+            # requirements does not mean full re-scoring of everything on
+            # every run, only of rows that are new or whose logic version
+            # is stale.
             reqs_res = await db.execute(
                 select(Requirement).where(
                     Requirement.status.notin_(["CLOSED", "REJECTED"]),
-                    Requirement.created_at >= since,
                 )
             )
             requirements = reqs_res.scalars().all()
