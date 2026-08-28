@@ -681,7 +681,6 @@ async def reparse_email(
             # requirements_sync.py already makes for a brand-new
             # requirement — applying it here too for a re-parsed one.
             from models import Requirement, Consultant, JobMatch
-            from sqlalchemy.future import select
             from matching_router import run_matching_for_requirement
             req_res = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
             req_obj = req_res.scalars().first()

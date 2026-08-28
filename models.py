@@ -773,6 +773,16 @@ class Resume(Base):
     target_role = Column(String(255), nullable=True)
     job_description = Column(Text, nullable=True)
     data = JSONBColumn(nullable=False, default=dict)
+    # BUG FIX ("finalize with a template, but Edit/View/Download shows
+    # Classic again"): the picked template was only ever passed as a
+    # transient argument to the ONE _generate_docx() call at finalize
+    # time — never stored anywhere. Every other screen that renders or
+    # regenerates this resume (Edit Resume's live preview, Save Changes,
+    # View, Download) had no way to know which template was used, so
+    # they all silently defaulted back to "classic". Persisting it here
+    # so every one of those paths can read the SAME value finalize set.
+    # MIGRATION REQUIRED — ALTER TABLE resumes ADD COLUMN template VARCHAR(50) DEFAULT 'classic';
+    template = Column(String(50), nullable=True, default="classic")
     s3_key = Column(String(500), nullable=True)
     ats_score = Column(Integer, nullable=True)
     status = Column(String(50), nullable=False, default='draft', index=True)

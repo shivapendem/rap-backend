@@ -286,6 +286,62 @@ class ProfileUpdateRequest(BaseModel):
         return list(dict.fromkeys(t for t in v if t in allowed))
 
 
+# BUG FIX (app crashed on startup): update_consultant_by_id below declares
+# its request body as AdminConsultantUpdateRequest, but that class didn't
+# exist anywhere in this file. Because `from __future__ import annotations`
+# is active at the top of this module, that missing name didn't raise
+# immediately at function-definition time — but FastAPI resolves every
+# route's type hints (via typing.get_type_hints) to build its request-body
+# validator the moment this router is registered, which happens as soon as
+# main.py imports it at startup. That resolution raised
+# `NameError: name 'AdminConsultantUpdateRequest' is not defined` and took
+# the entire app down before it could even start serving requests — not
+# just this one endpoint.
+#
+# Defined here to mirror ProfileUpdateRequest's field names and validators
+# for every field update_consultant_by_id actually assigns below, but
+# omitting title/summary/clientWriteSeq — this is an admin or recruiter
+# editing someone ELSE's profile, not the consultant's own profile form,
+# and the endpoint never reads those three fields.
+class AdminConsultantUpdateRequest(BaseModel):
+    fullName: str = Field(..., min_length=1, max_length=200)
+    location: str = Field(..., min_length=2, max_length=100)
+    phone: str = Field(..., pattern=r"^\+?[\d\s\-().]{7,20}$")
+    linkedInUrl: str = Field(..., min_length=1)
+    primarySkills: List[str] = Field(..., min_length=1)
+    secondarySkills: List[str] = Field(..., min_length=1)
+    workAuth: str = Field(...)
+    employmentTypes: List[str] = Field(..., min_length=1)
+    preferredRoles: str = Field(..., min_length=1, max_length=200)
+    preferredLocations: str = Field(..., min_length=1, max_length=200)
+    totalExperienceYears: float = Field(..., ge=0, le=60)
+    education: List[EducationEntryRequest] = Field(..., min_length=1)
+    resumeRichText: Optional[str] = None
+
+    @field_validator("workAuth")
+    @classmethod
+    def validate_work_auth(cls, v):
+        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        if v not in valid:
+            raise ValueError(f"workAuth must be one of {', '.join(sorted(valid))}")
+        return v
+
+    @field_validator("linkedInUrl")
+    @classmethod
+    def validate_linkedin_url(cls, v):
+        if not re.match(r"^https?://", v):
+            raise ValueError("linkedInUrl must be a valid URL")
+        if "linkedin.com" not in v:
+            raise ValueError("linkedInUrl must be a LinkedIn URL")
+        return v
+
+    @field_validator("employmentTypes")
+    @classmethod
+    def validate_employment_types(cls, v):
+        allowed = {"FULL_TIME", "CONTRACT"}
+        return list(dict.fromkeys(t for t in v if t in allowed))
+
+
 class ProfileResponse(BaseModel):
     model_config = {"from_attributes": True}
     id: str
@@ -1399,6 +1455,25 @@ async def upload_resume(
     if len(file_bytes) > MAX_RESUME_BYTES:
         raise HTTPException(413, "File exceeds 10 MB limit")
 
+    # SECURITY FIX: the checks above only look at the client-supplied
+    # Content-Type header, which is trivially spoofable — any file could
+    # be uploaded and stored under a .docx name/type as long as the
+    # client claims the right header. A real .docx is a ZIP archive
+    # (Office Open XML), so first check the actual ZIP magic bytes, then
+    # confirm python-docx can genuinely open it as a Word document.
+    # BEHAVIOR NOTE: previously, a corrupt/fake file would silently
+    # "succeed" here and only fail later inside _extract_resume_text's
+    # best-effort try/except (swallowed, producing blank extracted text
+    # with no error shown) — so this also surfaces a real error to the
+    # consultant instead of silently storing a broken resume.
+    if not file_bytes.startswith(b"PK\x03\x04"):
+        raise HTTPException(400, "File does not appear to be a valid DOCX (Word) document.")
+    try:
+        from docx import Document
+        Document(io.BytesIO(file_bytes))
+    except Exception:
+        raise HTTPException(400, "File does not appear to be a valid DOCX (Word) document.")
+
     # Delete old file if present
     if consultant.base_resume_file_path:
         _delete_file_if_exists(consultant.base_resume_file_path)
@@ -1918,9 +1993,7 @@ async def update_consultant_resume_rich_text(
     if current_user.role == "RECRUITER":
         await _assert_recruiter_mapped(db, current_user.id, consultant_id)
 
-    consultant = await _get_consultant_by_id(db, consultant_id)
-    if not consultant:
-        raise HTTPException(status_code=404, detail="Consultant not found")
+    consultant = await _get_consultant_or_404(db, consultant_id)
 
     consultant.resume_rich_text = payload.resumeRichText
     await db.commit()
