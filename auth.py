@@ -42,7 +42,14 @@ if not SECRET_KEY:
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "24"))
-IS_PRODUCTION = os.getenv("NODE_ENV", "").lower() == "production"
+# SECURITY FIX: NODE_ENV is a Node.js convention and is never set in this
+# Python backend's environment (confirmed absent from .env), so
+# IS_PRODUCTION silently evaluated to False everywhere it gates something
+# — including the Google OAuth audience check and the Host-header check
+# in main.py — even in production. ENVIRONMENT is the new, correct
+# variable to set going forward. NODE_ENV is kept as a fallback purely so
+# this can't regress any environment that happens to already set it.
+IS_PRODUCTION = os.getenv("ENVIRONMENT", os.getenv("NODE_ENV", "")).lower() == "production"
 
 # ---------------------------------------------------------------------------
 # Auth utility functions — copied verbatim from main.py
