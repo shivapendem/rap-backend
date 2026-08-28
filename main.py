@@ -370,21 +370,9 @@ async def lifespan(app: FastAPI):
         except Exception as sync_err:
             print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
 
-    sync_task = asyncio.create_task(_gmail_to_requirements_loop())
-    email_queue_task = asyncio.create_task(_email_queue_worker_loop())
 
     yield
 
-    sync_task.cancel()
-    email_queue_task.cancel()
-    try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await email_queue_task
-    except asyncio.CancelledError:
-        pass
 
     # Dispose database engine and close all connection pool sockets on shutdown
     try:

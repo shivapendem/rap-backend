@@ -7,7 +7,7 @@ import asyncio
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime, timezone, date
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,27 +28,6 @@ from phase3 import _extract_text_from_docx
 
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
-# BUG FIX ("View still says base resume is missing from storage even
-# after re-saving My Profile"): _regen_in_background below is launched
-# via asyncio.create_task() with nothing retaining the returned Task
-# object. Per Python's own asyncio docs, the event loop only holds a
-# *weak* reference to tasks — one with no other reference anywhere can
-# be garbage-collected at any point before it finishes, silently, with
-# no exception raised and nothing logged (since GC doesn't go through
-# the function's own try/except at all). That means the DOCX
-# rebuild + Spaces upload triggered by a My Profile save could simply
-# never finish, intermittently, leaving base_resume_file_path pointing
-# at whatever it was before — which is exactly what "still broken after
-# re-saving, nothing in the logs" looks like. Keeping a strong reference
-# in this module-level set (recommended pattern from the asyncio docs)
-# until each task completes prevents that.
-_background_tasks: set = set()
-
-
-def _run_background(coro) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
 
 
 # PERMANENT FIX ("QueuePool limit ... connection timed out" under rapid
@@ -1738,6 +1717,7 @@ async def sync_base_resume_text(
     db: AsyncSession,
     consultant: Consultant,
     resume_info: Optional[dict] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> None:
     """Regenerate and stage consultant.base_resume_text from CURRENT
     profile fields — called by phase3.py whenever Skills, Experience,
@@ -1819,7 +1799,14 @@ async def sync_base_resume_text(
     # already has one in flight, rather than stacking DB sessions.
     if consultant_id not in _regen_in_flight:
         _regen_in_flight.add(consultant_id)
-        _run_background(_regen_in_background(consultant_id))
+        if background_tasks:
+            background_tasks.add_task(_regen_in_background, consultant_id)
+        else:
+            # Fallback if no background_tasks provided (should not happen in normal flows)
+            # We must use asyncio.create_task here but we warn about it.
+            import logging
+            logging.getLogger(__name__).warning("sync_base_resume_text called without BackgroundTasks!")
+            asyncio.create_task(_regen_in_background(consultant_id))
 
 
 @router.get("/base/content", response_model=BaseResumeContentDTO)

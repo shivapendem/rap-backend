@@ -54,7 +54,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status, BackgroundTasks
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -889,6 +889,7 @@ async def get_own_profile(
 )
 async def update_own_profile(
     payload: ProfileUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -979,7 +980,7 @@ async def update_own_profile(
     # DB — we already have it in memory, so that query was pure wasted
     # round-trip latency on every save.
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant, existing_info)
+    await sync_base_resume_text(db, consultant, existing_info, background_tasks)
 
     await db.commit()
     await db.refresh(consultant)
@@ -1184,7 +1185,8 @@ async def get_consultant_by_id(
 )
 async def update_consultant_by_id(
     consultant_id: int,
-    payload: ProfileUpdateRequest,
+    payload: AdminConsultantUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1200,15 +1202,18 @@ async def update_consultant_by_id(
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
     consultant.secondary_skills = ", ".join(payload.secondarySkills)
+    consultant.linkedin_url = payload.linkedInUrl
     consultant.preferred_employment_types = _resolve_employment_types(
         consultant.preferred_employment_types, payload.employmentTypes
     )
     consultant.preferred_roles = payload.preferredRoles
     consultant.preferred_locations = payload.preferredLocations
     consultant.total_experience_years = payload.totalExperienceYears
+    consultant.education = [e.model_dump() for e in payload.education]
+    consultant.resume_rich_text = payload.resumeRichText
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     await db.refresh(consultant)
@@ -1246,7 +1251,7 @@ async def admin_create_consultant(
         raise HTTPException(409, f"A user with email '{payload.email}' already exists")
     existing_consultant = await db.execute(select(Consultant).where(Consultant.email == payload.email))
     if existing_consultant.scalars().first():
-        raise HTTPException(409, f"Consultant with email '{payload.email}' already exists")
+        raise HTTPException(409, "Consultant with email '{payload.email}' already exists")
 
     recruiter_id_int: Optional[int] = None
     if payload.recruiter_id:
@@ -1516,6 +1521,7 @@ async def list_own_experience(
 )
 async def create_experience(
     payload: ExperienceRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1558,7 +1564,7 @@ async def create_experience(
     await db.flush()
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     await db.refresh(exp)
@@ -1573,6 +1579,7 @@ async def create_experience(
 async def update_experience(
     experience_id: int,
     payload: ExperienceRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1604,7 +1611,7 @@ async def update_experience(
     exp.sort_order = payload.sortOrder
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     await db.refresh(exp)
@@ -1618,6 +1625,7 @@ async def update_experience(
 )
 async def delete_experience(
     experience_id: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1643,7 +1651,7 @@ async def delete_experience(
     await db.delete(exp)
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
 
@@ -1654,6 +1662,7 @@ async def delete_experience(
 )
 async def reorder_experience(
     payload: ReorderRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1681,7 +1690,7 @@ async def reorder_experience(
         )
 
     from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant)
+    await sync_base_resume_text(db, consultant, None, background_tasks)
 
     await db.commit()
     return {"message": f"Reordered {len(payload.orderedIds)} entries"}
