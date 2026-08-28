@@ -2650,6 +2650,22 @@ async def update_resume(
                         resume.status = 'completed'
                         await db.commit()
                         await db.refresh(resume)
+
+                # BUG FIX ("view/download resume doesn't load the expected
+                # template after editing"): View and Download both actually
+                # serve the DOCX (not the PDF above), and only regenerate it
+                # when it's missing from storage entirely — so this save was
+                # updating the PDF but leaving a stale, pre-edit DOCX in
+                # place forever. Keep the DOCX at its own key in sync with
+                # every save too, so View/Download never serve outdated
+                # content or the wrong template again.
+                docx_key = s3_key.rsplit(".", 1)[0] + ".docx"
+                with open(docx_path, "rb") as f:
+                    await asyncio.to_thread(
+                        upload_file_to_s3,
+                        f, docx_key,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
         except Exception as e:
             # Don't fail the save over a PDF regen hiccup — the data edit
             # itself already succeeded and committed above. The next save
