@@ -448,13 +448,49 @@ def _validate_resume_output(resume_data: dict, consultant: Consultant) -> tuple[
 # Task 4 — DOCX Generation (verbatim from Phase 6 doc code example)
 # ---------------------------------------------------------------------------
 
-def _generate_docx(resume_data: dict, output_path: Path) -> None:
-    """Master Resume DOCX Builder modeled after shivashankar.docx.pdf template."""
+def _generate_docx(resume_data: dict, output_path: Path, template: str = "classic") -> None:
+    """Master Resume DOCX Builder modeled after shivashankar.docx.pdf template.
+
+    `template` mirrors the frontend's TEMPLATE_CONFIG in
+    ResumeRichPreview.tsx — same 11 ids, same per-section style choices
+    (objective/skills/experience/education/certifications). Kept as a
+    plain dict here (not imported from the frontend) since this is a
+    different language/runtime; if a template is added/changed on the
+    frontend, mirror the change here too. Defaults to "classic" so every
+    existing caller that doesn't pass a template keeps producing exactly
+    the same output as before this parameter existed.
+
+    Not every frontend visual nuance has a DOCX equivalent — skill
+    "bars" and "pills" don't translate meaningfully to a Word document,
+    so both render as the same plain "Category: skill1, skill2" text
+    line as the "inline" style; a colored/tinted background (Modern
+    accent) isn't reproduced since a real ATS-safe DOCX shouldn't carry
+    color-coded meaning. The goal here is matching the STRUCTURAL choice
+    (table vs. list vs. plain text, bulleted vs. one-line experience,
+    centered vs. left-aligned) since that's what actually differs a
+    template's information layout, not decorative color.
+    """
     from docx import Document
     from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     import re
+
+    TEMPLATE_CONFIG = {
+        "classic":      {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",  "certifications": "list"},
+        "compact":      {"header": "default", "objective": "plain",    "skills": "inline", "experience": "standard",  "education": "list",  "certifications": "list"},
+        "modern":       {"header": "default", "objective": "plain",    "skills": "table", "experience": "accent-box", "education": "table",  "certifications": "list"},
+        "executive":    {"header": "default", "objective": "centered", "skills": "table", "experience": "standard",   "education": "centered", "certifications": "centered"},
+        "timeline":     {"header": "default", "objective": "plain",    "skills": "table", "experience": "timeline",   "education": "list",  "certifications": "list"},
+        "banner":       {"header": "banner",  "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",  "certifications": "list"},
+        "skillbars":    {"header": "default", "objective": "plain",    "skills": "inline", "experience": "standard",  "education": "list",  "certifications": "list"},
+        "sidebar":      {"header": "default", "objective": "plain",    "skills": "inline", "experience": "standard",  "education": "list",  "certifications": "list"},
+        "editorial":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",  "certifications": "list"},
+        "professional": {"header": "default", "objective": "boxed",    "skills": "table", "experience": "accent-box", "education": "table",  "certifications": "list"},
+        "focused":      {"header": "default", "objective": "boxed",    "skills": "inline", "experience": "timeline",  "education": "list",  "certifications": "list"},
+    }
+    cfg = TEMPLATE_CONFIG.get(template, TEMPLATE_CONFIG["classic"])
 
     doc = Document()
 
@@ -465,10 +501,14 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
         section.left_margin = Inches(0.75)
         section.right_margin = Inches(0.75)
 
+    center_headings = (template == "executive")
+
     def add_section_header(title: str):
         p = doc.add_paragraph()
         p.paragraph_format.space_before = Pt(12)
         p.paragraph_format.space_after = Pt(4)
+        if center_headings:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(title.upper())
         run.bold = True
         run.font.size = Pt(11)
@@ -530,6 +570,15 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     run_name = p_name.add_run(name)
     run_name.bold = True
     run_name.font.size = Pt(15)
+    if template == "executive":
+        p_name.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif cfg["header"] == "banner":
+        p_name.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_name.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:fill'), '1E293B')
+        p_name._p.get_or_add_pPr().append(shd)
 
     contact_parts = []
     if resume_data.get("email"):
@@ -546,7 +595,16 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     if contact_parts:
         p_contact = doc.add_paragraph()
         p_contact.paragraph_format.space_after = Pt(6)
-        p_contact.add_run(" | ".join(contact_parts))
+        run_contact = p_contact.add_run(" | ".join(contact_parts))
+        if template == "executive":
+            p_contact.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        elif cfg["header"] == "banner":
+            p_contact.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run_contact.font.color.rgb = RGBColor(0xE2, 0xE8, 0xF0)
+            shd2 = OxmlElement('w:shd')
+            shd2.set(qn('w:val'), 'clear')
+            shd2.set(qn('w:fill'), '1E293B')
+            p_contact._p.get_or_add_pPr().append(shd2)
 
     # Add thin horizontal rule under header
     p_hr = doc.add_paragraph()
@@ -564,7 +622,20 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     career_obj = resume_data.get("career_objective") or resume_data.get("summary")
     if career_obj:
         add_section_header("CAREER OBJECTIVE:")
-        add_formatted_paragraph(career_obj, space_after=6)
+        obj_p = add_formatted_paragraph(career_obj, space_after=6)
+        if obj_p:
+            if cfg["objective"] == "centered":
+                obj_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif cfg["objective"] == "boxed":
+                box_border = OxmlElement('w:pBdr')
+                for side in ("top", "left", "bottom", "right"):
+                    edge = OxmlElement(f'w:{side}')
+                    edge.set(qn('w:val'), 'single')
+                    edge.set(qn('w:sz'), '6')
+                    edge.set(qn('w:space'), '4')
+                    edge.set(qn('w:color'), '94A3B8')
+                    box_border.append(edge)
+                obj_p._p.get_or_add_pPr().append(box_border)
 
     # 3. TECHNICAL PROFICIENCIES — moved here, right after Career
     # Objective and before Experience, to match the web preview/editor's
@@ -575,7 +646,7 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     skills_list = resume_data.get("skills", [])
     if tech_profs or skills_list:
         add_section_header("TECHNICAL PROFICIENCIES:")
-        if tech_profs and isinstance(tech_profs, list):
+        if tech_profs and isinstance(tech_profs, list) and cfg["skills"] == "table":
             table = doc.add_table(rows=0, cols=2)
             table.style = "Table Grid"
             table.autofit = False
@@ -597,6 +668,18 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
             # crammed against it.
             spacer = doc.add_paragraph()
             spacer.paragraph_format.space_after = Pt(4)
+        elif tech_profs and isinstance(tech_profs, list):
+            # "inline" style (also covers "pills"/"bars", which don't
+            # have a meaningful DOCX equivalent) — plain "Category:
+            # skills" line per category instead of a bordered table.
+            for tp in tech_profs:
+                cat = tp.get("category", "Skills")
+                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
+                p_line = doc.add_paragraph()
+                p_line.paragraph_format.space_after = Pt(2)
+                r_cat = p_line.add_run(f"{cat}: ")
+                r_cat.bold = True
+                p_line.add_run(skills_val)
         elif skills_list:
             p_sk = doc.add_paragraph(style="List Bullet")
             r_cat = p_sk.add_run(f"{'Core Skills':<25} : ")
@@ -615,11 +698,22 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
             date_str = f"{start} – {end}".strip(" –")
 
             exp_line = f"Associated with {company}" if company else ""
+            if cfg["experience"] == "timeline" and exp_line:
+                exp_line = f"● {exp_line}"
             if date_str:
                 exp_line += f" ({date_str})"
             if exp_line:
                 p_exp = add_formatted_paragraph(exp_line)
                 p_exp.runs[0].bold = True
+                if cfg["experience"] == "accent-box":
+                    left_border = OxmlElement('w:pBdr')
+                    edge = OxmlElement('w:left')
+                    edge.set(qn('w:val'), 'single')
+                    edge.set(qn('w:sz'), '18')
+                    edge.set(qn('w:space'), '4')
+                    edge.set(qn('w:color'), '6366F1')
+                    left_border.append(edge)
+                    p_exp._p.get_or_add_pPr().append(left_border)
 
             if role:
                 add_formatted_paragraph(f"Designation: {role}")
@@ -710,7 +804,31 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     education = resume_data.get("education") or resume_data.get("educational_background")
     if education:
         add_section_header("EDUCATIONAL BACKGROUND:")
-        if isinstance(education, list):
+        if isinstance(education, list) and cfg["education"] == "table":
+            edu_table = doc.add_table(rows=0, cols=2)
+            edu_table.style = "Table Grid"
+            edu_table.autofit = False
+            edu_table.columns[0].width = Inches(0.9)
+            edu_table.columns[1].width = Inches(5.6)
+            for edu in education:
+                if isinstance(edu, dict):
+                    deg = edu.get("degree", "")
+                    inst = edu.get("institution") or edu.get("college", "")
+                    yr = edu.get("year", "")
+                    line = deg
+                    if inst:
+                        line += f" - {inst}"
+                    row = edu_table.add_row()
+                    cell_yr, cell_deg = row.cells
+                    cell_yr.width = Inches(0.9)
+                    cell_deg.width = Inches(5.6)
+                    r_yr = cell_yr.paragraphs[0].add_run(str(yr))
+                    r_yr.font.size = Pt(9)
+                    r_deg = cell_deg.paragraphs[0].add_run(line)
+                    r_deg.font.size = Pt(9)
+            spacer2 = doc.add_paragraph()
+            spacer2.paragraph_format.space_after = Pt(4)
+        elif isinstance(education, list):
             for edu in education:
                 if isinstance(edu, dict):
                     deg = edu.get("degree", "")
@@ -729,7 +847,12 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
                         line += f" ({yr})"
                     if det:
                         line += f" | {det}"
-                    add_formatted_paragraph(line, style="List Bullet")
+                    if cfg["education"] == "centered":
+                        p_edu = add_formatted_paragraph(line)
+                        if p_edu:
+                            p_edu.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    else:
+                        add_formatted_paragraph(line, style="List Bullet")
                 else:
                     add_formatted_paragraph(str(edu), style="List Bullet")
         elif isinstance(education, str):
@@ -745,7 +868,11 @@ def _generate_docx(resume_data: dict, output_path: Path) -> None:
     certifications = resume_data.get("certifications")
     if certifications:
         add_section_header("CERTIFICATIONS:")
-        if isinstance(certifications, list):
+        if isinstance(certifications, list) and cfg["certifications"] == "centered":
+            p_cert = doc.add_paragraph()
+            p_cert.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p_cert.add_run(" • ".join(str(c) for c in certifications))
+        elif isinstance(certifications, list):
             for cert in certifications:
                 add_formatted_paragraph(str(cert), style="List Bullet")
         else:

@@ -1340,16 +1340,15 @@ def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[st
         user_prompt = f"Requirement Role: {requirement_role}\\nConsultant Roles: {', '.join(consultant_roles)}\\nEvaluate the match."
         
         response = client.messages.with_raw_response.create(
-            # BUG FIX ("Error calling Claude API for role matching: 404 -
-            # model: claude-haiku-3-5"): this model ID was never valid —
-            # not a deprecated/renamed model, a plain typo/placeholder
-            # that 404'd on every single call, every time this ran (which
-            # is every profile save's background re-matching — see
-            # phase3.py's update_own_profile). The current Haiku model ID
-            # requires its full date suffix (a bare "claude-haiku-4-5"
-            # also 404s) — this restores the original "faster, cheaper
-            # model" intent rather than falling back to Sonnet.
-            model="claude-haiku-4-5-20251001",
+            # UPGRADED (explicit request): was claude-haiku-4-5-20251001 —
+            # cheaper/faster, chosen when this call was first fixed from a
+            # 404'ing invalid model ID (see git history). Switched to
+            # Sonnet for higher-quality role-match judgments at the cost
+            # of higher per-call price; _ROLE_MATCH_CACHE below still
+            # caches by (requirement_role, consultant_roles) pair, so a
+            # given pair is only ever billed once, not once per match
+            # scored.
+            model="claude-sonnet-4-6",
             max_tokens=100,
             system=ROLE_MATCH_SYSTEM_PROMPT,
             messages=[

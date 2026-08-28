@@ -100,6 +100,7 @@ class ResumeResponse(BaseModel):
     target_role: Optional[str] = None
     job_description: Optional[str] = None
     data: dict
+    template: Optional[str] = "classic"
     s3_key: Optional[str] = None
     s3_url: Optional[str] = None
     ats_score: Optional[int] = None
@@ -695,6 +696,7 @@ async def finalize_resume(
         raise HTTPException(status_code=404, detail="Resume not found")
 
     resume.data = request.data
+    resume.template = request.template or "classic"
     resume.status = 'generating'
     await db.commit()
     await db.refresh(resume)
@@ -2638,7 +2640,7 @@ async def update_resume(
         pdf_path = resume_dir / "resume.pdf"
 
         try:
-            _generate_docx(resume.data, docx_path)
+            _generate_docx(resume.data, docx_path, template=resume.template or "classic")
             if _convert_to_pdf(docx_path, pdf_path):
                 s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
                 with open(pdf_path, "rb") as f:
@@ -2728,7 +2730,7 @@ async def download_resume(
 
             upload_error: list = []
             try:
-                _generate_docx(resume.data, docx_path)
+                _generate_docx(resume.data, docx_path, template=resume.template or "classic")
                 if _convert_to_pdf(docx_path, pdf_path):
                     s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
                     with open(pdf_path, "rb") as f:
@@ -2786,7 +2788,7 @@ async def download_resume(
             resume_dir.mkdir(parents=True, exist_ok=True)
             tmp_docx_path = resume_dir / "resume_view.docx"
             try:
-                _generate_docx(resume.data, tmp_docx_path)
+                _generate_docx(resume.data, tmp_docx_path, template=resume.template or "classic")
                 with open(tmp_docx_path, "rb") as f:
                     # PERF FIX: blocking boto3 upload off the event loop.
                     if await asyncio.to_thread(upload_file_to_s3, f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
@@ -2924,7 +2926,7 @@ async def download_resume_docx(
             docx_path = resume_dir / "resume.docx"
 
             try:
-                _generate_docx(resume.data, docx_path)
+                _generate_docx(resume.data, docx_path, template=resume.template or "classic")
                 with open(docx_path, "rb") as f:
                     docx_bytes = f.read()
                 # Only upload back to S3 if there's actually a key to put
