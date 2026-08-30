@@ -1047,6 +1047,7 @@ async def get_requirements(
         date_from = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
 
     if date_from:
+        date_from = date_from.strip()
         try:
             from datetime import time
             if "T" in date_from:
@@ -1060,6 +1061,7 @@ async def get_requirements(
             raise HTTPException(status_code=422, detail="Invalid date_from format")
 
     if date_to:
+        date_to = date_to.strip()
         try:
             from datetime import time
             if "T" in date_to:
