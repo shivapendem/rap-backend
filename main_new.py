@@ -973,29 +973,7 @@ async def get_requirements(
         total_pages=total_pages,
     )
 
-@app.post("/api/admin/gmail-emails/sync-to-requirements")
-async def sync_gmail_to_requirements_endpoint(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    On-demand trigger: runs the same sync_pending_emails logic used by
-    the background loop, once, and returns a summary for the frontend.
-    """
-    try:
-        summary = await sync_pending_emails(db)
-    except Exception as e:
-        from error_logger import log_db_error
-        await log_db_error(stage="gmail_sync_manual_trigger", error=e)
-        raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
 
-    return {
-        "scanned": summary.get("total", 0),
-        "requirements_created": summary.get("saved", 0),
-        "duplicates": summary.get("duplicates", 0),
-        "skipped_not_a_requirement": summary.get("skipped_not_a_requirement", 0),
-        "errors": summary.get("errors", 0),
-    }
 
 
 @app.get("/api/consultants", response_model=List[ConsultantResponse])
