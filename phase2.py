@@ -412,7 +412,7 @@ async def get_raw_email(
                    bcc_addresses, reply_to, body_text, body_html, date,
                    is_read, is_starred, has_attachments, attachments, labels,
                    thread_id, raw_headers, fetched_at, category, priority,
-                   processed, classified_at, classifier_tier, job_posting_id, status_desc,
+                   processed, classified_at, classifier_tier, job_posting_id, status_desc, reason,
                    EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = gmail_emails.id) AS has_requirement
             FROM gmail_emails WHERE id = :id
         """),
@@ -779,7 +779,7 @@ async def get_gmail_emails(
                    ge.is_read, ge.is_starred, ge.has_attachments, ge.attachments, ge.labels,
                    ge.thread_id, ge.raw_headers, ge.fetched_at, ge.category, ge.priority,
                    ge.processed, ge.classified_at, ge.classifier_tier, ge.job_posting_id,
-                   ge.status_desc,
+                   ge.status_desc, ge.reason,
                    EXISTS (
                        SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
                    ) AS has_requirement
