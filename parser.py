@@ -201,12 +201,25 @@ CLIENT_PATTERNS = [
     r'(?i)\bend\s*client\s*[:\-]\s*(.+)',
     r'(?i)\bclient\s*[:\-]\s*(.+)',
     r'(?i)\bcustomer\s*[:\-]\s*(.+)',
+    r'(?i)\bimplementation\s*(?:partner)?\s*[:\-]\s*(.+)',
     # "Client is Zensar" -- no colon at all, just prose. Tightly bounded to
     # 1-4 capitalized words (typical company-name shape) so it stops
     # naturally at the client name instead of running into the rest of the
     # sentence like ".+" would (there's no colon-based field boundary to
     # crop at here).
-    r'(?i)\bclient\s+is\s+([A-Z][a-zA-Z0-9&.\-]*(?:\s+[A-Z][a-zA-Z0-9&.\-]*){0,3})',
+    #
+    # BUG FIX: the [A-Z] here was meant to require the captured text
+    # START with a capital letter -- a guard against matching ordinary
+    # prose like "Client is seeking an experienced Senior Product
+    # Manager..." as if "seeking" were a company name. But this whole
+    # pattern (and first_match()'s own re.search call) apply
+    # re.IGNORECASE, which makes [A-Z] match lowercase letters too --
+    # silently defeating the one thing the pattern was designed to check.
+    # (?-i:[A-Z]) scopes case-sensitivity back on for just that one
+    # character, regardless of the IGNORECASE flag applied around it.
+    r'(?i)\bclient\s+is\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
+    # "Implementation Partner is TCS" -- same prose shape/guard as above.
+    r'(?i)\bimplementation\s*(?:partner)?\s+is\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
 ]
 
 LOCATION_PATTERNS = [
@@ -229,17 +242,25 @@ DURATION_PATTERNS = [
 ]
 
 SKILLS_PATTERNS = [
-    r'(?i)primary\s*skills?\b\s*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)required\s*skills?\b\s*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)technical\s*skills?\b\s*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)key\s*skills?\b\s*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)skill\s*set\s*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)tech(?:nology|nical)?\s*stack\s*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    # BUG FIX: the whitespace before "[:\-]" used to be \s* (matches
+    # newlines too), which let the pattern skip across several BLANK
+    # LINES to reach an unrelated "--" email-signature delimiter far
+    # below the last mention of "skills" and treat that as "the hyphen
+    # after skills" -- silently capturing the entire sender signature
+    # block (name, company, address) as if it were the skills list.
+    # [ \t]* only matches same-line whitespace, so the colon/hyphen must
+    # actually appear on (or right after) the same line as the label.
+    r'(?i)primary\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)required\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)technical\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)key\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)skill\s*set[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)tech(?:nology|nical)?\s*stack[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     # Bare "skills:" kept LAST and colon-REQUIRED (not optional) — this one is
     # generic enough that making it colon-optional would risk matching the
     # word "skills" inside unrelated sentences ("strong problem-solving and
     # debugging skills.") anywhere in the body.
-    r'(?i)skills?\s*[:\-]\s*\n?\s*[•\-\*\u2022]?\s*(.+)',
+    r'(?i)skills?[ \t]*[:\-]\s*\n?\s*[•\-\*\u2022]?\s*(.+)',
 ]
 
 EXPERIENCE_PATTERNS = [
@@ -326,6 +347,26 @@ def resolve_state_code(token: str) -> Optional[str]:
     return US_STATE_NAMES.get(token.lower())
 
 
+# A "City, ST" match can accidentally land inside a work-authorization /
+# visa-status enumeration -- e.g. "H1-B, H4-EAD, TN, E3, L2, STEM OPT",
+# where "TN" is the TN (NAFTA professional) visa category rather than the
+# state of Tennessee, and the preceding token ("EAD") coincidentally looks
+# like a city name in a "City, ST" shape. Rejects a match when 2+ distinct
+# visa-status tokens appear in a window around it -- a real address is
+# extremely unlikely to sit in the middle of a run of visa abbreviations.
+_VISA_STATUS_TOKENS = re.compile(
+    r'(?i)\bh-?1-?b\b|\bh-?4\b|\bh-?4[\s\-]*ead\b|\bstem\s*opt\b|\bopt\b|'
+    r'\bcpt\b|\bgc[\s\-]*ead\b|\bgc\b|\bl-?1\b|\bl-?2\b|\be-?3\b|\btn\b|'
+    r'\bu\s*visa\b|\busc\b'
+)
+
+
+def _looks_like_visa_status_context(text: str, start: int, end: int) -> bool:
+    window = text[max(0, start - 40):end + 40]
+    hits = {m.group(0).lower() for m in _VISA_STATUS_TOKENS.finditer(window)}
+    return len(hits) >= 2
+
+
 def _find_city_state_match(text: str, reject_first_words=None):
     """
     Sliding-window search for the first VALIDATED "City, ST" / "City ST"
@@ -346,7 +387,11 @@ def _find_city_state_match(text: str, reject_first_words=None):
             return None
         code = resolve_state_code(m.group(2))
         first_word = m.group(1).split()[0].lower()
-        if code and first_word not in reject_first_words:
+        if (
+            code
+            and first_word not in reject_first_words
+            and not _looks_like_visa_status_context(text, m.start(), m.end())
+        ):
             return m
         pos = m.start() + 1
     return None
@@ -383,20 +428,37 @@ _PUNCT_MAP = {
 }
 
 NEXT_FIELD_LABELS = [
-    'job title', 'job role', 'position', 'role', 'opening', 'requirement',
-    'end client', 'client', 'customer', 'work location', 'place of work',
-    'location', 'pay rate', 'bill rate', 'compensation', 'rate',
-    'contract length', 'contract duration', 'duration', 'primary skills',
-    'required skills', 'technical skills', 'key skills', 'skill set', 'skills',
-    'experience', 'employment type', 'employment', 'work mode', 'vendor',
+    'job title', 'job role', 'position', 'role', 'role type', 'opening',
+    'requirement', 'domain', 'end client', 'client', 'customer',
+    'work location', 'place of work', 'location', 'pay rate', 'bill rate',
+    'compensation', 'rate', 'contract length', 'contract duration',
+    'duration', 'primary skills', 'required skills', 'technical skills',
+    'key skills', 'skill set', 'skills',
+    'experience', 'employment type', 'employment', 'work mode',
+    'work type', 'vendor',
     'recruiter', 'contact', 'phone', 'email', 'responsibilities',
     'qualifications', 'job description', 'benefits', 'visa', 'type',
     'no. of position', 'no. of positions', 'number of position',
     'number of positions',
 ]
 
+def _label_dash_terminator(label: str) -> str:
+    """Regex fragment matching `label` followed by the colon/hyphen that
+    marks it as a field boundary. For most labels a bare trailing hyphen
+    is safe (recruiters often write "Location- Chicago"), but "domain" is
+    also the first half of ordinary compound words like "Domain-Driven
+    Design" -- so for that one label specifically, a hyphen only counts
+    as the boundary when it's NOT immediately followed by another word
+    character (i.e. an actual separator, not part of a compound word).
+    """
+    esc = re.escape(label)
+    if label == 'domain':
+        return esc + r'\s*(?::|-(?!\w))'
+    return esc + r'\s*[:\-]'
+
+
 NEXT_FIELD_PATTERN = re.compile(
-    r'\b(?:' + '|'.join(re.escape(w) for w in NEXT_FIELD_LABELS) + r')\s*[:\-]',
+    r'\b(?:' + '|'.join(_label_dash_terminator(w) for w in NEXT_FIELD_LABELS) + r')',
     re.IGNORECASE,
 )
 
@@ -404,10 +466,10 @@ NEXT_FIELD_PATTERN = re.compile(
 # e.g. "TrintechLocation:" or "ArchitectDuration:". Uses longest-label-first
 # ordering so multi-word labels ("work location") beat single-word prefixes.
 _FIELD_LABEL_ALTERNATION = '|'.join(
-    re.escape(w) for w in sorted(NEXT_FIELD_LABELS, key=len, reverse=True)
+    _label_dash_terminator(w) for w in sorted(NEXT_FIELD_LABELS, key=len, reverse=True)
 )
 _GLUED_LABEL_PATTERN = re.compile(
-    r'(?<=[A-Za-z0-9])(?=(?:' + _FIELD_LABEL_ALTERNATION + r')\s*[:\-])',
+    r'(?<=[A-Za-z0-9])(?=(?:' + _FIELD_LABEL_ALTERNATION + r'))',
     re.IGNORECASE,
 )
 
@@ -670,6 +732,9 @@ _HOTLIST_INDICATORS = re.compile(
     r'\bour\s+(?:consultants?|resources?|candidates?)\s+(?:are|is)\b|'
     r'\bconsultants?\s+(?:are\s+)?ready\s+to\s+join\b|'
     r'\bbench\s+(?:consultants?|resources?)\b|'
+    r'\bbench\s*list\b|'
+    r'\bconsultants?\s+coming\s+out\s+of\s+(?:the\s+)?projects?\b|'
+    r'\badd\s+[\w.+\-]+@[\w.\-]+\s+to\s+(?:your\s+)?requirements?\b|'
     r'\bsend\s+(?:me\s+)?(?:the\s+)?requirements?\s+(?:to\s+my\s+email|on\s+(?:a\s+)?daily\s+basis)\b'
 )
 
@@ -798,10 +863,25 @@ _HYBRID_NON_WORKMODE_CONTEXT = re.compile(
 
 
 def extract_work_mode(text: str) -> str:
-    """Extract work mode from text."""
+    """Extract work mode from text.
+
+    BUG FIX: previously iterated WORK_MODE_PATTERNS as a fixed-priority
+    dict (REMOTE checked before HYBRID checked before ONSITE) and
+    returned the first mode with ANY match ANYWHERE in the whole
+    document. A JD stating "Work Type: Hybrid: Onsite 4 days Per Week,
+    Remote Fridays" came back as REMOTE, purely because a bare "remote"
+    keyword happened to exist somewhere later in the text -- even though
+    "Hybrid" is the officially stated work type and appears earlier in
+    the very same sentence. Now finds the EARLIEST matching keyword
+    across all three modes (same earliest-wins approach first_match()
+    already uses for other fields), so whichever mode is actually stated
+    first in the document wins, regardless of pattern dict order.
+    """
     if not text:
         return "UNKNOWN"
     text_lower = text.lower()
+    best_pos = None
+    best_mode = "UNKNOWN"
     for mode, patterns in WORK_MODE_PATTERNS.items():
         for pattern in patterns:
             for m in re.finditer(pattern, text_lower):
@@ -809,8 +889,11 @@ def extract_work_mode(text: str) -> str:
                     trailing = text_lower[m.end():m.end() + 25]
                     if _HYBRID_NON_WORKMODE_CONTEXT.search(trailing):
                         continue  # false positive -- try next occurrence
-                return mode
-    return "UNKNOWN"
+                if best_pos is None or m.start() < best_pos:
+                    best_pos = m.start()
+                    best_mode = mode
+                break  # earliest valid match for this pattern is enough
+    return best_mode
 
 
 # Negation words immediately before a keyword mean it is being excluded —
@@ -932,6 +1015,19 @@ TECH_KEYWORDS = [
     # Project methodology
     'Agile', 'Scrum', 'Kanban', 'Waterfall', 'SAFe', 'Sprint Planning',
     'User Stories', 'UAT', 'SDLC',
+    # Mainframe / legacy enterprise systems -- confirmed missing entirely
+    # (a real mainframe JD's skills list matched almost nothing without
+    # these; only "C++" was picked up out of ~20 real skills).
+    'z/OS', 'ISPF', 'CICS', 'DB2', 'IMS', 'COBOL', 'PL/I', 'Assembler',
+    'Rexx', 'JCL', 'VSAM', 'IDz', 'IBM File Manager', 'FastRexx',
+    'BMC FileAid', 'CA Broadcom', 'Macro4', 'Microsoft PowerPoint',
+    # Data engineering -- "ETL" itself was missing, despite being the
+    # literal first word of one JD's title.
+    'ETL', 'ELT', 'Snowflake', 'Azure Data Factory', 'Databricks',
+    # BI / analytics tooling
+    'Looker', 'LookML', 'BigQuery', 'Tableau', 'Power BI',
+    # Modern DevOps / AI-assisted development tooling
+    'GitHub Copilot', 'Bamboo', 'Bitbucket',
 ]
 
 
@@ -1010,6 +1106,18 @@ def extract_skills_from_keywords(text: str, max_skills: int = 15) -> List[str]:
     return [kw for _, kw in kept][:max_skills]
 
 
+# Recognized "bullet" glyphs for splitting a skills section into one
+# chunk per item. Beyond the standard •/\u2022, this also covers the
+# Word/Outlook middle-dot (·, U+00B7) and a curated set of emoji glyphs
+# commonly used as bullets in "hiring alert" style recruiter emails.
+_BULLET_CHAR_PATTERN = re.compile(
+    r'[•\u2022\u00b7\u25E6\u2043\u2219\u2705\u2714\u2611'
+    r'\U0001F539\U0001F538\U0001F525\u2B50\U0001F4CC\U0001F3E2'
+    r'\U0001F4BC\U0001F4CD\U0001F6A8]'
+    r'|\n\s*[-\*]\s'
+)
+
+
 def extract_skills(text: str) -> List[str]:
     """Extract skills from text as a list."""
     if not text:
@@ -1060,12 +1168,38 @@ def extract_skills(text: str) -> List[str]:
     # Splitting this on commas (old behavior) shreds sentences into
     # meaningless fragments. Instead: split into one chunk per bullet, then
     # pull the actual skill tokens out of each sentence.
-    if re.search(r'[•\u2022]|\n\s*[-\*]\s', skills_text):
-        bullet_chunks = re.split(r'[•\u2022]|\n\s*[-\*]\s', skills_text)
+    #
+    # BUG FIX: this only ever recognized •/\u2022 and a newline-anchored
+    # -/* as "a bullet". Real recruiter emails routinely use OTHER glyphs
+    # for the same purpose -- middle-dot "·" (a common Word/Outlook paste
+    # artifact) and emoji "bullets" (✅ 🔹 🔥 ⭐ 📌 etc., common in
+    # "exciting hiring alert" style emails) -- none of which were
+    # recognized, so those sections fell through to the flat comma/"and"
+    # splitter and got shredded mid-sentence. Also: when a Word/Outlook
+    # <li> list collapses to plain text, each item lands on its own line
+    # with NO leading symbol at all -- handled as a second fallback below.
+    if _BULLET_CHAR_PATTERN.search(skills_text):
+        bullet_chunks = _BULLET_CHAR_PATTERN.split(skills_text)
         skills = []
         for chunk in bullet_chunks:
             skills.extend(_extract_skill_tokens(chunk))
         return list(dict.fromkeys(skills))[:20]
+
+    # No recognized bullet glyph anywhere -- but the section may still be
+    # "one item per line" with nothing prepended (the <li> case above).
+    # Treat that the same as a bulleted list rather than falling through
+    # to the flat splitter, which shreds phrases like "MicroStrategy Admin
+    # and Technical knowledge" into meaningless fragments on the word
+    # "and". Deliberately conservative (>=3 short lines) so a single
+    # glued run-on paragraph with no line breaks at all still falls
+    # through to flat mode below, unchanged.
+    line_candidates = [ln.strip() for ln in skills_text.split('\n') if ln.strip()]
+    if len(line_candidates) >= 3 and all(len(ln) < 150 for ln in line_candidates):
+        skills = []
+        for chunk in line_candidates:
+            skills.extend(_extract_skill_tokens(chunk))
+        if skills:
+            return list(dict.fromkeys(skills))[:20]
 
     # Flat list mode: "Python, Java, AWS, Docker" — original comma/semicolon
     # splitting logic, unchanged.
@@ -1153,6 +1287,101 @@ def _extract_skill_tokens(sentence: str) -> List[str]:
         if 1 < len(tok) < 45:
             results.append(tok)
     return results
+
+
+# BUG FIX: recruiting-broadcast-portal emails (ProHires Powerhouse and
+# similar mailing-list relays) put the ACTUAL recruiter's identity in the
+# body as its own mini "From:" block, while the outer email header 'From'
+# is just the broadcast platform's relay address (e.g.
+# phph001@prohirespowerhouse.com). A typical embedded block looks like:
+#     From:
+#     Sonam Kumari,
+#     Tanisha Systems
+#     sonam.kumari@tanishasystems.com
+#     Reply to:   sonam.kumari@tanishasystems.com
+# Confirmed across every broadcast-sourced sample seen so far -- vendor
+# extraction was silently attributing every one of these to the broadcast
+# platform itself instead of the real recruiter.
+_EMBEDDED_FROM_BLOCK = re.compile(
+    r'(?im)^[ \t]*From\s*:\s*\n+[ \t]*'
+    r'([A-Za-z][\w\'.\-]*(?:\s+[A-Za-z][\w\'.\-]*){0,3}),?[ \t]*\n+[ \t]*'
+    r'([A-Za-z0-9&.,\-\' ]{2,60}?)[ \t]*\n+[ \t]*'
+    r'([\w.+-]+@[\w\-]+\.[a-zA-Z]{2,})'
+)
+
+# Plain "Email: name@company.com" line -- common when a recruiter pastes
+# their own contact info directly into the body (no embedded From: block).
+_BODY_EMAIL_LABEL_PATTERN = re.compile(
+    r'(?im)^[ \t]*email\s*[:\-]\s*([\w.+-]+@[\w\-]+\.[a-zA-Z]{2,})'
+)
+
+# BUG FIX: real HTML-derived signature blocks often have several
+# whitespace-only lines between the sign-off word and the actual name,
+# frequently containing stray non-breaking spaces (\xa0) or tabs mixed in
+# with the blank lines -- a single "\n+[ \t]*" was too rigid to span that
+# reliably. Handled procedurally below instead of as one monolithic regex.
+_SIGNOFF_WORD_PATTERN = re.compile(r'(?i)\b(?:regards|thanks|sincerely|best\s*regards)\b')
+_PLAIN_NAME_SHAPE = re.compile(r"^[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,3}$")
+
+
+def _extract_signoff_name(body: str) -> Optional[str]:
+    """Find the first plausible person-name-shaped line following a
+    sign-off word ("Thanks", "Regards", "Sincerely", ...). Scans line by
+    line and stops at the first non-blank line -- if that line isn't
+    name-shaped, gives up rather than scanning arbitrarily deep into
+    unrelated JD text below the signature.
+    """
+    m = _SIGNOFF_WORD_PATTERN.search(body)
+    if not m:
+        return None
+    # Resume scanning from the line AFTER the sign-off phrase, not
+    # mid-line -- "Thanks" matches inside "Thanks and Regards," and the
+    # rest of that same line ("and Regards,") isn't blank, which would
+    # otherwise look like a non-name first line and bail out immediately.
+    line_end = body.find('\n', m.end())
+    if line_end == -1:
+        return None
+    for line in body[line_end + 1:].split('\n')[:30]:
+        candidate = line.strip('\xa0').strip()
+        if not candidate:
+            continue
+        if _PLAIN_NAME_SHAPE.match(candidate) and len(candidate) <= 40:
+            return candidate
+        return None
+    return None
+
+
+# Personal webmail domains -- a bare "vendor: Gmail" guess (capitalizing
+# the domain) is never a real company name, so these always warrant
+# checking the body for the real sender identity instead.
+_PERSONAL_WEBMAIL_DOMAINS = {
+    'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'live.com',
+    'aol.com', 'icloud.com', 'ymail.com', 'msn.com', 'rediffmail.com',
+}
+
+
+def extract_vendor_from_body(body: str) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort extraction of the REAL sender's name/email from the
+    email body, for use when the header 'From' is a mailing-list /
+    broadcast-portal relay address, or a personal webmail address with no
+    useful display name. Returns (name, email); either may be None.
+    """
+    if not body:
+        return None, None
+
+    m = _EMBEDDED_FROM_BLOCK.search(body)
+    if m:
+        name = m.group(1).strip().strip('"\'')
+        email = m.group(3).strip().lower()
+        return (name or None), email
+
+    email = None
+    email_m = _BODY_EMAIL_LABEL_PATTERN.search(body)
+    if email_m:
+        email = email_m.group(1).strip().lower()
+
+    name = _extract_signoff_name(body)
+    return name, email
 
 
 def extract_vendor_contact(
@@ -1261,17 +1490,31 @@ def clean_role(role: Optional[str]) -> Optional[str]:
     )
     role = re.sub(r'^[^0-9A-Za-z]+', '', role).strip()
     role = re.sub(r'[\-\u2013,:;]+\s*$', '', role).strip()
+    # BUG FIX: emoji used as field-label bullets in "hiring alert" style
+    # emails (💼, 📍, 🏢, etc.) sit directly adjacent to the next field's
+    # label with no space, so once crop_at_next_field() correctly stops
+    # the value right at that label, the emoji glyph itself -- being on
+    # the "value" side of the boundary -- is left dangling on the end.
+    role = re.sub(r'[\U0001F300-\U0001FAFF\u2600-\u27BF]+\s*$', '', role).strip()
     # ROLE-SPECIFIC PARSING: real job titles are short (typically 2-8 words).
     # If crop_at_next_field() didn't find a clean boundary (e.g. HTML-collapsed
     # single-line emails with no recognizable "Location:"/signature marker
     # nearby), this cuts off at the point runaway sentence text starts,
     # instead of falling through to a blunt 60-char truncation that grabs
     # unrelated trailing words like "AWS Engineer so on more unwanted...".
+    # BUG FIX: an 8-word cap silently drops trailing words from a
+    # perfectly clean, correctly-bounded title when standalone punctuation
+    # tokens ("–", "&", "/") each count as one of the 8 -- e.g. "Senior
+    # AWS Cloud Consultant – AI/ML & Generative AI" is 9 whitespace-
+    # separated tokens, so the real trailing word "AI" was silently cut
+    # with no ellipsis, making it look like a different, shorter title.
+    # Raised to 10 words / 70 chars, which comfortably covers this shape
+    # while still guarding against genuinely runaway sentence text.
     words = role.split()
-    if len(words) > 8:
-        role = ' '.join(words[:8])
-    if len(role) > 60:
-        role = role[:57] + '...'
+    if len(words) > 10:
+        role = ' '.join(words[:10])
+    if len(role) > 70:
+        role = role[:67] + '...'
     return role or None
 
 
@@ -1369,6 +1612,9 @@ def clean_location(location: Optional[str]) -> Optional[str]:
     # 'Hybrid - New Jersey') instead of collapsing it to just 'Hybrid'.
     if len(location) > 50:
         location = location[:47] + '...'
+    # Same emoji-glyph-glued-to-next-label cleanup as clean_role() -- see
+    # that function's comment for the full explanation.
+    location = re.sub(r'[\U0001F300-\U0001FAFF\u2600-\u27BF]+\s*$', '', location).strip()
     return location or None
 
 
@@ -1413,9 +1659,21 @@ def clean_duration(duration: Optional[str]) -> Optional[str]:
     if not duration:
         return None
     duration = crop_at_next_field(duration)
+    # BUG FIX: neither numeric pattern allowed a "+" between the number and
+    # its unit ("6+ Months"), so anything phrased that way failed BOTH
+    # numeric patterns and fell all the way through to the bare "contract"
+    # match -- e.g. "6+ Months Contract" came back as just "Contract",
+    # silently dropping the actual length. Also added a dedicated
+    # "long term contract" alternative ahead of the bare "long term" one,
+    # so "Long Term Contract" is captured as one phrase instead of
+    # stopping at "Long Term" and dropping "Contract". Both numeric
+    # patterns now optionally capture a trailing "Contract"/"Contract to
+    # hire" word too, via the unnamed trailing group -- m.group(0) below
+    # already returns the whole match, contract-suffix included.
     duration_patterns = [
-        r'(\d+)\s*[-\u2013]\s*(\d+)\s*(months?|weeks?)',
-        r'(\d+)\s*(months?|weeks?|days?)',
+        r'(\d+)\s*[-\u2013]\s*(\d+)\+?\s*(months?|weeks?)(?:\s*(contract(?:\s*to\s*hire)?))?',
+        r'(\d+)\+?\s*(months?|weeks?|days?)(?:\s*(contract(?:\s*to\s*hire)?))?',
+        r'(long\s*term\s*contract)',
         r'(long\s*term)',
         r'(contract\s*to\s*hire|contract)',
         r'(full\s*time|permanent)',
@@ -1732,6 +1990,7 @@ def parse_requirement(
     # ── Vendor info ───────────────────────────────────────────────────────
     vendor_name = None
     vendor_email = None
+    vendor_name_from_domain_guess = False
     from_header = safe_headers.get('from', '')
     reply_to_header = safe_headers.get('reply-to', '') or safe_headers.get('reply_to', '')
 
@@ -1755,6 +2014,30 @@ def parse_requirement(
         domain_match = re.search(r'@([^.]+)\.', vendor_email)
         if domain_match:
             vendor_name = domain_match.group(1).capitalize()
+            vendor_name_from_domain_guess = True
+
+    # BUG FIX: the header 'From' is frequently NOT the actual recruiter --
+    # either a mailing-list/broadcast-portal relay address (ProHires
+    # Powerhouse and similar), or a personal webmail address with no
+    # display name at all (which previously fell back to a useless
+    # capitalized-domain guess like "vendor: Gmail"). In both cases the
+    # real name/email is usually sitting in the body itself -- an embedded
+    # "From:" mini-header (broadcast format), a plain "Email: x@y.com"
+    # line, or a "Thanks & Regards / <Name>" sign-off. Only overrides the
+    # header result when the header itself looked untrustworthy, so a
+    # genuine "Real Name <real@company.com>" header is never touched.
+    from_domain = vendor_email.rsplit('@', 1)[-1].lower() if vendor_email and '@' in vendor_email else ''
+    header_looks_untrustworthy = (
+        vendor_name_from_domain_guess
+        or not vendor_name
+        or from_domain in _PERSONAL_WEBMAIL_DOMAINS
+    )
+    if header_looks_untrustworthy:
+        body_name, body_email = extract_vendor_from_body(safe_body)
+        if body_email:
+            vendor_email = body_email
+        if body_name:
+            vendor_name = body_name
 
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email
@@ -1838,8 +2121,126 @@ def _find_role_label_anchors(text: str) -> List[tuple]:
             if not value or is_email_body(value) or len(value) > 200:
                 continue
             line_start = text.rfind('\n', 0, m.start()) + 1
-            anchors.append((m.start(), line_start, value))
+            anchors.append((m.start(), line_start, value, False))
     anchors.sort(key=lambda a: a[0])
+    return anchors
+
+
+# JD section headers that must NEVER be mistaken for a bare job-title
+# anchor, even in the (rare) case one happens to be followed by something
+# location-shaped. Not exhaustive by design -- the blank-line + immediate
+# location-line requirement in _find_bare_title_anchors() is the real
+# safety margin; this is a belt-and-suspenders check for the most common
+# recurring header phrases.
+_SECTION_HEADER_EXCLUSIONS = {
+    'job description', 'job summary', 'role overview', 'key responsibilities',
+    'core responsibilities', 'primary responsibilities', 'required skills',
+    'required experience', 'preferred qualifications', 'qualifications',
+    'requirements', 'responsibilities', 'non-negotiable requirements',
+    'program delivery', 'venue readiness', 'cross-functional coordination',
+    'change management', 'risk & issue management', 'installation oversight',
+    'operational readiness', 'stakeholder management', 'reporting',
+    'leadership responsibilities', 'nice to have', 'preferred',
+    'must-have skills', 'must have skills', 'key skills', 'soft skills',
+    'core skills', 'technical skills', 'key responsibilities:',
+}
+_TITLE_CONNECTOR_WORDS = {'of', 'and', 'the', 'for', 'or', 'in', 'on', 'to', '&', 'a', 'an'}
+# A job title essentially never ends with a company-name suffix -- guards
+# against lines like "Agile Enterprise Solutions Inc." (a recruiter's own
+# company name in their email signature) being mistaken for a posting
+# title just because a company address on the next line happens to
+# contain a "City, ST" pattern.
+_COMPANY_SUFFIX_WORDS = {
+    'inc', 'inc.', 'llc', 'llc.', 'ltd', 'ltd.', 'corp', 'corp.',
+    'corporation', 'solutions', 'systems', 'technologies', 'technology',
+    'consulting', 'group', 'partners', 'associates', 'staffing', 'services',
+}
+
+
+def _looks_like_bare_job_title(line: str) -> bool:
+    line = line.strip()
+    if not line or line.endswith(':'):
+        return False
+    if not (3 <= len(line) <= 60):
+        return False
+    if line.lower() in _SECTION_HEADER_EXCLUSIONS:
+        return False
+    if NEXT_FIELD_PATTERN.search(line):
+        return False
+    words = line.split()
+    if not (1 <= len(words) <= 7):
+        return False
+    if words[-1].strip('.,()').lower() in _COMPANY_SUFFIX_WORDS:
+        return False
+    for w in words:
+        core = w.strip('()')
+        if not core or core.lower() in _TITLE_CONNECTOR_WORDS:
+            continue
+        if not core[0].isupper():
+            return False
+    return True
+
+
+def _looks_like_location_line(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+    if find_city_state(line):
+        return True
+    return bool(re.search(r'(?i)\b(onsite|on-site|remote|hybrid)\b', line))
+
+
+def _find_bare_title_anchors(text: str) -> List[tuple]:
+    """Detect additional distinct-posting anchors for JDs that introduce
+    each posting with a bare, UNLABELED title line (no "Job Title:"/
+    "Role:" prefix) followed -- after a blank line -- by a location-
+    shaped line, e.g.:
+        Logistics Lead
+
+        Los Angeles, CA-Onsite
+
+        Rate-$55
+
+    BUG FIX: _find_role_label_anchors() alone only recognizes labeled
+    postings ("Job Title:", "Role:", etc.) — a real multi-posting email
+    with this bare-title style had two whole job postings (each with
+    substantial, hard non-negotiable requirements) silently swallowed
+    into whichever labeled posting happened to be open at that point in
+    the text, never becoming their own requirement rows at all.
+    Deliberately narrow (short title line + blank line + immediate
+    location-shaped line) to keep false-positive risk low — ordinary JD
+    section headers essentially never have a location-shaped line
+    immediately following a blank line.
+    """
+    anchors = []
+    lines = text.split('\n')
+    offsets = []
+    pos = 0
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln) + 1
+
+    # Reject any candidate sitting shortly after a sign-off word ("Thanks",
+    # "Regards", ...) -- almost always still inside THAT posting's own
+    # signature block (a name/company/address triple, not a new posting),
+    # confirmed via a real false-positive ("Agile Enterprise Solutions
+    # Inc." followed by an address line) just 16-26 chars after a sign-off.
+    # A genuinely new posting after a forwarded-email chain sits much
+    # farther out (600+ chars in the confirmed multi-posting case), so a
+    # short window here doesn't risk suppressing that.
+    signoff_ends = [m.end() for m in SIGNATURE_PATTERN.finditer(text)]
+
+    n = len(lines)
+    for i in range(n):
+        if any(0 <= offsets[i] - se < 350 for se in signoff_ends):
+            continue
+        if not _looks_like_bare_job_title(lines[i]):
+            continue
+        j = i + 1
+        while j < n and not lines[j].strip():
+            j += 1
+        if j > i + 1 and j < n and _looks_like_location_line(lines[j]):
+            anchors.append((offsets[i], offsets[i], lines[i].strip(), True))
     return anchors
 
 
@@ -1857,18 +2258,19 @@ def split_into_requirement_segments(body_text: str, max_segments: int = 10) -> L
     if not body_text or not body_text.strip():
         return [body_text]
 
-    raw_anchors = _find_role_label_anchors(body_text)
+    raw_anchors = _find_role_label_anchors(body_text) + _find_bare_title_anchors(body_text)
+    raw_anchors.sort(key=lambda a: a[0])
     if len(raw_anchors) < 2:
         return [body_text]
 
     accepted: list = []
-    for pos, line_start, value in raw_anchors:
+    for pos, line_start, value, is_bare in raw_anchors:
         if accepted:
-            prev_pos, _prev_line_start, prev_value = accepted[-1]
+            prev_pos, _prev_line_start, prev_value, _prev_bare = accepted[-1]
             if pos - prev_pos < _ANCHOR_MIN_GAP and value.strip().lower() == prev_value.strip().lower():
                 # Same role restated close together — not a second posting.
                 continue
-        accepted.append((pos, line_start, value))
+        accepted.append((pos, line_start, value, is_bare))
 
     if len(accepted) < 2:
         return [body_text]
@@ -1876,9 +2278,21 @@ def split_into_requirement_segments(body_text: str, max_segments: int = 10) -> L
     accepted = accepted[:max_segments]
 
     segments = []
-    for i, (_, line_start, _value) in enumerate(accepted):
+    for i, (_, line_start, value, is_bare) in enumerate(accepted):
         seg_end = accepted[i + 1][1] if i + 1 < len(accepted) else len(body_text)
         segment = body_text[line_start:seg_end].strip()
+        if is_bare:
+            # BUG FIX: a bare-title anchor's segment has no "Role:"/"Job
+            # Title:" label of its own -- without this, parse_requirement()
+            # finds no labeled role INSIDE the segment and falls back to
+            # the one shared email subject line for every segment, so a
+            # multi-posting email with unlabeled titles (e.g. "Logistics
+            # Lead", "Deputy Cluster Telecom Operations Manager") had
+            # every such posting come back with the SAME wrong role
+            # (whatever the first labeled posting's role happened to be).
+            # Prepending a synthetic "Role:" line gives this segment's own
+            # extraction the correct title immediately.
+            segment = f"Role: {value}\n{segment}"
         if segment:
             segments.append(segment)
 

@@ -17,7 +17,17 @@ NOISE_PATTERNS = [
     r'(?is)-----original message-----.*',
     r'(?is)---+\s*forwarded message\s*---+.*',
     r'(?is)on .+ wrote:.*',
-    r'(?is)from:.*sent:.*to:.*subject:.*',
+    # BUG FIX: the trailing ".*" here was unbounded AND (?s) makes "."
+    # match newlines, so once a forwarded-message header block was found,
+    # this deleted EVERYTHING from that point to the end of the string --
+    # not just the header itself. A real email forwarding a batch of
+    # positions ("FW: Open Positions") had every posting AFTER the
+    # forwarded header silently wiped from the stored job_description.
+    # Bounded to the header block itself: non-greedy up through "Subject:"
+    # and its own line only (no (?s) on that final segment), so it stops
+    # at the end of the Subject line instead of consuming the rest of the
+    # document.
+    r'(?is)from\s*:.*?\bsent\s*:.*?\bto\s*:.*?\bsubject\s*:[^\n]*\n?',
     r'(?is)click here to unsubscribe.*',
     r'(?is)this email was sent to.*',
     r'(?is)copyright.*all rights reserved.*',
