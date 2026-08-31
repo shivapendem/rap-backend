@@ -770,7 +770,18 @@ async def get_gmail_emails(
     )
     total = count_result.scalar_one()
 
-    # Get data with ALL columns
+    # BUG FIX ("new mail not showing immediately"): this sorted by ge.date
+    # — the sender's own "Date:" header, copied through as-is from the
+    # source email. That value is out of our control and has already
+    # shown up skewed (the Gmail admin page displayed a "received" email
+    # dated hours in the future — see fmtDate's own history). A newly-
+    # ingested email with an off header date can sort anywhere in this
+    # list instead of at the top, so it doesn't appear "immediately" even
+    # though the row landed in the table the moment it was fetched.
+    # ge.fetched_at is OUR OWN timestamp, stamped by this app at ingestion
+    # time — it's reliably monotonic, so ordering by it guarantees the
+    # most-recently-ingested mail is always first. Falls back to ge.date
+    # only for legacy rows that predate fetched_at being populated.
     result = await db.execute(
         text(f"""
             SELECT ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
@@ -785,7 +796,7 @@ async def get_gmail_emails(
                    ) AS has_requirement
             FROM gmail_emails ge
             {where_sql}
-            ORDER BY ge.date DESC
+            ORDER BY COALESCE(ge.fetched_at, ge.date) DESC
             LIMIT :limit OFFSET :offset
         """),
         params

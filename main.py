@@ -385,9 +385,22 @@ async def lifespan(app: FastAPI):
         except Exception as sync_err:
             print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
 
+    # BUG FIX: these background loops were defined but never scheduled —
+    # no asyncio.create_task() call existed anywhere in the app, so
+    # gmail_emails rows never got bridged into requirements, and queued
+    # outbound emails never got sent, no matter how long the app ran.
+    gmail_sync_task = asyncio.create_task(_gmail_to_requirements_loop())
+    email_queue_task = asyncio.create_task(_email_queue_worker_loop())
 
     yield
 
+    # Stop both background loops cleanly on shutdown
+    for task in (gmail_sync_task, email_queue_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     # Dispose database engine and close all connection pool sockets on shutdown
     try:

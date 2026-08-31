@@ -57,6 +57,14 @@ class ResumeCreateRequest(BaseModel):
     # resume flow — links this Resume back to that specific requirement so
     # the dashboard can find it and unlock the Apply button.
     requirement_id: Optional[int] = None
+    # BUG FIX ("experience style is missing" after generating): this
+    # endpoint had no way to receive a template at all — Resume(...) below
+    # never set `template=`, so it silently fell back to the "classic"
+    # DB column default every time, regardless of what the caller
+    # intended, and that default then stuck permanently (every later Save
+    # Changes/regenerate reads resume.template right back out). Same class
+    # of bug the finalize endpoint already had fixed for its own payload.
+    template: Optional[str] = None
 
 async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: User):
     if current_user.role == "ADMIN":
@@ -439,60 +447,41 @@ async def generate_resume_from_template(
             achievements_html = "<ul>" + "".join([f"<li>{b.strip()}</li>" for b in base_achievements.split('\n') if b.strip()]) + "</ul>" if base_achievements else ""
             parsed_html = re.sub(r'\{achievements_' + tag + r'\}', achievements_html, parsed_html)
 
-    # Save to S3 and database
+    # BUG FIX ("Edit Resume preview shows one template, View/Download show
+    # a different one"): this used to build the final file by directly
+    # LibreOffice-converting parsed_html (the consultant's raw rich-text
+    # template) to PDF — a separate rendering path from every other
+    # screen, AND a lossy one (LibreOffice doesn't reliably preserve
+    # shading/border formatting on conversion). Edit Resume's preview and
+    # the DOCX download both render `resume.data` through _generate_docx's
+    # TEMPLATE_CONFIG layouts, keyed off resume.template — which this
+    # endpoint never set either, silently defaulting to "classic". Route
+    # through that exact same DOCX-only pipeline and persist template, so
+    # Edit, View, and Download all read the one same file.
     s3_key = None
+    resume_template = "classic"
     if not request.draft:
         try:
+            from phase6 import _generate_docx
+
             with tempfile.TemporaryDirectory(prefix="resume_template_") as tmpdir:
-                html_path = Path(tmpdir) / "resume.html"
-                pdf_path = Path(tmpdir) / "resume.pdf"
-                
-                # Wrap HTML to ensure it renders correctly
-                full_html = f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="utf-8">
-                    <title>{request.title}</title>
-                    <style>
-                        body {{ font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; }}
-                        .ql-align-center {{ text-align: center; }}
-                        .ql-align-right {{ text-align: right; }}
-                        .ql-align-justify {{ text-align: justify; }}
-                    </style>
-                </head>
-                <body>
-                    {parsed_html}
-                </body>
-                </html>
-                """
-                
-                html_path.write_text(full_html, encoding='utf-8')
-                
-                # Convert using libreoffice
-                with tempfile.TemporaryDirectory(prefix="lo_profile_") as profile_dir:
-                    result = subprocess.run(
-                        ["libreoffice", "--headless",
-                         f"-env:UserInstallation=file://{profile_dir}",
-                         "--convert-to", "pdf",
-                         "--outdir", str(pdf_path.parent), str(html_path)],
-                        capture_output=True, timeout=30, text=True,
-                    )
-                
-                if result.returncode == 0 and pdf_path.exists():
-                    s3_key = f"resumes/{target_user_id}/{uuid.uuid4()}.pdf"
-                    with open(pdf_path, "rb") as f:
-                        file_bytes = f.read()
+                docx_path = Path(tmpdir) / "resume.docx"
+
+                _generate_docx(generated_data, docx_path, template=resume_template)
+
+                s3_key = f"resumes/{target_user_id}/{uuid.uuid4()}.docx"
+                with open(docx_path, "rb") as f:
                     # PERF FIX: blocking boto3 upload off the event loop —
                     # same class of fix as _regenerate_base_resume_docx_file.
-                    success = await asyncio.to_thread(upload_file_to_s3, file_bytes, s3_key, "application/pdf")
-                    if not success:
-                        logger.error("Failed to upload template PDF to S3")
-                        s3_key = None
-                else:
-                    logger.error(f"LibreOffice HTML to PDF failed: {result.stderr}")
+                    success = await asyncio.to_thread(
+                        upload_file_to_s3, f, s3_key,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                if not success:
+                    logger.error("Failed to upload template DOCX to S3")
+                    s3_key = None
         except Exception as e:
-            logger.error(f"Failed to generate or upload PDF: {e}")
+            logger.error(f"Failed to generate or upload DOCX: {e}")
             logger.error(traceback.format_exc())
 
     ats_score = math.floor(generated_data.get("ats_score", 0)) if generated_data.get("ats_score") else 85
@@ -502,6 +491,7 @@ async def generate_resume_from_template(
         title=request.title,
         job_description=request.job_description,
         data=generated_data,
+        template=resume_template,
         is_base=False,
         is_draft=request.draft,
         s3_key=s3_key,
@@ -591,15 +581,26 @@ async def generate_resume(
         from error_logger import log_db_error
         await log_db_error(stage="ats_scoring", error=e)
         ats_value = None
+    # BUG FIX ("Skills Gap panel still shows after finalize"): same
+    # reasoning as finalize_resume's fix below — only strip it when this
+    # call is NOT a draft (i.e. it's the final saved version with no
+    # separate /finalize call to catch it later). A draft keeps
+    # missing_skills so the review screen can still act on it before the
+    # resume is actually finalized.
+    resume_data_to_save = dict(generated_data)
+    if not request.draft:
+        resume_data_to_save.pop("missing_skills", None)
+
     new_resume = Resume(
         user_id=target_user_id,
         requirement_id=request.requirement_id,
         title=request.title,
         target_role=request.target_role,
         job_description=request.job_description,
-        data=generated_data,
+        data=resume_data_to_save,
         status='draft' if request.draft else 'generating',
         ats_score=ats_value,
+        template=request.template or "classic",
     )
 
     db.add(new_resume)
@@ -609,58 +610,38 @@ async def generate_resume(
     if request.draft:
         return new_resume
 
-    # Generate DOCX and PDF using phase6 logic
-    from phase6 import _generate_docx, _convert_to_pdf
+    # Generate DOCX using phase6 logic. No PDF step — see the matching
+    # BUG FIX comment on finalize_resume: LibreOffice's PDF conversion
+    # doesn't reliably preserve template formatting, so the DOCX itself
+    # is now the one file every screen (Edit preview, View, Download)
+    # reads from.
+    from phase6 import _generate_docx
     from pathlib import Path
 
     resume_dir = Path("/tmp/resumes") / str(target_user_id) / str(new_resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
-
     docx_path = resume_dir / "resume.docx"
-    pdf_path = resume_dir / "resume.pdf"
 
     try:
-        _generate_docx(generated_data, docx_path)
-        pdf_ok = _convert_to_pdf(docx_path, pdf_path)
-
-        if pdf_ok:
-            s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.pdf"
-            with open(pdf_path, "rb") as f:
-                # PERF FIX: blocking boto3 upload off the event loop.
-                if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf"):
-                    new_resume.s3_key = s3_key
-                    new_resume.status = 'completed'
-                else:
-                    new_resume.status = 'failed_upload'
-        else:
-            new_resume.status = 'failed_pdf_conversion'
-
-        # DOCX upload — was never wired up for this resume type before,
-        # only the PDF ever got persisted. Key is derived from s3_key's
-        # own naming pattern (same folder, extension swapped) so no new
-        # column/migration is needed — the download endpoint derives the
-        # same key back. Isolated in its own try/except on purpose: a
-        # DOCX-only failure here must never downgrade the PDF status set
-        # just above.
-        try:
-            docx_s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.docx"
-            with open(docx_path, "rb") as f:
-                # PERF FIX: blocking boto3 upload off the event loop.
-                await asyncio.to_thread(
-                    upload_file_to_s3,
-                    f, docx_s3_key,
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-        except Exception as docx_exc:
-            print(f"DOCX upload failed (PDF result unaffected): {docx_exc}")
-            from error_logger import log_db_error
-            await log_db_error(stage="resume_docx_s3_upload", error=docx_exc)
+        _generate_docx(generated_data, docx_path, template=new_resume.template or "classic")
+        docx_s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.docx"
+        with open(docx_path, "rb") as f:
+            # PERF FIX: blocking boto3 upload off the event loop.
+            if await asyncio.to_thread(
+                upload_file_to_s3,
+                f, docx_s3_key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                new_resume.s3_key = docx_s3_key
+                new_resume.status = 'completed'
+            else:
+                new_resume.status = 'failed_upload'
     except Exception as e:
         new_resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
         from error_logger import log_db_error
         await log_db_error(
-            stage="resume_generate_docx_pdf",
+            stage="resume_generate_docx",
             error=e,
             source_type="resume",
             source_id=str(new_resume.id),
@@ -695,58 +676,62 @@ async def finalize_resume(
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
-    resume.data = request.data
+    # BUG FIX ("Skills Gap panel still shows after finalize"):
+    # missing_skills lives inside resume.data, the same JSON the preview
+    # reads everywhere (Edit, View, future re-opens) — ResumeRichPreview's
+    # Skills Gap panel is marked print:hidden specifically because it's a
+    # generation-time aid ("here's what to still add"), not something
+    # meant to persist once the resume is done. Nothing ever stripped it
+    # from storage before, so a resume finalized with unresolved gaps kept
+    # showing that orange panel forever afterward. Drop it here, once,
+    # at the point the resume is actually being finalized.
+    finalized_data = dict(request.data)
+    finalized_data.pop("missing_skills", None)
+
+    resume.data = finalized_data
     resume.template = request.template or "classic"
     resume.status = 'generating'
     await db.commit()
     await db.refresh(resume)
 
-    from phase6 import _generate_docx, _convert_to_pdf
+    # BUG FIX ("template picked at finalize, but View/Download show a
+    # different look than Edit's preview"): this used to build the DOCX
+    # correctly with `template`, then LibreOffice-convert it to a PDF and
+    # store THAT as resume.s3_key. LibreOffice headless doesn't reliably
+    # preserve template-specific OOXML formatting (banner header shading,
+    # boxed objective, accent-box experience blocks) on conversion, so the
+    # PDF View/Download actually served came out flatter/plainer than the
+    # DOCX it was built from — while Edit's preview (rendered client-side
+    # from `data`, never touching that PDF) always looked right. Dropping
+    # the PDF step entirely and storing the DOCX itself as resume.s3_key
+    # means every screen reads the one same rendering.
+    from phase6 import _generate_docx
     from pathlib import Path
 
     resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
-
     docx_path = resume_dir / "resume.docx"
-    pdf_path = resume_dir / "resume.pdf"
 
     try:
-        _generate_docx(resume.data, docx_path, template=request.template or "classic")
-        pdf_ok = _convert_to_pdf(docx_path, pdf_path)
-
-        if pdf_ok:
-            s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
-            with open(pdf_path, "rb") as f:
-                # PERF FIX: blocking boto3 upload off the event loop.
-                if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf"):
-                    resume.s3_key = s3_key
-                    resume.status = 'completed'
-                else:
-                    resume.status = 'failed_upload'
-        else:
-            resume.status = 'failed_pdf_conversion'
-
-        # Same DOCX addition as generate_resume above — isolated so a
-        # DOCX-only failure can't downgrade the PDF status set just above.
-        try:
-            docx_s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
-            with open(docx_path, "rb") as f:
-                # PERF FIX: blocking boto3 upload off the event loop.
-                await asyncio.to_thread(
-                    upload_file_to_s3,
-                    f, docx_s3_key,
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-        except Exception as docx_exc:
-            print(f"DOCX upload failed (PDF result unaffected): {docx_exc}")
-            from error_logger import log_db_error
-            await log_db_error(stage="resume_finalize_docx_s3_upload", error=docx_exc)
+        _generate_docx(resume.data, docx_path, template=resume.template)
+        docx_s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+        with open(docx_path, "rb") as f:
+            # PERF FIX: blocking boto3 upload off the event loop.
+            if await asyncio.to_thread(
+                upload_file_to_s3,
+                f, docx_s3_key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                resume.s3_key = docx_s3_key
+                resume.status = 'completed'
+            else:
+                resume.status = 'failed_upload'
     except Exception as e:
         resume.status = 'failed_generation'
         print(f"Resume generation failed: {e}")
         from error_logger import log_db_error
         await log_db_error(
-            stage="resume_finalize_docx_pdf",
+            stage="resume_finalize_docx",
             error=e,
             source_type="resume",
             source_id=str(resume.id),
@@ -2623,57 +2608,52 @@ async def update_resume(
     await db.refresh(resume)
 
     # BUG FIX: this endpoint only ever updated the `data` JSON column —
-    # the actual downloadable PDF sitting in S3 was generated once at
+    # the actual downloadable file sitting in S3 was generated once at
     # creation time and never touched again. Editing a resume (adding a
     # LinkedIn URL, fixing a typo, or picking up a template fix like the
-    # Declaration section removal) had zero effect on what "Download PDF"
+    # Declaration section removal) had zero effect on what "Download"
     # actually served — it kept returning the exact same stale file
     # forever. Regenerate and re-upload whenever the content changed, so
-    # Save Changes and Download PDF never drift apart again.
+    # Save Changes and Download never drift apart again.
+    #
+    # BUG FIX ("view/download resume doesn't load the expected template
+    # after editing"): this used to regenerate a PDF (via LibreOffice) as
+    # the primary artifact and only patch up a separate .docx key as an
+    # afterthought — LibreOffice doesn't reliably preserve template-
+    # specific formatting (shading, borders) on conversion, so the PDF
+    # View/Download served could look plainer than the template actually
+    # selected. Generating and storing the DOCX itself as resume.s3_key
+    # removes that lossy conversion step entirely.
     if request.data is not None:
-        from phase6 import _generate_docx, _convert_to_pdf
+        from phase6 import _generate_docx
         from pathlib import Path
 
         resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
         resume_dir.mkdir(parents=True, exist_ok=True)
         docx_path = resume_dir / "resume.docx"
-        pdf_path = resume_dir / "resume.pdf"
 
         try:
             _generate_docx(resume.data, docx_path, template=resume.template or "classic")
-            if _convert_to_pdf(docx_path, pdf_path):
-                s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
-                with open(pdf_path, "rb") as f:
-                    # PERF FIX: blocking boto3 upload off the event loop.
-                    if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf"):
-                        resume.s3_key = s3_key
-                        resume.status = 'completed'
-                        await db.commit()
-                        await db.refresh(resume)
-
-                # BUG FIX ("view/download resume doesn't load the expected
-                # template after editing"): View and Download both actually
-                # serve the DOCX (not the PDF above), and only regenerate it
-                # when it's missing from storage entirely — so this save was
-                # updating the PDF but leaving a stale, pre-edit DOCX in
-                # place forever. Keep the DOCX at its own key in sync with
-                # every save too, so View/Download never serve outdated
-                # content or the wrong template again.
-                docx_key = s3_key.rsplit(".", 1)[0] + ".docx"
-                with open(docx_path, "rb") as f:
-                    await asyncio.to_thread(
-                        upload_file_to_s3,
-                        f, docx_key,
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    )
+            docx_key = resume.s3_key or f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+            with open(docx_path, "rb") as f:
+                # PERF FIX: blocking boto3 upload off the event loop.
+                if await asyncio.to_thread(
+                    upload_file_to_s3,
+                    f, docx_key,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ):
+                    resume.s3_key = docx_key
+                    resume.status = 'completed'
+                    await db.commit()
+                    await db.refresh(resume)
         except Exception as e:
-            # Don't fail the save over a PDF regen hiccup — the data edit
+            # Don't fail the save over a regen hiccup — the data edit
             # itself already succeeded and committed above. The next save
             # (or the lazy self-heal in download_resume) will retry.
-            print(f"PDF regeneration on save failed for resume {resume.id}: {e}")
+            print(f"DOCX regeneration on save failed for resume {resume.id}: {e}")
             from error_logger import log_db_error
             await log_db_error(
-                stage="resume_pdf_regen_on_save",
+                stage="resume_docx_regen_on_save",
                 error=e,
                 source_type="resume",
                 source_id=str(resume.id),
@@ -2724,48 +2704,53 @@ async def download_resume(
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
-    if not resume.s3_key:
-        # SELF-HEAL: some resumes (e.g. "ATS DevOps" in the bug report) have
-        # tailored content (resume.data) but never got a PDF — the earlier
-        # generate/finalize call hit a transient LibreOffice/S3 failure and
-        # left status as 'failed_pdf_conversion'/'failed_upload' with no
-        # s3_key. Previously this just 400'd forever ("Resume does not have
-        # a generated PDF"), which is what the frontend's generic catch
-        # turns into "Failed to download and attach resume" — the user has
-        # no way to recover short of clicking "Generate Tailored Resume"
-        # again from scratch. Instead, retry building the PDF from the data
-        # that's already there before giving up.
-        if resume.data:
-            from phase6 import _generate_docx, _convert_to_pdf
-            from pathlib import Path
+    # BUG FIX ("View shows a different template than Edit/Download"): this
+    # used to store a LibreOffice-converted PDF as the canonical s3_key and
+    # separately patch up a matching .docx as a rendering source — the PDF
+    # conversion doesn't reliably preserve template-specific formatting
+    # (shading, borders), so View (which preferred the PDF whenever the
+    # .docx companion was missing) could show a flatter look than the
+    # template actually selected. resume.s3_key now always points straight
+    # at the DOCX — same file Edit's Save Changes and Download both write
+    # — so there's nothing left to reconcile here.
+    if not resume.s3_key and resume.data:
+        # SELF-HEAL: some resumes have tailored content (resume.data) but
+        # never got a file — the earlier generate/finalize call hit a
+        # transient failure and left status as 'failed_generation'/
+        # 'failed_upload' with no s3_key. Previously this just 400'd
+        # forever, which is what the frontend's generic catch turns into
+        # "Failed to download and attach resume" — the user has no way to
+        # recover short of clicking "Generate Tailored Resume" again from
+        # scratch. Instead, retry building the DOCX from the data that's
+        # already there before giving up.
+        from phase6 import _generate_docx
+        from pathlib import Path
 
-            resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
-            resume_dir.mkdir(parents=True, exist_ok=True)
-            docx_path = resume_dir / "resume.docx"
-            pdf_path = resume_dir / "resume.pdf"
+        resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+        resume_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = resume_dir / "resume.docx"
 
-            upload_error: list = []
-            try:
-                _generate_docx(resume.data, docx_path, template=resume.template or "classic")
-                if _convert_to_pdf(docx_path, pdf_path):
-                    s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.pdf"
-                    with open(pdf_path, "rb") as f:
-                        # PERF FIX: blocking boto3 upload off the event loop.
-                        if await asyncio.to_thread(upload_file_to_s3, f, s3_key, "application/pdf", _error_out=upload_error):
-                            resume.s3_key = s3_key
-                            resume.status = 'completed'
-                            await db.commit()
-                            await db.refresh(resume)
-            except Exception as e:
-                print(f"Lazy PDF regeneration failed for resume {resume.id}: {e}")
-                upload_error = [str(e)]
-                from error_logger import log_db_error
-                await log_db_error(
-                    stage="resume_lazy_pdf_regen",
-                    error=e,
-                    source_type="resume",
-                    source_id=str(resume.id),
-                )
+        upload_error: list = []
+        try:
+            _generate_docx(resume.data, docx_path, template=resume.template or "classic")
+            docx_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+            with open(docx_path, "rb") as f:
+                # PERF FIX: blocking boto3 upload off the event loop.
+                if await asyncio.to_thread(upload_file_to_s3, f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", _error_out=upload_error):
+                    resume.s3_key = docx_key
+                    resume.status = 'completed'
+                    await db.commit()
+                    await db.refresh(resume)
+        except Exception as e:
+            print(f"Lazy DOCX regeneration failed for resume {resume.id}: {e}")
+            upload_error = [str(e)]
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_lazy_docx_regen",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
 
         if not resume.s3_key:
             # BUG FIX ("View gives a generic 400 with no way to diagnose
@@ -2782,50 +2767,10 @@ async def download_resume(
                 detail += f" (Storage error: {upload_error[0]})"
             raise HTTPException(status_code=400, detail=detail)
 
-    # View shows the actual DOCX, not the PDF. A generated/tailored
-    # resume's s3_key is always a .pdf (see generate_resume/finalize_resume
-    # above) — the .docx it was actually built from is a rendering source,
-    # not what gets stored as the canonical file. Show that .docx here
-    # too, same as manually-uploaded resumes. If the .docx object is
-    # missing from storage (generate_resume's own DOCX upload runs in a
-    # best-effort try/except that can fail independently of the PDF
-    # succeeding), rebuild it from resume.data and upload it before
-    # presigning, instead of silently falling back to PDF.
-    view_key = resume.s3_key
-    view_mime = "application/pdf"
-    if resume.s3_key.lower().endswith(".pdf"):
-        docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx"
-        docx_bytes, _ = await asyncio.to_thread(download_file_from_s3, docx_key)
-        if docx_bytes is None and resume.data:
-            from phase6 import _generate_docx
-            from pathlib import Path
+    if not resume.s3_key:
+        raise HTTPException(status_code=400, detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one.")
 
-            resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
-            resume_dir.mkdir(parents=True, exist_ok=True)
-            tmp_docx_path = resume_dir / "resume_view.docx"
-            try:
-                _generate_docx(resume.data, tmp_docx_path, template=resume.template or "classic")
-                with open(tmp_docx_path, "rb") as f:
-                    # PERF FIX: blocking boto3 upload off the event loop.
-                    if await asyncio.to_thread(upload_file_to_s3, f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
-                        docx_bytes = True  # just need to know it now exists
-            except Exception as e:
-                print(f"View-time DOCX regeneration failed for resume {resume.id}: {e}")
-                from error_logger import log_db_error
-                await log_db_error(
-                    stage="resume_view_docx_regen",
-                    error=e,
-                    source_type="resume",
-                    source_id=str(resume.id),
-                )
-        if docx_bytes is not None:
-            view_key = docx_key
-            view_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        # else: no .docx obtainable at all (no resume.data to rebuild
-        # from) — falls through and shows the .pdf instead, same as
-        # today, rather than failing View entirely.
-
-    url = generate_presigned_url(view_key)
+    url = generate_presigned_url(resume.s3_key)
     if not url:
         raise HTTPException(status_code=500, detail="Failed to generate download link.")
 
@@ -2834,12 +2779,15 @@ async def download_resume(
     resume.last_downloaded = datetime.now(timezone.utc)
     await db.commit()
 
-    ext = os.path.splitext(view_key)[1].lower()
     safe_title = "".join(
         c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_"
     ).strip() or f"Resume_{id}"
 
-    return {"url": url, "filename": f"{safe_title}{ext or '.docx'}", "mimeType": view_mime}
+    return {
+        "url": url,
+        "filename": f"{safe_title}.docx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
 
 @router.get("/{id}/download/file")
 async def download_resume_file(

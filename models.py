@@ -432,6 +432,16 @@ class GeneratedResume(Base):
     generation_status = Column(Text, nullable=True)   # mirrors status, Phase 5 dashboard naming
     status = Column(Text, nullable=False, default="GENERATING")
     is_final = Column(Boolean, nullable=False, default=False)
+    # BUG FIX ("tailored resume — after finalize, view/download missing
+    # experience style — consider all templates"): this model had NO
+    # template column at all, unlike Resume (the admin/manual-resume
+    # model, which already went through this exact fix). Every DOCX this
+    # pipeline ever produced was hardcoded to _generate_docx()'s "classic"
+    # default — there was no way for ANY template's styling (accent-box
+    # experience, timeline, modern's tinted table, etc.) to reach the
+    # tailored-resume flow, regardless of what a picker might show.
+    # MIGRATION REQUIRED — ALTER TABLE generated_resumes ADD COLUMN template VARCHAR(50) DEFAULT 'classic';
+    template = Column(String(50), nullable=True, default="classic")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

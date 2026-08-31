@@ -477,20 +477,57 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     from docx.oxml.ns import qn
     import re
 
+    # BUG FIX ("view/download doesn't match the live preview, for any
+    # template"): this TEMPLATE_CONFIG had drifted from the real frontend
+    # (ResumeRichPreview.tsx) in several places — compact's skills style
+    # was "inline" here but is "table" there, timeline's was "table" here
+    # but is "zebra" there, skillbars' was "inline" here but is "bars"
+    # there. It also carried four ids ("banner", "editorial",
+    # "professional", "focused") that don't exist in the frontend's
+    # RESUME_TEMPLATES at all — dead config nothing can ever select, kept
+    # here only by copy-paste, now removed. Confirmed against the actual
+    # current frontend source (not guessed from screenshots) — see the 7
+    # entries in ResumeRichPreview.tsx's TEMPLATE_CONFIG.
     TEMPLATE_CONFIG = {
-        "classic":      {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",  "certifications": "list"},
-        "compact":      {"header": "default", "objective": "plain",    "skills": "inline", "experience": "standard",  "education": "list",  "certifications": "list"},
-        "modern":       {"header": "default", "objective": "plain",    "skills": "table", "experience": "accent-box", "education": "table",  "certifications": "list"},
-        "executive":    {"header": "default", "objective": "centered", "skills": "table", "experience": "standard",   "education": "centered", "certifications": "centered"},
-        "timeline":     {"header": "default", "objective": "plain",    "skills": "table", "experience": "timeline",   "education": "list",  "certifications": "list"},
-        "banner":       {"header": "banner",  "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",  "certifications": "list"},
-        "skillbars":    {"header": "default", "objective": "plain",    "skills": "inline", "experience": "standard",  "education": "list",  "certifications": "list"},
-        "sidebar":      {"header": "default", "objective": "plain",    "skills": "inline", "experience": "standard",  "education": "list",  "certifications": "list"},
-        "editorial":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",  "certifications": "list"},
-        "professional": {"header": "default", "objective": "boxed",    "skills": "table", "experience": "accent-box", "education": "table",  "certifications": "list"},
-        "focused":      {"header": "default", "objective": "boxed",    "skills": "inline", "experience": "timeline",  "education": "list",  "certifications": "list"},
+        "classic":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",     "certifications": "list"},
+        "compact":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",     "certifications": "list"},
+        "modern":     {"header": "default", "objective": "plain",    "skills": "table", "experience": "accent-box", "education": "table",    "certifications": "pills"},
+        "executive":  {"header": "default", "objective": "centered", "skills": "table", "experience": "standard",   "education": "centered", "certifications": "centered"},
+        "timeline":   {"header": "default", "objective": "plain",    "skills": "zebra", "experience": "timeline",   "education": "list",     "certifications": "list"},
+        "skillbars":  {"header": "default", "objective": "plain",    "skills": "bars",  "experience": "standard",   "education": "list",     "certifications": "list"},
+        "sidebar":    {"header": "default", "objective": "plain",    "skills": "pills", "experience": "standard",   "education": "list",     "certifications": "list"},
     }
     cfg = TEMPLATE_CONFIG.get(template, TEMPLATE_CONFIG["classic"])
+
+    # BUG FIX ("view/download doesn't match the live preview, for any
+    # template"): matched directly against ResumeRichPreview.tsx's actual
+    # `accent` values and its TEMPLATE_SCOPED_CSS this time, not eyeballed
+    # from a screenshot. Two templates carry an accent color: compact
+    # (#334155) and modern (#4338ca) — nothing else does, so every other
+    # template keeps plain black text exactly as before.
+    #
+    # The frontend's `.tpl-modern h2:not(.objective-heading)` rule boxes
+    # EVERY section heading (Experience, Technical Proficiencies, Key
+    # Projects, Education, Certifications, etc.) except Career Objective,
+    # which is excluded by that :not() and instead gets the same plain
+    # colored-underline treatment `.tpl-compact h2` gives ALL of compact's
+    # headings (no box, just a colored border). HEADER_MODE below picks
+    # between those two treatments (or "plain" black/underline for every
+    # other template) once per document, and add_section_header applies
+    # it per-heading via the is_objective flag.
+    ACCENT_HEX = {"modern": "4338CA", "compact": "334155"}
+    accent_hex = ACCENT_HEX.get(template)
+    HEADER_MODE = "box" if template == "modern" else ("border" if template == "compact" else "plain")
+    # Only modern tints the skills table's category column and boxes
+    # headings — compact's scoped CSS removes table borders and bolds/
+    # narrows the category column, but never colors or shades it.
+    tint_bg_hex = "EEF2FF" if template == "modern" else None
+    tint_text_hex = "3730A3" if template == "modern" else None
+    # Both modern and compact drop the skills table's visible grid lines
+    # (`.tpl-modern table, .tpl-modern table td { border: none }` /
+    # `.tpl-compact table, .tpl-compact table td { border: none }`) —
+    # classic/executive/others keep the bordered "Table Grid" look.
+    skills_table_borderless = template in ("modern", "compact")
 
     doc = Document()
 
@@ -503,17 +540,32 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
 
     center_headings = (template == "executive")
 
-    def add_section_header(title: str):
+    def add_section_header(title: str, is_objective: bool = False):
         p = doc.add_paragraph()
         p.paragraph_format.space_before = Pt(12)
         p.paragraph_format.space_after = Pt(4)
         if center_headings:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        use_box = (HEADER_MODE == "box" and not is_objective)
+        # Objective under "box" mode falls back to the colored-underline
+        # treatment (matches the frontend's :not(.objective-heading)
+        # exclusion); "border" mode (compact) uses it for every heading,
+        # objective included.
+        use_colored_underline = (HEADER_MODE == "border") or (HEADER_MODE == "box" and is_objective)
+
+        if use_box:
+            p.paragraph_format.space_before = Pt(14)
+            box_shd = OxmlElement('w:shd')
+            box_shd.set(qn('w:val'), 'clear')
+            box_shd.set(qn('w:fill'), tint_bg_hex)
+            p._p.get_or_add_pPr().append(box_shd)
+
         run = p.add_run(title.upper())
         run.bold = True
         run.font.size = Pt(11)
-        run.font.underline = True
-        run.font.color.rgb = RGBColor(0, 0, 0)
+        run.font.underline = use_colored_underline or not accent_hex
+        run.font.color.rgb = RGBColor.from_string(accent_hex) if accent_hex else RGBColor(0, 0, 0)
         return p
 
     def add_formatted_paragraph(text: str, style: Optional[str] = None, space_after: int = 4):
@@ -570,6 +622,8 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     run_name = p_name.add_run(name)
     run_name.bold = True
     run_name.font.size = Pt(15)
+    if accent_hex:
+        run_name.font.color.rgb = RGBColor.from_string(accent_hex)
     if template == "executive":
         p_name.alignment = WD_ALIGN_PARAGRAPH.CENTER
     elif cfg["header"] == "banner":
@@ -621,7 +675,7 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     # 2. CAREER OBJECTIVE / SUMMARY
     career_obj = resume_data.get("career_objective") or resume_data.get("summary")
     if career_obj:
-        add_section_header("CAREER OBJECTIVE:")
+        add_section_header("CAREER OBJECTIVE:", is_objective=True)
         obj_p = add_formatted_paragraph(career_obj, space_after=6)
         if obj_p:
             if cfg["objective"] == "centered":
@@ -646,13 +700,22 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     skills_list = resume_data.get("skills", [])
     if tech_profs or skills_list:
         add_section_header("TECHNICAL PROFICIENCIES:")
-        if tech_profs and isinstance(tech_profs, list) and cfg["skills"] == "table":
+        if tech_profs and isinstance(tech_profs, list) and cfg["skills"] in ("table", "zebra"):
+            is_zebra = cfg["skills"] == "zebra"
             table = doc.add_table(rows=0, cols=2)
-            table.style = "Table Grid"
+            # BUG FIX: this always applied "Table Grid" (visible borders)
+            # regardless of template — but compact's scoped CSS removes
+            # table borders too (`.tpl-compact table, .tpl-compact table
+            # td { border: none }`), same as modern, and timeline's
+            # "zebra" style (`border-collapse`, no border classes at all)
+            # never had a grid to begin with. Only classic/executive/etc.
+            # (which use a real bordered <table>) keep "Table Grid".
+            if not (skills_table_borderless or is_zebra):
+                table.style = "Table Grid"
             table.autofit = False
             table.columns[0].width = Inches(1.9)
             table.columns[1].width = Inches(4.6)
-            for tp in tech_profs:
+            for idx, tp in enumerate(tech_profs):
                 cat = tp.get("category", "Skills")
                 skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
                 row = table.add_row()
@@ -662,6 +725,24 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
                 r_cat = cell_cat.paragraphs[0].add_run(cat)
                 r_cat.bold = True
                 r_cat.font.size = Pt(9)
+                if tint_bg_hex:
+                    cat_shd = OxmlElement('w:shd')
+                    cat_shd.set(qn('w:val'), 'clear')
+                    cat_shd.set(qn('w:fill'), tint_bg_hex)
+                    cell_cat._tc.get_or_add_tcPr().append(cat_shd)
+                elif is_zebra and idx % 2 == 0:
+                    # BUG FIX: "zebra" (timeline template) never had its
+                    # namesake alternating-row shading — it fell through
+                    # to the plain table branch and looked identical to
+                    # "table". Matches the frontend's `bg-slate-100` on
+                    # even rows.
+                    for cell in (cell_cat, cell_skills):
+                        row_shd = OxmlElement('w:shd')
+                        row_shd.set(qn('w:val'), 'clear')
+                        row_shd.set(qn('w:fill'), 'F1F5F9')
+                        cell._tc.get_or_add_tcPr().append(row_shd)
+                if tint_text_hex:
+                    r_cat.font.color.rgb = RGBColor.from_string(tint_text_hex)
                 r_sk = cell_skills.paragraphs[0].add_run(skills_val)
                 r_sk.font.size = Pt(9)
             # Spacer after the table so the next section header isn't
@@ -669,9 +750,10 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             spacer = doc.add_paragraph()
             spacer.paragraph_format.space_after = Pt(4)
         elif tech_profs and isinstance(tech_profs, list):
-            # "inline" style (also covers "pills"/"bars", which don't
-            # have a meaningful DOCX equivalent) — plain "Category:
-            # skills" line per category instead of a bordered table.
+            # "pills"/"bars" (sidebar/skillbars) — neither has a
+            # meaningful DOCX equivalent (badge chips, filled progress
+            # bars), so both fall back to plain "Category: skills" lines
+            # per category instead of a bordered table.
             for tp in tech_profs:
                 cat = tp.get("category", "Skills")
                 skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
@@ -697,21 +779,49 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             end = exp.get("end") or exp.get("end_date") or ""
             date_str = f"{start} – {end}".strip(" –")
 
-            exp_line = f"Associated with {company}" if company else ""
-            if cfg["experience"] == "timeline" and exp_line:
-                exp_line = f"● {exp_line}"
-            if date_str:
-                exp_line += f" ({date_str})"
-            if exp_line:
-                p_exp = add_formatted_paragraph(exp_line)
-                p_exp.runs[0].bold = True
+            company_text = f"Associated with {company}" if company else ""
+            if cfg["experience"] == "timeline" and company_text:
+                # BUG FIX ("experience have missed styles" — a small box/
+                # tofu glyph showing instead of a marker): "●" (BLACK
+                # CIRCLE, U+25CF) doesn't have reliable font support in
+                # Google's DOCX viewer and rendered as a missing-glyph
+                # placeholder box instead of a bullet. "•" (BULLET,
+                # U+2022) is the character actually used for bullets
+                # nearly everywhere and has far more universal support.
+                company_text = f"\u2022 {company_text}"
+            if company_text or date_str:
+                p_exp = doc.add_paragraph()
+                p_exp.paragraph_format.space_after = Pt(2)
+                if company_text:
+                    r_company = p_exp.add_run(company_text)
+                    r_company.bold = True
+                    if cfg["experience"] == "accent-box" and accent_hex:
+                        r_company.font.color.rgb = RGBColor.from_string(accent_hex)
+                if date_str:
+                    r_date = p_exp.add_run(f" ({date_str})" if company_text else date_str)
+                    r_date.bold = True
                 if cfg["experience"] == "accent-box":
                     left_border = OxmlElement('w:pBdr')
                     edge = OxmlElement('w:left')
                     edge.set(qn('w:val'), 'single')
                     edge.set(qn('w:sz'), '18')
                     edge.set(qn('w:space'), '4')
-                    edge.set(qn('w:color'), '6366F1')
+                    edge.set(qn('w:color'), accent_hex or '6366F1')
+                    left_border.append(edge)
+                    p_exp._p.get_or_add_pPr().append(left_border)
+                elif cfg["experience"] == "timeline":
+                    # Approximates the frontend's vertical connecting
+                    # line down the left side of the timeline (a real
+                    # positioned line + dot isn't reproducible in DOCX,
+                    # but a thin left border reads the same way at a
+                    # glance). Falls back to the same slate color the
+                    # frontend's timeline dot uses when no accent is set.
+                    left_border = OxmlElement('w:pBdr')
+                    edge = OxmlElement('w:left')
+                    edge.set(qn('w:val'), 'single')
+                    edge.set(qn('w:sz'), '8')
+                    edge.set(qn('w:space'), '4')
+                    edge.set(qn('w:color'), accent_hex or '334155')
                     left_border.append(edge)
                     p_exp._p.get_or_add_pPr().append(left_border)
 
@@ -908,11 +1018,18 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
         else:
             add_formatted_paragraph(str(hobbies))
 
-    # Missing skills transparency
-    missing = resume_data.get("missing_skills", [])
-    if missing:
-        add_section_header("SKILLS GAP (NOT IN PROFILE):")
-        add_formatted_paragraph(f"Skills requested in job description: {', '.join(missing)}")
+    # BUG FIX ("Skills Gap ... shouldn't be in the downloadable resume at
+    # all"): this used to write a literal "SKILLS GAP (NOT IN PROFILE):
+    # Skills requested in job description: X, Y, Z" section into the
+    # actual DOCX — but the frontend's version of this (the orange Skills
+    # Gap panel in ResumeRichPreview.tsx) is explicitly marked
+    # `print:hidden` specifically because it's a generation-time review
+    # aid ("here's what to still add before finalizing"), never meant to
+    # reach the real document a consultant sends out. Handing a hiring
+    # manager a resume that itself lists its own missing skills would be
+    # actively counterproductive. Dropped entirely — resume_router.py
+    # also now strips missing_skills from resume.data at finalize time,
+    # so this is belt-and-suspenders for any other caller.
 
     doc.save(str(output_path))
 
@@ -1044,6 +1161,7 @@ def _build_resume_data_dto(
         "downloadUrls": _build_download_urls(requirement.id),
         "generationAttempts": generated.generation_attempt,
         "generated": True,
+        "template": generated.template or "classic",
     }
 
 
@@ -1070,6 +1188,7 @@ def _build_generate_result_dto(
         },
         "downloadUrls": _build_download_urls(requirement_id),
         "generationAttempts": generated.generation_attempt,
+        "template": generated.template or "classic",
     }
 
 
@@ -1084,6 +1203,7 @@ async def _run_generation_pipeline(
     match: RequirementConsultantMatch,
     current_user: User,
     attempt: int = 1,
+    template: str = "classic",
 ) -> GeneratedResume:
     """
     Full Phase 6 pipeline per doc flow:
@@ -1136,7 +1256,7 @@ async def _run_generation_pipeline(
     if ats_total < ATS_PASS_THRESHOLD and attempt < MAX_GENERATION_ATTEMPTS:
         logger.info("ATS %s < %s — retrying (attempt %d)", ats_total, ATS_PASS_THRESHOLD, attempt + 1)
         return await _run_generation_pipeline(
-            db, consultant, requirement, match, current_user, attempt=attempt + 1
+            db, consultant, requirement, match, current_user, attempt=attempt + 1, template=template
         )
 
     final_status = "READY" if ats_total >= ATS_PASS_THRESHOLD else "NEEDS_REVIEW"
@@ -1164,51 +1284,26 @@ async def _run_generation_pipeline(
     base_stem = base_filename_with_ext.removesuffix(".pdf")
 
     # ── Step 7: Generate DOCX ─────────────────────────────────────────────
+    # BUG FIX ("need all in DOCX only for consistency"): this used to also
+    # run _convert_to_pdf() (LibreOffice) and upload a second PDF artifact
+    # right after — that's a second lossy conversion step (per the same
+    # reasoning already applied to resume_router.py's Resume model: DOCX
+    # preserves template formatting, a LibreOffice PDF conversion doesn't
+    # reliably), plus a whole extra failure mode ("Install LibreOffice on
+    # the server for PDF generation") for a file nothing downstream
+    # actually needs once DOCX is the only supported format. DOCX is now
+    # the only artifact this pipeline produces.
     resume_dir = RESUME_UPLOAD_DIR / "generated" / str(consultant.id) / str(requirement.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
 
     docx_path = resume_dir / f"{base_stem}.docx"
-    pdf_path = resume_dir / f"{base_stem}.pdf"
 
     try:
-        _generate_docx(resume_data, docx_path)
+        _generate_docx(resume_data, docx_path, template=template)
         logger.info("DOCX generated: %s", docx_path)
     except Exception as exc:
         logger.error("DOCX generation failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to generate DOCX: {exc}")
-
-    # ── Step 8: Convert to PDF ────────────────────────────────────────────
-    pdf_ok = _convert_to_pdf(docx_path, pdf_path)
-    s3_pdf_key = None
-    if not pdf_ok:
-        logger.warning("PDF conversion failed — DOCX available, PDF unavailable")
-    else:
-        try:
-            from s3_service import upload_file_to_s3
-            import uuid
-            s3_pdf_key = f"resumes/generated/{consultant.id}/{requirement.id}/{uuid.uuid4()}.pdf"
-            with open(pdf_path, "rb") as f:
-                upload_success = upload_file_to_s3(f, s3_pdf_key, "application/pdf")
-            if upload_success:
-                logger.info(f"Uploaded generated PDF to S3: {s3_pdf_key}")
-                # Optional: Delete local PDF to save space
-                try:
-                    pdf_path.unlink(missing_ok=True)
-                except Exception as del_err:
-                    logger.warning(f"Could not delete local PDF: {del_err}")
-            else:
-                logger.warning("S3 upload returned False, keeping local PDF")
-                s3_pdf_key = None
-        except Exception as e:
-            logger.error(f"S3 upload failed for generated PDF: {e}")
-            from error_logger import log_db_error
-            await log_db_error(
-                stage="generated_resume_s3_upload",
-                error=e,
-                source_type="requirement",
-                source_id=str(requirement.id) if requirement else None,
-            )
-            s3_pdf_key = None
 
     # ── Step 9: Mark previous versions non-final ─────────────────────────
     await db.execute(
@@ -1237,12 +1332,13 @@ async def _run_generation_pipeline(
         ats_matched_keywords=ats_matched,
         ats_missing_keywords=ats_missing,
         docx_path=str(docx_path),
-        pdf_path=s3_pdf_key if s3_pdf_key else (str(pdf_path) if pdf_ok else None),
-        pdf_url=f"/api/consultant/requirements/{requirement.id}/resume/download/pdf" if pdf_ok else None,
+        pdf_path=None,
+        pdf_url=None,
         filename=base_filename_with_ext,
         status=final_status,
         generation_status="COMPLETED" if final_status == "READY" else final_status,
         is_final=True,
+        template=template,
     )
     db.add(generated)
 
@@ -1269,12 +1365,19 @@ async def _run_generation_pipeline(
 )
 async def generate_resume(
     requirement_id: int,
+    template: str = "classic",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     CONSULTANT role only — per doc code example: require_role('CONSULTANT').
     Returns GenerateResumeResultDTO matching frontend types/index.ts.
+
+    BUG FIX ("tailored resume — missing experience style, consider all
+    templates"): `template` used to not exist as a parameter anywhere in
+    this endpoint at all — every generation was hardcoded to "classic" no
+    matter what. Query param (not a request body) so existing callers
+    that POST with no body at all keep working unchanged.
     """
     _require_role(current_user, "CONSULTANT")
     consultant = await _get_consultant_for_user(db, current_user)
@@ -1331,6 +1434,7 @@ async def generate_resume(
         match=match,
         current_user=current_user,
         attempt=existing_count + 1,
+        template=template,
     )
 
     try:
@@ -1388,6 +1492,13 @@ class GeneratedResumeContentDTO(BaseModel):
     resumeContent: dict
     requirementRole: str
     clientName: str
+    # BUG FIX ("tailored resume — after finalize, view/download missing
+    # experience style"): this DTO never included template at all, so
+    # GeneratedResumeEditorPage.tsx's `resume?.template` was always
+    # undefined and silently fell back to "classic" in its own preview —
+    # completely independent of whatever the actual saved resume used,
+    # even after every other piece of this fix. Last missing link.
+    template: str = "classic"
 
 
 @router.get(
@@ -1425,11 +1536,18 @@ async def get_resume_content(
         resumeContent=generated.resume_content or {},
         requirementRole=requirement.role,
         clientName=requirement.client or "",
+        template=generated.template or "classic",
     )
 
 
 class UpdateGeneratedResumeRequest(BaseModel):
     resumeContent: dict
+    # BUG FIX ("tailored resume — missing experience style, consider all
+    # templates"): same gap as generate_resume — no way to ever set or
+    # change a template for this resume. Optional so existing callers
+    # that only send resumeContent keep the resume's current template
+    # unchanged rather than silently resetting it.
+    template: Optional[str] = None
 
 
 @router.put(
@@ -1520,30 +1638,27 @@ async def update_resume_content(
     )
     base_stem = base_filename_with_ext.removesuffix(".pdf")
 
+    # BUG FIX ("tailored resume — missing experience style"): update the
+    # stored template if the caller sent one, then always regenerate
+    # using generated.template (never the hardcoded classic default) —
+    # same read-after-write pattern the admin Resume model already uses.
+    if request.template is not None:
+        generated.template = request.template
+
     resume_dir = RESUME_UPLOAD_DIR / "generated" / str(consultant.id) / str(requirement.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
     docx_path = resume_dir / f"{base_stem}.docx"
-    pdf_path = resume_dir / f"{base_stem}.pdf"
 
     try:
-        _generate_docx(resume_data, docx_path)
-        pdf_ok = _convert_to_pdf(docx_path, pdf_path)
+        _generate_docx(resume_data, docx_path, template=generated.template or "classic")
     except Exception as exc:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to regenerate DOCX: {exc}")
 
-    s3_pdf_key = None
-    if pdf_ok:
-        from s3_service import upload_file_to_s3
-        s3_pdf_key = f"generated/{consultant.id}/{requirement.id}/{base_stem}.pdf"
-        with open(pdf_path, "rb") as f:
-            if not upload_file_to_s3(f, s3_pdf_key, "application/pdf"):
-                s3_pdf_key = None
-
     generated.filename = base_filename_with_ext
     generated.docx_path = str(docx_path)
-    generated.pdf_path = s3_pdf_key if s3_pdf_key else (str(pdf_path) if pdf_ok else None)
-    generated.generation_status = "COMPLETED" if pdf_ok else generated.generation_status
+    generated.pdf_path = None
+    generated.generation_status = "COMPLETED"
 
     await db.commit()
     await db.refresh(generated)
@@ -1604,15 +1719,23 @@ async def download_resume(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Serves the actual DOCX or PDF file.
-    Frontend DownloadButtonGroup and ResumeActionCell both link to these URLs.
-    file_type must be 'pdf' or 'docx'.
+    Serves the actual DOCX file.
+    Frontend DownloadButtonGroup and ResumeActionCell both link to this URL.
+    file_type must be 'docx' — PDF generation was removed (DOCX-only now,
+    for consistency with the admin Resume model's file handling, which
+    dropped its own LibreOffice PDF-conversion step for the same reason:
+    it didn't reliably preserve template formatting).
     """
     _require_role(current_user, "CONSULTANT")
     consultant = await _get_consultant_for_user(db, current_user)
 
-    if file_type not in ("pdf", "docx"):
-        raise HTTPException(status_code=422, detail="file_type must be 'pdf' or 'docx'")
+    if file_type == "pdf":
+        raise HTTPException(
+            status_code=410,
+            detail="PDF downloads have been removed — resumes are now DOCX-only. Use file_type=docx.",
+        )
+    if file_type != "docx":
+        raise HTTPException(status_code=422, detail="file_type must be 'docx'")
 
     result = await db.execute(
         select(GeneratedResume).where(
@@ -1625,20 +1748,15 @@ async def download_resume(
     if not generated:
         raise HTTPException(status_code=404, detail="No generated resume found.")
 
-    file_path = generated.pdf_path if file_type == "pdf" else generated.docx_path
+    file_path = generated.docx_path
 
-    # BUG FIX: generated.filename is always stored ending in ".pdf"
-    # (see _build_resume_filename — it hardcodes the suffix), and that one
-    # stored name gets reused for BOTH the pdf_path and docx_path files.
-    # Downloading "pdf" happened to look right by coincidence, but
-    # downloading "docx" served real DOCX bytes under a filename ending in
-    # ".pdf" — both downloads then land in the Downloads folder with the
-    # same base name, making it easy to open the wrong one and see Word
-    # content where a PDF was expected. Force the extension to match what
-    # was actually requested, regardless of what's stored.
+    # generated.filename is always stored ending in ".pdf" (see
+    # _build_resume_filename — it hardcodes the suffix, a leftover from
+    # when PDF was the primary format); force the extension to .docx
+    # regardless of what's stored, since that's the only format served now.
     stored_name = generated.filename or Path(file_path).name
     stem = stored_name.rsplit(".", 1)[0] if "." in stored_name else stored_name
-    correct_filename = f"{stem}.{file_type}"
+    correct_filename = f"{stem}.docx"
 
     if file_path and not Path(file_path).exists():
         from s3_service import download_file_from_s3
@@ -1647,7 +1765,7 @@ async def download_resume(
             from fastapi.responses import Response
             return Response(
                 content=body,
-                media_type=content_type or "application/pdf",
+                media_type=content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 headers={
                     "Content-Disposition":
                         f'attachment; filename="{correct_filename}"'
@@ -1657,18 +1775,12 @@ async def download_resume(
     if not file_path or not Path(file_path).exists():
         raise HTTPException(
             status_code=404,
-            detail=f"{file_type.upper()} file not available. "
-                   + ("Install LibreOffice on the server for PDF generation." if file_type == "pdf" else ""),
+            detail="DOCX file not available.",
         )
-
-    media_type = (
-        "application/pdf" if file_type == "pdf"
-        else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
 
     return FileResponse(
         path=file_path,
-        media_type=media_type,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=correct_filename,
         headers={"Cache-Control": "no-store"},
     )
