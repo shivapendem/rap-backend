@@ -1193,44 +1193,60 @@ class BaseResumeContentUpdateRequest(BaseModel):
             if not degree or not institution or not year:
                 raise ValueError("Degree, institution, and year are all required for each education entry")
 
-        # BUG FIX (consistency with "My Profile"): Primary and Secondary
-        # Skills are both required there (SkillTagInput.tsx — at least one
-        # skill each) — this screen has no dedicated Primary/Secondary
-        # Skills fields of its own, but its Technical Proficiencies rows
-        # are exactly what update_base_resume_content below buckets into
-        # those same two Consultant columns, keyed off whether "primary"
-        # appears anywhere in a row's Category text (anything else,
-        # including a blank category, falls through to secondary — same
-        # rule as the bucketing logic further down this file). Mirrored
-        # here rather than centralized only because that logic lives in
-        # the endpoint body, not a place a Pydantic validator can share
-        # directly — kept the exact same "primary" substring rule so the
-        # two can't drift apart.
+        # BUG FIX (this validator's own comment warned about exactly
+        # this: "kept the exact same 'primary' substring rule so the
+        # two can't drift apart" — they drifted apart anyway once the
+        # endpoint body below moved to a per-skill {"name","isPrimary"}
+        # tag instead of guessing tier from category text. Real
+        # categories are technology-type labels ("Programming
+        # Languages", "Cloud Platforms") that never contain the literal
+        # word "primary", so has_primary here was permanently False —
+        # this validator ran BEFORE the endpoint body, so it rejected
+        # every save with a 422 before the correct, already-fixed
+        # bucketing logic further down this file ever got a chance to
+        # run. Mirrors that same per-skill tag now, with the same
+        # legacy-string fallback, so the two genuinely can't drift
+        # apart again — both read the identical shape.
         tech_rows = v.get("technical_proficiencies")
         tech_rows = tech_rows if isinstance(tech_rows, list) else []
 
-        def _row_has_skills(row: dict) -> bool:
+        def _row_skill_items(row: dict) -> list:
             skills_val = row.get("skills")
-            skills_str = ", ".join(skills_val) if isinstance(skills_val, list) else str(skills_val or "")
-            return bool(skills_str.strip())
+            if isinstance(skills_val, list):
+                return skills_val
+            return [s.strip() for s in str(skills_val or "").split(",") if s.strip()]
 
-        has_primary = any(
-            isinstance(row, dict) and "primary" in str(row.get("category") or "").strip().lower() and _row_has_skills(row)
-            for row in tech_rows
-        )
-        has_secondary = any(
-            isinstance(row, dict) and "primary" not in str(row.get("category") or "").strip().lower() and _row_has_skills(row)
-            for row in tech_rows
-        )
+        has_primary = False
+        has_secondary = False
+        for row in tech_rows:
+            if not isinstance(row, dict):
+                continue
+            category = str(row.get("category") or "").strip().lower()
+            legacy_bucket = "primary" if "primary" in category else "secondary"
+            for item in _row_skill_items(row):
+                if isinstance(item, dict):
+                    if not str(item.get("name") or "").strip():
+                        continue
+                    if item.get("isPrimary"):
+                        has_primary = True
+                    else:
+                        has_secondary = True
+                else:
+                    if not str(item or "").strip():
+                        continue
+                    if legacy_bucket == "primary":
+                        has_primary = True
+                    else:
+                        has_secondary = True
+
         if not has_primary:
             raise ValueError(
-                'Add at least one Technical Proficiencies row with "Primary" in the Category '
-                '(e.g. "Primary Skills") and at least one skill listed'
+                "Mark at least one skill as Primary in Technical Proficiencies "
+                "(click the star on a skill chip)"
             )
         if not has_secondary:
             raise ValueError(
-                'Add at least one more Technical Proficiencies row (any category without "Primary" in it) '
-                "with at least one skill listed"
+                "Add at least one more skill that isn't marked Primary"
             )
 
         return v
@@ -1420,10 +1436,26 @@ def _flatten_base_resume_content_to_text(data: dict) -> str:
     add(None, data.get("name"))
     add("Career Objective", data.get("career_objective") or data.get("summary"))
 
+    # BUG FIX: skills can now be a list of {"name","isPrimary"} tag
+    # objects, not just plain strings — the `add()` helper's
+    # ", ".join(str(v) for v in value ...) would str() each dict
+    # directly, embedding literal Python dict-repr text (e.g.
+    # "{'name': 'Python', 'isPrimary': True}") into base_resume_text —
+    # which feeds AI tailoring and TF-IDF matching, so this would
+    # silently degrade both rather than crash outright. Extract just
+    # the display name regardless of shape.
+    def _skill_display_names(skills_val):
+        if isinstance(skills_val, list):
+            return [
+                (s.get("name") if isinstance(s, dict) else s)
+                for s in skills_val
+            ]
+        return skills_val
+
     tech = data.get("technical_proficiencies")
     if isinstance(tech, list) and tech:
         for tp in tech:
-            skills = tp.get("skills") if isinstance(tp, dict) else None
+            skills = _skill_display_names(tp.get("skills")) if isinstance(tp, dict) else None
             add(tp.get("category") if isinstance(tp, dict) else None, skills)
     else:
         add("Skills", data.get("skills"))
@@ -1969,23 +2001,50 @@ async def update_base_resume_content(
             info["summary"] = summary_val
             user_row.resume_info = info
 
+    # BUG FIX (primary/secondary tier silently wiped on every resume
+    # save): this used to decide a whole ROW's tier by checking whether
+    # the word "primary" appeared in its CATEGORY text — but real
+    # categories are technology-type labels ("Programming Languages",
+    # "Cloud Platforms", etc.), never "Primary Skills", so every row
+    # fell into the `else` branch and consultant.secondary_skills got
+    # overwritten with the ENTIRE skill set on every save while
+    # primary_skills went stale. Tier now lives per-skill (see
+    # categorize_skills_with_tier in claude_service.py) as an
+    # {"name", "isPrimary"} object, so it's read directly instead of
+    # guessed from category wording. Legacy rows saved before this
+    # change may still have plain string skills with no tier — those
+    # fall back to the old category-text heuristic so older data
+    # doesn't just disappear, but any row using the new per-skill shape
+    # is now correct regardless of how its category is named.
     tech_rows = resume_data.get("technical_proficiencies") or []
     primary_bits, secondary_bits = [], []
     for row in tech_rows:
         if not isinstance(row, dict):
             continue
         skills_val = row.get("skills")
-        skills_str = ", ".join(skills_val) if isinstance(skills_val, list) else (skills_val or "")
-        skills_str = skills_str.strip()
-        if not skills_str:
-            continue
         category = (row.get("category") or "").strip().lower()
-        if "primary" in category:
-            primary_bits.append(skills_str)
-        elif "secondary" in category:
-            secondary_bits.append(skills_str)
-        else:
-            secondary_bits.append(skills_str)
+        legacy_bucket = "primary" if "primary" in category else "secondary"
+
+        items = skills_val if isinstance(skills_val, list) else (
+            [s.strip() for s in (skills_val or "").split(",") if s.strip()]
+        )
+        for item in items:
+            if isinstance(item, dict):
+                name = (item.get("name") or "").strip()
+                if not name:
+                    continue
+                if item.get("isPrimary"):
+                    primary_bits.append(name)
+                else:
+                    secondary_bits.append(name)
+            else:
+                name = (item or "").strip()
+                if not name:
+                    continue
+                if legacy_bucket == "primary":
+                    primary_bits.append(name)
+                else:
+                    secondary_bits.append(name)
     if primary_bits:
         consultant.primary_skills = ", ".join(primary_bits)
     if secondary_bits:

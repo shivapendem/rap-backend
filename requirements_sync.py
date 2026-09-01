@@ -38,7 +38,7 @@
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from parser import parse_requirements, is_reply_email
+from parser import parse_requirements, is_reply_email, is_hotlist_email
 from cleaner import clean_requirement_text, html_to_text
 from dedup import save_requirement
 import re
@@ -164,6 +164,15 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                 headers["reply_to"] = row["reply_to"]
 
             if is_reply_email(subject):
+                skipped_not_a_requirement += 1
+                continue
+
+            # BUG FIX: is_hotlist_email() existed in parser.py but was
+            # never actually wired into this sync loop -- see pipeline.py
+            # for the matching fix and full rationale. Skip "hotlist"/
+            # bench-broadcast emails before they get run through
+            # requirement parsing at all.
+            if is_hotlist_email(body):
                 skipped_not_a_requirement += 1
                 continue
 

@@ -1176,8 +1176,27 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    # BUG FIX ("which engine is more accurate" — this was the answer):
+    # this was the LAST of four occurrences of the exact same gap found
+    # this session (requirements_sync.py, phase2.py's reparse, and this
+    # one — the CORE Pipeline A function itself, called by every
+    # Pipeline A trigger: admin "Rematch", requirements_sync.py,
+    # phase2.py's reparse). Unlike Pipeline B's run_matching_for_requirement(),
+    # which now receives a pre-filtered roster at all 3 of its call sites,
+    # this queried Consultant.status == "ACTIVE" alone — no User join, no
+    # role == "CONSULTANT" check, no is_authorized check — so Pipeline A
+    # could still match a requirement against a deactivated user's or a
+    # non-consultant-role user's Consultant profile. Matches the same
+    # filter now applied consistently everywhere else. (User is already
+    # imported at module level above — no new import needed.)
     consultants_result = await db.execute(
-        select(Consultant).where(Consultant.status == "ACTIVE")
+        select(Consultant)
+        .join(User, Consultant.user_id == User.id)
+        .where(
+            Consultant.status == "ACTIVE",
+            User.role == "CONSULTANT",
+            User.is_authorized == True,
+        )
     )
     consultants = consultants_result.scalars().all()
 

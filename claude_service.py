@@ -189,6 +189,24 @@ def categorize_skills_with_tier(primary: list[str], secondary: list[str]) -> lis
     markdown — so those asterisks showed up literally in the UI instead
     of rendering as bold. Returns plain skill strings now; no tier
     markup in this table.
+
+    BUG FIX (primary/secondary tier lost on resume edit round-trip):
+    this used to return plain skill strings per category, which meant
+    the primary/secondary tier only ever existed for the instant this
+    function ran — it was never actually stored anywhere per-skill.
+    When resume_router.py's save handler later tried to reconstruct
+    "is this row primary?" by checking whether the word "primary"
+    appeared in the CATEGORY text ("Programming Languages", "Cloud
+    Platforms", etc. never contain that word), every row fell through
+    to secondary, silently wiping out primary_skills on every resume
+    save. Each skill now carries its own {"name", "isPrimary"} tag that
+    survives independently of which technology-type category it's
+    displayed under, so the tier is a real per-skill fact instead of a
+    guess based on category wording. This function is the only caller
+    of categorize_skills() whose output feeds the tier-sensitive base
+    resume path — categorize_skills() itself is left untouched so the
+    unrelated tailored-resume/gap-analysis callers keep working exactly
+    as before.
     """
     primary_clean = [s.strip() for s in (primary or []) if s and s.strip()]
     primary_lower = {s.lower() for s in primary_clean}
@@ -196,7 +214,17 @@ def categorize_skills_with_tier(primary: list[str], secondary: list[str]) -> lis
         s.strip() for s in (secondary or [])
         if s and s.strip() and s.strip().lower() not in primary_lower
     ]
-    return categorize_skills(primary_clean + secondary_clean)
+    categorized = categorize_skills(primary_clean + secondary_clean)
+    return [
+        {
+            "category": row["category"],
+            "skills": [
+                {"name": skill, "isPrimary": skill.lower() in primary_lower}
+                for skill in row["skills"]
+            ],
+        }
+        for row in categorized
+    ]
 
 
 def categorize_skills(skills: list[str]) -> list[dict]:

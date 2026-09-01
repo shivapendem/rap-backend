@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gmail_reader import save_raw_email
-from parser import parse_requirements
+from parser import parse_requirements, is_hotlist_email
 from cleaner import clean_requirement_text, html_to_text
 from dedup import create_jd_hash, save_requirement
 # Shared HTML-vs-plain-text detection (regex-tuned, see its own comment in
@@ -134,6 +134,25 @@ async def process_email(
         body = body_text
     else:
         body = html_to_text(body_html)
+
+    # BUG FIX: is_hotlist_email() existed in parser.py but was never
+    # actually wired into this pipeline. "Hotlist"/bench-broadcast emails
+    # (a recruiter advertising THEIR available consultants, asking others
+    # to send THEM requirements) use nearly all the same staffing
+    # keywords as a real job posting, so they were being run through
+    # requirement parsing like any other email -- producing garbage rows
+    # (role = the raw subject line, location/skills pulled from a
+    # candidate roster table, etc.) for emails that were never job
+    # postings in the first place. Skip requirement creation entirely for
+    # these; the `emails` bookkeeping row above is still saved either way.
+    if is_hotlist_email(body):
+        return {
+            "email_status": email_status,
+            "requirement_status": "skipped_hotlist",
+            "requirement_id": None,
+            "all_requirement_ids": [],
+            "requirement_count": 0,
+        }
 
     # MULTI-REQUIREMENT FIX: an email can contain more than one distinct
     # job posting. parse_requirements() (plural) splits the body into

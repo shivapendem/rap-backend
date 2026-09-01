@@ -135,6 +135,14 @@ async def save_requirement(
         except ValueError:
             received_date = None
 
+    # Defensive: a real email can never be "received" in the future. If the
+    # upstream value is more than a few minutes ahead of now, it's corrupted
+    # (bad timezone parsing upstream) -- don't let it through as-is.
+    if received_date is not None:
+        now_utc = datetime.now(timezone.utc)
+        if received_date > now_utc + timedelta(minutes=10):
+            received_date = None
+
     # Check for duplicate
     duplicate = await is_duplicate(db, vendor_email, role, jd_hash, received_date=received_date)
     if duplicate:
