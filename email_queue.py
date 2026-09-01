@@ -1618,17 +1618,33 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
             # personal address still fails here exactly as it should —
             # it just now gets Google's real rejection reason instead of
             # being blocked pre-emptively by our own narrow domain check.
+            sa_exc_detail = None
             try:
                 sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
                 access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, item.from_email)
             except Exception as sa_exc:
+                sa_exc_detail = str(sa_exc)
                 print(f"[email-queue debug {item.id}] Service-account fallback failed for {item.from_email!r}: {sa_exc}")
 
         if not access_token:
+            # BUG FIX: this used to tell the consultant to "connect their
+            # Gmail account before applying" — that self-serve OAuth
+            # connect flow was dead code (fully built, never wired into
+            # any screen) and has since been removed entirely, so that
+            # instruction pointed at a feature that doesn't exist and
+            # gave the consultant no actual way to resolve this. The only
+            # real fix is server-side (service-account-key.json missing/
+            # misconfigured, or domain-wide delegation not authorized in
+            # Google Workspace Admin for this domain/scope) — surface the
+            # actual sa_exc reason here instead of hiding it in server
+            # logs, so whoever sees this error (admin/support) has enough
+            # to act on without needing separate server log access.
+            reason_suffix = f" Underlying error: {sa_exc_detail}" if sa_exc_detail else ""
             raise ValueError(
-                f"No OAuth token found for candidate/consultant ({item.from_email}), and this address "
-                f"isn't part of the company's Google Workspace domain either, so no automatic send method "
-                f"is available. The consultant needs to connect their Gmail account before applying."
+                f"No send method available for {item.from_email}: no per-consultant Gmail token on file, "
+                f"and the service-account fallback failed.{reason_suffix} This requires an admin to check the "
+                f"service-account configuration (service-account-key.json and Google Workspace domain-wide "
+                f"delegation) on the server — this is not something the consultant can fix themselves."
             )
 
         print(f"[email-queue debug {item.id}] Token resolved successfully. Resolving attachments...")

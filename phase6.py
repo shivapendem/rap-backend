@@ -717,7 +717,15 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             table.columns[1].width = Inches(4.6)
             for idx, tp in enumerate(tech_profs):
                 cat = tp.get("category", "Skills")
-                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
+                # BUG FIX: skills can now be a list of {"name","isPrimary"}
+                # dicts (per-skill tier tag), not just plain strings —
+                # ", ".join(...) crashed on dict items. Extract the
+                # display name regardless of shape; the DOCX itself never
+                # needs to show the tier, only the skill name.
+                _raw_skills = tp.get("skills", [])
+                skills_val = ", ".join(
+                    (s.get("name", "") if isinstance(s, dict) else str(s)) for s in _raw_skills
+                ) if isinstance(_raw_skills, list) else str(_raw_skills or "")
                 row = table.add_row()
                 cell_cat, cell_skills = row.cells
                 cell_cat.width = Inches(1.9)
@@ -756,7 +764,12 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             # per category instead of a bordered table.
             for tp in tech_profs:
                 cat = tp.get("category", "Skills")
-                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
+                # BUG FIX: same dict-vs-string compatibility as the table
+                # branch above — see the comment there.
+                _raw_skills = tp.get("skills", [])
+                skills_val = ", ".join(
+                    (s.get("name", "") if isinstance(s, dict) else str(s)) for s in _raw_skills
+                ) if isinstance(_raw_skills, list) else str(_raw_skills or "")
                 p_line = doc.add_paragraph()
                 p_line.paragraph_format.space_after = Pt(2)
                 r_cat = p_line.add_run(f"{cat}: ")
