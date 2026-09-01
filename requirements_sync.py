@@ -41,6 +41,41 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from parser import parse_requirements, is_reply_email
 from cleaner import clean_requirement_text, html_to_text
 from dedup import save_requirement
+import re
+
+
+# BUG FIX ("some JD parsed as HTML format, role UNKNOWN") — used below to
+# decide whether body_text itself needs html_to_text() before parsing (see
+# its call site's own comment for the full story). A real regex matching
+# any tag SHAPE (</?word ...>), not a hardcoded list of specific tag
+# names — an earlier version only checked for "<html"/"<body"/"<div"/
+# "<table"/"<p>"/"<p " substrings, which misses the many other tags real
+# recruiter HTML actually uses (<span>, <br>, <a href=, <font>, <b>, <tr>,
+# <td>, <li>, <h1>-<h6>, <img...) and would silently pass through an
+# HTML-templated email that happens not to use any of those six specific
+# tags.
+#
+# TUNED (threshold lowered 3 -> 2): this also gates whether skills/
+# job_description extraction ever sees clean text, not just role, so a
+# false negative here is costlier than in clean_role()'s own tag-strip
+# safety net (which only protects role and always runs regardless). Two
+# tag-shaped matches is still enough to rule out a JD casually mentioning
+# a single tag name in prose ("familiar with <div> layouts") — genuine
+# HTML-sourced text packs tags close together, never just one — while
+# catching real HTML sooner than requiring a third match.
+_HTML_TAG_RE = re.compile(r'</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>')
+
+
+def _looks_like_html(t: str) -> bool:
+    if not t:
+        return False
+    low = t.lower()
+    if "<!doctype html" in low or "<html" in low or "<body" in low or "<head" in low:
+        return True
+    # Scoped to the first 2000 chars — plenty to catch a templated header
+    # (which is where the tag density is highest) without scanning a
+    # possibly-huge body on every row.
+    return len(_HTML_TAG_RE.findall(t[:2000])) >= 2
 
 
 async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
@@ -93,7 +128,31 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
             subject = row["subject"] or ""
             body_text = row["body_text"] or ""
             body_html = row["body_html"] or ""
-            body = body_text or html_to_text(body_html)
+            # BUG FIX ("some JD parsed as HTML format, role UNKNOWN"): this
+            # only fell back to html_to_text(body_html) when body_text was
+            # EMPTY — but some senders' HTML-only templates (like this
+            # exact "atsEmail" one) get synced with the raw HTML markup
+            # sitting in body_text itself (no real multipart/alternative
+            # plain-text part was ever provided upstream), which is
+            # non-empty and therefore "wins" the `or` before ever reaching
+            # html_to_text. parse_requirements() below then runs its
+            # regex-based extraction directly against raw "<p><span
+            # style=...>Job Title: ...</span></p>" markup instead of clean
+            # text — labels like "Job Title:" no longer sit next to their
+            # value the way ROLE_PATTERNS expects, so role comes out
+            # UNKNOWN or garbled. clean_requirement_text() already has
+            # this exact "<html"/"<body" detection, but it only runs
+            # AFTER parsing (on job_description, for storage) — too late
+            # to help extraction. Applying the same detection here (see
+            # _looks_like_html above), before parsing, means whichever
+            # source is actually usable text wins, regardless of which DB
+            # column it happened to land in.
+            if _looks_like_html(body_text):
+                body = html_to_text(body_text)
+            elif body_text:
+                body = body_text
+            else:
+                body = html_to_text(body_html)
 
             headers = {}
             if row["from_address"]:
@@ -182,7 +241,35 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                             # requirements via the multi-requirement split
                             # above, so this still runs once per SAVED
                             # requirement, same as before per-item.
-                            cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+                            # BUG FIX ("auto-synced requirements matched
+                            # against deactivated/non-consultant users"):
+                            # this used to query Consultant.status ==
+                            # "ACTIVE" alone, with no User join at all —
+                            # unlike the bulk "Run Engine" background run
+                            # (matching_router.py's
+                            # _run_matching_engine_background), which also
+                            # requires User.role == "CONSULTANT" and
+                            # User.is_authorized == True. Both call the
+                            # same run_matching_for_requirement(), so every
+                            # real-time auto-sync match was scored against
+                            # a broader, inconsistent roster than the
+                            # manual run uses — including consultants whose
+                            # account is deactivated. get_pending_matches
+                            # happens to filter is_authorized at read time
+                            # today, which is why this wasn't user-visible,
+                            # but it still created and scored stray
+                            # JobMatch rows for ineligible people on every
+                            # sync. Matches the bulk run's filter exactly.
+                            from models import User as _User
+                            cons_res = await db.execute(
+                                select(Consultant)
+                                .join(_User, Consultant.user_id == _User.id)
+                                .where(
+                                    Consultant.status == "ACTIVE",
+                                    _User.role == "CONSULTANT",
+                                    _User.is_authorized == True,
+                                )
+                            )
                             consultants = cons_res.scalars().all()
                             existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
                             existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
@@ -266,4 +353,4 @@ if __name__ == "__main__":
             summary = await sync_pending_emails(db)
             print(summary)
 
-    asyncio.run(_run())           
+    asyncio.run(_run())

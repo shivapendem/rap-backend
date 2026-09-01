@@ -10,6 +10,10 @@ from gmail_reader import save_raw_email
 from parser import parse_requirements
 from cleaner import clean_requirement_text, html_to_text
 from dedup import create_jd_hash, save_requirement
+# Shared HTML-vs-plain-text detection (regex-tuned, see its own comment in
+# requirements_sync.py) — imported rather than duplicated so both
+# ingestion paths stay in sync instead of drifting apart over time.
+from requirements_sync import _looks_like_html
 
 
 async def process_email(
@@ -114,8 +118,22 @@ async def process_email(
         if reply_to_email:
             headers["reply_to"] = reply_to_email
 
-    # Use plain text if available, else convert HTML
-    body = body_text or html_to_text(body_html)
+    # BUG FIX ("some JD parsed as HTML format, role UNKNOWN") — same fix as
+    # requirements_sync.py's sync_pending_emails (see _looks_like_html's own
+    # comment there for the full story and the regex tuning rationale):
+    # this only fell back to html_to_text(body_html) when body_text was
+    # EMPTY. Some senders' HTML-only templates get synced with the raw HTML
+    # markup sitting in body_text itself (no real plain-text MIME part was
+    # ever provided upstream) — non-empty, so it "won" the `or` before ever
+    # reaching html_to_text, and the regex-based parsing below then ran
+    # directly against raw "<p><span style=...>Job Title: ...</span></p>"
+    # markup instead of clean text. Detect that case and convert it too.
+    if _looks_like_html(body_text):
+        body = html_to_text(body_text)
+    elif body_text:
+        body = body_text
+    else:
+        body = html_to_text(body_html)
 
     # MULTI-REQUIREMENT FIX: an email can contain more than one distinct
     # job posting. parse_requirements() (plural) splits the body into

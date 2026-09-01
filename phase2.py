@@ -680,12 +680,33 @@ async def reparse_email(
             # an admin separately clicked "Run Engine". Same call
             # requirements_sync.py already makes for a brand-new
             # requirement — applying it here too for a re-parsed one.
-            from models import Requirement, Consultant, JobMatch
+            from models import Requirement, Consultant, JobMatch, User
             from matching_router import run_matching_for_requirement
             req_res = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
             req_obj = req_res.scalars().first()
             if req_obj:
-                cons_res = await db.execute(select(Consultant).where(Consultant.status == "ACTIVE"))
+                # BUG FIX ("Reparse"-triggered matches scored against
+                # deactivated/non-consultant users): same fix already
+                # applied to requirements_sync.py's own copy of this exact
+                # query — this used Consultant.status == "ACTIVE" alone,
+                # with no User join at all, unlike the bulk "Run Engine"
+                # background run (matching_router.py's
+                # _run_matching_engine_background), which also requires
+                # User.role == "CONSULTANT" and User.is_authorized ==
+                # True. All three call sites feed the same
+                # run_matching_for_requirement(), so this one was still
+                # scoring a re-parsed requirement against a broader,
+                # inconsistent roster than the manual "Run Engine" button
+                # uses. Matches that filter exactly.
+                cons_res = await db.execute(
+                    select(Consultant)
+                    .join(User, Consultant.user_id == User.id)
+                    .where(
+                        Consultant.status == "ACTIVE",
+                        User.role == "CONSULTANT",
+                        User.is_authorized == True,
+                    )
+                )
                 consultants = cons_res.scalars().all()
                 existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
                 existing_pairs = {(row[0], row[1]) for row in existing_res.all()}

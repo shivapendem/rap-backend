@@ -554,10 +554,18 @@ def score_role(
     if raw_pref_roles:
         unique_roles = tuple(sorted(set(raw_pref_roles)))
         req_role_clean = requirement_role.strip()
-        
-        # Serialize to string for JSON dict keys
-        cache_key = json.dumps([req_role_clean, list(unique_roles)])
-        
+
+        # BUG FIX: cache_key had no version component, so a prompt fix to
+        # ROLE_MATCH_SYSTEM_PROMPT (e.g. the job-function-before-domain
+        # gating fix) had zero effect on any (requirement_role,
+        # consultant_roles) pair already scored under the old prompt —
+        # it would just keep returning the stale wrong score from disk
+        # forever, cache hit every time. JobMatch rows already
+        # self-invalidate on MATCHING_LOGIC_VERSION changes; this gives
+        # the AI role-match cache the same self-healing behavior.
+        from claude_service import ROLE_MATCH_PROMPT_VERSION
+        cache_key = json.dumps([ROLE_MATCH_PROMPT_VERSION, req_role_clean, list(unique_roles)])
+
         cached_score = _ROLE_MATCH_CACHE.get(cache_key)
         if cached_score is not None:
             return cached_score
@@ -599,8 +607,28 @@ def score_role(
     # "Platform Engineer") — check that before giving up.
     if not req_domain:
         if req_tokens and _known_generic_phrase_domain(req_tokens):
-            req_domain = set(req_tokens)
-            req_generic = set()
+            # BUG FIX ("Platform Engineer" scored 42.5 — a real partial
+            # match — against "Network Engineer", "QA Engineer", "Data
+            # Engineer", and any other unrelated "*Engineer" title): this
+            # used to fall through to the normal domain_overlap/ratio
+            # flow with req_domain = set(req_tokens) — dumping the
+            # GENERIC component of the phrase ("engineer") into the
+            # domain-overlap pool alongside the genuinely domain-specific
+            # word ("platform"). Any title merely sharing that one
+            # generic word then registered as a real specialization
+            # match, exactly the single-generic-word-inflation problem
+            # GENERIC_ROLE_WORDS exists to prevent everywhere else. A
+            # known compound phrase like "Platform Engineer" should only
+            # be credited when the OTHER side recognizes the SAME
+            # phrase (exact) or a genuinely adjacent one —
+            # _adjacent_role_credit() already does exactly that
+            # comparison on domain-only tokens, which is the mechanism
+            # this branch's own docstring says it was meant to reach in
+            # the first place. Score directly here instead of merging
+            # into the generic ratio-based flow below.
+            if req_tokens.issubset(pref_tokens) or _adjacent_role_credit(req_tokens, pref_tokens):
+                return 85.0
+            return 0.0
         else:
             return 50.0
 
@@ -744,6 +772,23 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
     REMOTE requirement matches any consultant fully (location-agnostic).
     Otherwise compare requirement.location against consultant.preferred_locations
     and work_mode against the consultant's most recent experience entry.
+
+    BUG FIX (soft score disagreed with the hard gate on the exact same
+    consultant): location_passes() — the actual eligibility GATE this
+    score feeds a ranking for — already treats a consultant with no
+    preferred_locations stated as N/A and passes them, same "unspecified
+    = don't penalize" wildcard rule documented on every other Stage 0-4
+    filter and on score_employment_type()'s own matching fix above. This
+    function never got that same treatment: it only ever awarded the 60
+    location points when BOTH requirement.location AND
+    consultant.preferred_locations were present, so a consultant who
+    correctly passed the gate specifically BECAUSE they have no location
+    constraint still lost up to 10 weighted points (location is 10% of
+    the total in score_match()) on their ranking score for having
+    "failed" a location match that was never actually evaluated against
+    them. Now mirrors location_passes(): no stated consultant preference
+    counts as an open match, same as the requirement-side REMOTE case
+    above already does.
     """
     req_work_mode = (requirement.work_mode or "").upper()
 
@@ -753,11 +798,14 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
     score = 0.0
 
     # Location match
-    if requirement.location and consultant.preferred_locations:
-        req_loc = requirement.location.lower()
-        pref_locs = consultant.preferred_locations.lower()
-        if req_loc in pref_locs:
+    if requirement.location:
+        if not consultant.preferred_locations:
             score += 60.0
+        else:
+            req_loc = requirement.location.lower()
+            pref_locs = consultant.preferred_locations.lower()
+            if req_loc in pref_locs:
+                score += 60.0
 
     # Work mode match — compare against most recent experience entry's work_mode
     if req_work_mode and experiences:
@@ -779,21 +827,44 @@ def score_work_auth(requirement: Requirement, consultant: Consultant) -> float:
     so this checks employment_types for C2C/W2 implications:
     - FULLTIME roles typically require US_CITIZEN or GC
     - C2C is open to most work authorizations including H1B
-    """
-    if not consultant.work_authorization:
-        return 0.0
 
+    BUG FIX (two stacked issues): "if not consultant.work_authorization:
+    return 0.0" ran FIRST, unconditionally — before even checking whether
+    the requirement needed FULLTIME at all. A consultant with no stated
+    work_authorization got zeroed on this factor against every C2C/
+    contract posting too, even though this function's own docstring says
+    those are "open to most work authorizations" and don't need to know
+    citizenship status in the first place. And even in the genuine
+    FULLTIME case, zeroing an unspecified consultant value outright
+    disagreed with work_auth_passes() — the actual Stage 2 eligibility
+    GATE this score feeds a ranking for — which already treats an N/A
+    consultant work_authorization as passing (same wildcard rule as
+    every other Stage 1-4 filter). A consultant who correctly passed the
+    gate for exactly that reason still lost this factor's full weight in
+    their ranking score. Now: no FULLTIME requirement means this factor
+    doesn't apply at all (100.0, matching the docstring's own stated
+    intent), and an unspecified consultant value gets the same
+    unspecified-is-neutral treatment used everywhere else in this file —
+    only a STATED value that's actually incompatible with a genuine
+    FULLTIME requirement reduces the score.
+    """
     req_types = set((requirement.employment_types or []))
+    if "FULLTIME" not in req_types:
+        return 100.0
+
+    if not consultant.work_authorization:
+        return 100.0
+
     auth = consultant.work_authorization.upper()
 
-# BUG FIX: consultant self-service My Profile now saves "USC" (not
+    # BUG FIX: consultant self-service My Profile now saves "USC" (not
     # "US_CITIZEN") — see phase3.py's validate_work_auth. Keeping
     # US_CITIZEN/GREEN_CARD here too so any consultant row saved under
     # the OLD dropdown before this change still passes correctly until
     # they resave. GC EAD (a pending green-card case's work permit, not
     # actual permanent residency) is deliberately NOT included — it's
     # not treated as equivalent to USC/GC for a direct full-time hire.
-    if "FULLTIME" in req_types and auth not in {"USC", "US_CITIZEN", "GC", "GREEN_CARD"}:
+    if auth not in {"USC", "US_CITIZEN", "GC", "GREEN_CARD"}:
         return 0.0
 
     return 100.0
@@ -1664,7 +1735,23 @@ async def match_all_requirements(
     """
     _require_role(current_user, "ADMIN")
 
-    result = await db.execute(select(Requirement))
+    # BUG FIX: this had no status filter at all — unlike Pipeline B's own
+    # bulk background run (matching_router.py's
+    # _run_matching_engine_background, which filters
+    # Requirement.status.notin_(["CLOSED", "REJECTED"])), every requirement
+    # ever created — including long-closed and rejected ones — got fully
+    # scored against every active consultant on each "Match All" click.
+    # match_requirement() itself only filters Consultant.status ==
+    # "ACTIVE"; nothing anywhere in this call chain excluded the
+    # requirement's own status. That's pure wasted compute at the scale
+    # this file's own comments describe (37,000+ requirements caused a
+    # real timeout before), and could create brand new ASSIGNED/NEAR_MISS
+    # rows for a posting that's no longer actually open. Matches Pipeline
+    # B's exact filter so both "run everything" entry points agree on
+    # what "everything" means.
+    result = await db.execute(
+        select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+    )
     requirements = result.scalars().all()
 
     total_assignments = 0

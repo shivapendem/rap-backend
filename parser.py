@@ -194,7 +194,54 @@ ROLE_PATTERNS = [
     r'(?i)\bposition\s*[:\-]\s*(.+)',
     r'(?i)\brole\s*[:\-]\s*(.+)',
     r'(?i)\bopening\s*[:\-]\s*(.+)',
-    r'(?i)\brequirement\s*[:\-]\s*(.+)',
+    # BUG FIX ("Title – SAP BTP DMS Data Archiving Consultant" parsed as
+    # UNKNOWN, or fell through entirely to a poor-quality subject-line
+    # guess): a bare "Title:"/"Title –" label — no "Job" prefix — was
+    # completely missing from this list. It's an extremely common
+    # recruiter template label on its own (this exact real email uses
+    # it), not just as part of "Job Title:". Allowing a dash too (not
+    # colon-only like "requirement" below) since "Title – <role>" is the
+    # more common form in practice, and "title" is specific enough a word
+    # that it doesn't share "requirement"'s false-positive risk from
+    # generic prose.
+    r'(?i)\btitle\s*[:\-]\s*(.+)',
+    # BUG FIX ("QA Engineer requirement - San Jose" subject parsed the
+    # ROLE as "San Jose"): this used to allow a dash too, same as every
+    # other pattern here — but "requirement" is a far more generic word
+    # than "job title"/"position"/"role"/"opening", and "<title>
+    # requirement - <location/client>" is an extremely common subject-line
+    # phrasing where the dash has nothing to do with a "Requirement:"
+    # label at all. first_match() falls back to scanning
+    # subject+body combined (full_text) when the body alone has no
+    # labeled title, so this pattern matching that incidental subject-
+    # line dash won every time — extracting whatever followed the dash
+    # (a location, a client, anything) as if it were the job title.
+    # Restricting to a colon only keeps the genuine "Requirement:
+    # <title>" label case working while no longer firing on ordinary
+    # prose that just happens to contain "requirement -".
+    r'(?i)\brequirement\s*:\s*(.+)',
+    # BUG FIX ("Hiring: Salesforce FSC (Financial Services Cloud)Developer"
+    # fell through to a poor/UNKNOWN result — the real title was sitting
+    # right there behind an unrecognized label): "Hiring:" is a common
+    # recruiter-template label announcing the role, distinct from generic
+    # "we are hiring" marketing prose. Colon-only, same caution as
+    # "requirement" above — "hiring" is common enough in ordinary dash-
+    # separated marketing phrasing ("Now Hiring - Apply Today!") that
+    # allowing a dash here would risk the same false-positive class that
+    # fix exists to prevent; a colon is a much stronger, more deliberate
+    # label signal.
+    r'(?i)\bhiring\s*:\s*(.+)',
+    # BUG FIX ("Role Name: Gemini Enterprise SME/Lead" / "Role Name:
+    # Guidewire PolicyCenter BSA Lead" fell through entirely, letting a
+    # multi-posting email's own "Position -      1." SEQUENCE NUMBER
+    # label win instead — see first_match()'s bare-number guard for that
+    # half of the fix): "Role Name:" is a distinct, common template label
+    # (not caught by the bare "role" pattern above, which requires "role"
+    # immediately followed by the colon/dash — "Name" sitting in between
+    # doesn't match \s*). Allowing a dash too, matching "title"/"role"
+    # above — "role name" is specific/unambiguous enough that it doesn't
+    # share "requirement"/"hiring"'s generic-prose false-positive risk.
+    r'(?i)\brole\s*name\s*[:\-]\s*(.+)',
 ]
 
 CLIENT_PATTERNS = [
@@ -382,8 +429,22 @@ _PUNCT_MAP = {
     '\r\n': '\n', '\r': '\n',
 }
 
+# BUG FIX ("DevOps Engineer</span></b></span></span></p>" / other literal
+# HTML tags leaking into the extracted role): the real fix for THIS is
+# upstream — requirements_sync.py/pipeline.py now detect raw HTML sitting
+# in body_text and convert it before parsing ever runs (see their own
+# _looks_like_html). But relying solely on catching it once, upstream, is
+# fragile — any future/unforeseen ingestion path that skips that check
+# would reproduce the exact same leak. This is a second, independent
+# layer: strip any literal tag-shaped text directly out of clean_role()'s
+# output, unconditionally, regardless of which extraction path produced
+# it or why. Matches ANY tag shape (opening, closing, or self-closing),
+# same pattern as the upstream detector, so it stays in sync with what
+# that one recognizes as "this looks like a tag".
+_ANY_TAG_RE = re.compile(r'</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>')
+
 NEXT_FIELD_LABELS = [
-    'job title', 'job role', 'position', 'role', 'opening', 'requirement',
+    'job title', 'job role', 'title', 'position', 'role', 'opening', 'requirement',
     'end client', 'client', 'customer', 'work location', 'place of work',
     'location', 'pay rate', 'bill rate', 'compensation', 'rate',
     'contract length', 'contract duration', 'duration', 'primary skills',
@@ -393,6 +454,13 @@ NEXT_FIELD_LABELS = [
     'qualifications', 'job description', 'benefits', 'visa', 'type',
     'no. of position', 'no. of positions', 'number of position',
     'number of positions',
+    # BUG FIX ("Job Title: Forward Deployed Engineer (FDE) - AI/ML & API
+    # Integration Domain: Banking / Financial Services" — role kept
+    # running straight through into the Domain field instead of stopping
+    # before it): "Domain:" is a common recruiter-template label (BFSI/
+    # Healthcare/Insurance-domain postings frequently use it right after
+    # the title) that was simply missing from this list entirely.
+    'domain',
 ]
 
 NEXT_FIELD_PATTERN = re.compile(
@@ -466,8 +534,6 @@ def _unglue_leading_city_state(text: str) -> str:
 def crop_at_next_field(value: str) -> str:
     """
     Trim a captured field value at the first next-field label or sign-off.
-    Also trims at a closing paren immediately followed by a new sentence
-    (common in single-line HTML-collapsed emails).
     """
     if not value:
         return value
@@ -478,10 +544,22 @@ def crop_at_next_field(value: str) -> str:
     m = SIGNATURE_PATTERN.search(value)
     if m:
         cut = min(cut, m.start())
-    # Stop at ")(CapitalWord" boundary — parenthetical ends, new sentence starts
-    m = re.search(r'\)\s*(?=[A-Z][a-z])', value)
-    if m:
-        cut = min(cut, m.start() + 1)
+    # BUG FIX ("Salesforce FSC (Financial Services Cloud)Developer" lost
+    # "Developer" entirely — twice fixed, now removed): this rule was
+    # meant to catch a zero-whitespace HTML-collapse paragraph break
+    # right after a closing paren (e.g. "...(Confidential)ABC Corp
+    # requires..."). It can't be told apart from a recruiter's simple
+    # missing-space typo INSIDE the same title (this exact real case),
+    # which looks byte-for-byte identical — ")" immediately followed by a
+    # capitalized word — and destroys real title content on that guess.
+    # It also turned out to be entirely redundant for the one case it
+    # could prove itself on: a glued NEXT-FIELD label like
+    # "(Onsite)Location:" is already caught by NEXT_FIELD_PATTERN above
+    # on its own, since \b matches a word boundary at ")"->"L" with no
+    # whitespace required at all — confirmed directly, cut lands at
+    # "Location:" either way. With its one provable case redundant and
+    # its unique case actively destructive, there's no scenario left
+    # where keeping this rule helps.
     return value[:cut].strip()
 
 
@@ -501,8 +579,21 @@ def role_from_subject(subject: str) -> Optional[str]:
     if m:
         s = m.group(1)
     s = crop_at_next_field(s)
-    # Drop ALL parentheticals: "(Local to VA)", "(USC AND H4 Only)", "(Onsite)"
-    s = re.sub(r'\s*\([^)]*\)', '', s).strip()
+    # BUG FIX (same class as crop_at_next_field's "(MFT) Engineer" bug):
+    # this stripped a parenthetical ANYWHERE in the string, unlike
+    # clean_role()'s trailing-only stripper (`...\)\s*$`) applied to the
+    # body-extracted value. A subject line like "Managed File Transfer
+    # (MFT) Engineer - Dallas TX" lost "(MFT)" here even though it's part
+    # of the actual title, not a recruiter aside — the given examples
+    # ("Local to VA", "USC AND H4 Only", "Onsite") are all genuinely
+    # TRAILING asides in real subject lines anyway, so restricting to
+    # trailing-only (looped, same pattern as clean_role) loses none of
+    # the intended cases while no longer eating a mid-title acronym.
+    for _ in range(3):
+        stripped = re.sub(r'\s*\([^)]*\)\s*$', '', s).strip()
+        if stripped == s:
+            break
+        s = stripped
     # Split on pipe || or double-slash // bulk separators
     s = re.split(r'\s*(?:\|\|+|//+)\s*', s)[0]
     # Drop a trailing location/work-mode suffix after a bare dash, but cut
@@ -530,27 +621,81 @@ def role_from_subject(subject: str) -> Optional[str]:
     s = re.split(r'(?i)\s+(?:in|near|@)\s+', s)[0]
     # Drop rate tokens
     s = re.sub(r'\$\s*\d.*$', '', s)
-    # Drop trailing slash-separated noise: "//Local to X"
-    s = re.sub(r'(?i)[/\\]+\s*\w.*$', '', s).strip()
+    # BUG FIX ("Financial/Operations Data Analyst" truncated to just
+    # "Financial", "UI/UX Designer" to just "UI", "QA/Test Engineer" to
+    # just "QA"): this was meant to drop a double-slash bulk separator
+    # noise pattern like "//Local to X" (per this comment, and matching
+    # the same "//"-based separator role_from_subject already splits on
+    # earlier via "Split on pipe || or double-slash // bulk separators"),
+    # but [/\\]+ matches ONE OR MORE slashes — so it fired on every
+    # completely ordinary single-slash dual-specialization title too,
+    # deleting everything after the FIRST slash. A single "/" inside a
+    # title is extremely common (UI/UX, QA/Test, DevOps/SRE, Financial/
+    # Operations) and is real title content, not noise. Requiring {2,}
+    # (two or more slashes together) keeps the intended "//Local to X"
+    # case working while no longer eating a single-slash title.
+    s = re.sub(r'(?i)[/\\]{2,}\s*\w.*$', '', s).strip()
     # Strip leading "Requirement for / Opening for" prefix
     s = re.sub(r'(?i)^\s*(?:requirement|req|opening|posting)\s+for\s+', '', s).strip()
+    # BUG FIX ("Trying To Reach To You- Material Planning & Logistics
+    # Master Data Functional Lead- Immediate Interviews- Applynow!!!"
+    # parsed as the role verbatim): broadcast recruiter subjects commonly
+    # sandwich the real title between a marketing OPENER and a marketing
+    # CLOSER, both dash-separated ("<opener>- <Real Title>- <closer>").
+    # The prefix stripper below only ever handled the opener side, and
+    # its keyword list didn't include this exact opener phrasing either
+    # ("Trying To Reach To You" wasn't in it at all) — so neither end got
+    # cleaned and the WHOLE noisy subject fell through as the "role".
+    # Shared vocabulary so the leading and trailing stripers can't drift
+    # out of sync with each other.
+    _MARKETING_PHRASES = (
+        r'needed|required|urgent(?:ly)?|immediate(?:ly)?|hiring(?:\s+now)?|hot|hire|'
+        r'opportunit(?:y|ies)|apply\s*now|apply|local|'
+        r'trying\s+to\s+reach(?:\s+(?:out|to\s+you|you))?|reach(?:ing)?\s+out|'
+        r'immediate\s+interviews?|interviews?\s+(?:today|now|asap)'
+    )
     # Drop marketing keywords only at START — a mid-string match like
     # "Hiring!! Financial Data Analyst" would wipe the whole role with .*$
     # Looped: multi-word prefixes like "Urgent hiring for X" need more than
     # one pass -- a single pass only strips "Urgent", leaving "hiring for X"
     # behind, since each pass only consumes one keyword from the group.
     _marketing_prefix_re = re.compile(
-        r'(?i)^\s*(?:needed|required|urgent|immediate|hiring(?:\s+now)?|hot|hire|'
-        r'opportunity|apply|local)\b\s*(?:for\s+)?[\s:\-!.]*'
+        r'(?i)^\s*(?:' + _MARKETING_PHRASES + r')\b\s*(?:for\s+)?[\s:\-!.]*'
     )
     for _ in range(3):
         stripped = _marketing_prefix_re.sub('', s)
         if stripped == s:
             break
         s = stripped
+    # Mirror of the prefix stripper, anchored at the END instead — strips
+    # a dash-separated marketing CLOSER ("- Immediate Interviews",
+    # "- Apply Now!!!"). Looped since these commonly chain two or more
+    # in a row, same reasoning as the prefix loop above. Requires the
+    # ENTIRE remaining tail after the dash to be just the marketing
+    # phrase (plus trailing "!"s) — never eats a dash-separated segment
+    # that has anything else in it, so a real trailing qualifier like
+    # "- PeopleSoft" is untouched.
+    _marketing_suffix_re = re.compile(
+        r'(?i)\s*[\-\u2013]\s*(?:' + _MARKETING_PHRASES + r')\s*!*\s*$'
+    )
+    for _ in range(4):
+        stripped = _marketing_suffix_re.sub('', s)
+        if stripped == s:
+            break
+        s = stripped
     s = s.strip()
     # Drop leading punctuation left behind after stripping
     s = re.sub(r'^[\s!?.,:;\-]+', '', s)
+    # BUG FIX (dangling trailing dash, e.g. "Senior Python Developer -"):
+    # clean_role() (used on body-extracted values) already strips trailing
+    # punctuation left behind after its own cleanup passes — this function
+    # never had the equivalent, so a trailing "-"/":" left over from the
+    # dash_m location-stripping block above (when the kept portion right
+    # before a dropped Remote/Hybrid/location trigger itself ended in a
+    # dash) survived into the final result. Same pattern as clean_role's.
+    # Includes "." too (see clean_role's matching fix) for a recruiter's
+    # own trailing sentence-ending period, e.g. "HELP DESK ANALYST II .".
+    s = re.sub(r'[\-\u2013,:;.]+\s*$', '', s).strip()
     s = sanitize_text(s)
     if not s:
         return None
@@ -558,6 +703,98 @@ def role_from_subject(subject: str) -> Optional[str]:
 
 
 _EMAIL_ADDR_PATTERN = re.compile(r'[\w.+-]+@[\w-]+\.[a-zA-Z]+')
+
+
+def role_from_bold_lead(norm_text: str) -> Optional[str]:
+    """
+    Fallback for the common recruiter-template pattern where the role is
+    stated plainly at the top of the body with NO label at all — just
+    emphasis markup, e.g. "*QA Engineer  *" or "**QA Engineer**" as
+    literally the first substantive line. None of the other fallbacks
+    catch this: first_match(ROLE_PATTERNS, ...) requires an explicit
+    "Job Title:"/"Role:"-style label (there isn't one here), and
+    role_from_body_lead grabs everything up to the next field label —
+    which, with no colon-labeled role to stop at either, swallows the
+    preceding "Hi, find the below JD" preamble right along with the
+    actual title, e.g. "Hi find the below JD *QA Engineer *".
+
+    Scoped to the first 800 chars (the title is always near the top in
+    this template) and deliberately conservative — same philosophy as
+    every other fallback in this file: a false positive (grabbing the
+    wrong bold span as the role) is worse than falling through to the
+    next fallback, so this only returns something when it's confident.
+    Rejects any bold span that's actually a known section-header word
+    (reuses FIELD_BOUNDARIES, e.g. "*Job Overview*", "*Key
+    Responsibilities*" — real section headers in this exact template,
+    not roles) or contains a field-label colon (e.g. a bold-wrapped
+    "*Location: San Jose*").
+    """
+    if not norm_text:
+        return None
+    header_slice = norm_text[:800]
+    boundary_words = {b.lower() for b in FIELD_BOUNDARIES}
+    # Reject a bold span that's just recruiter marketing noise ("*URGENT*",
+    # "*Hiring Now*", "*Hot Requirement*") rather than the actual title —
+    # these commonly appear as the FIRST bold span, ahead of the real
+    # title, in exactly this kind of unlabeled template. Same noise-word
+    # spirit as role_from_subject's own marketing-prefix stripper, just
+    # applied to the whole candidate here rather than a leading prefix.
+    _noise_only_re = re.compile(
+        r'(?i)^(?:urgent|immediate|hot|new|hiring(?:\s+now)?|apply(?:\s+now)?|'
+        r'needed|required|please\s+respond|respond\s+asap|asap)\s*!*$'
+    )
+    for m in re.finditer(r'\*{1,2}([^*\n]{2,60}?)\*{1,2}', header_slice):
+        candidate = sanitize_text(m.group(1))
+        if not candidate:
+            continue
+        if ':' in candidate or '-' in candidate:
+            continue
+        if candidate.lower().strip() in boundary_words:
+            continue
+        if _noise_only_re.match(candidate.strip()):
+            continue
+        if is_email_body(candidate) or len(candidate.split()) > 8:
+            continue
+        return candidate
+    return None
+
+
+def role_from_numbered_label(text: str) -> Optional[str]:
+    """
+    Fallback for a common multi-posting broadcast pattern: "Role: 1" /
+    "Position: 2" used as a bare SEQUENCE NUMBER header for that posting
+    within the email, with the actual title sitting unlabeled on the very
+    next line — e.g.:
+        Role: 1
+        Senior AWS Application Architect
+        Location: New York, NY ...
+
+    first_match()'s bare-numeric-value guard correctly refuses to treat
+    "1"/"2" itself as a role (see that guard's own comment), but on its
+    own that just means NOTHING gets extracted from the body for this
+    segment — falling all the way through to role_from_subject(), which
+    returns the SAME shared, generic subject text (e.g. "Multiple
+    Requirements") for every numbered posting in the email instead of
+    each one's own specific, correct title. Scoped to the first 500
+    chars — this pattern always appears right at the top of a segment,
+    right after split_into_requirement_segments() has already split on
+    these exact "Role: N" anchors.
+    """
+    if not text:
+        return None
+    m = re.search(
+        r'(?im)^[ \t]*(?:role|position)\s*[:\-]?\s*\d+\s*[.):]?[ \t]*\n[ \t]*(.+)',
+        text[:500],
+    )
+    if not m:
+        return None
+    candidate = sanitize_text(m.group(1).split('\n', 1)[0])
+    if not candidate:
+        return None
+    candidate = crop_at_next_field(candidate)
+    if not candidate or is_email_body(candidate) or len(candidate) > 100:
+        return None
+    return candidate
 
 
 def role_from_body_lead(norm_text: str) -> Optional[str]:
@@ -779,6 +1016,22 @@ def first_match(patterns: List[str], text: str) -> Optional[str]:
                 continue
             value = crop_at_next_field(value)
             if not value or is_email_body(value) or len(value) > 200:
+                continue
+            # BUG FIX ("Position -      1." parsed as role="1."): this
+            # docstring's own earlier fix (earliest-match-wins) only helps
+            # when a DIFFERENT, correctly-labeled match exists somewhere
+            # else in the text to win instead — it doesn't help when the
+            # bad match is the ONLY one found, which is exactly what
+            # happens in a multi-posting broadcast email numbered
+            # "Position -      1." / "Position-    2" (posting SEQUENCE
+            # numbers, not a job title) alongside a "Role Name:" label
+            # ROLE_PATTERNS didn't recognize at all. A value that's
+            # purely digits (with optional trailing "." or ":") can never
+            # be a real job title/position name under any of these
+            # patterns — reject it here and let the next pattern (or
+            # fallback tier) have a chance instead of "winning" on a bare
+            # number.
+            if re.fullmatch(r'\d+\s*[.:)]?', value.strip()):
                 continue
             if best_pos is None or match.start() < best_pos:
                 best_pos = match.start()
@@ -1237,6 +1490,35 @@ def calculate_confidence(parsed: Dict[str, Any]) -> float:
 # Cleaning Functions
 # ---------------------------------------------------------------------------
 
+def _cap_real_words(text: str, max_words: int) -> str:
+    """
+    Truncate `text` to at most `max_words` REAL (contains a letter/digit)
+    words, keeping any punctuation-only tokens ("-", "&", "/", "|") that
+    fall before the cutoff.
+
+    BUG FIX ("... AI/ML & API Integration Domain: ..." truncated to "...
+    AI/ML & API", losing "Integration"): the plain `words[:N]` slice this
+    replaces counted every whitespace-separated token as a full "word" —
+    including a standalone connector like a lone "-" or "&", which are
+    completely normal inside real job titles ("AI/ML & API Integration",
+    "Full Stack - Backend Developer"). That wasted slots in the cap on
+    non-content tokens and cut off real title words sitting right after
+    them. Only tokens with at least one letter or digit count toward the
+    word budget; a bare punctuation token is kept but doesn't consume a
+    slot itself.
+    """
+    words = text.split()
+    kept = []
+    real_word_count = 0
+    for w in words:
+        if real_word_count >= max_words:
+            break
+        kept.append(w)
+        if re.search(r'[0-9A-Za-z]', w):
+            real_word_count += 1
+    return ' '.join(kept)
+
+
 def clean_role(role: Optional[str]) -> Optional[str]:
     """
     Clean role title.
@@ -1245,6 +1527,14 @@ def clean_role(role: Optional[str]) -> Optional[str]:
     if not role:
         return None
     role = sanitize_text(normalize_text(role))
+    if not role:
+        return None
+    # Strip any leaked HTML tags FIRST — before crop_at_next_field or any
+    # other regex below runs — so those operate on genuinely clean text
+    # instead of potentially matching against tag fragments. See _ANY_TAG_RE
+    # above for the full rationale.
+    role = _ANY_TAG_RE.sub(' ', role)
+    role = sanitize_text(role)
     if not role:
         return None
     role = crop_at_next_field(role)
@@ -1260,18 +1550,39 @@ def clean_role(role: Optional[str]) -> Optional[str]:
         r'\b[\s:\-!.]*', '', role
     )
     role = re.sub(r'^[^0-9A-Za-z]+', '', role).strip()
-    role = re.sub(r'[\-\u2013,:;]+\s*$', '', role).strip()
-    # ROLE-SPECIFIC PARSING: real job titles are short (typically 2-8 words).
-    # If crop_at_next_field() didn't find a clean boundary (e.g. HTML-collapsed
-    # single-line emails with no recognizable "Location:"/signature marker
-    # nearby), this cuts off at the point runaway sentence text starts,
-    # instead of falling through to a blunt 60-char truncation that grabs
-    # unrelated trailing words like "AWS Engineer so on more unwanted...".
+    # BUG FIX ("HELP DESK ANALYST II ." — the recruiter's own trailing
+    # sentence-ending period survived all the way through): this stripped
+    # a trailing dash/comma/colon/semicolon but never a period, so
+    # "Job Title: HELP DESK ANALYST II ." kept that literal " ." on the
+    # end. A trailing period on a role title is always just punctuation,
+    # never meaningful title content, so it's safe to strip unconditionally
+    # here (a real title using periods, like "Sr." or "R&D", has them
+    # mid-string, not as the very last character).
+    role = re.sub(r'[\-\u2013,:;.]+\s*$', '', role).strip()
+    # ROLE-SPECIFIC PARSING: real job titles are short — typically 2-8
+    # words, but a legitimate "Role A or Role B" dual/alternate-title
+    # posting (recruiters commonly broadcasting two acceptable titles for
+    # the same req, e.g. "Supply Chain Data & KPI Analyst or SAP IBP
+    # Business/Data Analyst") runs longer while still being entirely real
+    # title content, not runaway sentence text. If crop_at_next_field()
+    # didn't find a clean boundary (e.g. HTML-collapsed single-line emails
+    # with no recognizable "Location:"/signature marker nearby), this cuts
+    # off at the point runaway sentence text starts, instead of falling
+    # through to a blunt 60-char truncation that grabs unrelated trailing
+    # words like "AWS Engineer so on more unwanted...". Capped at 12 (was
+    # 8) to comfortably fit a real two-title posting while still catching
+    # genuine runaway text well before it reaches a 60-char cutoff.
     words = role.split()
-    if len(words) > 8:
-        role = ' '.join(words[:8])
-    if len(role) > 60:
-        role = role[:57] + '...'
+    if len(words) > 12:
+        role = _cap_real_words(role, 12)
+    # BUG FIX: this blunt char-cap ran regardless of the word-cap outcome
+    # above, so raising the word cap alone wasn't enough — a real 10-word
+    # dual-title role like "Supply Chain Data & KPI Analyst or SAP IBP
+    # Business/Data Analyst" (64 chars) still got hard-cut mid-word here.
+    # Raised to 80 to match role_from_subject()'s own length limit, so
+    # both fallback paths agree on how long a real title is allowed to be.
+    if len(role) > 80:
+        role = role[:77] + '...'
     return role or None
 
 
@@ -1283,6 +1594,10 @@ def clean_client(client: Optional[str]) -> Optional[str]:
     if not client:
         return None
     client = sanitize_text(normalize_text(client))
+    if not client:
+        return None
+    # Same HTML-tag safety net as clean_role() — see _ANY_TAG_RE's comment.
+    client = sanitize_text(_ANY_TAG_RE.sub(' ', client))
     if not client:
         return None
     client = crop_at_next_field(client)
@@ -1312,7 +1627,7 @@ def clean_client(client: Optional[str]) -> Optional[str]:
     # back to a blunt character truncation.
     words = client.split()
     if len(words) > 10:
-        client = ' '.join(words[:10])
+        client = _cap_real_words(client, 10)
     if len(client) > 50:
         client = client[:47] + '...'
     return client or None
@@ -1336,6 +1651,10 @@ def clean_location(location: Optional[str]) -> Optional[str]:
     if not location:
         return None
     location = sanitize_text(normalize_text(location))
+    if not location:
+        return None
+    # Same HTML-tag safety net as clean_role() — see _ANY_TAG_RE's comment.
+    location = sanitize_text(_ANY_TAG_RE.sub(' ', location))
     if not location:
         return None
     location = crop_at_next_field(location)
@@ -1379,6 +1698,10 @@ def clean_rate(rate: Optional[str]) -> Optional[str]:
     rate = sanitize_text(normalize_text(rate))
     if not rate:
         return None
+    # Same HTML-tag safety net as clean_role() — see _ANY_TAG_RE's comment.
+    rate = sanitize_text(_ANY_TAG_RE.sub(' ', rate))
+    if not rate:
+        return None
     rate = crop_at_next_field(rate)
     # Range: $55-65/hr or $55-$65/hr
     m = re.search(
@@ -1410,6 +1733,10 @@ def clean_duration(duration: Optional[str]) -> Optional[str]:
     if not duration:
         return None
     duration = sanitize_text(normalize_text(duration))
+    if not duration:
+        return None
+    # Same HTML-tag safety net as clean_role() — see _ANY_TAG_RE's comment.
+    duration = sanitize_text(_ANY_TAG_RE.sub(' ', duration))
     if not duration:
         return None
     duration = crop_at_next_field(duration)
@@ -1573,13 +1900,36 @@ def parse_requirement(
 
     # ── Role ──────────────────────────────────────────────────────────────
     # AI first (run through the same cleaner regex output gets — P0 fix #2),
-    # then body-first regex to prevent subject-line poisoning, then the
-    # subject-line and bare-body-lead fallbacks.
+    # then body-only regex to prevent subject-line poisoning, then a
+    # bold/emphasis-wrapped bare title (common template: role stated
+    # plainly at the top with no label at all, just "*Role Name*"), then a
+    # "Role: N" sequence-number header with the real title unlabeled on
+    # the next line.
+    #
+    # BUG FIX (multi-posting email "Role: 1 / <Title 1>" and "Role: 2 /
+    # <Title 2>" both came out as the SAME generic "Multiple
+    # Requirements" — the shared email subject): first_match(...,
+    # full_text) — the body+subject-combined fallback — used to run
+    # BEFORE role_from_numbered_label below. Since full_text prepends the
+    # SAME subject ahead of every segment's own body, and a generic
+    # broadcast subject can itself match a ROLE_PATTERNS label (e.g.
+    # "Urgent Hiring: Multiple Requirements" matches the "hiring:"
+    # pattern), that subject-sourced match won for every segment before
+    # the per-segment numbered-label fallback ever got a turn — the exact
+    # same subject-leaking-into-full_text class of bug already fixed once
+    # for "QA Engineer requirement - San Jose", just via a different
+    # ROLE_PATTERNS entry this time. Moved the full_text fallback to AFTER
+    # every body-only fallback (bold-lead, numbered-label) — it's a last-
+    # resort catch for the rare case where the body truly has no usable
+    # signal at all, not something that should out-rank a more specific,
+    # already-successful body-only signal.
     role = clean_role(_ai_field('role', unknown_value='UNKNOWN'))
     if not role:
-        raw_role = first_match(ROLE_PATTERNS, norm_body) or first_match(ROLE_PATTERNS, full_text)
         role = (
-            clean_role(raw_role)
+            clean_role(first_match(ROLE_PATTERNS, norm_body))
+            or clean_role(role_from_bold_lead(norm_body))
+            or clean_role(role_from_numbered_label(norm_body))
+            or clean_role(first_match(ROLE_PATTERNS, full_text))
             or clean_role(role_from_subject(safe_subject))
             or clean_role(role_from_body_lead(norm_body))
         )

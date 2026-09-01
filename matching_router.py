@@ -558,6 +558,49 @@ async def get_pending_matches(
     result = await db.execute(stmt)
     rows = result.mappings().all()
 
+    # BUG FIX ("Pending Applications" dashboard card stuck at exactly 200,
+    # shifting slightly on every 15s refetch): the frontend stat card
+    # computed its count as `matches.length` from this endpoint's response
+    # — but this endpoint always caps at .limit(200) above (a real, correct
+    # limit for the actual Pending Applications LIST page, which paginates
+    # and doesn't need a full unbounded result set). Using that capped
+    # array's length as if it were a total count meant the dashboard could
+    # never show more than 200 no matter how many pending matches actually
+    # exist — with the specific 200 rows behind that ceiling shifting
+    # between polls as new matches came in, which is what looked like "it
+    # keeps changing" while staying wrong. Compute a genuine COUNT(*) with
+    # the exact same filters (before the limit/order_by above), and return
+    # it alongside the capped list — one extra lightweight query, and no
+    # caller that already reads only "matches" is affected.
+    count_stmt = (
+        select(func.count())
+        .select_from(JobMatch)
+        .join(Requirement, JobMatch.requirement_id == Requirement.id)
+        .join(Consultant, JobMatch.consultant_id == Consultant.id)
+        .join(User, User.id == Consultant.user_id)
+        .where(
+            JobMatch.status == target_status,
+            Consultant.status == "ACTIVE",
+            User.is_authorized == True,
+        )
+    )
+    if consultant_id:
+        c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
+        if c_ids:
+            count_stmt = count_stmt.where(JobMatch.consultant_id.in_(c_ids))
+    if current_user.role == "CONSULTANT":
+        cons_subq = select(Consultant.id).where(Consultant.user_id == current_user.id).scalar_subquery()
+        count_stmt = count_stmt.where(JobMatch.consultant_id == cons_subq)
+    elif current_user.role == "RECRUITER":
+        from models import RecruiterConsultant
+        assigned_subq = select(RecruiterConsultant.consultant_id).where(
+            RecruiterConsultant.recruiter_id == current_user.id,
+            RecruiterConsultant.is_active == True,
+        ).scalar_subquery()
+        count_stmt = count_stmt.where(JobMatch.consultant_id.in_(assigned_subq))
+
+    total_count = (await db.execute(count_stmt)).scalar_one()
+
     import math
     def _safe_float(val):
         if val is None:
@@ -591,7 +634,7 @@ async def get_pending_matches(
         for row in rows
     ]
 
-    return {"matches": output}
+    return {"matches": output, "total": total_count}
 
 @router.post("/{match_id}/apply")
 async def mark_match_applied(
@@ -601,12 +644,59 @@ async def mark_match_applied(
 ):
     """
     Mark a match as applied.
+
+    BUG FIX (two stacked issues, found by comparing against reject_match()
+    just below, which already got both of these right):
+
+    1. No authorization/ownership scoping at all — this only checked that
+       the caller was logged in, not that the match actually belonged to
+       them. get_pending_matches() (the GET endpoint that lists these
+       same rows) already scopes CONSULTANT to their own matches and
+       RECRUITER to their assigned consultants' matches — any
+       authenticated CONSULTANT could call this on ANY match_id,
+       including another consultant's, and mark it "APPLIED" on their
+       behalf. Added the identical scoping here.
+
+    2. No status guard at all — reject_match() below refuses to act on
+       anything that isn't currently PENDING; this let a match in ANY
+       state (already REJECTED, already INVALIDATED — meaning the engine
+       has since determined the consultant no longer even qualifies —
+       or already APPLIED) be silently flipped to "APPLIED" too. Widened
+       slightly beyond reject_match()'s own PENDING-only check to also
+       allow NEAR_MISS, since the Pending Applications UI shows an
+       "Apply Now" button on NEAR_MISS rows the same as PENDING ones —
+       restricting to PENDING-only here would have broken that real,
+       intended use case.
     """
     result = await db.execute(select(JobMatch).where(JobMatch.id == match_id))
     match = result.scalars().first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
-        
+
+    if current_user.role == "CONSULTANT":
+        cons_check = await db.execute(
+            select(Consultant.id).where(
+                Consultant.id == match.consultant_id,
+                Consultant.user_id == current_user.id,
+            )
+        )
+        if not cons_check.scalars().first():
+            raise HTTPException(status_code=404, detail="Match not found")
+    elif current_user.role == "RECRUITER":
+        from models import RecruiterConsultant
+        assigned_check = await db.execute(
+            select(RecruiterConsultant.id).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.consultant_id == match.consultant_id,
+                RecruiterConsultant.is_active == True,
+            )
+        )
+        if not assigned_check.scalars().first():
+            raise HTTPException(status_code=404, detail="Match not found")
+
+    if match.status not in ("PENDING", "NEAR_MISS"):
+        raise HTTPException(status_code=400, detail="Only pending or near-miss matches can be applied")
+
     match.status = "APPLIED"
     await db.commit()
     return {"success": True}
@@ -618,6 +708,13 @@ async def reject_match(
 ):
     """
     Reject a pending match, hiding it from the pending view.
+
+    BUG FIX: same missing-scoping issue as mark_match_applied() above —
+    added the identical role-based ownership check. Also widened the
+    status guard to allow rejecting a NEAR_MISS match, not just PENDING
+    — the Pending Applications UI shows the same "Reject" button on both,
+    and PENDING-only here silently 400'd every reject attempt on a
+    NEAR_MISS row despite the UI offering it.
     """
     query = select(JobMatch).where(JobMatch.id == match_id)
     result = await db.execute(query)
@@ -626,8 +723,29 @@ async def reject_match(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    if match.status != "PENDING":
-        raise HTTPException(status_code=400, detail="Only pending matches can be rejected")
+    if current_user.role == "CONSULTANT":
+        cons_check = await db.execute(
+            select(Consultant.id).where(
+                Consultant.id == match.consultant_id,
+                Consultant.user_id == current_user.id,
+            )
+        )
+        if not cons_check.scalars().first():
+            raise HTTPException(status_code=404, detail="Match not found")
+    elif current_user.role == "RECRUITER":
+        from models import RecruiterConsultant
+        assigned_check = await db.execute(
+            select(RecruiterConsultant.id).where(
+                RecruiterConsultant.recruiter_id == current_user.id,
+                RecruiterConsultant.consultant_id == match.consultant_id,
+                RecruiterConsultant.is_active == True,
+            )
+        )
+        if not assigned_check.scalars().first():
+            raise HTTPException(status_code=404, detail="Match not found")
+
+    if match.status not in ("PENDING", "NEAR_MISS"):
+        raise HTTPException(status_code=400, detail="Only pending or near-miss matches can be rejected")
 
     match.status = "REJECTED"
     await db.commit()

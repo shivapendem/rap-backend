@@ -1310,15 +1310,55 @@ Generate the tailored template JSON now.
 # PARSE_REQUIREMENT_TOOL, parse_requirement_text() — moved to claude_parsing_service.py.
 # parser.py now imports parse_requirement_text from there.
 
+# BUG FIX ("Technical Project Manager - AI/ML, Generative AI" matching
+# "AI/ML Engineer" / "Generative AI Engineer" consultants): this prompt
+# only ever asked the model to compare DOMAIN/specialization ("AI/ML",
+# "Generative AI") — it never asked it to check the primary job
+# FUNCTION/title type (Manager vs. Engineer vs. Architect vs. Analyst)
+# at all. Following these instructions literally, the model saw the
+# shared AI/ML domain and scored it high, with nothing telling it that
+# Manager vs. Engineer is a disqualifying mismatch regardless of shared
+# domain — exactly the failure mode reported. Now requires the job
+# function to match (or be genuinely adjacent, e.g. Engineer/Developer)
+# BEFORE domain overlap is even considered, with an explicit worked
+# example matching the reported bug so the model has a concrete anchor
+# for what "same domain, different function" should score.
 ROLE_MATCH_SYSTEM_PROMPT = """You are an expert technical recruiter evaluating role match.
-Given a Requirement Role and a Consultant's Role History (a list of roles they've held or preferred), 
-evaluate how well the consultant's specialization matches the requirement.
-Consider domains and specializations (e.g., 'DevOps Engineer' matches 'Site Reliability Engineer', but 'Java Developer' does not match 'Python Developer' just because they both have 'Developer').
+Given a Requirement Role and a Consultant's Role History (a list of roles they've held or preferred),
+evaluate how well the consultant's role matches the requirement.
+
+Evaluate in this order — job FUNCTION first, THEN domain:
+
+1. Job function/title type: identify the primary function of each role
+   (e.g. Engineer, Developer, Architect, Manager, Analyst, Administrator,
+   Lead, Consultant, Scientist). A Manager/PM-type role and an
+   Engineer/Developer-type (hands-on IC) role are DIFFERENT functions,
+   even when they mention the exact same technology or domain — shared
+   domain keywords (e.g. both mentioning "AI/ML" or "Generative AI") do
+   NOT make a Technical Project Manager role match an AI/ML Engineer or
+   Generative AI Engineer role. Score that pairing low (10-25), not high,
+   regardless of domain overlap. Closely adjacent functions doing
+   effectively the same hands-on work (e.g. "Engineer" vs "Developer") are
+   fine to treat as the same function.
+2. Only once the function is the same (or genuinely adjacent), consider
+   domain/specialization overlap (e.g., 'DevOps Engineer' matches 'Site
+   Reliability Engineer', but 'Java Developer' does not match 'Python
+   Developer' just because they both have 'Developer').
+
 Ignore seniority differences (e.g. 'Senior' or 'Lead').
 
 Return ONLY a valid JSON object with a single field 'score', which is an integer between 0 and 100 representing the match percentage.
 Example: {"score": 85}
 """
+
+# Bumped whenever ROLE_MATCH_SYSTEM_PROMPT changes in a way that could
+# change past scores — folded into the disk cache key in
+# evaluate_role_match_with_ai's caller (phase4.py's score_role) so a
+# prompt fix like this one doesn't leave old, wrong scores stuck in
+# _ROLE_MATCH_CACHE forever (unlike JobMatch rows, which already
+# self-invalidate on MATCHING_LOGIC_VERSION changes — this cache had no
+# equivalent before).
+ROLE_MATCH_PROMPT_VERSION = 2
 
 def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[str]) -> Optional[float]:
     """

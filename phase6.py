@@ -481,21 +481,24 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     # template"): this TEMPLATE_CONFIG had drifted from the real frontend
     # (ResumeRichPreview.tsx) in several places — compact's skills style
     # was "inline" here but is "table" there, timeline's was "table" here
-    # but is "zebra" there, skillbars' was "inline" here but is "bars"
-    # there. It also carried four ids ("banner", "editorial",
+    # but is "zebra" there. It also carried four ids ("banner", "editorial",
     # "professional", "focused") that don't exist in the frontend's
     # RESUME_TEMPLATES at all — dead config nothing can ever select, kept
     # here only by copy-paste, now removed. Confirmed against the actual
-    # current frontend source (not guessed from screenshots) — see the 7
+    # current frontend source (not guessed from screenshots) — see the
     # entries in ResumeRichPreview.tsx's TEMPLATE_CONFIG.
+    #
+    # REMOVED: "skillbars" and "sidebar" templates dropped entirely
+    # (frontend and backend) — skillbars' "bars" skills style and
+    # sidebar's dark-rail page layout had no DOCX equivalent anyway (see
+    # the elif branch below, which used to lump them together as a
+    # plain-text fallback).
     TEMPLATE_CONFIG = {
         "classic":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",     "certifications": "list"},
         "compact":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",     "certifications": "list"},
         "modern":     {"header": "default", "objective": "plain",    "skills": "table", "experience": "accent-box", "education": "table",    "certifications": "pills"},
         "executive":  {"header": "default", "objective": "centered", "skills": "table", "experience": "standard",   "education": "centered", "certifications": "centered"},
         "timeline":   {"header": "default", "objective": "plain",    "skills": "zebra", "experience": "timeline",   "education": "list",     "certifications": "list"},
-        "skillbars":  {"header": "default", "objective": "plain",    "skills": "bars",  "experience": "standard",   "education": "list",     "certifications": "list"},
-        "sidebar":    {"header": "default", "objective": "plain",    "skills": "pills", "experience": "standard",   "education": "list",     "certifications": "list"},
     }
     cfg = TEMPLATE_CONFIG.get(template, TEMPLATE_CONFIG["classic"])
 
@@ -749,19 +752,6 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             # crammed against it.
             spacer = doc.add_paragraph()
             spacer.paragraph_format.space_after = Pt(4)
-        elif tech_profs and isinstance(tech_profs, list):
-            # "pills"/"bars" (sidebar/skillbars) — neither has a
-            # meaningful DOCX equivalent (badge chips, filled progress
-            # bars), so both fall back to plain "Category: skills" lines
-            # per category instead of a bordered table.
-            for tp in tech_profs:
-                cat = tp.get("category", "Skills")
-                skills_val = ", ".join(tp.get("skills", [])) if isinstance(tp.get("skills"), list) else str(tp.get("skills", ""))
-                p_line = doc.add_paragraph()
-                p_line.paragraph_format.space_after = Pt(2)
-                r_cat = p_line.add_run(f"{cat}: ")
-                r_cat.bold = True
-                p_line.add_run(skills_val)
         elif skills_list:
             p_sk = doc.add_paragraph(style="List Bullet")
             r_cat = p_sk.add_run(f"{'Core Skills':<25} : ")
