@@ -319,7 +319,7 @@ US_STATE_NAMES = {
 
 # Matches "City, TX" / "City TX" / "City, Texas" — resolved through resolve_state_code()
 BARE_LOCATION_PATTERN = re.compile(
-    r'\b([A-Z][a-zA-Z]+(?:[ \-][A-Z][a-zA-Z]+){0,2}),?\s*'
+    r'\b([A-Z][a-zA-Z]+(?:[ \-][A-Z][a-zA-Z]+){0,2})\s*,?\s*'
     r'([A-Z]{2}\b|[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)'
 )
 
@@ -573,7 +573,7 @@ def role_from_subject(subject: str) -> Optional[str]:
     # The old blind cut assumed anything capitalized after a dash was a
     # location, so "Senior Technical Leads - PeopleSoft, Remote" lost
     # "PeopleSoft" (real title content, not a location) along with "Remote".
-    dash_m = re.search(r'\s-\s([A-Z][a-zA-Z].*)$', s)
+    dash_m = re.search(r'\s*-\s([A-Z][a-zA-Z].*)$', s)
     if dash_m:
         tail = dash_m.group(1)
         mode_m = re.search(r'(?i)\b(remote|hybrid|onsite|on-site|on\s+location)\b', tail)
@@ -603,9 +603,9 @@ def role_from_subject(subject: str) -> Optional[str]:
     # behind, since each pass only consumes one keyword from the group.
     _marketing_prefix_re = re.compile(
         r'(?i)^\s*(?:needed|required|urgent|immediate|hiring(?:\s+now)?|hot|hire|'
-        r'opportunity|apply|local)\b\s*(?:for\s+)?[\s:\-!.]*'
+        r'opportunity|apply|local|new|requirement|req)\b\s*(?:for\s+)?[\s:\-!.]*'
     )
-    for _ in range(3):
+    for _ in range(6):
         stripped = _marketing_prefix_re.sub('', s)
         if stripped == s:
             break
@@ -688,6 +688,13 @@ def sanitize_text(text: Optional[str]) -> Optional[str]:
     text = text.replace('|', ' ')
     text = text.replace('\t', ' ')
     text = ' '.join(text.split())
+    text = text.strip()
+    # BUG FIX: plain-text emails using "*bold*"-style markdown emphasis
+    # around field labels/values (e.g. "*Location: San Jose*") leave a
+    # stray leading/trailing "*" stuck to the captured value once the
+    # label itself is stripped off. Strip it the same way pipes are
+    # already stripped above.
+    text = re.sub(r'^\*+\s*|\s*\*+$', '', text)
     return text.strip()
 
 
@@ -1028,6 +1035,10 @@ TECH_KEYWORDS = [
     'Looker', 'LookML', 'BigQuery', 'Tableau', 'Power BI',
     # Modern DevOps / AI-assisted development tooling
     'GitHub Copilot', 'Bamboo', 'Bitbucket',
+    # Accessibility / QA testing
+    'WCAG', 'Section 508', 'ARIA', 'WAI-ARIA', 'axe-core', 'axe DevTools',
+    'Lighthouse', 'Accessibility Insights', 'NVDA', 'JAWS', 'VoiceOver',
+    'TalkBack', 'HTML', 'CSS', 'DOM',
 ]
 
 
@@ -1200,6 +1211,9 @@ def extract_skills(text: str) -> List[str]:
             skills.extend(_extract_skill_tokens(chunk))
         if skills:
             return list(dict.fromkeys(skills))[:20]
+
+    if is_email_body(skills_text):
+        return extract_skills_from_keywords(text_scope)
 
     # Flat list mode: "Python, Java, AWS, Docker" — original comma/semicolon
     # splitting logic, unchanged.
@@ -1444,12 +1458,12 @@ def calculate_confidence(parsed: Dict[str, Any]) -> float:
     if not parsed:
         return 0.0
     
-    important_fields = ['client', 'location', 'rate', 'employment_types', 'role', 'must_have_skills']
+    important_fields = ['client', 'location', 'rate', 'employment_types', 'role', 'skills']
     valid_fields = 0
     
     for field in important_fields:
         value = parsed.get(field)
-        if field == 'employment_types' or field == 'must_have_skills':
+        if field == 'employment_types' or field == 'skills':
             if value and isinstance(value, list) and value != ['UNKNOWN']:
                 valid_fields += 1
         else:
@@ -1930,6 +1944,8 @@ def parse_requirement(
         if not location:
             # Bare City/State fallback — reject sign-off lines like "Regards, VA"
             location = find_city_state(norm_body, reject_first_words=_SIGNOFF_WORDS)
+        if not location:
+            location = find_city_state(normalize_text(safe_subject), reject_first_words=_SIGNOFF_WORDS)
 
     # ── Rate ──────────────────────────────────────────────────────────────
     rate = clean_rate(_ai_field('rate'))
