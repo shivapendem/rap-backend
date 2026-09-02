@@ -184,6 +184,22 @@ _DEFAULT_USERS = [
 
 GMAIL_SYNC_INTERVAL_SECONDS = int(os.getenv("GMAIL_SYNC_INTERVAL_SECONDS", "300"))  # default: every 5 min
 
+# BUG FIX (duplicate Gmail-sync workers race condition): this in-app loop
+# and the standalone `rap-cron-gmail-sync` pm2 process (cron_gmail_sync.py)
+# both call sync_pending_emails() against the same gmail_emails rows on
+# independent ~5-minute timers. Running both at once means every cycle
+# risks two processes racing to claim the same Pending rows — wasted
+# double-processing at best, confusing interleaved logs, and no single
+# source of truth for "did this row get synced yet."
+#
+# The standalone cron worker is the intended sole owner of this job (it
+# exists specifically for this purpose and runs independently of the API
+# process's own uptime/restarts). This in-app copy now defaults to OFF —
+# set ENABLE_INAPP_GMAIL_SYNC=true only for a deployment where the
+# standalone cron worker is NOT running, so gmail sync still happens
+# somewhere.
+ENABLE_INAPP_GMAIL_SYNC = os.getenv("ENABLE_INAPP_GMAIL_SYNC", "false").strip().lower() == "true"
+
 
 async def _gmail_to_requirements_loop():
     """
@@ -389,13 +405,20 @@ async def lifespan(app: FastAPI):
     # no asyncio.create_task() call existed anywhere in the app, so
     # gmail_emails rows never got bridged into requirements, and queued
     # outbound emails never got sent, no matter how long the app ran.
-    gmail_sync_task = asyncio.create_task(_gmail_to_requirements_loop())
+    if ENABLE_INAPP_GMAIL_SYNC:
+        gmail_sync_task = asyncio.create_task(_gmail_to_requirements_loop())
+    else:
+        gmail_sync_task = None
+        print("[gmail-sync] in-app loop disabled (ENABLE_INAPP_GMAIL_SYNC is not 'true') — "
+              "relying on the standalone rap-cron-gmail-sync worker as sole owner of this job")
     email_queue_task = asyncio.create_task(_email_queue_worker_loop())
 
     yield
 
     # Stop both background loops cleanly on shutdown
     for task in (gmail_sync_task, email_queue_task):
+        if task is None:
+            continue
         task.cancel()
         try:
             await task

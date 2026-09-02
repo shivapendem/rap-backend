@@ -82,6 +82,30 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # re-validated on the next run, then stays skipped until the next bump.
 MATCHING_LOGIC_VERSION = "2026-08-22-data-generic-word-fix"
 
+# BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
+# restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
+# per query (a signed int16 field in the Bind message). match_consultant()
+# below can build an .in_(ids_needing_scoring) clause covering every open
+# requirement — 44,000+ in production — right after a MATCHING_LOGIC_VERSION
+# bump, or on a cold cache. A single query at that scale isn't just slow,
+# it's outright invalid for the protocol; asyncpg does not surface this as
+# a clean, catchable Python exception in every case, which is what was
+# taking the whole process down rather than just failing one request.
+#
+# _chunk_ids() lets any .in_(some_id_list) call stay well under that limit
+# regardless of how large the id list gets, by splitting it into fixed-size
+# batches and letting the caller merge results — same final data, more
+# (cheap) round trips instead of one query the database can't accept.
+_SQL_IN_CHUNK_SIZE = 5000
+
+
+def _chunk_ids(ids: list[int], size: int = _SQL_IN_CHUNK_SIZE):
+    """Yield `ids` in fixed-size slices, preserving order. size=5000 keeps
+    every chunk far under Postgres's 32,767-bind-parameter hard limit
+    while still keeping the query count small (44,000 ids -> ~9 queries)."""
+    for i in range(0, len(ids), size):
+        yield ids[i:i + size]
+
 # ---------------------------------------------------------------------------
 # Skill library — same alias-dictionary pattern as phase3.py's _detect_skills
 # Kept as its own copy here per Phase 4 doc Task 2's own code example
@@ -1671,16 +1695,28 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     # Full Requirement objects ONLY for the (typically much smaller)
     # subset that genuinely needs scoring — this is the expensive fetch,
     # now scoped to a delta instead of every open requirement.
-    reqs_result = await db.execute(select(Requirement).where(Requirement.id.in_(ids_needing_scoring)))
-    requirements = reqs_result.scalars().all()
+    #
+    # CHUNKED (see _chunk_ids() above): ids_needing_scoring can still hold
+    # every open requirement in the worst case (right after a
+    # MATCHING_LOGIC_VERSION bump). A single .in_(ids_needing_scoring) at
+    # that scale can exceed Postgres's bind-parameter limit and take the
+    # process down. Batching keeps every individual query well within the
+    # limit; requirements/existing_by_req end up identical to the
+    # single-query version, just assembled across a few round trips.
+    requirements: list[Requirement] = []
+    for _chunk in _chunk_ids(ids_needing_scoring):
+        _chunk_result = await db.execute(select(Requirement).where(Requirement.id.in_(_chunk)))
+        requirements.extend(_chunk_result.scalars().all())
 
-    existing_result = await db.execute(
-        select(RequirementConsultantMatch).where(
-            RequirementConsultantMatch.consultant_id == consultant_id,
-            RequirementConsultantMatch.requirement_id.in_(ids_needing_scoring),
+    existing_by_req: dict[int, RequirementConsultantMatch] = {}
+    for _chunk in _chunk_ids(ids_needing_scoring):
+        _chunk_result = await db.execute(
+            select(RequirementConsultantMatch).where(
+                RequirementConsultantMatch.consultant_id == consultant_id,
+                RequirementConsultantMatch.requirement_id.in_(_chunk),
+            )
         )
-    )
-    existing_by_req = {m.requirement_id: m for m in existing_result.scalars().all()}
+        existing_by_req.update({m.requirement_id: m for m in _chunk_result.scalars().all()})
 
     # SINGLE-SOURCE-OF-COMPUTATION (removes the Pipeline A/B double scoring
     # cost — see match_requirement() above for the full rationale): each
@@ -1703,13 +1739,16 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     # existing JobMatch rows for the whole delta in ONE query up front
     # instead, and hand each call its own single-row slice via
     # existing_by_consultant= so its internal query is skipped entirely.
-    existing_jobmatch_result = await db.execute(
-        select(JobMatch).where(
-            JobMatch.consultant_id == consultant_id,
-            JobMatch.requirement_id.in_(ids_needing_scoring),
+    # CHUNKED — same reasoning as the two batches above.
+    jobmatch_by_requirement: dict[int, JobMatch] = {}
+    for _chunk in _chunk_ids(ids_needing_scoring):
+        _chunk_result = await db.execute(
+            select(JobMatch).where(
+                JobMatch.consultant_id == consultant_id,
+                JobMatch.requirement_id.in_(_chunk),
+            )
         )
-    )
-    jobmatch_by_requirement = {m.requirement_id: m for m in existing_jobmatch_result.scalars().all()}
+        jobmatch_by_requirement.update({m.requirement_id: m for m in _chunk_result.scalars().all()})
 
     for i, requirement in enumerate(requirements):
         # PERFORMANCE FIX (root cause of "the whole app stalls during a

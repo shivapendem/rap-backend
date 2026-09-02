@@ -110,11 +110,59 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
                    ge.body_html, ge.date
             FROM gmail_emails ge
             WHERE (ge.category IS NULL OR ge.category = 'job_posting' OR ge.category = 'unclassified')
-              AND (ge.status_desc IS NULL OR ge.status_desc = 'Pending')
+              -- BUG FIX ("Failed rows never auto-retry"): status_desc='Failed'
+              -- (set below in the except block on any exception) used to be
+              -- permanently excluded here, since it's neither NULL nor
+              -- 'Pending' -- the only way back in was the admin's manual
+              -- per-email "Reparse" button (which looks the row up by id
+              -- directly and doesn't go through this query at all). Letting
+              -- 'Failed' back in means a transient failure (bad API call,
+              -- brief DB hiccup, race condition) gets picked up again
+              -- automatically. Bounded two ways, both using the existing
+              -- processing_errors table (already populated by log_db_error
+              -- on every failure -- no schema change needed beyond the
+              -- (source_type, source_id) index added alongside this fix):
+              --   1. Max 3 attempts total -- a row that fails 3 times is
+              --      treated as a real, persistent failure rather than
+              --      transient, and falls back to requiring manual Reparse,
+              --      same as before this fix.
+              --   2. At least 15 minutes since its last failure -- avoids
+              --      re-firing the same doomed attempt again within the same
+              --      handful of cron cycles, giving whatever caused the
+              --      failure (rate limit, DB pool exhaustion, etc.) actual
+              --      time to clear. Rows with no prior failures (NULL/Pending)
+              --      are unaffected -- COALESCE makes this check a no-op for
+              --      them, same as today.
+              AND (ge.status_desc IS NULL OR ge.status_desc = 'Pending' OR ge.status_desc = 'Failed')
               AND NOT EXISTS (
                   SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
               )
-            ORDER BY (ge.category = 'job_posting') DESC, ge.date DESC
+              AND (
+                  SELECT COUNT(*) FROM processing_errors pe
+                  WHERE pe.source_type = 'gmail_emails'
+                    AND pe.source_id = CAST(ge.id AS TEXT)
+              ) < 3
+              AND COALESCE(
+                  (SELECT MAX(pe.occurred_at) FROM processing_errors pe
+                   WHERE pe.source_type = 'gmail_emails'
+                     AND pe.source_id = CAST(ge.id AS TEXT)),
+                  TIMESTAMP '1970-01-01'
+              ) < NOW() - INTERVAL '15 minutes'
+            -- BUG FIX ("backlog can starve older Pending rows"): newest-first
+            -- meant that on any run where inflow exceeded batch_size, the
+            -- oldest waiting rows lost the "top N" race to fresher arrivals
+            -- -- and kept losing on every subsequent run for as long as the
+            -- backlog persisted, since something newer always existed to
+            -- fill the slots first. Sorting oldest-eligible-first guarantees
+            -- every row eventually reaches the front of the queue and gets
+            -- attempted, regardless of how bursty inflow is. job_posting
+            -- rows still get priority as a category ahead of unclassified
+            -- ones (unchanged business rule) -- only the within-category
+            -- tiebreak direction changed. No 14-day window exists in this
+            -- file, so there's no silent-aging-out risk here the way there
+            -- was in rap_python_cron's copy -- this ordering change alone
+            -- is the complete fix for this file.
+            ORDER BY (ge.category = 'job_posting') DESC, ge.date ASC
             LIMIT :limit
         """),
         {"limit": batch_size},
