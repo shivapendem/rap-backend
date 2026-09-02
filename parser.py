@@ -159,7 +159,8 @@ FIELD_BOUNDARIES = [
     'Regards', 'Thanks', 'Best Regards', 'Best,', 'Warm Regards',
     'Sincerely', 'Yours', 'Thank You', 'Cheers',
     'Job Summary', 'Key Responsibilities', 'Requirements', 'Minimum Requirements',
-    'Preferred Qualifications', 'Education', 'Certifications', 'Schedule',
+    'Preferred Qualifications', 'Preferred Experience', 'Nice to Have',
+    'Education', 'Certifications', 'Schedule',
     'Work Schedule', 'Shift', 'Hours', 'Benefits', 'Perks'
 ]
 
@@ -168,7 +169,19 @@ FIELD_BOUNDARIES = [
 # they appear naturally mid-sentence, e.g. "5+ years of experience with SQL"
 # was being incorrectly cut at "experience" even though it wasn't a real
 # "Experience:" section label.
-STOP_PATTERNS = [rf'(?:^|\n)\s*{re.escape(boundary)}\s*[:\-]' for boundary in FIELD_BOUNDARIES]
+# BUG FIX: this required a colon/hyphen right after the boundary word,
+# so bare headings with no colon at all (common from real <li>/<h2>-
+# derived HTML, e.g. "Qualifications" or "Preferred Experience" sitting
+# alone on their own line) were never recognized as a stop point. That
+# let a skills-section capture run straight through Qualifications, the
+# sender's own signature, and the unsubscribe footer before finally
+# hitting the 3000-char cap -- all of which then got bullet-split as if
+# it were "skills". (?=\n|$) accepts a bare heading (line-start-anchored,
+# so this stays safe against matching mid-sentence).
+STOP_PATTERNS = [
+    rf'(?:^|\n)\s*{re.escape(boundary)}\s*(?:[:\-]|(?=\n|$))'
+    for boundary in FIELD_BOUNDARIES
+]
 STOP_PATTERN = re.compile('|'.join(STOP_PATTERNS), re.IGNORECASE)
 
 EMPLOYMENT_KEYWORDS = {
@@ -270,9 +283,11 @@ CLIENT_PATTERNS = [
 ]
 
 LOCATION_PATTERNS = [
-    r'(?i)\bwork\s*location\s*[:\-]\s*(.+)',
+    r'(?i)\bwork\s*locations?\s*[:\-]\s*(.+)',
     r'(?i)\bplace\s*of\s*work\s*[:\-]\s*(.+)',
-    r'(?i)\blocation\s*[:\-]\s*(.+)',
+    # BUG FIX: plural "Locations -Remote" was missed entirely (returned
+    # null) because the pattern only accepted the singular form.
+    r'(?i)\blocations?\s*[:\-]\s*(.+)',
 ]
 
 RATE_PATTERNS = [
@@ -301,7 +316,15 @@ SKILLS_PATTERNS = [
     r'(?i)required\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     r'(?i)technical\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     r'(?i)key\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)skill\s*set[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    # BUG FIX: no trailing \b/plural meant this matched only the first 8
+    # chars of "skillsets:", leaving a stray unconsumed "s" before the
+    # real colon -- since the colon check here is optional, the whole
+    # capture then silently ran from right after that stray "s" instead
+    # of after the real colon, swallowing the entire rest of the JD
+    # (Qualifications, Responsibilities, everything) as if it were
+    # "skills". sets?\b makes both "skill set:" and "skillsets:" resolve
+    # to the real colon correctly.
+    r'(?i)skill\s*sets?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     r'(?i)tech(?:nology|nical)?\s*stack[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     # Bare "skills:" kept LAST and colon-REQUIRED (not optional) — this one is
     # generic enough that making it colon-optional would risk matching the
@@ -491,14 +514,17 @@ _ANY_TAG_RE = re.compile(r'</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>')
 NEXT_FIELD_LABELS = [
     'job title', 'job role', 'title', 'position', 'role', 'role type',
     'opening', 'requirement', 'end client', 'client', 'customer',
-    'work location', 'place of work', 'location', 'pay rate', 'bill rate',
+    'work location', 'work locations', 'place of work', 'location',
+    'locations', 'pay rate', 'bill rate',
     'compensation', 'rate', 'contract length', 'contract duration',
     'duration', 'primary skills', 'required skills', 'technical skills',
     'key skills', 'skill set', 'skills',
     'experience', 'employment type', 'employment', 'work mode',
     'work type', 'vendor',
     'recruiter', 'contact', 'phone', 'email', 'responsibilities',
-    'qualifications', 'job description', 'benefits', 'visa', 'type',
+    'qualifications', 'job description', 'role description',
+    'role descriptions', 'position description', 'position descriptions',
+    'benefits', 'visa', 'type',
     'no. of position', 'no. of positions', 'number of position',
     'number of positions',
     # BUG FIX ("Job Title: Forward Deployed Engineer (FDE) - AI/ML & API
@@ -562,6 +588,7 @@ def normalize_text(text: str) -> str:
     # Un-glue labels AFTER punct-fold so en-dash variants are already '-'
     text = _GLUED_LABEL_PATTERN.sub(' ', text)
     text = _unglue_leading_city_state(text)
+    text = _GLUED_WORKMODE_PATTERN.sub(' ', text)
     return text
 
 
@@ -1118,7 +1145,20 @@ def first_match(patterns: List[str], text: str) -> Optional[str]:
 _HYBRID_NON_WORKMODE_CONTEXT = re.compile(
     r'(?i)^\s*[\-]?\s*(?:cloud|identity|architecture|infrastructure|'
     r'deployment|deployments|environment|environments|approach|strategy|'
-    r'model|integration|integrations)\b'
+    r'model|integration|integrations|connectivity|networking|network)\b'
+)
+
+# BUG FIX: "Remote"/"Hybrid"/"Onsite" glued directly onto an adjacent
+# word with no space at all (e.g. "-RemoteAbout the Role", "F2FOnsite
+# Flexibility:") makes the keyword invisible to its own \b-bounded regex
+# entirely -- \b requires an actual word/non-word transition on both
+# sides, and there is none between two glued letters. Confirmed this
+# silently dropped a real "Remote" statement, letting an unrelated later
+# "onsite" mention win by default. Inserts a space at exactly these glue
+# points during normalize_text() -- see below.
+_GLUED_WORKMODE_PATTERN = re.compile(
+    r'(?<=[A-Za-z0-9])(?=(?:Remote|Hybrid|Onsite)\b)|'
+    r'(?<=\b(?:Remote|Hybrid|Onsite))(?=[A-Z])'
 )
 
 
@@ -1189,13 +1229,28 @@ def extract_employment_types(text: str) -> List[str]:
     return found_types if found_types else ["UNKNOWN"]
 
 
+# BUG FIX: "Candidate should NOT be more than 15 years of experience" (a
+# maximum cap) was being returned as if it were the real required
+# experience level -- it's the only phrase in the email literally
+# containing "years...experience" together, since the real "5+ years of
+# backend software engineering..." requirement doesn't have the word
+# "experience" immediately after "years" at all and never matched any
+# pattern here in the first place.
+_EXPERIENCE_CAP_CONTEXT = re.compile(
+    r'(?i)\b(?:not\s+(?:be\s+)?more\s+than|no\s+more\s+than|should\s+not\s+exceed|'
+    r'not\s+to\s+exceed|no\s+longer\s+than|less\s+than|under)\b[\s\S]{0,15}$'
+)
+
+
 def extract_experience(text: str) -> Optional[str]:
     """Extract experience requirement from text."""
     if not text:
         return None
     for pattern in EXPERIENCE_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            preceding = text[max(0, match.start() - 40):match.start()]
+            if _EXPERIENCE_CAP_CONTEXT.search(preceding):
+                continue  # this occurrence is a maximum/cap, not a requirement
             exp = match.group(1).strip()
             year_match = re.search(r'\d+\+?\s*(?:-\s*\d+\s*)?years?', exp, re.IGNORECASE)
             if year_match:
@@ -1205,11 +1260,13 @@ def extract_experience(text: str) -> Optional[str]:
             if re.fullmatch(r'\d+\+?', exp):
                 return f"{exp} years"
             return exp
-    number_match = re.search(
+    for match in re.finditer(
         r'(\d+\+?)\s*[-\u2013]?\s*(?:\d+\+?\s*)?years?', text, re.IGNORECASE
-    )
-    if number_match:
-        return f"{number_match.group(1)} years"
+    ):
+        preceding = text[max(0, match.start() - 40):match.start()]
+        if _EXPERIENCE_CAP_CONTEXT.search(preceding):
+            continue
+        return f"{match.group(1)} years"
     return None
 
 
@@ -1287,7 +1344,9 @@ TECH_KEYWORDS = [
     # BI / analytics tooling
     'Looker', 'LookML', 'BigQuery', 'Tableau', 'Power BI',
     # Modern DevOps / AI-assisted development tooling
-    'GitHub Copilot', 'Bamboo', 'Bitbucket',
+    'GitHub Copilot', 'Bamboo', 'Bitbucket', 'GitHub', 'CloudFormation',
+    # Project management tools & certifications
+    'Jira', 'Confluence', 'PMP', 'CSM', 'PMI-ACP',
     # Accessibility / QA testing
     'WCAG', 'Section 508', 'ARIA', 'WAI-ARIA', 'axe-core', 'axe DevTools',
     'Lighthouse', 'Accessibility Insights', 'NVDA', 'JAWS', 'VoiceOver',
@@ -1331,7 +1390,12 @@ def extract_skills_from_keywords(text: str, max_skills: int = 15) -> List[str]:
     their shorter substrings ('React') so both don't get listed redundantly."""
     if not text:
         return []
-    text_scope = text[:6000]
+    # BUG FIX: a genuinely long, thorough JD's own clean "Core Technology
+    # Stack: GCP | Terraform | ... | FinOps" summary line sat at char
+    # 7,388 -- past the old 6000-char window -- so it was completely
+    # invisible to extraction even though it was the single cleanest,
+    # most authoritative skill list in the whole email.
+    text_scope = text[:10000]
 
     found = []  # (start, end, keyword)
     for kw, pattern in _TECH_KEYWORD_PATTERNS:
@@ -1458,7 +1522,13 @@ def extract_skills(text: str) -> List[str]:
     # glued run-on paragraph with no line breaks at all still falls
     # through to flat mode below, unchanged.
     line_candidates = [ln.strip() for ln in skills_text.split('\n') if ln.strip()]
-    if len(line_candidates) >= 3 and all(len(ln) < 150 for ln in line_candidates):
+    # BUG FIX: genuine per-<li>-item bullet lists can contain a few long,
+    # detailed items (parenthetical examples lists, etc.) -- requiring
+    # EVERY line under 150 chars rejected the WHOLE list over a single
+    # long-but-legitimate bullet, falling back to flat comma-splitting
+    # and shredding parenthetical examples into dangling fragments like
+    # "GCP)" and "Cloud Run)". Raised to 300.
+    if len(line_candidates) >= 3 and all(len(ln) < 300 for ln in line_candidates):
         skills = []
         for chunk in line_candidates:
             skills.extend(_extract_skill_tokens(chunk))
@@ -1523,6 +1593,43 @@ _GENERIC_SKILL_WORDS = {
 }
 
 
+def _split_respecting_parens(text: str, delimiter_pattern: str) -> List[str]:
+    """Split `text` on `delimiter_pattern` matches, but never inside
+    parentheses -- so a bullet like "container technologies (Azure
+    Functions, AWS Lambda, ..., Cloud Run)" survives as ONE token instead
+    of being shredded at every comma inside the parenthetical examples
+    list, leaving dangling fragments like "GCP)" and "Cloud Run)".
+    """
+    delim_re = re.compile(delimiter_pattern)
+    parts = []
+    depth = 0
+    last = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '(':
+            depth += 1
+            i += 1
+            continue
+        if ch == ')':
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0:
+            m = delim_re.match(text, i)
+            if m:
+                parts.append(text[last:i])
+                i = m.end()
+                last = i
+                continue
+        i += 1
+    parts.append(text[last:])
+    return parts
+
+
+_TRAILING_PAREN_LIST = re.compile(r'^(.*?)\(([^()]+)\)\.?$')
+
+
 def _extract_skill_tokens(sentence: str) -> List[str]:
     """
     Pull actual skill/technology names out of one JD bullet sentence.
@@ -1541,7 +1648,11 @@ def _extract_skill_tokens(sentence: str) -> List[str]:
     core = _SKILL_TRAILING_FILLER.sub('', core).strip()
     if not core:
         return []
-    tokens = re.split(r',\s*|\s+and\s+', core)
+    # BUG FIX: a plain comma-split ran straight through parentheses too,
+    # shredding "container technologies (Azure Functions, AWS Lambda,
+    # Kubernetes/AKS, ECS/Fargate, GKE, Cloud Run)" into fragments with
+    # dangling brackets ("GCP)", "Cloud Run)"). Respects paren depth now.
+    tokens = _split_respecting_parens(core, r',\s*|\s+and\s+')
     results = []
     for tok in tokens:
         tok = tok.strip().strip('.')
@@ -1551,6 +1662,20 @@ def _extract_skill_tokens(sentence: str) -> List[str]:
         tok_lower = tok.lower()
         if not tok or tok_lower in _GENERIC_SKILL_WORDS:
             continue
+        # A trailing parenthetical after a generic category phrase
+        # usually lists the REAL concrete technologies -- pull those out
+        # individually instead of keeping one long, generic-prefixed blob
+        # that then gets rejected by the length cap below, silently
+        # dropping every real technology name inside it.
+        paren_m = _TRAILING_PAREN_LIST.match(tok)
+        if paren_m:
+            inner_items = [i.strip() for i in paren_m.group(2).split(',') if i.strip()]
+            if len(inner_items) >= 2:
+                for item in inner_items:
+                    item = re.sub(r'(?i)^(?:or|and)\s+', '', item).strip()
+                    if 1 < len(item) < 45:
+                        results.append(item)
+                continue
         if 1 < len(tok) < 45:
             results.append(tok)
     return results
@@ -1591,6 +1716,14 @@ _SIGNOFF_WORD_PATTERN = re.compile(r'(?i)\b(?:regards|thanks|sincerely|best\s*re
 _PLAIN_NAME_SHAPE = re.compile(r"^[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,3}$")
 
 
+# A name sharing its line with a title, e.g. "MD Irfan | Senior Talent
+# Acquisition" -- extracts just the leading name-shaped portion before
+# the separator.
+_NAME_WITH_TRAILING_TITLE = re.compile(
+    r"^([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,3})\s*[|,\-]\s*\S"
+)
+
+
 def _extract_signoff_name(body: str) -> Optional[str]:
     """Find the first plausible person-name-shaped line following a
     sign-off word ("Thanks", "Regards", "Sincerely", ...). Scans line by
@@ -1614,6 +1747,13 @@ def _extract_signoff_name(body: str) -> Optional[str]:
             continue
         if _PLAIN_NAME_SHAPE.match(candidate) and len(candidate) <= 40:
             return candidate
+        # BUG FIX: some signatures put the name and title on the SAME
+        # line, separated by "|"/","/"-" (e.g. "MD Irfan | Senior Talent
+        # Acquisition") -- extract just the leading name-shaped portion
+        # instead of requiring the whole line to be the name.
+        title_m = _NAME_WITH_TRAILING_TITLE.match(candidate)
+        if title_m and len(title_m.group(1)) <= 40:
+            return title_m.group(1)
         return None
     return None
 
@@ -2068,10 +2208,19 @@ def parse_requirement(
     safe_body = body or ''
     safe_headers = headers if isinstance(headers, dict) else {}
 
+    # BUG FIX: footer/mailing-list boilerplate was only ever stripped
+    # inside extract_skills() -- every OTHER field extractor scanned the
+    # raw, unstripped text. A Google Group literally named "C2C
+    # REQUIREMENTS" was leaking into employment_types as if the email
+    # itself had stated a real C2C requirement. Stripping once here,
+    # before any field extraction runs, protects every field the same
+    # way skills extraction already was.
+    safe_body_for_parsing = strip_boilerplate_footer(safe_body)
+
     # Normalize BEFORE the is_job_requirement_email gate so that HTML-collapsed
     # labels (e.g. "LeadLocation:") get un-glued and register as indicators.
-    full_text = normalize_text(f"{safe_subject}\n{safe_body}")
-    norm_body = normalize_text(safe_body)
+    full_text = normalize_text(f"{safe_subject}\n{safe_body_for_parsing}")
+    norm_body = normalize_text(safe_body_for_parsing)
 
     if not is_job_requirement_email(full_text) or is_hotlist_email(full_text):
         return {

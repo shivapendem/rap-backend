@@ -87,6 +87,9 @@ async def run_matching_for_requirement(
     existing_pairs: set,
     *,
     experiences_by_consultant: dict = None,
+    collect_results: Optional[list] = None,
+    existing_by_consultant: Optional[dict] = None,
+    persist: bool = True,
 ) -> int:
     """
     Compute and persist JobMatch rows for ONE requirement against the given
@@ -111,9 +114,68 @@ async def run_matching_for_requirement(
     row a human has already acted on (status APPLIED or REJECTED) is
     left untouched, since that's a real decision, not something the
     matching engine owns anymore.
+
+    SINGLE-SOURCE-OF-COMPUTATION (removes Pipeline A/B double scoring):
+    Pipeline A (phase4.py's match_requirement()/match_consultant()) used
+    to run its OWN validate_match()+score_match() loop over the same
+    consultants, purely to fill in RequirementConsultantMatch — paying
+    the full CPU cost of scoring a second time for exactly the same
+    (requirement, consultant) pairs this function already scores for
+    JobMatch. Pipeline A now calls this function to get the computation
+    done ONCE and passes `collect_results` (a plain list it owns) to
+    receive every consultant's {consultant, experiences, eligible,
+    validation, result} it needs to upsert RequirementConsultantMatch
+    itself, with zero re-validation/re-scoring.
+
+    Passing collect_results has two further effects, both required for
+    Pipeline A to get a COMPLETE and CORRECT set of results, not just a
+    fast one:
+
+    1. It forces this function to skip its own "already up to date"
+       fast-path (below) — that fast path is keyed off THIS function's
+       own JobMatch version tag, which says nothing about whether
+       Pipeline A's separate RequirementConsultantMatch row is stale, so
+       a caller that needs full per-consultant results has to get them
+       for every consultant, not just the ones JobMatch itself considers
+       dirty.
+
+    2. It forces this function to still COMPUTE (never just skip) a
+       consultant whose existing JobMatch row is APPLIED/REJECTED — the
+       validate_match()/score_match() result is still returned via
+       collect_results, it's only the JobMatch row itself that's left
+       untouched. (Without this, a consultant whose JobMatch happened to
+       reach APPLIED/REJECTED before Pipeline A ever scored them for
+       RequirementConsultantMatch would get silently skipped there too —
+       forever, since Pipeline A would have no way to independently
+       decide their eligibility without recomputing it itself, which is
+       exactly the duplicate cost this refactor removes.) This costs
+       nothing extra: validate_match()/score_match() were going to run
+       for this consultant anyway whenever collect_results is requested;
+       the only thing suppressed for an APPLIED/REJECTED row is the
+       JobMatch write below.
+
+    existing_by_consultant: optional pre-fetched {consultant_id: JobMatch}
+    for THIS requirement. When a caller is calling this function many
+    times in a loop (Pipeline A's match_consultant(), one call per open
+    requirement for a single consultant) the per-call JobMatch SELECT
+    below would reintroduce the exact per-requirement query cost that
+    function was specifically optimized to avoid at 44,000+ requirement
+    scale. Passing this in lets such a caller batch that lookup ONCE,
+    up front, across the whole set of requirements it's about to loop
+    over, instead of once per requirement.
+
+    persist: when False, JobMatch rows are never created or modified —
+    validate_match()/score_match() still run and collect_results (if
+    given) is still fully populated, but this call has no side effect on
+    the JobMatch table at all. Pipeline A passes persist=False from
+    contexts where writing to "Pending Applications" isn't wanted purely
+    as a side effect of an unrelated trigger (see phase4.py for which
+    call sites choose which).
     """
     if not consultants:
         return 0
+
+    force_full_compute = collect_results is not None
 
     if experiences_by_consultant is None:
         # If not passed in (e.g. from single requirement sync), fetch locally
@@ -125,17 +187,18 @@ async def run_matching_for_requirement(
         for exp in exp_res.scalars().all():
             experiences_by_consultant.setdefault(exp.consultant_id, []).append(exp)
 
-    # Batch-fetch existing JobMatch rows for THIS requirement, keyed by
-    # consultant_id, so stale/no-longer-qualifying rows can be found and
-    # removed instead of just being silently skipped forever.
-    cons_ids_all = [c.id for c in consultants]
-    existing_result = await db.execute(
-        select(JobMatch).where(
-            JobMatch.requirement_id == requirement.id,
-            JobMatch.consultant_id.in_(cons_ids_all),
+    if existing_by_consultant is None:
+        # Batch-fetch existing JobMatch rows for THIS requirement, keyed by
+        # consultant_id, so stale/no-longer-qualifying rows can be found and
+        # removed instead of just being silently skipped forever.
+        cons_ids_all = [c.id for c in consultants]
+        existing_result = await db.execute(
+            select(JobMatch).where(
+                JobMatch.requirement_id == requirement.id,
+                JobMatch.consultant_id.in_(cons_ids_all),
+            )
         )
-    )
-    existing_by_consultant: dict = {m.consultant_id: m for m in existing_result.scalars().all()}
+        existing_by_consultant = {m.consultant_id: m for m in existing_result.scalars().all()}
 
     new_matches = 0
 
@@ -151,9 +214,25 @@ async def run_matching_for_requirement(
         existing = existing_by_consultant.get(cons.id)
 
         # Never touch a row a human already acted on — that's a real
-        # decision, not the matching engine's to revise.
+        # decision, not the matching engine's to revise. Still COMPUTE a
+        # real answer when a caller needs full results (see point 2 in
+        # the docstring above) — only the JobMatch write is suppressed.
         if existing and existing.status in ("APPLIED", "REJECTED"):
             existing_pairs.add((requirement.id, cons.id))
+            if not force_full_compute:
+                continue
+            validation = validate_match(requirement, cons, experiences, requirement_skills=requirement_skills)
+            result = (
+                score_match(requirement, cons, experiences, requirement_skills=requirement_skills)
+                if validation["eligible"] else None
+            )
+            collect_results.append({
+                "consultant": cons,
+                "experiences": experiences,
+                "eligible": validation["eligible"],
+                "validation": validation,
+                "result": result,
+            })
             continue
 
         # PERFORMANCE (BUG FIX: "Run Engine" timing out at 300s): making
@@ -170,7 +249,17 @@ async def run_matching_for_requirement(
         # migration needed) — only a row from before a logic change still
         # pays the full re-check cost, restoring the old fast-skip
         # performance for the common case where nothing has changed.
-        if existing and existing.matching_info and existing.matching_info.get("_version") == MATCHING_LOGIC_VERSION:
+        #
+        # Skipped entirely when collect_results is set (force_full_compute)
+        # — a caller asking for full results (Pipeline A) needs a fresh
+        # answer for every consultant regardless of what JobMatch alone
+        # considers up to date; see SINGLE-SOURCE-OF-COMPUTATION above.
+        if (
+            not force_full_compute
+            and existing
+            and existing.matching_info
+            and existing.matching_info.get("_version") == MATCHING_LOGIC_VERSION
+        ):
             existing_pairs.add((requirement.id, cons.id))
             continue
 
@@ -191,15 +280,35 @@ async def run_matching_for_requirement(
             # INVALIDATED instead so it drops out of the active Pending
             # list (get_pending_matches defaults to status=PENDING) while
             # the row and its original reasoning stay in the table.
-            if existing and existing.status != "INVALIDATED":
+            if persist and existing and existing.status != "INVALIDATED":
                 existing.status = "INVALIDATED"
                 existing.match_reasoning = (
                     f"No longer eligible — failed at stage '{validation['stage_failed']}': {validation['reason']}"
                 )
                 await db.flush()
+            if collect_results is not None:
+                collect_results.append({
+                    "consultant": cons,
+                    "experiences": experiences,
+                    "eligible": False,
+                    "validation": validation,
+                    "result": None,
+                })
             continue
 
         result = score_match(requirement, cons, experiences, requirement_skills=requirement_skills)
+
+        if collect_results is not None:
+            collect_results.append({
+                "consultant": cons,
+                "experiences": experiences,
+                "eligible": True,
+                "validation": validation,
+                "result": result,
+            })
+
+        if not persist:
+            continue
 
         score = result["total"]
         if score > 0:  # Matches are already strictly validated, so just ensure it's > 0 or whatever minimum
@@ -431,7 +540,13 @@ async def get_matching_run_status(
         raise HTTPException(status_code=403, detail="Not authorized")
     return _matching_run_state
 
-async def run_matching_for_consultant(db: AsyncSession, consultant_id: int) -> int:
+async def run_matching_for_consultant(
+    db: AsyncSession,
+    consultant_id: int,
+    *,
+    collect_results: Optional[dict] = None,
+    persist: bool = True,
+) -> int:
     """
     Pipeline B equivalent of phase4.py's match_consultant() — matches ONE
     consultant against every still-open requirement for the JobMatch table.
@@ -452,6 +567,26 @@ async def run_matching_for_consultant(db: AsyncSession, consultant_id: int) -> i
     exactly as written — no matching logic duplicated or changed here,
     only the loop direction (one consultant across many requirements
     instead of one requirement across many consultants).
+
+    collect_results: same single-source-of-computation mechanism as
+    run_matching_for_requirement's collect_results, keyed by
+    requirement_id here since this loops requirements instead of
+    consultants — {requirement_id: [{consultant, experiences, eligible,
+    validation, result}]}. Pipeline A's match_consultant() passes a dict
+    it owns to get every requirement's computed result for this one
+    consultant without re-running validate_match()/score_match() itself.
+
+    PERFORMANCE: this loops requirements and calls
+    run_matching_for_requirement() once per requirement — that inner call
+    would, by default, run its own JobMatch SELECT scoped to just this
+    one consultant on every single call, which turns into one query per
+    open requirement (thousands, at this app's scale) for what is
+    logically a single-consultant lookup that's trivial to batch. All of
+    this consultant's existing JobMatch rows are fetched ONCE up front
+    instead, and the correct single-row slice is handed to each inner
+    call via existing_by_consultant= (see that parameter on
+    run_matching_for_requirement) so the inner call's own JobMatch query
+    is skipped entirely.
     """
     cons_result = await db.execute(select(Consultant).where(Consultant.id == consultant_id))
     consultant = cons_result.scalars().first()
@@ -470,17 +605,32 @@ async def run_matching_for_consultant(db: AsyncSession, consultant_id: int) -> i
     )
     experiences_by_consultant = {consultant_id: exp_res.scalars().all()}
 
-    existing_res = await db.execute(
-        select(JobMatch.requirement_id, JobMatch.consultant_id).where(JobMatch.consultant_id == consultant_id)
+    # ONE query for every existing JobMatch row this consultant has,
+    # across every open requirement — see PERFORMANCE note above.
+    existing_jobmatch_res = await db.execute(
+        select(JobMatch).where(
+            JobMatch.consultant_id == consultant_id,
+            JobMatch.requirement_id.in_([r.id for r in requirements]),
+        )
     )
-    existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
+    jobmatch_by_requirement = {m.requirement_id: m for m in existing_jobmatch_res.scalars().all()}
+    existing_pairs = {(req_id, consultant_id) for req_id in jobmatch_by_requirement}
 
     new_matches = 0
     for req in requirements:
+        per_req_results = [] if collect_results is not None else None
+        existing_for_this_req = (
+            {consultant_id: jobmatch_by_requirement[req.id]} if req.id in jobmatch_by_requirement else {}
+        )
         new_matches += await run_matching_for_requirement(
             db, req, [consultant], existing_pairs,
             experiences_by_consultant=experiences_by_consultant,
+            existing_by_consultant=existing_for_this_req,
+            persist=persist,
+            collect_results=per_req_results,
         )
+        if collect_results is not None:
+            collect_results[req.id] = per_req_results
 
     await db.commit()
     return new_matches
