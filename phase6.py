@@ -619,7 +619,13 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
         return first_p
 
     # 1. HEADER & CONTACT
-    name = resume_data.get("name", "").strip() or "FULL NAME"
+    # BUG FIX ("failed ... 'dict' object has no attribute 'strip'"):
+    # resume_data.get("name", "") only falls back to "" when the key is
+    # ABSENT — if "name" is present but isn't a plain string (a caller
+    # passing something malformed, or a future caller passing a nested
+    # value), .strip() on that raised AttributeError with no useful
+    # context. str(...) first makes this safe for any input shape.
+    name = str(resume_data.get("name") or "").strip() or "FULL NAME"
     p_name = doc.add_paragraph()
     p_name.paragraph_format.space_after = Pt(2)
     run_name = p_name.add_run(name)

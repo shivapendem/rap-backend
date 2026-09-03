@@ -161,6 +161,13 @@ async def save_requirement(
         employment_types=parsed.get("employment_types", ["UNKNOWN"]),
         rate=parsed.get("rate"),
         duration=parsed.get("duration"),
+        # BUG FIX (ported from rap_python_cron's identical addition): this
+        # column now exists on the Requirement model (see models.py) and
+        # parser.py now computes a real value for it (see
+        # extract_work_authorization()) — this constructor never read it
+        # out of `parsed` at all, so it would have stayed permanently NULL
+        # otherwise, same gap the cron project had before its own fix.
+        work_authorization=parsed.get("work_authorization"),
         job_description=cleaned_jd,
         jd_hash=jd_hash,
         dedup_key=dedup_key,

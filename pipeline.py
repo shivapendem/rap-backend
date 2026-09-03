@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gmail_reader import save_raw_email
 from parser import parse_requirements, is_hotlist_email
-from cleaner import clean_requirement_text, html_to_text
+from cleaner import clean_requirement_text, html_to_text, is_junk_plain_text, strip_css_junk
 from dedup import create_jd_hash, save_requirement
 # Shared HTML-vs-plain-text detection (regex-tuned, see its own comment in
 # requirements_sync.py) — imported rather than duplicated so both
@@ -130,10 +130,26 @@ async def process_email(
     # markup instead of clean text. Detect that case and convert it too.
     if _looks_like_html(body_text):
         body = html_to_text(body_text)
-    elif body_text:
+    elif body_text and not is_junk_plain_text(body_text):
         body = body_text
     else:
-        body = html_to_text(body_html)
+        # BUG FIX ("Failed" status / garbage role extracted from CSS —
+        # see cleaner.py's is_junk_plain_text/strip_css_junk docstrings):
+        # this branch used to run whenever body_text was falsy — but
+        # some vendor mailers send a broken text/plain part that is raw,
+        # untagged CSS instead of real plain text (no tags, so
+        # _looks_like_html doesn't catch it, and it's very much
+        # non-empty, so `elif body_text` used to take it as-is). That
+        # CSS-plus-real-content mix went straight into parse_requirements
+        # unmodified, and normalize_text()'s own label-unglue step turned
+        # a CSS class name like ".mTitle-1{...}" into a bogus matched
+        # "Title:" field, extracting the CSS rule body as the job title.
+        # Detect that case (is_junk_plain_text) and fall back to the HTML
+        # part when available, or strip the CSS out of body_text itself
+        # when it's the only thing we have — instead of using junk
+        # verbatim or losing real content that's genuinely still there.
+        html_fallback = html_to_text(body_html)
+        body = html_fallback or strip_css_junk(body_text) or body_text
 
     # BUG FIX: is_hotlist_email() existed in parser.py but was never
     # actually wired into this pipeline. "Hotlist"/bench-broadcast emails

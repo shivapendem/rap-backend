@@ -205,7 +205,23 @@ ROLE_PATTERNS = [
     r'(?i)\bjob\s*title\s*[:\-]\s*(.+)',
     r'(?i)\bjob\s*role\s*[:\-]\s*(.+)',
     r'(?i)\bposition\s*[:\-]\s*(.+)',
-    r'(?i)\brole\s*[:\-]\s*(.+)',
+    # BUG FIX ("role parsed as an ordinary sentence, e.g. 'if so, we can
+    # connect and speak further'"): the dash form used to accept ANY
+    # text after "role -", including plain sentence punctuation ("...
+    # interested in this role - if so, we can connect...") — completely
+    # unrelated to a real "Role: <title>" label, but first_match() picks
+    # whichever match starts earliest in the document across ALL
+    # patterns, so this false match at "role -" in ordinary prose won
+    # over the real "Role: <title>" label appearing later in the same
+    # email. The colon form is a much stronger, more deliberate label
+    # signal (recruiters don't habitually write "role:" as a sentence
+    # connector) and stays fully permissive; the dash form now requires
+    # the captured value start with a capital letter — the same guard
+    # CLIENT_PATTERNS already uses for this exact class of problem — a
+    # real job title ("Java Developer") is capitalized, an ordinary
+    # sentence continuation ("if so, we can connect") is not.
+    r'(?i)\brole\s*:\s*(.+)',
+    r'(?i)\brole\s*\-\s*((?-i:[A-Z]).+)',
     r'(?i)\bopening\s*[:\-]\s*(.+)',
     # BUG FIX ("Title – SAP BTP DMS Data Archiving Consultant" parsed as
     # UNKNOWN, or fell through entirely to a poor-quality subject-line
@@ -314,6 +330,15 @@ SKILLS_PATTERNS = [
     # actually appear on (or right after) the same line as the label.
     r'(?i)primary\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     r'(?i)required\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    # BUG FIX ("skills undercounted — only a short 'Mandatory Skills'
+    # one-liner used, a much richer 'Skill Requirements' bulleted section
+    # further down in the same email completely ignored"): "Skill
+    # Requirements" (noun-noun, skill THEN requirements) is the reverse
+    # word order from every other pattern in this list ("required
+    # skills", "technical skills", "key skills" — all adjective/label
+    # THEN "skills"), so it matched none of them and was never even
+    # tried as a candidate section.
+    r'(?i)skill\s*requirements?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     r'(?i)technical\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     r'(?i)key\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     # BUG FIX: no trailing \b/plural meant this matched only the first 8
@@ -609,6 +634,17 @@ _ANY_TAG_RE = re.compile(r'</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>')
 NEXT_FIELD_LABELS = [
     'job title', 'job role', 'title', 'position', 'role', 'role type',
     'opening', 'requirement', 'end client', 'client', 'customer',
+    # BUG FIX ("Yardi Consultant-Multiple Locations- Dallas..." role
+    # captured as "Yardi Consultant-Multiple" — cut off mid-phrase):
+    # "locations" alone as a boundary correctly stopped the crop right
+    # before "Locations-", but "Multiple" (part of the very common
+    # recruiter boilerplate phrase "Multiple Locations", not a real
+    # field value) sat one word earlier with nothing telling the crop to
+    # stop there instead, so it stayed glued onto the role. Registering
+    # the whole two-word phrase as its own boundary — same pattern
+    # "work location"/"place of work" already use for compound labels —
+    # moves the stop point one word earlier, to right before "Multiple".
+    'multiple locations', 'multiple location',
     'work location', 'work locations', 'place of work', 'location',
     'locations', 'pay rate', 'bill rate',
     'compensation', 'rate', 'contract length', 'contract duration',
@@ -1656,15 +1692,27 @@ def extract_skills(text: str) -> List[str]:
     # "Required Skills" list is many lines, and the old single-line capture
     # combined with an outer split('\n', 1)[0] elsewhere silently dropped
     # every bullet after the first. re.DOTALL lets '.' span newlines here.
+    #
+    # BUG FIX ("skills undercounted — a short 'Mandatory Skills' one-liner
+    # used instead of a much richer 'Skill Requirements' bulleted section
+    # later in the same email"): this used to take whichever pattern
+    # matched FIRST in list order and break immediately, never checking
+    # whether a later pattern would have found a more complete section.
+    # Now tries every pattern and keeps whichever candidate section is
+    # LONGEST after the same stop-boundary cropping already applied below
+    # — the richer section wins regardless of which pattern found it, and
+    # the single-match case (the overwhelming majority of emails) behaves
+    # exactly as before since there's only one candidate to compare.
     for pattern in SKILLS_PATTERNS:
         match = re.search(pattern, text_scope, re.IGNORECASE | re.DOTALL)
         if match:
-            skills_text = match.group(1).strip()
-            stop_match = STOP_PATTERN.search(skills_text)
+            candidate = match.group(1).strip()
+            stop_match = STOP_PATTERN.search(candidate)
             if stop_match:
-                skills_text = skills_text[:stop_match.start()].strip()
-            skills_text = _crop_skills_boilerplate(skills_text)
-            break
+                candidate = candidate[:stop_match.start()].strip()
+            candidate = _crop_skills_boilerplate(candidate)
+            if candidate and (skills_text is None or len(candidate) > len(skills_text)):
+                skills_text = candidate
     if not skills_text:
         return extract_skills_from_keywords(text_scope)
 
@@ -2681,7 +2729,24 @@ def parse_requirement(
     # Each falls back independently to its regex/heuristic extractor, which
     # already returns the correct 'UNKNOWN' / ['UNKNOWN'] / None sentinel
     # when nothing is found — so no separate normalization pass is needed.
-    work_mode = _ai_field('work_mode', unknown_value='UNKNOWN') or extract_work_mode(full_text)
+    #
+    # BUG FIX ("onsite in Dallas/Austin/Bay Area/Irvine or Remote" came
+    # back as REMOTE — the body's OWN primary descriptor, "onsite",
+    # completely overridden): extract_work_mode() picks whichever mode's
+    # keyword appears EARLIEST in the given text — but this called it on
+    # full_text (subject + body), and the subject line here ends with
+    # "...or Remote." (a short echo of the body's own "onsite ... or
+    # Remote" phrase). Since the subject is concatenated BEFORE the body,
+    # "Remote" from the subject's tail always sits earlier in the
+    # combined string than "onsite" appearing partway through the body's
+    # own sentence — winning for a reason unrelated to which mode is
+    # actually primary. Try body text alone first (same body-then-
+    # full_text fallback shape role/title extraction already use), and
+    # only fall through to including the subject when the body itself
+    # says nothing about work mode at all.
+    work_mode = _ai_field('work_mode', unknown_value='UNKNOWN') or extract_work_mode(norm_body)
+    if work_mode == 'UNKNOWN':
+        work_mode = extract_work_mode(full_text)
 
     ai_employment_types = _ai_field('employment_types', unknown_value=['UNKNOWN'])
     employment_types = ai_employment_types or extract_employment_types(full_text)

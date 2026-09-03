@@ -557,6 +557,91 @@ async def _get_consultant_for_user(db: AsyncSession, user: User) -> Consultant:
     return c
 
 
+async def _sync_experience_into_resume_info(db: AsyncSession, consultant: Consultant) -> None:
+    """Keep User.resume_info["experience"] in sync with the real
+    ConsultantExperience rows whenever they change.
+
+    BUG FIX ("add experience is not updating in json"): the merge in
+    phase_users_service.py's update_consultant() already keeps
+    resume_info in sync for every OTHER consultant-editable field
+    (skills, education, phone, location, linkedin, years, preferred
+    roles) the moment any of them changes — but Experience is managed
+    through this completely separate table/endpoint set and never went
+    through that merge at all. Adding/editing/deleting/reordering an
+    entry updated the real ConsultantExperience rows fine, and actual
+    resume generation already picks them up correctly (see
+    resume_router.py's _build_resume_info, which queries this table
+    fresh every time) — but the raw "Resume Info (JSON)" field shown on
+    the admin/consultant profile screens kept showing whatever was there
+    before, since nothing here ever touched it. Rebuilds the full
+    experience list from the current rows and persists it — same
+    one-field merge shape, leaving every other resume_info key
+    (summary, certifications, etc.) untouched.
+    """
+    if not consultant.user_id:
+        return
+    user_result = await db.execute(select(User).where(User.id == consultant.user_id))
+    linked_user = user_result.scalars().first()
+    if not linked_user:
+        return
+
+    from resume_router import _format_month_year
+
+    exp_result = await db.execute(
+        select(ConsultantExperience)
+        .where(ConsultantExperience.consultant_id == consultant.id)
+        .order_by(ConsultantExperience.sort_order.asc())
+    )
+    experience_list = []
+    for exp in exp_result.scalars().all():
+        bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
+        experience_list.append({
+            "id": str(exp.id),
+            "title": exp.role_title or "",
+            "company": exp.client_name or "",
+            "start": _format_month_year(exp.start_date) if exp.start_date else "",
+            "end": "Present" if exp.is_present else (_format_month_year(exp.end_date) if exp.end_date else ""),
+            "is_present": bool(exp.is_present),
+            "location": exp.location or "",
+            "bullets": bullets,
+            "technologies": exp.technologies or [],
+        })
+
+    existing_info = dict(linked_user.resume_info or {})
+    existing_info["experience"] = experience_list
+    linked_user.resume_info = existing_info
+
+
+async def _resolve_experience_consultant(
+    db: AsyncSession, current_user: User, user_id: Optional[int] = None,
+) -> Consultant:
+    """Resolve which consultant's experience is being managed.
+
+    BUG FIX ("consultant has all fields filled but resume still won't
+    generate — 'Add Experience' keeps showing"): every experience
+    endpoint below was hard-locked to CONSULTANT-role, self-only
+    (_require_role(current_user, "CONSULTANT") + _get_consultant_for_user
+    on current_user, with no way to target anyone else) — there was
+    literally no path for an admin or recruiter to add Experience on a
+    consultant's behalf anywhere in the app, even though the exact same
+    admin/recruiter "apply on behalf of" flow that requires Experience to
+    generate a resume exists. A consultant who hadn't filled in their own
+    Experience yet had no way to get past this check at all from the
+    admin side. Reuses resume_router.py's _resolve_target_user so this
+    endpoint enforces the identical "who can act on whose behalf" rule
+    resume generation already does (ADMIN: any consultant; RECRUITER:
+    only their assigned consultants) — not a new, separately-drifting
+    permission rule.
+    """
+    if user_id is None:
+        _require_role(current_user, "CONSULTANT")
+        return await _get_consultant_for_user(db, current_user)
+
+    from resume_router import _resolve_target_user
+    _, target_user = await _resolve_target_user(user_id, current_user, db)
+    return await _get_consultant_for_user(db, target_user)
+
+
 async def _consultant_to_profile_response(
     db: AsyncSession, c: Consultant, experience_count: int = 0, *, include_resume_size: bool = True
 ) -> ProfileResponse:
@@ -1270,6 +1355,7 @@ async def update_consultant_by_id(
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
+    await _sync_experience_into_resume_info(db, consultant)
 
     await db.commit()
     await db.refresh(consultant)
@@ -1574,11 +1660,11 @@ async def admin_delete_resume(
     summary="List own experience entries ordered by sortOrder",
 )
 async def list_own_experience(
+    user_id: Optional[int] = Query(None, description="Admin/recruiter only — list a specific consultant's experience"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
+    consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
     result = await db.execute(
         select(ConsultantExperience)
@@ -1597,11 +1683,11 @@ async def list_own_experience(
 async def create_experience(
     payload: ExperienceRequest,
     background_tasks: BackgroundTasks,
+    user_id: Optional[int] = Query(None, description="Admin/recruiter only — add on a specific consultant's behalf"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
+    consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
     # BUG FIX: new experiences are meant to always land at the TOP
     # (sort_order 0) — but simply setting sort_order=0 collides with
@@ -1640,6 +1726,7 @@ async def create_experience(
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
+    await _sync_experience_into_resume_info(db, consultant)
 
     await db.commit()
     await db.refresh(exp)
@@ -1655,11 +1742,11 @@ async def update_experience(
     experience_id: int,
     payload: ExperienceRequest,
     background_tasks: BackgroundTasks,
+    user_id: Optional[int] = Query(None, description="Admin/recruiter only — edit on a specific consultant's behalf"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
+    consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
     result = await db.execute(
         select(ConsultantExperience).where(
@@ -1687,6 +1774,7 @@ async def update_experience(
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
+    await _sync_experience_into_resume_info(db, consultant)
 
     await db.commit()
     await db.refresh(exp)
@@ -1701,11 +1789,11 @@ async def update_experience(
 async def delete_experience(
     experience_id: int,
     background_tasks: BackgroundTasks,
+    user_id: Optional[int] = Query(None, description="Admin/recruiter only — delete on a specific consultant's behalf"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
+    consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
     result = await db.execute(
         select(ConsultantExperience).where(
@@ -1727,6 +1815,7 @@ async def delete_experience(
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
+    await _sync_experience_into_resume_info(db, consultant)
 
     await db.commit()
 
@@ -1738,6 +1827,7 @@ async def delete_experience(
 async def reorder_experience(
     payload: ReorderRequest,
     background_tasks: BackgroundTasks,
+    user_id: Optional[int] = Query(None, description="Admin/recruiter only — reorder on a specific consultant's behalf"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1746,8 +1836,7 @@ async def reorder_experience(
     in the desired display order. Each entry's sort_order is set to its
     index in the list.
     """
-    _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
+    consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
     for idx, exp_id_str in enumerate(payload.orderedIds):
         try:
@@ -1766,6 +1855,7 @@ async def reorder_experience(
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
+    await _sync_experience_into_resume_info(db, consultant)
 
     await db.commit()
     return {"message": f"Reordered {len(payload.orderedIds)} entries"}
