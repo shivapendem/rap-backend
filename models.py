@@ -290,14 +290,16 @@ class Requirement(Base):
     #     ALTER TABLE requirements ADD COLUMN work_authorization TEXT;
     # BUG FIX (ported from rap_python_cron's identical fix): this project's
     # Requirement model never had a work_authorization column at all —
-    # parser.py never extracted one, dedup.py never tried to populate one
-    # (so no crash here, unlike the cron project's dedup.py, which DID try
-    # to pass this keyword before its own matching fix — see that
-    # project's history), and phase4.py's _requirement_work_auth_text()
-    # had no structured field to read even if it wanted to. Added here as
-    # part of also porting parser.py's extract_work_authorization() and
+    # parser.py never extracted one, dedup.py never tried to populate one,
+    # and phase4.py's _requirement_work_auth_text() / matching_engine.py's
+    # work-auth stage already read requirement.work_authorization as their
+    # primary signal with no structured field to actually read. Added here
+    # as part of also porting parser.py's extract_work_authorization() and
     # dedup.py's population of it (see those files' own comments) — this
-    # column is the piece all three needed to slot into.
+    # column is the piece all of them needed to slot into. Note that
+    # Base.metadata.create_all() only creates tables that don't yet exist,
+    # so this migration must still be run once, by hand, against any
+    # already-existing `requirements` table.
     work_authorization = Column(Text, nullable=True)
     job_description = Column(Text, nullable=True)
     jd_hash = Column(Text, nullable=True, index=True)          # Phase 2: SHA-256 of normalized cleaned JD
