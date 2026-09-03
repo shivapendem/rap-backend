@@ -111,6 +111,63 @@ class HTMLToTextParser(HTMLParser):
         return "".join(self.text_parts)
 
 
+def is_junk_plain_text(text: str) -> bool:
+    """
+    Detect a broken vendor "plain text alternative" that is actually raw,
+    untagged CSS (e.g. some ATS mailers dump `@import url(...);` and
+    `.class{...}` rules straight into text/plain with no wrapping tags at
+    all). Real JD text sometimes contains stray braces/semicolons further
+    down (e.g. skill matrices), so this is scoped to the first 2000 chars
+    to avoid false positives on legitimate long postings.
+
+    BUG FIX: this function didn't exist in this copy of cleaner.py at
+    all — pipeline.py (the manual "Reparse" path) used body_text
+    unconditionally whenever it was non-empty, with no way to detect
+    this specific failure mode. The cron project's copy of this file
+    already had this check (plus strip_css_junk below); this backend
+    copy had drifted behind it.
+    """
+    if not text:
+        return False
+    head = text[:2000]
+    if "@import url(" in head or "-webkit-text-size-adjust" in head:
+        return True
+    return len(re.findall(r'\.[a-zA-Z][\w-]*\s*\{', head)) >= 3
+
+
+def strip_css_junk(text: str) -> str:
+    """
+    Remove CSS @import/@media/rule-block junk from text that
+    is_junk_plain_text() has flagged as containing it.
+
+    BUG FIX ("Failed" status / garbage role like "1{color:#333;...}"
+    extracted instead of the real job title): some ATS mailers dump raw,
+    untagged CSS directly into the plain-text body, with the REAL
+    message sandwiched in the middle or after it. Detecting the junk
+    isn't enough on its own — when there's no body_html to fall back to,
+    the raw CSS-plus-content was passed straight through to the parser
+    as-is. normalize_text()'s own "un-glue a field label HTML-collapse
+    fused onto a preceding word" step then actively made this worse: it
+    saw ".mTitle-1{color:#333;...}", recognized "Title-" as a real
+    field-label pattern, and inserted a space right before it — creating
+    a brand-new, fake word boundary that let the role-extraction regex
+    match "Title:" inside a CSS class name and capture the CSS body
+    itself as the job title.
+
+    Strips just the CSS-shaped chunks (import statements, @media blocks,
+    and flat "selector{prop:val;...}" rule blocks) and keeps everything
+    else, so the real content — which real-world testing confirms is
+    often still fully present, just sandwiched between CSS blocks —
+    survives instead of the row failing or saving garbage.
+    """
+    if not text:
+        return text
+    text = re.sub(r'@import\s+url\([^)]*\)\s*;?', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'@media[^{]*\{(?:[^{}]|\{[^{}]*\})*\}', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'[.\#]?[\w][\w\-]*(?:\s*,\s*[.\#]?[\w][\w\-]*)*\s*\{[^{}]*\}', ' ', text)
+    return re.sub(r'[ \t]+', ' ', text).strip()
+
+
 def html_to_text(html: str) -> str:
     """Convert HTML to plain text."""
     if not html:
