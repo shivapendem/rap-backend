@@ -908,30 +908,93 @@ def employment_type_passes(
     return score > 0, f"employment_type score={score}"
 
 
+# BUG FIX (work-authorization matching ignoring the real column and having
+# no negation awareness): _requirement_work_auth_text() below used to
+# ALWAYS re-derive the JD's work-authorization requirement by scanning
+# requirement.job_description with a flat keyword search -- its own
+# docstring claimed "The Requirement model has no explicit work-
+# authorization column", which is no longer true now that models.py/
+# dedup.py's save_requirement() store a real, precisely-extracted
+# requirement.work_authorization column (see parser.py's
+# extract_work_authorization()). Ignoring that in favor of a cruder
+# re-scan of the raw JD text threw away real signal AND had no negation
+# handling at all: the keyword search checks USC/GC-group terms before
+# H1B/F1 with no regard for polarity, so a JD literally saying "H1B and
+# OPT welcome — no US-citizen restriction" would still resolve to the
+# most restrictive USC batch, purely because the words "US-citizen"
+# appear in an EXCLUSION clause. These three helpers give
+# _requirement_work_auth_text() below the same negation-aware per-batch
+# scan parser.py's own extract_work_authorization() already uses for the
+# same class of problem, applied to whichever text it's given (the
+# structured field first, the raw JD as a fallback for older rows that
+# predate the column being populated).
+_WA_BATCH1_TOKENS = re.compile(r'(?i)\bstem\s*opt\b|\bopt\b|\bcpt\b|\bf-?1\b')
+_WA_BATCH2_TOKENS = re.compile(r'(?i)\bh-?1-?b\b')
+_WA_BATCH3_TOKENS = re.compile(
+    r'(?i)\busc\b|\bu\.?s\.?\s*citizens?\b|\bcitizens?\s+only\b|\bgreen\s*card\b|'
+    r'\bgc[\s\-]*ead\b|\bgc\b|\bl-?1\b|\bl-?2\b|\btn\s*visa\b|\btn\b|\bu\s*visa\b'
+)
+_WA_NEGATION_CUE = re.compile(
+    r'(?i)\b(?:no|not|except|excluding|won\'?t\s+accept|cannot\s+accept)\b(?:\s+[\w/\-]+){0,3}?\s*$'
+)
+
+
+def _batch_mentioned_positively(text: str, pattern: re.Pattern) -> bool:
+    """True if `pattern` matches somewhere in `text` in a NON-negated
+    context — i.e. actually required/accepted, not explicitly excluded
+    ("No H1B", "not accepting OPT"). Checks a short window immediately
+    before each match for a negation cue, same approach and window size
+    as parser.py's own extract_work_authorization()."""
+    for m in pattern.finditer(text):
+        window_before = text[max(0, m.start() - 30):m.start()]
+        if not _WA_NEGATION_CUE.search(window_before):
+            return True
+    return False
+
+
 def _requirement_work_auth_text(requirement: Requirement) -> Optional[str]:
     """
-    The Requirement model has no explicit work-authorization column — the
-    JD's implied requirement is derived by scanning its text for keywords,
-    same regex patterns validate_match() already used inline. Returns a
-    representative batch label ("F1"/"H1B"/"USC") or None if the JD doesn't
-    mention work authorization at all (N/A — passes everyone).
+    Returns a representative batch label ("F1"/"H1B"/"USC") derived from
+    the requirement's work-authorization requirement, or None if it
+    doesn't state one at all (N/A — passes everyone).
+
+    Prefers requirement.work_authorization — the field parser.py already
+    extracts precisely (see extract_work_authorization()) — scanned with
+    negation awareness so an explicitly-excluded status never wins over
+    an explicitly-accepted one. Falls back to a negation-aware scan of
+    the raw job_description only when that column is missing/blank
+    (older rows saved before it was populated, or rows where extraction
+    genuinely found nothing) — never silently prefers the cruder source
+    when the precise one is available.
     """
+    structured = (requirement.work_authorization or "").strip()
+    if structured and structured.upper() != "N/A":
+        if _batch_mentioned_positively(structured, _WA_BATCH3_TOKENS):
+            return "USC"
+        if _batch_mentioned_positively(structured, _WA_BATCH2_TOKENS):
+            return "H1B"
+        if _batch_mentioned_positively(structured, _WA_BATCH1_TOKENS):
+            return "F1"
+        # Every mention in the structured field was negated (e.g. "No
+        # H1B, No OPT" with nothing stated as actually required) —
+        # nothing is positively restricted, so this is N/A, not a batch.
+        return None
+
+    # No structured field to work with — fall back to the same
+    # negation-aware scan applied to the raw JD text instead. Bare "TN"
+    # (e.g. "Must have TN status") is included in _WA_BATCH3_TOKENS
+    # directly, matching get_batch()'s treatment of it on the consultant
+    # side, unlike this fallback's predecessor which only recognized the
+    # rarer two-word "tn visa" phrase.
     jd = (requirement.job_description or "").lower()
-    # BUG FIX (merged from a parallel fix on this same file): bare "TN"
-    # (e.g. "Must have TN status") — the far more common way recruiters
-    # actually write it — was never detected, only the two-word phrase
-    # "tn visa" was, which real JDs rarely use. That silently misclassified
-    # these requirements as work-auth N/A (passes everyone) instead of
-    # correctly restricting to Batch 3. get_batch() already treats bare
-    # "TN" as Batch 3 on the consultant side — this brings the requirement
-    # side in line with that.
-    if re.search(r'\b(usc|gc|green card|us citizen|citizens only|citizen|gc ead|tn|tn visa|l1|u visa)\b', jd):
+    if _batch_mentioned_positively(jd, _WA_BATCH3_TOKENS):
         return "USC"
-    if re.search(r'\b(h1b|h1-b)\b', jd):
+    if _batch_mentioned_positively(jd, _WA_BATCH2_TOKENS):
         return "H1B"
-    if re.search(r'\b(f1|opt|cpt|stem opt)\b', jd):
+    if _batch_mentioned_positively(jd, _WA_BATCH1_TOKENS):
         return "F1"
     return None
+
 
 
 def experience_passes(
@@ -1621,7 +1684,7 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
             (JobMatch.requirement_id == Requirement.id)
             & (JobMatch.consultant_id == consultant_id),
         )
-        .where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+        .where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
     )
     lightweight_rows = lightweight_result.all()
     if not lightweight_rows:
@@ -2058,8 +2121,15 @@ async def match_all_requirements(
     # rows for a posting that's no longer actually open. Matches Pipeline
     # B's exact filter so both "run everything" entry points agree on
     # what "everything" means.
+    #
+    # Now reads Requirement.TERMINAL_STATUSES (a single shared constant on
+    # the model — see models.py) instead of its own hardcoded copy of the
+    # same two strings — matching_router.py's two occurrences of this same
+    # filter still use their own literal list; this is the first of the
+    # three to move to the shared constant, opportunistically, not a
+    # requirement for this fix to work correctly on its own.
     result = await db.execute(
-        select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+        select(Requirement).where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
     )
     requirements = result.scalars().all()
 

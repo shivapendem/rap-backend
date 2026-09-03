@@ -437,6 +437,101 @@ def _looks_like_visa_status_context(text: str, start: int, end: int) -> bool:
     return len(hits) >= 2
 
 
+# ---------------------------------------------------------------------------
+# Work Authorization (ported from rap_python_cron's identical addition)
+# ---------------------------------------------------------------------------
+# BUG FIX: this project's Requirement model never had a work_authorization
+# column at all, and there was no extraction logic anywhere in this file --
+# so the field was silently unavailable on every row ever saved, regardless
+# of what the email actually said (and plenty of recruiter emails state
+# this explicitly, e.g. "USC or GC only", "No H1B"). See models.py's own
+# comment for the required column addition this pairs with, and dedup.py's
+# save_requirement() for where the extracted value gets persisted.
+
+WORK_AUTH_PATTERNS = [
+    r'(?i)\bwork\s*authorization\s*[:\-]\s*(.+)',
+    r'(?i)\bwork\s*auth\.?\s*[:\-]\s*(.+)',
+    r'(?i)\bvisa\s*status\s*[:\-]\s*(.+)',
+    r'(?i)\bvisa\s*requirement\s*[:\-]\s*(.+)',
+    r'(?i)\bvisa\s*[:\-]\s*(.+)',
+    r'(?i)\bauthoriz(?:ation|ed)\s*to\s*work\s*[:\-]\s*(.+)',
+]
+
+# Reuses the same visa-abbreviation vocabulary _looks_like_visa_status_context
+# already relies on elsewhere, plus a few common spelled-out phrases that
+# vocabulary doesn't cover (it was only ever built to recognize an
+# abbreviation *run*, not to be read as English).
+_WORK_AUTH_TOKEN_PATTERN = re.compile(
+    r'(?i)\bno\s+(?:third\s*party\s+)?sponsorship\b|'
+    r'\bwithout\s+sponsorship\b|'
+    r'\bunrestricted\s+work\s+authorization\b|\bunrestricted\s+visa\b|'
+    r'\bus\s+citizens?\b|\bu\.s\.\s+citizens?\b|\bcitizens?\s+only\b|'
+    r'\bgreen\s*card\b|'
+    r'\bh-?1-?b\s*(?:transfer)?\b|\bh-?4[\s\-]*ead\b|\bh-?4\b|'
+    r'\bstem\s*opt\b|\bopt\b|\bcpt\b|\bgc[\s\-]*ead\b|\bgc\b|'
+    r'\bl-?1\b|\bl-?2\b|\be-?3\b|\btn\s*visa\b|\busc\b|\bf-?1\b|'
+    r'\bany\s+visa\b|\bno\s+visa\s+sponsorship\b'
+)
+
+
+def clean_work_authorization(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = sanitize_text(normalize_text(value))
+    if not value:
+        return None
+    value = sanitize_text(_ANY_TAG_RE.sub(' ', value))
+    if not value:
+        return None
+    value = crop_at_next_field(value)
+    if not value or is_email_body(value):
+        return None
+    if len(value) > 100:
+        value = _cap_real_words(value, 15)
+    return value or None
+
+
+def extract_work_authorization(text: str) -> Optional[str]:
+    """Best-effort work authorization / visa status extraction.
+
+    Tries a labeled field first ("Work Authorization:", "Visa Status:",
+    etc.), then falls back to collecting every recognized visa/citizenship
+    token mentioned anywhere in the text (e.g. a bare "USC or GC only"
+    sentence with no field label at all) and returning them joined in the
+    order they appear. Returns None when nothing is found rather than
+    guessing — an absent statement is not the same as "no restriction".
+    """
+    if not text:
+        return None
+    labeled = first_match(WORK_AUTH_PATTERNS, text[:6000])
+    cleaned = clean_work_authorization(labeled)
+    if cleaned:
+        return cleaned
+    tokens = []
+    seen = set()
+    # Negation-aware: "No H1B or OPT candidates please, USC/GC only" must
+    # not come back as "H1B, OPT, USC, GC" with no indication H1B/OPT are
+    # explicitly EXCLUDED. Checks a short window immediately before each
+    # token for a negation cue and prefixes "No " onto that token
+    # specifically, so excluded and accepted statuses stay distinguishable.
+    _NEGATION_CUE = re.compile(
+        r'(?i)\b(?:no|not|except|excluding|won\'?t\s+accept|cannot\s+accept)\b'
+        r'(?:\s+[\w/\-]+){0,3}?\s*$'
+    )
+    for m in _WORK_AUTH_TOKEN_PATTERN.finditer(text[:6000]):
+        tok = re.sub(r'\s+', ' ', m.group(0)).strip()
+        window_before = text[max(0, m.start() - 30):m.start()]
+        negated = bool(_NEGATION_CUE.search(window_before)) and not tok.lower().startswith('no ')
+        display = f"No {tok}" if negated else tok
+        key = display.lower()
+        if key not in seen:
+            seen.add(key)
+            tokens.append(display)
+    if tokens:
+        return ', '.join(tokens[:8])
+    return None
+
+
 def _find_city_state_match(text: str, reject_first_words=None):
     """
     Sliding-window search for the first VALIDATED "City, ST" / "City ST"
@@ -1446,6 +1541,91 @@ _BULLET_CHAR_PATTERN = re.compile(
 )
 
 
+# BUG FIX (ported from rap_python_cron's identical fix — skills list
+# swallowing the sign-off / boilerplate that follows it): STOP_PATTERN
+# alone only recognizes a small fixed set of labeled field boundaries
+# (FIELD_BOUNDARIES) -- it has no idea a decorative separator line
+# ("===============================", common in multi-posting broadcast
+# emails) or a bare "Requirement 2:" / "Position 2:" sequence header
+# (singular "Requirement" was never in FIELD_BOUNDARIES at all, only the
+# plural "Requirements") mark the end of real content. Worse, STOP_
+# PATTERN's own bare-heading branch requires the boundary word to be
+# followed by ONLY whitespace before the line ends -- a sign-off written
+# as "Thanks," (trailing comma, the overwhelmingly common real-world
+# phrasing) never matches it, so the capture ran straight through the
+# recruiter's own name, company, and email address as if they were
+# skills.
+#
+# Three additional stop signals, all cropped to whichever occurs
+# EARLIEST (same "take the minimum" approach crop_at_next_field() already
+# uses for NEXT_FIELD_PATTERN vs SIGNATURE_PATTERN):
+#   1. SIGNATURE_PATTERN -- the same sign-off-word pattern every other
+#      field (role/client/location/rate/duration) already crops against
+#      via crop_at_next_field(). It has no punctuation-adjacency
+#      requirement (plain \b...\b), so "Thanks," is caught correctly.
+#   2. A decorative separator line (5+ repeated =/-/_/* characters).
+#   3. A bare "Requirement N" / "Position N" / "Posting N" sequence
+#      header line, common in multi-posting broadcast emails.
+#   4. A "Work Auth:"/"Work Authorization:" label -- not in
+#      FIELD_BOUNDARIES or NEXT_FIELD_LABELS at all (only the bare word
+#      "visa" is), so a skills section immediately followed by one ran
+#      straight through it too.
+_SKILLS_SEPARATOR_LINE_PATTERN = re.compile(r'(?:^|\n)[ \t]*[=\-_*]{5,}[ \t]*(?=\n|$)')
+_SKILLS_NUMBERED_POSTING_HEADER_PATTERN = re.compile(
+    r'(?im)(?:^|\n)[ \t]*(?:requirement|position|posting|opening|role)\s*#?\s*\d+\s*[:.\)]?[ \t]*(?=\n|$)'
+)
+_SKILLS_WORK_AUTH_LABEL_PATTERN = re.compile(r'(?im)(?:^|\n)[ \t]*work\s*auth(?:orization)?\s*[:\-]')
+
+
+def _crop_skills_boilerplate(skills_text: str) -> str:
+    if not skills_text:
+        return skills_text
+    cut = len(skills_text)
+    for pattern in (
+        SIGNATURE_PATTERN,
+        _SKILLS_SEPARATOR_LINE_PATTERN,
+        _SKILLS_NUMBERED_POSTING_HEADER_PATTERN,
+        _SKILLS_WORK_AUTH_LABEL_PATTERN,
+    ):
+        m = pattern.search(skills_text)
+        if m:
+            cut = min(cut, m.start())
+    return skills_text[:cut].strip()
+
+
+# BUG FIX (ported from rap_python_cron's identical fix — skills list
+# swallowing trailing "call to action" sentences): even after cropping at
+# a signature/separator/numbered-header boundary above, a skills section
+# that's the LAST labeled field before a plain CTA sentence with no field
+# label and no sign-off word at all -- "Interested candidates send resume
+# to john.mathew@...", "Send resumes to team@recruitfast.com", "Call me
+# at 214-555-0198 anytime" -- has no boundary to stop at, so that sentence
+# gets bullet/comma-split right alongside the real skills. None of these
+# are skill-shaped: a real skill token is never a full imperative sentence
+# directed at the reader, and never contains an email address or phone
+# number attached to several words of surrounding prose.
+_CTA_LEAD_PATTERN = re.compile(
+    r'(?i)^(?:interested\s+candidates?|please\s+(?:send|share|contact|reach|call)|'
+    r'kindly\s+(?:send|share)|send\s+(?:your\s+|updated\s+)?resumes?|'
+    r'share\s+(?:your\s+|updated\s+)?resumes?|call\s+me|contact\s+(?:me|us)|'
+    r'reach\s+out|feel\s+free\s+to|for\s+more\s+(?:details?|info(?:rmation)?)\b)'
+)
+
+
+def _is_cta_or_contact_sentence(token: str) -> bool:
+    """True for a trailing recruiter call-to-action / contact-info sentence
+    that isn't a real skill -- see the BUG FIX comment above."""
+    if not token:
+        return False
+    stripped = token.strip()
+    if _CTA_LEAD_PATTERN.match(stripped):
+        return True
+    word_count = len(stripped.split())
+    if word_count > 4 and (_EMAIL_ADDR_PATTERN.search(stripped) or PHONE_PATTERN.search(stripped)):
+        return True
+    return False
+
+
 def extract_skills(text: str) -> List[str]:
     """Extract skills from text as a list."""
     if not text:
@@ -1483,6 +1663,7 @@ def extract_skills(text: str) -> List[str]:
             stop_match = STOP_PATTERN.search(skills_text)
             if stop_match:
                 skills_text = skills_text[:stop_match.start()].strip()
+            skills_text = _crop_skills_boilerplate(skills_text)
             break
     if not skills_text:
         return extract_skills_from_keywords(text_scope)
@@ -1554,6 +1735,8 @@ def extract_skills(text: str) -> List[str]:
         skill = re.sub(r'\s+', ' ', skill).strip()
         if 2 < len(skill) < 40:
             skill = skill.rstrip('.')
+            if _is_cta_or_contact_sentence(skill):
+                continue
             skills.append(skill)
     return list(dict.fromkeys(skills))[:10]
 
@@ -1676,6 +1859,8 @@ def _extract_skill_tokens(sentence: str) -> List[str]:
                     if 1 < len(item) < 45:
                         results.append(item)
                 continue
+        if _is_cta_or_contact_sentence(tok):
+            continue
         if 1 < len(tok) < 45:
             results.append(tok)
     return results
@@ -2222,7 +2407,19 @@ def parse_requirement(
     full_text = normalize_text(f"{safe_subject}\n{safe_body_for_parsing}")
     norm_body = normalize_text(safe_body_for_parsing)
 
-    if not is_job_requirement_email(full_text) or is_hotlist_email(full_text):
+    # BUG FIX (ported from rap_python_cron's identical fix): is_hotlist_email()
+    # was being checked against full_text (subject+body combined) here, same
+    # as is_job_requirement_email() just before it -- but is_hotlist_email()
+    # only has ONE positive-signal-free indicator, a bare `\bhotlist\b`
+    # match, and staffing broadcast subject lines routinely use "Hotlist" as
+    # a generic label for "batch of postings" even when the body is a single
+    # genuine job requirement (e.g. "Hotlist :: Multiple Openings" relaying
+    # one real posting). Combining subject+body meant that word alone,
+    # anywhere in the subject, discarded an otherwise well-formed real
+    # posting. is_job_requirement_email() stays on full_text (a POSITIVE
+    # signal -- subject words like "Requirement"/"Contract" genuinely help
+    # there); is_hotlist_email() is scoped to norm_body only.
+    if not is_job_requirement_email(full_text) or is_hotlist_email(norm_body):
         return {
             'role': 'UNKNOWN',
             'client': None,
@@ -2491,6 +2688,13 @@ def parse_requirement(
 
     experience = _ai_field('experience') or extract_experience(full_text)
 
+    # BUG FIX (ported from rap_python_cron's identical addition): this
+    # field was never computed at all here — extract_work_authorization()
+    # now exists above (see that section's own comment), this just wires
+    # it into the actual field-assembly flow the same way experience/
+    # skills already are.
+    work_authorization = _ai_field('work_authorization') or extract_work_authorization(full_text)
+
     ai_skills = _ai_field('skills')
     skills = ai_skills if ai_skills else extract_skills(full_text)
 
@@ -2562,6 +2766,7 @@ def parse_requirement(
         'vendor': vendor_name,
         'vendor_contact': vendor_contact,
         'experience': experience,
+        'work_authorization': work_authorization,
         'skills': skills,
         'parsing_model': _ai_field('parsing_model') or "Regex Parser",
         'parsing_log': parsing_log,

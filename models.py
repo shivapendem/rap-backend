@@ -283,18 +283,46 @@ class Requirement(Base):
     employment_types = ArrayTextColumn(nullable=True)
     rate = Column(Text, nullable=True)
     duration = Column(Text, nullable=True)
+    # MIGRATION REQUIRED — run this against the real Postgres database
+    # before deploying this change (if not already applied by the
+    # rap_python_cron project's identical fix, since both projects share
+    # the same physical database — this ALTER only needs to run once):
+    #     ALTER TABLE requirements ADD COLUMN work_authorization TEXT;
+    # BUG FIX (ported from rap_python_cron's identical fix): this project's
+    # Requirement model never had a work_authorization column at all —
+    # parser.py never extracted one, dedup.py never tried to populate one
+    # (so no crash here, unlike the cron project's dedup.py, which DID try
+    # to pass this keyword before its own matching fix — see that
+    # project's history), and phase4.py's _requirement_work_auth_text()
+    # had no structured field to read even if it wanted to. Added here as
+    # part of also porting parser.py's extract_work_authorization() and
+    # dedup.py's population of it (see those files' own comments) — this
+    # column is the piece all three needed to slot into.
+    work_authorization = Column(Text, nullable=True)
     job_description = Column(Text, nullable=True)
     jd_hash = Column(Text, nullable=True, index=True)          # Phase 2: SHA-256 of normalized cleaned JD
     dedup_key = Column(Text, nullable=True, unique=True, index=True)  # Phase 2: vendor_email|role|jd_hash
     parsed_fields = JSONBColumn(nullable=True)
     parse_confidence = Column(Numeric(5, 2), default=0)
     ats_match_count = Column(Integer, default=0)
-    status = Column(Text, nullable=False, default="NEW")
+    status = Column(Text, nullable=False, default="NEW", index=True)
     received_date = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     VALID_STATUSES = {"NEW", "REVIEWING", "SUBMITTED", "INTERVIEWING", "CLOSED", "REJECTED"}
+
+    # BUG FIX (ported from rap_python_cron's identical fix — "Match All"
+    # rematching closed/rejected requirements): this project's own
+    # match_all_requirements() (phase4.py) already independently gained a
+    # status filter at some point, and matching_router.py's two bulk
+    # queries already filter on it too — but all three still spell out
+    # their own literal ["CLOSED", "REJECTED"] rather than sharing one
+    # definition, so a future bulk-matching entry point can silently
+    # forget the filter the same way phase4.py's match_all_requirements()
+    # once did. A single named constant here removes that risk going
+    # forward — existing call sites can adopt it opportunistically.
+    TERMINAL_STATUSES = {"CLOSED", "REJECTED"}
 
     @validates("role")
     def validate_role(self, key, value):

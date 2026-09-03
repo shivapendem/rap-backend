@@ -406,7 +406,7 @@ async def _run_matching_engine_background():
             # is stale.
             reqs_res = await db.execute(
                 select(Requirement).where(
-                    Requirement.status.notin_(["CLOSED", "REJECTED"]),
+                    Requirement.status.notin_(Requirement.TERMINAL_STATUSES),
                 )
             )
             requirements = reqs_res.scalars().all()
@@ -594,7 +594,7 @@ async def run_matching_for_consultant(
         return 0
 
     reqs_res = await db.execute(
-        select(Requirement).where(Requirement.status.notin_(["CLOSED", "REJECTED"]))
+        select(Requirement).where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
     )
     requirements = reqs_res.scalars().all()
     if not requirements:
