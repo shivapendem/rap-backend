@@ -283,6 +283,21 @@ class Requirement(Base):
     employment_types = ArrayTextColumn(nullable=True)
     rate = Column(Text, nullable=True)
     duration = Column(Text, nullable=True)
+    # BUG FIX: matching_engine.py's work-auth stage (see
+    # _requirement_work_auth_text()) already reads requirement.work_
+    # authorization as its primary signal, and the cron project's copy
+    # of dedup.py already writes it — this model was still missing the
+    # column, which would crash that write with "'work_authorization' is
+    # an invalid keyword argument for Requirement" the moment this
+    # backend's own dedup.py/pipeline.py is ever updated to set it too
+    # (matching the cron project's write side). Adding proactively so
+    # that update doesn't reintroduce this crash here. Doesn't
+    # retroactively add the column to an already-existing `requirements`
+    # table in a real database — Base.metadata.create_all() only creates
+    # tables that don't exist yet — so this also needs, once, against
+    # the real database:
+    #   ALTER TABLE requirements ADD COLUMN work_authorization TEXT;
+    work_authorization = Column(Text, nullable=True)
     job_description = Column(Text, nullable=True)
     jd_hash = Column(Text, nullable=True, index=True)          # Phase 2: SHA-256 of normalized cleaned JD
     dedup_key = Column(Text, nullable=True, unique=True, index=True)  # Phase 2: vendor_email|role|jd_hash
