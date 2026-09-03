@@ -157,6 +157,16 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         # real column going forward, so this only matters for old rows.
         linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
         education=c.education or (resume_info or {}).get("education") or [],
+        # BUG FIX (the actual "Resume Info JSON is missing" cause): this
+        # fetched User.resume_info into the local `resume_info` variable
+        # above purely for the linkedin_url/education fallback, but never
+        # actually put it on the returned DTO — every admin screen that
+        # reads a consultant (detail page, edit drawers) got resume_info:
+        # null back regardless of what was really saved in the database.
+        # Any consultant whose JSON editor "used to work" and now shows
+        # blank was hitting exactly this — the data was never lost, this
+        # endpoint just never sent it.
+        resume_info=resume_info,
         last_login_at=last_login_at.isoformat() if last_login_at else None,
         total_applications_sent=total_applications_sent,
         total_resumes_generated=total_resumes_generated,
@@ -301,6 +311,11 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
             ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
             linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
             education=c.education or (resume_info or {}).get("education") or [],
+            # Same fix as _consultant_to_dto above — was fetched for the
+            # fallback logic on the two lines above but never actually
+            # returned on the DTO, so the Consultants list / any screen
+            # backed by this bulk fetch always saw resume_info: null.
+            resume_info=resume_info,
             last_login_at=last_login_at.isoformat() if last_login_at else None,
             total_applications_sent=total_applications_sent,
             total_resumes_generated=total_resumes_generated,
@@ -454,6 +469,15 @@ class UserService:
                 consultant.primary_skills = req.primary_skills
             consultant.full_name = user.full_name
             consultant.email = user.email
+            # BUG FIX ("toggle Authorize/Unauthorize in User Management
+            # doesn't stick — Consultants list still shows the old
+            # status"): user.is_authorized was updated above, but
+            # consultant.status (the field the Consultants admin table
+            # and ConsultantDetailPage actually read) was never kept in
+            # sync, so the two screens silently disagreed after every
+            # toggle. Mirror it here the same way deactivate/activate
+            # already do for the Consultants page's own toggle.
+            consultant.status = "ACTIVE" if req.is_authorized else "INACTIVE"
             await ConsultantRepository.update(db, consultant)
             if req.recruiter_id:
                 rid = int(req.recruiter_id)
@@ -501,6 +525,17 @@ class UserService:
         user.is_authorized = (status_value == "ACTIVE" or status_value == "AUTHORIZED")
         user = await UserRepository.update(db, user)
         new_status = "Authorized" if user.is_authorized else "Unauthorized"
+
+        # BUG FIX: same consultant.status desync as update_user() above —
+        # the Authorize/Unauthorize dropdown action (User Management's
+        # "three dot" menu) only ever flipped user.is_authorized and
+        # never touched the linked Consultant row, so the Consultants
+        # page kept showing the pre-toggle status.
+        if user.role == "CONSULTANT":
+            consultant = await ConsultantRepository.get_by_user_id(db, user.id)
+            if consultant:
+                consultant.status = "ACTIVE" if user.is_authorized else "INACTIVE"
+                await ConsultantRepository.update(db, consultant)
 
         await log_action(
             db, "USER_STATUS_CHANGED",

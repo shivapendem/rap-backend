@@ -459,15 +459,76 @@ async def generate_resume_from_template(
     # through that exact same DOCX-only pipeline and persist template, so
     # Edit, View, and Download all read the one same file.
     s3_key = None
-    resume_template = "classic"
+    # BUG FIX ("Edit shows exact template but View/Download show a
+    # different style"): the comment above already explains the intent
+    # (Edit/View/Download all read the same _generate_docx-rendered file,
+    # keyed by resume.template) — but this line never actually read the
+    # template the request carries (ResumeCreateRequest.template, set
+    # from whatever style the consultant picked), it just hardcoded
+    # "classic" unconditionally. Edit renders straight from what was just
+    # picked in the UI, so it looked right; View/Download render from
+    # this saved Resume row, which was always "classic" regardless.
+    resume_template = request.template or "classic"
     if not request.draft:
         try:
             from phase6 import _generate_docx
 
+            # BUG FIX ("education/linkedin/etc. missing while generating
+            # tailored resume"): generate_template_values() only ever
+            # returns summary/skills/experience/ats_score (see its
+            # docstring — "ONLY the core fields needed for templating"),
+            # but _generate_docx builds a FULL resume document and needs
+            # name/email/phone/location/linkedin/education/certifications
+            # too. Those were never in generated_data at all, so every
+            # DOCX built through this template flow silently rendered
+            # without them regardless of how complete the consultant's
+            # actual profile was. Merge the real profile fields in — same
+            # field names/shape generate_tailored_resume's mock_fallback
+            # already uses for the same _generate_docx call elsewhere —
+            # without touching the AI-tailored summary/skills/experience.
+            docx_data = {
+                "name": resume_info.get("full_name", ""),
+                "email": resume_info.get("email", ""),
+                "phone": resume_info.get("phone", ""),
+                "location": resume_info.get("location", ""),
+                "linkedin": resume_info.get("linkedin", ""),
+                "github": resume_info.get("github", ""),
+                "education": resume_info.get("education") or resume_info.get("educational_background") or [],
+                "certifications": resume_info.get("certifications") or [],
+                "technical_proficiencies": resume_info.get("technical_proficiencies"),
+                **generated_data,
+            }
+
+            # BUG FIX ("experience style and format missing" — the accent-
+            # box border/bold company line, timeline connector, and dates
+            # all silently disappeared): generate_template_values() asks
+            # the AI for experience entries shaped {"role", "employer",
+            # "bullets"} only (see its own prompt schema) — no dates at
+            # all, and "employer" instead of the "client"/"company" key
+            # _generate_docx's EXPERIENCE section actually reads
+            # (`exp.get("client") or exp.get("company")`). Every entry's
+            # company name and dates came back blank, which also skipped
+            # the styling attached to that header line, since it's only
+            # drawn when company_text or date_str is non-empty. Normalize
+            # field names and backfill start/end from the real profile
+            # experience (resume_info["experience"], same order the AI
+            # was given them in) rather than inventing dates.
+            real_experience = resume_info.get("experience") or []
+            normalized_experience = []
+            for i, exp in enumerate(docx_data.get("experience") or []):
+                real_exp = real_experience[i] if i < len(real_experience) else {}
+                normalized_experience.append({
+                    **exp,
+                    "company": exp.get("company") or exp.get("client") or exp.get("employer") or real_exp.get("company", ""),
+                    "start": exp.get("start") or real_exp.get("start", ""),
+                    "end": exp.get("end") or real_exp.get("end", ""),
+                })
+            docx_data["experience"] = normalized_experience
+
             with tempfile.TemporaryDirectory(prefix="resume_template_") as tmpdir:
                 docx_path = Path(tmpdir) / "resume.docx"
 
-                _generate_docx(generated_data, docx_path, template=resume_template)
+                _generate_docx(docx_data, docx_path, template=resume_template)
 
                 s3_key = f"resumes/{target_user_id}/{uuid.uuid4()}.docx"
                 with open(docx_path, "rb") as f:
@@ -490,7 +551,14 @@ async def generate_resume_from_template(
         user_id=target_user_id,
         title=request.title,
         job_description=request.job_description,
-        data=generated_data,
+        # Was `generated_data` — the same sparse summary/skills/
+        # experience/ats_score dict passed to _generate_docx before the
+        # merge fix above. Saving that meant any later re-read of this
+        # resume (re-edit, re-download) lost name/education/linkedin/etc.
+        # all over again, even though the DOCX itself now has them.
+        # `docx_data` is the merged, complete version — keep the two in
+        # sync.
+        data=docx_data if not request.draft else generated_data,
         template=resume_template,
         is_base=False,
         is_draft=request.draft,
@@ -1979,8 +2047,14 @@ async def update_base_resume_content(
 
     resume_data = dict(request.content or {})
 
-    if (resume_data.get("name") or "").strip():
-        consultant.full_name = resume_data["name"].strip()
+    # BUG FIX: (value.get("name") or "").strip() only protects against a
+    # missing/empty "name" — if it's present but not a plain string, the
+    # `or ""` never triggers (a non-empty dict/list is truthy) and
+    # .strip() still runs directly on the non-string value. str(...)
+    # first makes this safe regardless of shape.
+    name_val = str(resume_data.get("name") or "").strip()
+    if name_val:
+        consultant.full_name = name_val
     if resume_data.get("phone") is not None:
         consultant.phone = resume_data.get("phone") or None
     if resume_data.get("location") is not None:
