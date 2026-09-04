@@ -90,6 +90,7 @@ async def run_matching_for_requirement(
     collect_results: Optional[list] = None,
     existing_by_consultant: Optional[dict] = None,
     persist: bool = True,
+    only_new_pairs: bool = False,
 ) -> int:
     """
     Compute and persist JobMatch rows for ONE requirement against the given
@@ -171,6 +172,26 @@ async def run_matching_for_requirement(
     contexts where writing to "Pending Applications" isn't wanted purely
     as a side effect of an unrelated trigger (see phase4.py for which
     call sites choose which).
+
+    only_new_pairs: when True (explicit product decision — "Run Engine
+    should only match the present-day/never-matched work, don't rematch
+    previous matches again"), a (requirement, consultant) pair that
+    already has ANY JobMatch row — regardless of status, regardless of
+    whether it was scored under an older MATCHING_LOGIC_VERSION — is left
+    completely untouched: no re-validation, no rescoring, no status flip,
+    not even a stale-version refresh. Only pairs with NO existing row at
+    all get scored and (if eligible) get a brand new row. This means a
+    requirement that already has some matches still gets checked against
+    any consultant who doesn't yet have a row for it (a newly added
+    consultant, or one just marked ACTIVE) — only the ALREADY-SCORED
+    pairs are skipped, not the whole requirement. Trade-off, by design:
+    once a pair has a row, a later change to the scoring logic itself
+    (like this session's role-matching fix) will NOT retroactively
+    refresh it — only brand new pairs pick up the new logic. Defaults to
+    False so every other caller (requirements_sync.py's per-requirement
+    auto-match on a brand new requirement, Pipeline A's collect_results
+    consumers) keeps its existing behavior unchanged; only the actual
+    "Run Engine" trigger below opts into this.
     """
     if not consultants:
         return 0
@@ -212,6 +233,17 @@ async def run_matching_for_requirement(
     for cons in consultants:
         experiences = experiences_by_consultant.get(cons.id, [])
         existing = existing_by_consultant.get(cons.id)
+
+        # "Only new pairs" mode (Run Engine): a pair with ANY existing row
+        # at all is frozen — never re-validated, never rescored, never
+        # status-flipped, regardless of status or matching-logic version.
+        # This check comes before every other branch below on purpose —
+        # it overrides even the APPLIED/REJECTED and version-staleness
+        # handling, since in this mode "already has a row" is itself the
+        # only thing that matters.
+        if only_new_pairs and existing is not None:
+            existing_pairs.add((requirement.id, cons.id))
+            continue
 
         # Never touch a row a human already acted on — that's a real
         # decision, not the matching engine's to revise. Still COMPUTE a
@@ -454,7 +486,16 @@ async def _run_matching_engine_background():
                 try:
                     new_matches += await run_matching_for_requirement(
                         db, req, consultants, existing_pairs,
-                        experiences_by_consultant=experiences_by_consultant
+                        experiences_by_consultant=experiences_by_consultant,
+                        # Explicit product decision: Run Engine only scores
+                        # pairs that have NEVER been matched before — a
+                        # requirement that already has some matches still
+                        # gets checked against any consultant who doesn't
+                        # have a row for it yet, but an existing pair is
+                        # never re-touched, no matter how old or how the
+                        # scoring logic has changed since. See this
+                        # parameter's docstring on run_matching_for_requirement().
+                        only_new_pairs=True,
                     )
                 except Exception as req_err:
                     await db.rollback()
@@ -703,7 +744,18 @@ async def get_pending_matches(
         ).scalar_subquery()
         stmt = stmt.where(JobMatch.consultant_id.in_(assigned_subq))
 
-    stmt = stmt.order_by(JobMatch.created_at.desc()).limit(200)
+    # BUG FIX / product change ("apply from highest match to lowest"):
+    # this used to order by JobMatch.created_at.desc() — most-recently
+    # generated match first, completely unrelated to how good the match
+    # actually is. A 92% match and a 51% match could land in either order
+    # depending purely on WHEN the matching engine happened to score
+    # them, forcing the recruiter to scan the whole list instead of
+    # working top-down. Ordering by match_score first means a fully
+    # confident match always appears above a weaker one; created_at is
+    # kept as a secondary tiebreaker so matches with an identical score
+    # still have a stable, predictable order (newest of that score first)
+    # rather than shuffling between requests.
+    stmt = stmt.order_by(JobMatch.match_score.desc(), JobMatch.created_at.desc()).limit(200)
 
     result = await db.execute(stmt)
     rows = result.mappings().all()

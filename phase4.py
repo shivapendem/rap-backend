@@ -80,7 +80,7 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-08-22-data-generic-word-fix"
+MATCHING_LOGIC_VERSION = "2026-09-05-role-mandatory-no-ai-skill-topup"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
@@ -145,6 +145,14 @@ SKILL_ALIASES: dict[str, list[str]] = {
     "graphql": ["graphql"],
     "microservices": ["microservices"],
     "machine learning": ["machine learning", "ml"],
+    # BUG FIX (role-title skill top-up never fired for "...with AI &
+    # React"-style titles): "ai" only existed as a SYNONYMS entry for role
+    # TOKEN expansion (score_role's old token comparison), never as a
+    # recognized canonical SKILL — so extract_skills() on a title
+    # containing "AI" found nothing, and the title-skill top-up in
+    # score_role() (see below) had no skill to credit even when the
+    # consultant's actual skill list included AI/ML work.
+    "ai": ["ai", "artificial intelligence", "genai", "generative ai"],
     "sql": ["sql", "postgresql", "mysql", "oracle sql"],
     "kafka": ["kafka", "apache kafka"],
     "spark": ["spark", "apache spark", "pyspark"],
@@ -519,9 +527,52 @@ def _known_generic_phrase_domain(req_tokens: set[str]) -> bool:
     return False
 
 
-from disk_cache import PersistentDiskCache
-import json
-_ROLE_MATCH_CACHE = PersistentDiskCache("role_match_cache.json")
+def _title_embedded_skills(requirement_role: Optional[str]) -> List[str]:
+    """
+    Skills named INSIDE the requirement's role/title text itself (e.g.
+    "ai", "react" out of "Full-Stack Developer with AI & React") — a
+    narrower, more targeted set than _requirement_skills()'s full-JD scan.
+    Reuses the same SKILL_ALIASES dictionary/extract_skills() so a skill
+    word means the same thing everywhere in this file. Deliberately reads
+    the FULL raw title (not the clear-role-only text below) — a skill
+    word can appear anywhere in the title, not just after a "with"/"using"
+    marker, so this stays broad even though role tokenization doesn't.
+    """
+    return extract_skills(requirement_role)
+
+
+# BUG FIX ("Full Stack Developer with AI & React" role-matched against a
+# consultant's role tokens as if "ai"/"react" were themselves role words):
+# score_role()'s domain-word comparison used to tokenize the requirement's
+# ENTIRE role/title text, including any skills tacked onto it after a
+# "with"/"using" clause — so those skill words became part of req_domain
+# and could accidentally register as a role-name match (e.g. against a
+# consultant whose preferred role happened to literally be "AI Engineer").
+# That's backwards: role matching should compare JOB TITLES only; skills
+# mentioned in the title are a separate, secondary signal
+# (_title_embedded_skills() above / the top-up mechanism below), never
+# blended into the primary role-name tokens. This strips a trailing
+# "with/using/w/ <skills...>" clause BEFORE tokenization so only the
+# clear job title (e.g. "Full Stack Developer") ever feeds the domain-word
+# comparison — the skill words still get considered, just later and only
+# as a top-up, never as if they were role-name overlap.
+_ROLE_SKILL_CLAUSE_PATTERN = re.compile(r'\s+(?:with|using|w/)\s+', re.IGNORECASE)
+
+
+def _clear_role_text(requirement_role: str) -> str:
+    """
+    The job-title-only portion of a requirement's role/title text, with
+    any trailing "with/using <skills>" clause removed. Only the FIRST
+    such marker is used as the cut point; if none is present the text is
+    returned unchanged (nothing to strip, e.g. "React Developer" with no
+    "with" clause at all).
+    """
+    match = _ROLE_SKILL_CLAUSE_PATTERN.search(requirement_role)
+    if match:
+        cleared = requirement_role[:match.start()].strip()
+        return cleared if cleared else requirement_role
+    return requirement_role
+
 
 def score_role(
     requirement_role: Optional[str],
@@ -531,81 +582,66 @@ def score_role(
     consultant_skills: Optional[List[str]] = None,
 ) -> float:
     """
-    Role title match — domain-word (specialization) aware, name-based only.
+    Role title match — deterministic, word/domain-based. Role is the
+    MANDATORY, primary signal; skills named inside the title text are a
+    secondary top-up, never a substitute for a genuine role match.
 
-    BUG FIX: the old version treated a single shared GENERIC word (e.g. both
-    titles containing "Developer") as a near-100% match on its own, even
-    when the actual specialization was unrelated ("Java Developer" vs
-    "Python Developer") — since role is weighted 50% of the total score,
-    this alone was often enough to clear the match threshold regardless of
-    real skill fit. This version splits tokens into a domain (specialization)
-    part and a generic part (GENERIC_ROLE_WORDS) and only a genuine
-    domain-word overlap earns a high score (path c). A requirement that
-    states a domain word with NO overlap at all is a real mismatch signal,
-    not missing data, and scores 0 outright — with a small hand-curated
-    ADJACENT_ROLES exception for genuinely related specializations (path d).
+    CHANGE (explicit product decision — "role with skill should take high
+    priority", AI role-matching removed): this used to call out to Claude
+    (claude_service.evaluate_role_match_with_ai) first, whenever the
+    consultant had any role data at all, and returned whatever score the
+    AI gave — the deterministic word/domain logic below only ever ran as
+    a fallback for when the AI call failed. That's been removed entirely.
+    Role matching is now ALWAYS this deterministic word/domain comparison
+    — same result every time for the same inputs, no live API call, no
+    opaque "job function" judgment that could score a role low even when
+    the requirement's own title contains the consultant's exact skill
+    words (e.g. "...with AI & React").
 
-    BUG FIX #2: role matching must be based on the actual role NAME, never
-    substituted by a skill-overlap coincidence — skills and role are two
-    separate factors in score_match()'s blend for a reason. The previous
-    version fell back to comparing skill lists whenever there was no title
-    to compare (blank title, no consultant role data, or a bare-generic
-    title with no domain word) — removed. Every one of those cases below
-    (a/b/e) now returns a plain neutral 50 instead: genuinely unknown,
-    neither a confident pass nor fail, decided purely on whether a real
-    name comparison was even possible — never on skills.
+    NEW — title-embedded-skill top-up: a title's domain words don't
+    always show up verbatim in a consultant's PREFERRED ROLE or job
+    TITLES (e.g. a requirement titled "...with AI & React" vs a
+    consultant whose preferred role is just "Full Stack Developer" but
+    whose SKILLS list genuinely includes React) — that's a real signal
+    the pure role-name comparison below can't see on its own. So:
+      1. ROLE MATCH IS COMPUTED FIRST AND IS MANDATORY — same
+         domain-word-overlap logic as before (GENERIC_ROLE_WORDS
+         stripped, SYNONYMS-expanded). This is always the base score.
+      2. Skills named literally in the requirement's title text
+         (extract_skills(requirement_role) — the SAME dictionary used for
+         the general skill match, so "AI"/"React" etc. are recognized)
+         are compared against the consultant's actual skill list. This is
+         a RATIO — matched-title-skills / total-title-skills — never a
+         single-word-is-enough credit. A title naming 3 skills where the
+         consultant has 1 only fills a third of the gap, not all of it.
+      3. Skills only ever TOP UP an ALREADY-PARTIAL role match — they
+         close part of the remaining distance to 100, never push a score
+         down, and never apply once role match is already 100 (path c
+         with full domain overlap) since there's no gap left to fill.
+         They also do NOT rescue a genuine, total specialization mismatch
+         (path d with zero domain overlap and no adjacent-role credit,
+         or the bare-generic-title no-match branch) — role is mandatory,
+         so a requirement whose stated domain is flatly different from
+         anything in the consultant's role history stays a hard 0
+         regardless of any coincidental skill overlap in the title.
+         General JD-wide skill matching (score_skills(), the separate
+         Matched/Missing skills shown in the UI) is UNCHANGED and still
+         carries 0 weight in score_match() per the earlier explicit
+         decision — this top-up only ever applies to skill words that
+         appear in the title text specifically, not the whole JD.
 
-    requirement_skills/consultant_skills are still accepted for signature
-    compatibility with existing callers but are no longer used by this
-    function — role scoring is name-only. Callers may stop passing them
-    to score_role() specifically at any point without changing behavior;
-    they're still needed elsewhere (score_skills()'s own factor).
+    requirement_skills is accepted for signature compatibility with
+    existing callers but is not used here (that's the full-JD skill list,
+    a different, still-0-weighted factor) — only consultant_skills is
+    used, to check against the title-extracted skill set.
     """
     # (a) No requirement role text at all — no name to compare against,
     # genuinely unknown either way.
     if not requirement_role or not requirement_role.strip():
         return 50.0
 
-    # Attempt AI evaluation first
-    raw_pref_roles = []
-    if consultant_preferred_roles:
-        raw_pref_roles.append(consultant_preferred_roles.strip())
-    if experiences:
-        for exp in experiences:
-            if exp.role_title:
-                raw_pref_roles.append(exp.role_title.strip())
-
-    if raw_pref_roles:
-        unique_roles = tuple(sorted(set(raw_pref_roles)))
-        req_role_clean = requirement_role.strip()
-
-        # BUG FIX: cache_key had no version component, so a prompt fix to
-        # ROLE_MATCH_SYSTEM_PROMPT (e.g. the job-function-before-domain
-        # gating fix) had zero effect on any (requirement_role,
-        # consultant_roles) pair already scored under the old prompt —
-        # it would just keep returning the stale wrong score from disk
-        # forever, cache hit every time. JobMatch rows already
-        # self-invalidate on MATCHING_LOGIC_VERSION changes; this gives
-        # the AI role-match cache the same self-healing behavior.
-        from claude_service import ROLE_MATCH_PROMPT_VERSION
-        cache_key = json.dumps([ROLE_MATCH_PROMPT_VERSION, req_role_clean, list(unique_roles)])
-
-        cached_score = _ROLE_MATCH_CACHE.get(cache_key)
-        if cached_score is not None:
-            return cached_score
-
-        try:
-            from claude_service import evaluate_role_match_with_ai
-            ai_score = evaluate_role_match_with_ai(req_role_clean, list(unique_roles))
-            if ai_score is not None:
-                _ROLE_MATCH_CACHE.set(cache_key, ai_score)
-                return ai_score
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"AI role match failed: {e}")
-
     # Build the consultant's role-token pool (preferred_roles + every
-    # experience row's role_title), same sources as before.
+    # experience row's role_title).
     pref_tokens: set[str] = set()
     if consultant_preferred_roles:
         pref_tokens |= _tokenize_role(consultant_preferred_roles)
@@ -619,7 +655,52 @@ def score_role(
     if not pref_tokens:
         return 50.0
 
-    req_tokens = _tokenize_role(requirement_role)
+    def _title_skill_topup(base_score: float, cap: float = 100.0) -> float:
+        """Close part of the gap to `cap` using title-embedded-skill
+        overlap — only when there IS a gap (base_score < cap) and the
+        consultant has a real skill list to check against.
+
+        `cap` distinguishes two very different "not fully matched"
+        situations per the role-is-mandatory rule:
+          - Genuine partial role signal already exists (some domain
+            overlap, or a hand-curated adjacent-role match) — skills can
+            top this all the way up to 100, there's real role evidence
+            underneath.
+          - Zero role signal or a stated domain CONFLICT (e.g. a
+            Salesforce-only consultant against an AI/React requirement,
+            or a consultant whose role text has no domain word at all) —
+            skills can still move the needle (so it's not stuck at a flat
+            0 forever), but are capped well below a real match. Role is
+            mandatory: a title's skill words alone — even ALL of them —
+            must never make a fundamentally different specialization look
+            like a full role match.
+        """
+        if base_score >= cap or not consultant_skills:
+            return min(base_score, cap)
+        title_skills = _title_embedded_skills(requirement_role)
+        if not title_skills:
+            return base_score
+        matched = set(title_skills) & set(consultant_skills)
+        skill_ratio = len(matched) / len(title_skills)
+        topped_up = base_score + (cap - base_score) * skill_ratio
+        return round(min(topped_up, cap), 2)
+
+    # Cap for the "no real role signal at all" branches — high enough that
+    # a strong title-skill overlap visibly moves a 0 somewhere useful, low
+    # enough that it can never read as a confident role match on its own.
+    NO_ROLE_SIGNAL_CAP = 55.0
+    # Cap for the "genuinely bare/unknown" case specifically (no domain
+    # word stated on the requirement side at all — e.g. plain "Full Stack
+    # Developer" once its "with <skills>" clause is stripped out by
+    # _clear_role_text() above). Not a conflict like NO_ROLE_SIGNAL_CAP's
+    # cases — there's no stated specialization to disagree with, just
+    # none stated at all — so a strong skill backing is allowed a bit
+    # more room to move the neutral 50 baseline, while still staying
+    # below the 70-point PASS tier: title skills alone still can't turn
+    # an unstated role into a confident match, only a stronger maybe.
+    BARE_GENERIC_CAP = 65.0
+
+    req_tokens = _tokenize_role(_clear_role_text(requirement_role))
     req_domain = req_tokens - GENERIC_ROLE_WORDS
     req_generic = req_tokens & GENERIC_ROLE_WORDS
 
@@ -651,15 +732,23 @@ def score_role(
             # the first place. Score directly here instead of merging
             # into the generic ratio-based flow below.
             if req_tokens.issubset(pref_tokens) or _adjacent_role_credit(req_tokens, pref_tokens):
-                return 85.0
-            return 0.0
+                return _title_skill_topup(85.0)
+            # No real role signal for this known phrase — capped topup,
+            # not a flat 0 and not a full match either.
+            return _title_skill_topup(0.0, cap=NO_ROLE_SIGNAL_CAP)
         else:
-            return 50.0
+            # No domain word stated at all (e.g. plain "Full Stack
+            # Developer" once its skill clause is stripped) — genuinely
+            # unknown, not a conflict. Skills can nudge the neutral
+            # baseline up toward a soft maybe, capped below a confident
+            # match.
+            return _title_skill_topup(50.0, cap=BARE_GENERIC_CAP)
 
     domain_overlap = req_domain & pref_tokens
     generic_overlap = req_generic & pref_tokens
 
-    # (c) Real specialization overlap — score normally.
+    # (c) Real specialization overlap — score normally, then let
+    # title-embedded skills top up whatever gap remains.
     if domain_overlap:
         ratio = len(domain_overlap) / len(req_domain)
         generic_ratio = (len(generic_overlap) / len(req_generic)) if req_generic else 0.0
@@ -677,20 +766,30 @@ def score_role(
         # spec test cases, this boost only ever fires for #11 either way).
         if len(domain_overlap) >= 2 and ratio >= 0.8 and score < 80:
             score = min(100.0, score + 15)
-        return round(min(score, 100.0), 2)
+        score = round(min(score, 100.0), 2)
+        return _title_skill_topup(score)
 
     # (d) A stated domain word exists but nothing overlaps at all — a real
-    # specialization mismatch (Python Dev vs Java Dev). Do NOT fall back to
-    # skills here; a stated, different specialization is a real signal.
-    # Exception: a hand-curated adjacent-role match earns 60% partial credit
-    # instead of a hard 0.
+    # specialization mismatch (Python Dev vs Java Dev). Role is mandatory:
+    # a stated, different specialization is a real signal that title
+    # skill-word overlap does NOT get to override. Exception (unchanged):
+    # a hand-curated adjacent-role match earns 60% partial credit instead
+    # of a hard 0 — that's a genuine partial role signal (not a skills
+    # coincidence), so IT can still be topped up by title skills.
     if _adjacent_role_credit(req_tokens, pref_tokens):
         # 60% of the domain component only (no generic-word bonus) — the
         # adjacency substitutes for a direct domain-word match, it isn't a
         # coincidental extra generic-word overlap on top of one.
-        return round(85.0 * 0.6, 2)
+        return _title_skill_topup(round(85.0 * 0.6, 2))
 
-    return 0.0
+    # No domain overlap at all and no adjacency credit — either the
+    # consultant's role text stated no domain word at all (no signal) or
+    # it stated a genuinely different one (a real conflict, e.g.
+    # Salesforce vs AI/React). Either way there's no real role evidence,
+    # so this stays capped low regardless of title-skill overlap — skills
+    # can nudge it up from a flat 0, but role is mandatory: they can never
+    # make this look like a confident match on their own.
+    return _title_skill_topup(0.0, cap=NO_ROLE_SIGNAL_CAP)
 
 
 def _calculate_total_experience_years(experiences: List[ConsultantExperience]) -> float:
