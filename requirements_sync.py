@@ -78,7 +78,15 @@ def _looks_like_html(t: str) -> bool:
     return len(_HTML_TAG_RE.findall(t[:2000])) >= 2
 
 
-async def sync_pending_emails(db: AsyncSession, batch_size: int = 100) -> dict:
+# TUNING (ported from rap_python_cron's identical change — requested:
+# "all pending" processed every cycle, not a capped batch): raised from
+# 100 so a backlog above 100 doesn't get artificially left for a later
+# cycle. This path is currently dead code (see this file's own header —
+# gated behind ENABLE_INAPP_GMAIL_SYNC, which isn't set anywhere in this
+# backend's .env, so the standalone cron worker is the sole owner of
+# this job today) but kept in sync so it doesn't reintroduce the same
+# cap if that ever changes.
+async def sync_pending_emails(db: AsyncSession, batch_size: int = 2000) -> dict:
     """
     Auto-parse every incoming Gmail email into a requirement — does NOT
     wait on the external Node.js classifier to tag category='job_posting'
