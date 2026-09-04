@@ -300,6 +300,67 @@ ROLE_PATTERNS = [
     r'(?i)\brole\s*name\s*[:\-]\s*(.+)',
 ]
 
+# BUG FIX: some JD templates render section headers ("Good to Have",
+# "Work & Interview Requirements", "Key Responsibilities", "Position
+# Overview", etc.) as bold/prominent standalone lines structurally
+# similar to a real "Role:"/"Job Title:" label -- sometimes even as
+# bullet-list items visually indistinguishable from real content once
+# flattened to plain text. The AI extractor has repeatedly been observed
+# picking one of these (or a sentence fragment sitting under one)
+# instead of the real, correctly-labeled title elsewhere in the same
+# email -- confirmed on multiple real emails where first_match(
+# ROLE_PATTERNS, ...) reliably found the correct labeled title, but the
+# AI's own answer was one of these header phrases instead. Reject a role
+# value that's just one of these known generic JD section headers, or
+# that's structurally NOT title-shaped at all (starts with a digit, or
+# with a common sentence-lead word a real job title essentially never
+# starts with, e.g. "2 days onsite every week in Raleigh, NC" or "Work &
+# Interview Requirements"), so the regex fallback chain below gets a
+# chance to find the real title instead.
+_GENERIC_ROLE_SECTION_PATTERN = re.compile(
+    r'(?i)^(?:'
+    r'good to have|nice to have|key responsibilities|roles?\s*(?:and|&)\s*responsibilities|'
+    r'position overview|role overview|about (?:the|this) role|'
+    r'required skills(?:\s*(?:and|&)\s*expertise)?|required qualifications|preferred qualifications|'
+    r'core skills|key skills|must[\s\-]have skills|soft skills|technical skills|'
+    r'work\s*(?:and|&)\s*interview requirements|'
+    r'experience\s*(?:and|&)\s*qualifications|'
+    r'key success metrics|program governance(?:\s*(?:and|&)\s*execution)?|'
+    r'technical leadership(?:\s*(?:and|&)\s*innovation)?|'
+    r'architecture(?:\s*(?:and|&)\s*consulting)?\s*skills|customer[\s\-]facing skills|'
+    r'security assessment(?:\s*(?:and|&)\s*maturity evaluation)?|'
+    r'job description|job summary|position summary|position description|'
+    r'responsibilities|requirements|qualifications|overview|summary'
+    r')\s*$'
+)
+# Words a real job title essentially never starts with -- used as a
+# structural (not phrase-exact) backstop for the pattern above, since new
+# JD templates keep introducing new header phrasing we can't fully
+# enumerate in advance.
+_ROLE_SENTENCE_LEAD_WORDS = {
+    'work', 'must', 'the', 'this', 'our', 'we', 'note', 'please',
+    'candidate', 'candidates', 'good', 'nice', 'day', 'days',
+}
+
+
+def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
+    """True when `role_value` is a known generic JD section-header phrase,
+    or is structurally not title-shaped (see BUG FIX comment above),
+    rather than a real job title."""
+    if not role_value:
+        return False
+    candidate = role_value.strip().rstrip('.').strip()
+    if not candidate:
+        return False
+    if _GENERIC_ROLE_SECTION_PATTERN.match(candidate):
+        return True
+    first_word = candidate.split()[0].lower().strip(',.:;')
+    if first_word.isdigit():
+        return True
+    if first_word in _ROLE_SENTENCE_LEAD_WORDS:
+        return True
+    return False
+
 CLIENT_PATTERNS = [
     r'(?i)\bend\s*client\s*[:\-]\s*(.+)',
     r'(?i)\bclient\s*[:\-]\s*(.+)',
@@ -324,6 +385,23 @@ CLIENT_PATTERNS = [
     # "Implementation Partner is TCS" -- same prose shape/guard as above.
     r'(?i)\bimplementation\s*(?:partner)?\s+is\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
 ]
+
+# BUG FIX: used by the client-echo guards below to distinguish "client
+# value was grounded in an actual explicit label somewhere in the email"
+# from "client value was inferred/guessed with no real client mention at
+# all". Without this distinction, the echo guards below would incorrectly
+# null out perfectly legitimate clients whose name happens to also be a
+# common tech vendor/skill (e.g. a genuine "Client: Oracle" next to
+# "Skills: Oracle, PL/SQL", or "Client: SAP" next to a role like "SAP
+# FICO Consultant") -- the value isn't an echo in that case, it's just a
+# client whose name is also a widely-used technology name. This only
+# needs to detect that SOME client-ish label exists somewhere in the
+# text, not extract its value (CLIENT_PATTERNS already does that).
+_CLIENT_LABEL_PRESENT_RE = re.compile(
+    r'(?i)\b(?:end\s*client|client|customer|implementation\s*(?:partner)?)\s*[:\-]'
+    r'|\bclient\s+is\b'
+    r'|\bimplementation\s*(?:partner)?\s+is\b'
+)
 
 LOCATION_PATTERNS = [
     r'(?i)\bwork\s*locations?\s*[:\-]\s*(.+)',
@@ -711,6 +789,16 @@ NEXT_FIELD_LABELS = [
     # Healthcare/Insurance-domain postings frequently use it right after
     # the title) that was simply missing from this list entirely.
     'domain',
+    # BUG FIX ("Location: RemoteNote: Migrate 600GB of data from Oracle
+    # to Db2..." — the entire freeform note, plus everything after it
+    # including the sender's email address, got swallowed into
+    # location): "Note:" is a common freeform recruiter-template field
+    # that was missing from this list entirely, so nothing ever stopped
+    # a preceding field's capture at it. Registering it here fixes both
+    # halves at once — this list also feeds _GLUED_LABEL_PATTERN, so a
+    # zero-whitespace glue like "RemoteNote:" gets un-glued to
+    # "Remote Note:" too, not just cropped.
+    'note',
 ]
 
 def _label_dash_terminator(label: str) -> str:
@@ -748,6 +836,21 @@ SIGNATURE_PATTERN = re.compile(
     r'\b(?:regards|thanks|thank you|best regards|warm regards|sincerely|'
     r'cheers|best,)\b',
     re.IGNORECASE,
+)
+
+# BUG FIX ("Cloud Policy as Code EngineerThis is 12+ months in Phoenix, AZ
+# (Hybrid)" — title ran straight into the duration/location sentence that
+# followed it, then got mid-sentence-truncated by the 12-word cap instead
+# of stopping at the real title boundary): a very common recruiter
+# template puts the title first, then an UNLABELED sentence like "This is
+# <duration> in <location> (<work mode>)" — no "Duration:"/"Location:"
+# label at all until much later (if ever), so NEXT_FIELD_PATTERN has
+# nothing to crop at. HTML-collapse also frequently glues this sentence
+# directly onto the title with zero whitespace ("EngineerThis is..."), so
+# this intentionally does NOT require a word boundary before "This" --
+# the literal substring match alone is enough to find the seam.
+RUNAWAY_SENTENCE_PATTERN = re.compile(
+    r'(?i)This\s+(?:is|will\s+be)\b|\bThis\s+(?:position|role|opportunity)\b'
 )
 
 
@@ -810,6 +913,9 @@ def crop_at_next_field(value: str) -> str:
     m = SIGNATURE_PATTERN.search(value)
     if m:
         cut = min(cut, m.start())
+    m = RUNAWAY_SENTENCE_PATTERN.search(value)
+    if m:
+        cut = min(cut, m.start())
     # BUG FIX ("Salesforce FSC (Financial Services Cloud)Developer" lost
     # "Developer" entirely — twice fixed, now removed): this rule was
     # meant to catch a zero-whitespace HTML-collapse paragraph break
@@ -841,7 +947,15 @@ def role_from_subject(subject: str) -> Optional[str]:
     # Strip reply/forward prefixes
     s = re.sub(r'(?i)^\s*(re|fw|fwd)\s*:\s*', '', s).strip()
     # If an explicit label is present, use its value
-    m = re.search(r'(?i)\b(?:job\s*title|job\s*role|position|role|opening)\s*[:\-]\s*(.+)', s)
+    # BUG FIX ("Looking For_____Kafka Administrator" parsed as the role
+    # verbatim): recruiter subjects commonly use "Looking for" as the
+    # label, and template fill-in-the-blank subjects glue the label
+    # straight onto the title with a run of underscores instead of a
+    # colon/dash (e.g. a "Looking For: __________" template where the
+    # title got typed directly into the blank, collapsing the space).
+    # Added "looking for" to the label list and widened the separator
+    # to also match one or more underscores.
+    m = re.search(r'(?i)\b(?:job\s*title|job\s*role|position|role|opening|looking\s*for)\s*(?:[:\-]|_+)\s*(.+)', s)
     if m:
         s = m.group(1)
     s = crop_at_next_field(s)
@@ -938,7 +1052,17 @@ def role_from_subject(subject: str) -> Optional[str]:
     # out of sync with each other.
     _MARKETING_PHRASES = (
         r'needed|need|required|urgent(?:ly)?|immediate(?:ly)?|hiring(?:\s+now)?|hot|hire|'
-        r'opportunit(?:y|ies)|apply\s*now|apply|local|'
+        r'opportunit(?:y|ies)|apply\s*now|apply|'
+        # BUG FIX ("Local Preferred: ServiceNow Developer" left "Preferred:"
+        # dangling on the front of the role): "local" alone matched and
+        # stripped, but "preferred" isn't a recognized marketing word on
+        # its own, so this common two-word recruiter qualifier
+        # ("Local Preferred" / "Locals Preferred" / "Local Only Preferred")
+        # never got fully removed. Listed BEFORE the bare "local"
+        # alternative so the longer, more specific phrase wins the match
+        # first — regex alternation takes the first alternative that
+        # matches, not the longest, so order here matters.
+        r'local(?:s)?\s+(?:only\s+)?preferred|local(?:s)?\s+only|local|'
         r'trying\s+to\s+reach(?:\s+(?:out|to\s+you|you))?|reach(?:ing)?\s+out|'
         r'immediate\s+interviews?|interviews?\s+(?:today|now|asap)'
     )
@@ -1031,20 +1155,39 @@ def role_from_bold_lead(norm_text: str) -> Optional[str]:
         r'(?i)^(?:urgent|immediate|hot|new|hiring(?:\s+now)?|apply(?:\s+now)?|'
         r'needed|required|please\s+respond|respond\s+asap|asap)\s*!*$'
     )
-    for m in re.finditer(r'\*{1,2}([^*\n]{2,60}?)\*{1,2}', header_slice):
-        candidate = sanitize_text(m.group(1))
-        if not candidate:
-            continue
-        if ':' in candidate or '-' in candidate:
-            continue
-        if candidate.lower().strip() in boundary_words:
-            continue
-        if _noise_only_re.match(candidate.strip()):
-            continue
-        if is_email_body(candidate) or len(candidate.split()) > 8:
-            continue
-        return candidate
-    return None
+    # BUG FIX (a bolded PHRASE INSIDE A BULLET POINT further down the body
+    # — e.g. "*7+ years*" in a "Required Qualifications" list — mistaken
+    # for the role, while a real PLAIN-TEXT title sitting unlabeled at the
+    # very top of the same email, with no emphasis markup at all, was
+    # never even looked at): this used to loop with re.finditer and, once
+    # the first candidate was rejected (e.g. "*Location:*", correctly
+    # excluded for containing a colon), kept scanning forward through the
+    # ENTIRE 800-char window for ANY other acceptable-looking emphasis
+    # span — however far into the document, including deep inside
+    # unrelated bullet content. A genuine "bold lead" title is by
+    # definition the very first substantive thing in the body (see this
+    # function's own docstring); only ever consider that FIRST emphasis
+    # span, and only when nothing but blank lines/whitespace precedes it.
+    # If that first candidate doesn't pass the exclusion checks below,
+    # there's no bold-lead pattern in this email at all — falling through
+    # to role_from_body_lead (which already handles an unlabeled PLAIN
+    # first-line title correctly) is the right outcome, not searching
+    # deeper for a different bold phrase to misattribute as the role.
+    m = re.search(r'\*{1,2}([^*\n]{2,60}?)\*{1,2}', header_slice)
+    if not m or header_slice[:m.start()].strip():
+        return None
+    candidate = sanitize_text(m.group(1))
+    if not candidate:
+        return None
+    if ':' in candidate or '-' in candidate:
+        return None
+    if candidate.lower().strip() in boundary_words:
+        return None
+    if _noise_only_re.match(candidate.strip()):
+        return None
+    if is_email_body(candidate) or len(candidate.split()) > 8:
+        return None
+    return candidate
 
 
 def role_from_numbered_label(text: str) -> Optional[str]:
@@ -1250,7 +1393,12 @@ def is_job_requirement_email(text: str) -> bool:
 # for one to be filled. "hotlist" itself is an almost unambiguous signal
 # in this domain; the other phrases are checked together for precision.
 _HOTLIST_INDICATORS = re.compile(
-    r'(?i)\bhotlist\b|'
+    # BUG FIX: this required the literal unhyphenated word "hotlist" --
+    # a real broadcast saying "Updated Hot-List of <company> consultants"
+    # (hyphenated, extremely common phrasing) never matched at all, since
+    # \b requires a word/non-word transition and the hyphen breaks the
+    # match. \s? / \-? between "hot" and "list" catches both spellings.
+    r'(?i)\bhot[\s\-]?list\b|'
     r'\bour\s+(?:consultants?|resources?|candidates?)\s+(?:are|is)\b|'
     r'\bconsultants?\s+(?:are\s+)?ready\s+to\s+join\b|'
     r'\bbench\s+(?:consultants?|resources?)\b|'
@@ -1258,6 +1406,20 @@ _HOTLIST_INDICATORS = re.compile(
     r'\bconsultants?\s+coming\s+out\s+of\s+(?:the\s+)?projects?\b|'
     r'\badd\s+[\w.+\-]+@[\w.\-]+\s+to\s+(?:your\s+)?requirements?\b|'
     r'\bsend\s+(?:me\s+)?(?:the\s+)?requirements?\s+(?:to\s+my\s+email|on\s+(?:a\s+)?daily\s+basis)\b|'
+    # BUG FIX: a distinct, very common recruiter-to-recruiter broadcast
+    # shape -- "we are looking C2C role for below candidates, if you
+    # have any [suitable/related] requirements please let me know, please
+    # share the Jd to..." -- named none of the phrases above and had no
+    # literal "hotlist"/"bench" word anywhere in the body at all, so it
+    # slipped straight through as if it were a real job posting, with the
+    # recruiter's own broadcast subject line then mistaken for the role.
+    # None of these phrases occur in a genuine job requirement -- a real
+    # JD IS the requirement, it never asks the reader to "share the JD"
+    # or "send your requirements" in return.
+    r'\bplease\s+share\s+(?:the\s+)?(?:jd|job\s+description)s?\b|'
+    r'\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z]+\s+){0,2}requirements?\b|'
+    r'\bsend\s+(?:me\s+)?your\s+(?:job\s+)?requirements?\b|'
+    r'\bcandidates?\s+available\b|'
     # BUG FIX ("Available Consultants" hotlist table treated as a real
     # requirement, role ending up as just the raw subject line): "Please
     # add my email ID to your distributing list and send daily
@@ -1273,13 +1435,48 @@ _HOTLIST_INDICATORS = re.compile(
     r'\bsend\s+(?:me\s+)?daily\s+requirements?\b'
 )
 
+# BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
+# a real job requirement, role coming out as the raw subject line): the
+# word "hotlist" was RIGHT THERE in the subject, but is_hotlist_email() is
+# deliberately scoped to the body only (see the class-level comment above
+# _HOTLIST_INDICATORS and parse_requirement()'s own bug-fix note) because
+# a genuine job posting's SUBJECT sometimes uses "Hotlist" as a generic
+# batch label while its BODY is still a real JD -- so trusting the
+# subject word alone would wrongly reject real postings. This particular
+# email's body, though, isn't a JD at all -- it's literally the
+# candidate's own resume (a bench-consultant profile broadcast for
+# someone else to place), and resumes have a structural signature no
+# real job requirement shares: named sections like "PROFESSIONAL
+# SUMMARY", "WORK EXPERIENCE", "EDUCATION", "SKILLS & CERTIFICATIONS"
+# appearing together, usually HTML-glued with no space before whatever
+# follows (e.g. "EDUCATIONPace University"), so no TRAILING word
+# boundary is required -- only a LEADING one, to avoid a mid-word false
+# hit like "framework experience" being mistaken for the "WORK
+# EXPERIENCE" section header. Requires 2+ distinct headers to fire,
+# since any single one of these words alone occasionally shows up in a
+# real JD's filler text.
+_RESUME_SECTION_HEADERS = re.compile(
+    r'(?i)(?<!\w)professional\s+summary|(?<!\w)work\s+experience|'
+    r'(?<!\w)skills\s*(?:&|and)\s*certifications|(?<!\w)education'
+)
+
+
+def _looks_like_resume_body(text: str) -> bool:
+    """True when `text` has 2+ distinct resume-style section headers
+    (see _RESUME_SECTION_HEADERS docstring above) -- i.e. this is a
+    candidate's resume/profile, not a job requirement JD."""
+    if not text:
+        return False
+    hits = {m.group(0).lower() for m in _RESUME_SECTION_HEADERS.finditer(text)}
+    return len(hits) >= 2
+
 
 def is_hotlist_email(text: str) -> bool:
     """True for recruiter 'available consultants' broadcasts -- the
     opposite of a job requirement email. See _HOTLIST_INDICATORS above."""
     if not text:
         return False
-    return bool(_HOTLIST_INDICATORS.search(text))
+    return bool(_HOTLIST_INDICATORS.search(text)) or _looks_like_resume_body(text)
 
 
 def safe_extract_value(text: str, max_length: int = 200) -> Optional[str]:
@@ -2715,6 +2912,24 @@ def parse_requirement(
     # signal at all, not something that should out-rank a more specific,
     # already-successful body-only signal.
     role = clean_role(_ai_field('role', unknown_value='UNKNOWN'))
+    # BUG FIX: some recruiter templates reuse the "Role:" label to mean
+    # engagement/employment type ("Role: Contract") instead of job title,
+    # with the real title sitting under a separate "Job Title:"/
+    # "Position:" label elsewhere in the same email. The AI extractor
+    # sometimes takes that literal "Role:" label at face value and
+    # returns the engagement type itself ("Contract", "C2C", "Full
+    # Time", etc.) as if it were the job title. Discard a role value that
+    # reduces to nothing but a known employment-type word/phrase so the
+    # regex fallback chain below (which already prefers "Job Title:"/
+    # "Position:" over a bare "Role:" label via first_match()'s
+    # earliest-match-wins logic) gets a chance to find the real title.
+    _employment_terms = {
+        term for terms in EMPLOYMENT_KEYWORDS.values() for term in terms
+    }
+    if role and role.strip().lower().rstrip('.') in _employment_terms:
+        role = None
+    if role and _looks_like_generic_role_header(role):
+        role = None
     if not role:
         # BUG FIX (ported from rap_python_cron's identical fix):
         # role_from_subject() has no way to tell a real title apart from
@@ -2742,6 +2957,10 @@ def parse_requirement(
             or clean_role(role_from_body_lead(norm_body))
             or clean_role(role_from_subject(safe_subject))
         )
+        if role and role.strip().lower().rstrip('.') in _employment_terms:
+            role = None
+        if role and _looks_like_generic_role_header(role):
+            role = None
     if not role or is_email_body(role):
         role = 'UNKNOWN'
 
@@ -2803,6 +3022,31 @@ def parse_requirement(
                 )
                 if cand and len(cand) <= 40 and not is_email_body(cand) and not is_role_echo:
                     client = cand
+
+    # BUG FIX: reject a client value that's just the role/JD title's own
+    # technology or product name/acronym echoed back (e.g. role "Oracle
+    # E-Business Suite (EBS) Upgrade" producing client "EBS", or role
+    # "Data Engineer with Manufacturing Domain EXP" producing client
+    # "Data Engineer"). The AI/regex fallback latches onto the role text
+    # whenever the email never actually names an end client (common
+    # phrasing: "one of our clients", or no client mention at all).
+    # GATED on _CLIENT_LABEL_PRESENT_RE finding no explicit client label
+    # anywhere in the email at all -- without that gate, this guard would
+    # also wrongly null out a perfectly real "Client: Oracle" sitting
+    # next to a role like "Oracle DBA", since "oracle" is a substring
+    # either way. Only apply the echo check when there's no genuine
+    # client-labeled field to have grounded the value in the first
+    # place -- that's when it's actually just a role echo, not a real
+    # client whose name happens to overlap with the role text.
+    if client and not _CLIENT_LABEL_PRESENT_RE.search(full_text):
+        _client_lower = client.strip().lower()
+        _role_lower = (role or '').strip().lower()
+        if _client_lower and _role_lower and (
+            _client_lower == _role_lower
+            or _client_lower in _role_lower
+            or _role_lower in _client_lower
+        ):
+            client = None
 
     # ── Location ──────────────────────────────────────────────────────────
     # OPTIMIZATION: same reasoning as Client above — a labeled
@@ -2913,6 +3157,29 @@ def parse_requirement(
 
     ai_skills = _ai_field('skills')
     skills = ai_skills if ai_skills else extract_skills(full_text)
+
+    # BUG FIX: reject a client value that's actually one of the extracted
+    # skills/technologies echoed back (e.g. skill "Salesforce" or "Oracle
+    # EBS" coming out as the client too, when the email never names a real
+    # end client). This is the second half of the client-echo guard above
+    # — `skills` isn't known yet at that point, so it's checked here
+    # instead. Same gate as above: only applies when there's no explicit
+    # client label anywhere in the email, so a genuine "Client: Oracle"
+    # next to "Skills: Oracle, PL/SQL" is left alone instead of being
+    # wrongly nulled out.
+    if client and skills and not _CLIENT_LABEL_PRESENT_RE.search(full_text):
+        _client_lower = client.strip().lower()
+        for _skill in skills:
+            if not isinstance(_skill, str):
+                continue
+            _skill_lower = _skill.strip().lower()
+            if not _skill_lower or _skill_lower == 'unknown':
+                continue
+            if (_client_lower == _skill_lower
+                    or _client_lower in _skill_lower
+                    or _skill_lower in _client_lower):
+                client = None
+                break
 
     # ── Vendor info ───────────────────────────────────────────────────────
     vendor_name = None
