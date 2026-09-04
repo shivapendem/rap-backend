@@ -225,7 +225,14 @@ _GENERIC_SUBJECT_ROLE_PATTERN = re.compile(
     r'urgent\s+requirements?|new\s+requirements?|job\s+alerts?|hiring\s+alerts?|'
     r'immediate\s+openings?|urgent\s+openings?|urgent\s+hiring|now\s+hiring|'
     r'we\s+are\s+hiring|open\s+positions?|new\s+positions?|job\s+postings?|'
-    r'new\s+postings?|requirements?|openings?|positions?\s+available)\s*$'
+    # BUG FIX ("role: 'JD'" from "JD || Senior Cloud Full Stack Developer ||
+    # MI ( Locals )"): recruiter subjects commonly lead with a bare "JD"
+    # segment (shorthand for "Job Description") before the real title —
+    # structurally identical to "Immediate Openings || <real title>" above,
+    # just a different filler word. Added as its own alternative since it's
+    # a standalone abbreviation, not a pluralizable noun phrase like the
+    # others in this list.
+    r'new\s+postings?|requirements?|openings?|positions?\s+available|jd)\s*$'
 )
 
 ROLE_PATTERNS = [
@@ -321,7 +328,12 @@ _GENERIC_ROLE_SECTION_PATTERN = re.compile(
     r'(?i)^(?:'
     r'good to have|nice to have|key responsibilities|roles?\s*(?:and|&)\s*responsibilities|'
     r'position overview|role overview|about (?:the|this) role|'
-    r'required skills(?:\s*(?:and|&)\s*expertise)?|required qualifications|preferred qualifications|'
+    # BUG FIX ("role: 'Required Skills & Experience'" from a Snowflake
+    # Cortex Developer JD): only the "& Expertise" wording was recognized --
+    # "& Experience" is at least as common a heading for this exact section
+    # and didn't match at all, so the anchored pattern failed on the whole
+    # line and let the header through as if it were a real title.
+    r'required skills(?:\s*(?:and|&)\s*(?:experience|expertise))?|required qualifications|preferred qualifications|'
     r'core skills|key skills|must[\s\-]have skills|soft skills|technical skills|'
     r'work\s*(?:and|&)\s*interview requirements|'
     r'experience\s*(?:and|&)\s*qualifications|'
@@ -342,17 +354,37 @@ _ROLE_SENTENCE_LEAD_WORDS = {
     'candidate', 'candidates', 'good', 'nice', 'day', 'days',
 }
 
+# BUG FIX ("role: 'Developer'" from a "Role name:      Developer" template
+# line, real title "Oracle EBS technical solutions R12 with emphasis on
+# O2C" sitting in the subject/body instead): some recruiter templates
+# reuse a role label to mean job LEVEL/CATEGORY rather than the actual
+# title -- a bare single generic category noun with no other qualifier is
+# a placeholder, not a specific title, even though it's technically a
+# real job-title word (unlike the section-header phrases above). A
+# genuinely specific title essentially always has at least one qualifier
+# in front ("Senior Developer", "Full Stack Developer") -- the BARE noun
+# alone, and only when it's the entire value, is the signal this is a
+# category placeholder rather than a real answer.
+_GENERIC_BARE_ROLE_WORDS = {
+    'developer', 'engineer', 'architect', 'administrator', 'analyst',
+    'consultant', 'manager', 'lead', 'programmer', 'specialist',
+    'designer', 'tester', 'scientist', 'scrum master',
+}
+
 
 def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
     """True when `role_value` is a known generic JD section-header phrase,
-    or is structurally not title-shaped (see BUG FIX comment above),
-    rather than a real job title."""
+    is just a bare job-category placeholder word, or is structurally not
+    title-shaped (see BUG FIX comments above), rather than a real job
+    title."""
     if not role_value:
         return False
     candidate = role_value.strip().rstrip('.').strip()
     if not candidate:
         return False
     if _GENERIC_ROLE_SECTION_PATTERN.match(candidate):
+        return True
+    if candidate.lower() in _GENERIC_BARE_ROLE_WORDS:
         return True
     first_word = candidate.split()[0].lower().strip(',.:;')
     if first_word.isdigit():
@@ -381,9 +413,21 @@ CLIENT_PATTERNS = [
     # silently defeating the one thing the pattern was designed to check.
     # (?-i:[A-Z]) scopes case-sensitivity back on for just that one
     # character, regardless of the IGNORECASE flag applied around it.
-    r'(?i)\bclient\s+is\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
+    #
+    # BUG FIX ("client: 'Position'" from "...with one of our client\n\n
+    # Position: Senior Java developer with AI\n\nLocation: ..."): neither
+    # of these two prose patterns had any bound on the \s+ gap between the
+    # trigger phrase and the captured value, so a genuinely client-less
+    # sentence followed by a blank line and a totally unrelated later
+    # paragraph (here, a "Position:" field label) read as if that next
+    # capitalized word were the client name named right after the trigger
+    # phrase. A real "Client is Zensar" / "Implementation Partner is TCS"
+    # always continues within the same sentence/paragraph -- add a
+    # negative lookahead rejecting the match outright if a blank line
+    # (paragraph break) sits between the trigger phrase and its value.
+    r'(?i)\bclient\s+is(?!\s*\n\s*\n)\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
     # "Implementation Partner is TCS" -- same prose shape/guard as above.
-    r'(?i)\bimplementation\s*(?:partner)?\s+is\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
+    r'(?i)\bimplementation\s*(?:partner)?\s+is(?!\s*\n\s*\n)\s+((?-i:[A-Z])[a-zA-Z0-9&.\-]*(?:\s+(?-i:[A-Z])[a-zA-Z0-9&.\-]*){0,3})',
 ]
 
 # BUG FIX: used by the client-echo guards below to distinguish "client
@@ -398,7 +442,22 @@ CLIENT_PATTERNS = [
 # needs to detect that SOME client-ish label exists somewhere in the
 # text, not extract its value (CLIENT_PATTERNS already does that).
 _CLIENT_LABEL_PRESENT_RE = re.compile(
-    r'(?i)\b(?:end\s*client|client|customer|implementation\s*(?:partner)?)\s*[:\-]'
+    # BUG FIX ("client: 'Business Architect'" role-echo not caught): the
+    # colon/hyphen branch had no check on what follows the separator, so
+    # an ordinary compound word like "customer-centric" or "client-facing"
+    # (hyphen glued directly onto the next word, no real field-label
+    # intent at all) satisfied it just as well as a genuine "Client: Acme"
+    # label. That false "a label IS present" reading disabled the
+    # role-echo guard this regex gates, letting the role text survive as
+    # the client value with nothing to reject it. A real label's
+    # separator is never immediately followed by a lowercase letter
+    # glued onto another word -- only by whitespace, a capital letter, or
+    # end of text -- so require that here too. (?-i:[a-z]) scopes
+    # case-sensitivity back on for the lookahead specifically -- the
+    # surrounding (?i) would otherwise make [a-z] match uppercase too,
+    # silently defeating the check (same class of bug already fixed once
+    # in CLIENT_PATTERNS below via the identical (?-i:...) technique).
+    r'(?i)\b(?:end\s*client|client|customer|implementation\s*(?:partner)?)\s*[:\-](?!(?-i:[a-z]))'
     r'|\bclient\s+is\b'
     r'|\bimplementation\s*(?:partner)?\s+is\b'
 )
@@ -1011,6 +1070,33 @@ def role_from_subject(subject: str) -> Optional[str]:
                 s = (s[:dash_m.start()].strip() + (' - ' + keep if keep else '')).strip()
         # else: nothing in the tail looks like a real location/work-mode
         # trigger -- leave s unchanged rather than guessing.
+
+    # BUG FIX ("role: 'QA Automation with Telecom Billing Experience for
+    # Alpharetta, GA (Onsite) - f...'" -- ran the full 80-char fallback
+    # truncation below because nothing cropped it): recruiters commonly
+    # introduce the location with a bare "for <City>" preposition instead
+    # of a dash ("...Experience for Alpharetta, GA (Onsite)") -- the
+    # dash-based cropping above has no dash to trigger on at all here, and
+    # "for" wasn't in the location-preposition drop list below either
+    # (only "in|near|@"). Same validated-trigger-only approach as the dash
+    # case above: only crop if what follows "for" actually looks like a
+    # real city/state or a remote/hybrid/onsite keyword, never a blind cut
+    # (a real title can legitimately contain "for", e.g. "Recruiter for
+    # Staffing Agency", so this must never fire on bare "for" alone).
+    for_m = re.search(r'\s+for\s+([A-Z].*)$', s)
+    if for_m:
+        tail = for_m.group(1)
+        mode_m = re.search(r'(?i)\b(remote|hybrid|onsite|on-site|on\s+location)\b', tail)
+        loc_m = _find_city_state_match(tail)
+        candidates = [m.start() for m in (mode_m, loc_m) if m]
+        if candidates:
+            trigger_pos = min(candidates)
+            if trigger_pos == 0:
+                s = s[:for_m.start()].strip()
+            else:
+                keep = tail[:trigger_pos].strip().strip(',').strip()
+                s = (s[:for_m.start()].strip() + (' for ' + keep if keep else '')).strip()
+
     # Drop location prepositions
     s = re.split(r'(?i)\s+(?:in|near|@)\s+', s)[0]
     # Drop rate tokens
@@ -2330,20 +2416,29 @@ _PERSONAL_WEBMAIL_DOMAINS = {
 }
 
 
-def extract_vendor_from_body(body: str) -> Tuple[Optional[str], Optional[str]]:
-    """Best-effort extraction of the REAL sender's name/email from the
-    email body, for use when the header 'From' is a mailing-list /
+def extract_vendor_from_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Best-effort extraction of the REAL sender's name/company/email from
+    the email body, for use when the header 'From' is a mailing-list /
     broadcast-portal relay address, or a personal webmail address with no
-    useful display name. Returns (name, email); either may be None.
+    useful display name. Returns (name, company, email); any may be None.
+
+    BUG FIX ("client: 'person'" root cause investigation surfaced a second,
+    smaller bug): _EMBEDDED_FROM_BLOCK already successfully captures the
+    company name as its own group (see that regex's own docstring example,
+    "Sonam Kumari, / Tanisha Systems"), but this function used to only
+    return group(1) (the person's name) and group(3) (the email), silently
+    throwing away the company every single time this path fired -- every
+    broadcast-relay email of this shape lost its agency name for no reason.
     """
     if not body:
-        return None, None
+        return None, None, None
 
     m = _EMBEDDED_FROM_BLOCK.search(body)
     if m:
         name = m.group(1).strip().strip('"\'')
+        company = m.group(2).strip().strip('"\'')
         email = m.group(3).strip().lower()
-        return (name or None), email
+        return (name or None), (company or None), email
 
     email = None
     email_m = _BODY_EMAIL_LABEL_PATTERN.search(body)
@@ -2351,7 +2446,7 @@ def extract_vendor_from_body(body: str) -> Tuple[Optional[str], Optional[str]]:
         email = email_m.group(1).strip().lower()
 
     name = _extract_signoff_name(body)
-    return name, email
+    return name, None, email
 
 
 def extract_vendor_contact(
@@ -2573,6 +2668,14 @@ def clean_client(client: Optional[str]) -> Optional[str]:
     )
     first_word = client.split()[0].lower().strip('.,:;') if client.split() else ''
     if first_word in _GENERIC_NON_CLIENT_LEAD_WORDS:
+        return None
+    # BUG FIX ("client: 'Rule Engines / Decision Engines'"): a real
+    # company/client name is never phrased as a slash-separated list of
+    # alternatives -- that shape is exactly how recruiter emails phrase
+    # location/schedule OPTIONS instead ("Charlotte, NC / New Jersey
+    # (Hybrid) / US Remote (Preferred)"), and is a strong sign the
+    # extractor grabbed a tool/skill phrase instead of an actual client.
+    if ' / ' in client:
         return None
     # ROLE-SPECIFIC PARSING: real client/company names are short (2-10 words).
     # Same runaway-text problem as role — cap word count before falling
@@ -2948,19 +3051,43 @@ def parse_requirement(
         _subject_role = clean_role(role_from_subject(safe_subject))
         if _subject_role and _GENERIC_SUBJECT_ROLE_PATTERN.match(_subject_role.strip()):
             _subject_role = None
-        role = (
-            clean_role(first_match(ROLE_PATTERNS, norm_body))
-            or clean_role(role_from_bold_lead(norm_body))
-            or clean_role(role_from_numbered_label(norm_body))
-            or clean_role(first_match(ROLE_PATTERNS, full_text))
-            or _subject_role
-            or clean_role(role_from_body_lead(norm_body))
-            or clean_role(role_from_subject(safe_subject))
+
+        # BUG FIX: this used to be a single `or` chain, with the
+        # employment-term/generic-header checks applied only once, to
+        # whichever candidate won the whole chain. That meant a generic
+        # value from an EARLY candidate (e.g. first_match(ROLE_PATTERNS,
+        # norm_body) returning "Developer" from a "Role name:      Developer"
+        # placeholder line) won the `or` immediately and short-circuited
+        # every later candidate -- including a perfectly good, specific
+        # title sitting in the subject or elsewhere in the body. The
+        # rejection then ran on that already-won "Developer" value, found
+        # it generic, and set role = None entirely (-> "UNKNOWN") instead
+        # of falling through to try the next candidate, which is exactly
+        # what every BUG FIX comment on the individual fallbacks above
+        # assumes will happen. Reject and skip forward per-candidate
+        # instead, so a generic/employment-term match anywhere in the
+        # chain correctly defers to the next one rather than winning by
+        # default or blanking the result.
+        def _first_real_role(*candidates):
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                if candidate.strip().lower().rstrip('.') in _employment_terms:
+                    continue
+                if _looks_like_generic_role_header(candidate):
+                    continue
+                return candidate
+            return None
+
+        role = _first_real_role(
+            clean_role(first_match(ROLE_PATTERNS, norm_body)),
+            clean_role(role_from_bold_lead(norm_body)),
+            clean_role(role_from_numbered_label(norm_body)),
+            clean_role(first_match(ROLE_PATTERNS, full_text)),
+            _subject_role,
+            clean_role(role_from_body_lead(norm_body)),
+            clean_role(role_from_subject(safe_subject)),
         )
-        if role and role.strip().lower().rstrip('.') in _employment_terms:
-            role = None
-        if role and _looks_like_generic_role_header(role):
-            role = None
     if not role or is_email_body(role):
         role = 'UNKNOWN'
 
@@ -2987,15 +3114,40 @@ def parse_requirement(
             client = None
         # Infer client from "Role Title – ClientName" dash pattern when no label found
         if not client:
+            # BUG FIX ("client: 'Person'" from "...Interview – In-Person
+            # Client Interviw Requirement –..."): the separator dash here had
+            # no whitespace requirement on the leading side, so it matched
+            # the hyphen glued inside an ordinary compound word ("In-Person")
+            # just as readily as a real "Title – Client" field separator --
+            # capturing "Person" (with the coincidental " Client" text right
+            # after it satisfying the lookahead) as if it were a company
+            # name. Require whitespace immediately before the dash too, same
+            # as the second fallback right below already does, so it can
+            # only fire on an actual separator, not a hyphenated word.
             dash_m = re.search(
                 r'(?i)(?:role|position|opening|title)\s*[:\-]\s*[^\n]+?'
-                r'[\-\u2013]\s*([A-Z][A-Za-z0-9&\s]{2,30}?)(?=\s*(?:Location|Client|Rate|\n|$))',
+                r'[ \t][\-\u2013][ \t]*([A-Z][A-Za-z0-9&\ \t]{2,30}?)(?=[ \t]*(?:Location|Client|Rate|\n|$))',
                 norm_body
             )
             if not dash_m:
+                # BUG FIX ("client: 'UI Automation Tools'" / "client:
+                # 'Playwright and'", both from ordinary bullet-list lines in
+                # a JD's skills section): this fallback's \s+ around the
+                # dash matches ANY whitespace, including newlines -- so it
+                # doesn't actually require the "<text> - <Value>" construct
+                # to sit on one line at all. It was matching the END of one
+                # bullet, the newline into the NEXT bullet, and that
+                # bullet's leading "- Capitalized Words" as if they were one
+                # continuous "Title - Client" phrase (bulleted JDs have this
+                # shape on nearly every line, so it always finds something).
+                # A real inline "Title - Client" convention is always a
+                # single visual line -- restrict every whitespace gap here
+                # to horizontal whitespace only ([ \t], never \n) so the
+                # whole match is forced to stay on one line, same fix
+                # applied to the first fallback above.
                 dash_m = re.search(
-                    r'[A-Za-z ]{4,}\s+[\-\u2013]\s+([A-Z][A-Za-z0-9&\s]{2,30}?)'
-                    r'(?=\s*(?:Location|Client|Rate|\n|$))',
+                    r'[A-Za-z ]{4,}[ \t]+[\-\u2013][ \t]+([A-Z][A-Za-z0-9&\ \t]{2,30}?)'
+                    r'(?=[ \t]*(?:Location|Client|Rate|\n|$))',
                     norm_body
                 )
             if dash_m:
@@ -3227,11 +3379,13 @@ def parse_requirement(
         or from_domain in _PERSONAL_WEBMAIL_DOMAINS
     )
     if header_looks_untrustworthy:
-        body_name, body_email = extract_vendor_from_body(safe_body)
+        body_name, body_company, body_email = extract_vendor_from_body(safe_body)
         if body_email:
             vendor_email = body_email
         if body_name:
             vendor_name = body_name
+        if body_company and body_company.strip().lower() != (body_name or '').strip().lower():
+            vendor_name = f"{vendor_name} ({body_company})" if vendor_name else body_company
 
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email
