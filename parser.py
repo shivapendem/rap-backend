@@ -192,6 +192,15 @@ EMPLOYMENT_KEYWORDS = {
     'CONTRACT': ['contract', 'contractual', 'contract-to-hire']
 }
 
+# Flat set of every employment-type keyword string above, used by
+# _looks_like_bare_job_title() to reject a bare employment-type value
+# ("Contract") sitting alone on its own line from being mistaken for a
+# job title — see that function's own comment for the confirmed
+# real-world case this fixes.
+_EMPLOYMENT_TYPE_BARE_WORDS = {
+    kw for keywords in EMPLOYMENT_KEYWORDS.values() for kw in keywords
+}
+
 WORK_MODE_PATTERNS = {
     'REMOTE': [
         r'\b100%\s*remote\b', r'\bremote\s+opportunity\b', r'\bremote\b',
@@ -200,6 +209,24 @@ WORK_MODE_PATTERNS = {
     'HYBRID': [r'\bhybrid\s+schedule\b', r'\bhybrid\b'],
     'ONSITE': [r'\bon\s*-?\s*site\b', r'\bin\s*-?\s*person\b', r'\bon\s+location\b']
 }
+
+# BUG FIX ("role: 'Openings'" from "Immediate Openings || Automation
+# Engineer with Lifescience and Delta V system Experience || contract ||
+# West Point, PA"): role_from_subject()'s pipe-split blindly took segment
+# [0], assuming the subject convention is always "<Role> || <Location> ||
+# <Duration>" — but "<generic prefix> || <Role> || <Type> || <Location>"
+# is just as common, with segment [0] being pure marketing filler
+# ("Immediate Openings", "Urgent Requirement") rather than any part of
+# the real title. This pattern recognizes that filler so the pipe-split
+# logic below can skip it and try the next segment instead.
+_GENERIC_SUBJECT_ROLE_PATTERN = re.compile(
+    r'(?i)^(?:new|weekly|daily|urgent|immediate|today\'?s?)?\s*'
+    r'(?:job\s+openings?|job\s+opportunit(?:y|ies)|new\s+opportunit(?:y|ies)|'
+    r'urgent\s+requirements?|new\s+requirements?|job\s+alerts?|hiring\s+alerts?|'
+    r'immediate\s+openings?|urgent\s+openings?|urgent\s+hiring|now\s+hiring|'
+    r'we\s+are\s+hiring|open\s+positions?|new\s+positions?|job\s+postings?|'
+    r'new\s+postings?|requirements?|openings?|positions?\s+available)\s*$'
+)
 
 ROLE_PATTERNS = [
     r'(?i)\bjob\s*title\s*[:\-]\s*(.+)',
@@ -729,6 +756,14 @@ NEXT_FIELD_LABELS = [
     'duration', 'primary skills', 'required skills', 'technical skills',
     'key skills', 'skill set', 'skills',
     'experience', 'employment type', 'employment', 'work mode',
+    # BUG FIX ("Role: 'Work Model'" — confirmed on a real requirement
+    # row): "Work Model" is a real, distinct label variant some vendor
+    # templates use as a synonym for "Work Mode" — it wasn't recognized
+    # at all, so a bare "Work Model" label line (value on the next line,
+    # no colon on this one) passed every check in
+    # _looks_like_bare_job_title() and got treated as if it were itself
+    # the job title.
+    'work model', 'work models',
     'work type', 'vendor',
     'recruiter', 'contact', 'phone', 'email', 'responsibilities',
     'qualifications', 'job description', 'role description',
@@ -736,6 +771,17 @@ NEXT_FIELD_LABELS = [
     'benefits', 'visa', 'type',
     'no. of position', 'no. of positions', 'number of position',
     'number of positions',
+    # BUG FIX ("Product Leader Digital Catering SolutionsStart Date:
+    # 09/21/2026# of..." — role ran straight through into the next two
+    # fields, glued with no space at all): confirmed on a real
+    # requirement row. Neither "Start Date" nor the "# of Positions"
+    # shorthand (as opposed to the already-recognized "No. of
+    # Positions"/"Number of Positions" spelled-out forms) was in this
+    # list at all, so crop_at_next_field() had no boundary to stop at,
+    # and the glued-label ungluer had nothing to insert a space before
+    # either — both problems at once, same as any other missing label
+    # here.
+    'start date', '# of position', '# of positions',
     # BUG FIX ("Job Title: Forward Deployed Engineer (FDE) - AI/ML & API
     # Integration Domain: Banking / Financial Services" — role kept
     # running straight through into the Domain field instead of stopping
@@ -929,7 +975,21 @@ def role_from_subject(subject: str) -> Optional[str]:
             break
         s = stripped
     # Split on pipe || or double-slash // bulk separators
-    s = re.split(r'\s*(?:\|\|+|//+)\s*', s)[0]
+    #
+    # BUG FIX ("role: 'Openings'" — see _GENERIC_SUBJECT_ROLE_PATTERN's
+    # comment above): blindly taking segment [0] assumes the subject
+    # convention is always "<Role> || <Location> || <Duration>" — try
+    # each segment in order and use the first one that isn't just
+    # generic filler instead, falling back to segment [0] if literally
+    # every segment looks generic (same as the unconditional behavior
+    # before this fix).
+    _pipe_segments = re.split(r'\s*(?:\|\|+|//+)\s*', s)
+    s = _pipe_segments[0]
+    for _seg in _pipe_segments:
+        _seg_stripped = _seg.strip()
+        if _seg_stripped and not _GENERIC_SUBJECT_ROLE_PATTERN.match(_seg_stripped):
+            s = _seg
+            break
     # Drop a trailing location/work-mode suffix after a bare dash, but cut
     # precisely AT the location trigger (a validated City/State match, or a
     # Remote/Hybrid/Onsite keyword) instead of blindly at the dash itself.
@@ -969,8 +1029,16 @@ def role_from_subject(subject: str) -> Optional[str]:
     # (two or more slashes together) keeps the intended "//Local to X"
     # case working while no longer eating a single-slash title.
     s = re.sub(r'(?i)[/\\]{2,}\s*\w.*$', '', s).strip()
-    # Strip leading "Requirement for / Opening for" prefix
-    s = re.sub(r'(?i)^\s*(?:requirement|req|opening|posting)\s+for\s+', '', s).strip()
+    # Strip leading "Requirement for / Opening for / Need for" prefix
+    #
+    # BUG FIX ("need for QA Lead Local to Naperville IL 45 max" and
+    # "Need Java Developer who working with Capital One" both saved
+    # verbatim as the role — confirmed on real requirement rows): "need"
+    # was missing from both this line and _MARKETING_PHRASES below —
+    # only the past-tense "needed" was covered, not the equally common
+    # base form recruiters actually lead a subject/sentence with
+    # ("Need Java Developer...", "need for QA Lead...").
+    s = re.sub(r'(?i)^\s*(?:requirement|req|opening|posting|need)\s+for\s+', '', s).strip()
     # BUG FIX ("Trying To Reach To You- Material Planning & Logistics
     # Master Data Functional Lead- Immediate Interviews- Applynow!!!"
     # parsed as the role verbatim): broadcast recruiter subjects commonly
@@ -983,7 +1051,7 @@ def role_from_subject(subject: str) -> Optional[str]:
     # Shared vocabulary so the leading and trailing stripers can't drift
     # out of sync with each other.
     _MARKETING_PHRASES = (
-        r'needed|required|urgent(?:ly)?|immediate(?:ly)?|hiring(?:\s+now)?|hot|hire|'
+        r'needed|need|required|urgent(?:ly)?|immediate(?:ly)?|hiring(?:\s+now)?|hot|hire|'
         r'opportunit(?:y|ies)|apply\s*now|apply|'
         # BUG FIX ("Local Preferred: ServiceNow Developer" left "Preferred:"
         # dangling on the front of the role): "local" alone matched and
@@ -1184,14 +1252,66 @@ def role_from_body_lead(norm_text: str) -> Optional[str]:
     if email_matches:
         text = text[email_matches[-1].end():]
     text = text.lstrip()
+    # BUG FIX (ported from rap_python_cron's identical fix — role
+    # captured as "Hi,"/"Hello,"/a bare greeting even when the real role
+    # is stated cleanly further down): the blank-line cut a few lines
+    # below (itself being ported in alongside this fix) exists to handle
+    # a genuine bare-title-then-prose opener ("Java Full Stack Developer
+    # \n\nWe are looking for..."), where "the line before the first
+    # blank line" really is the title. A greeting paragraph has the
+    # exact same shape (one short line, then a blank line) but obviously
+    # isn't a title. Skip past a leading greeting paragraph first so the
+    # blank-line heuristic correctly applies to whatever comes after it
+    # instead of the greeting itself.
+    greet_m = re.match(
+        r'(?i)^\s*(?:hi|hello|hey|greetings|dear|good\s*(?:morning|afternoon|evening))'
+        r'\b[^\n]{0,40}\n\s*\n',
+        text
+    )
+    if greet_m:
+        text = text[greet_m.end():].lstrip()
     cut = len(text)
     m = NEXT_FIELD_PATTERN.search(text)
     if m:
         cut = min(cut, m.start())
+    # BUG FIX (ported from rap_python_cron's identical fix): a bare
+    # unlabeled title line followed by a blank line then ordinary prose
+    # ("Java Full Stack Developer\n\nWe are looking for a skilled
+    # developer...") had no cut point at all before this — NEXT_FIELD_
+    # PATTERN only fires on an actual labeled field further down (if one
+    # exists at all), so the whole candidate included that prose
+    # sentence too, which then failed the is_email_body() check below
+    # and returned None entirely — even though the very first line alone
+    # was a perfectly good, obvious title. A blank line very reliably
+    # marks "the title is just what came before this" in this specific
+    # bare-lead-line context (now that a leading greeting is skipped
+    # past first, per the fix above).
+    blank_m = re.search(r'\n\s*\n', text)
+    if blank_m:
+        cut = min(cut, blank_m.start())
     loc_m = _find_city_state_match(text)
     if loc_m:
         cut = min(cut, loc_m.start())
-    candidate = sanitize_text(text[:cut])
+    candidate_raw = text[:cut]
+    # BUG FIX (ported from rap_python_cron's identical fix): when the
+    # candidate's own text started with a bare label word ALONE ON ITS
+    # OWN LINE (the "Role" in "Role\nJava Developer" from a stacked
+    # table row), sanitize_text() below collapses that newline to a
+    # space, leaving the label word glued onto the front of the actual
+    # value — "Role Java Developer" instead of "Java Developer". Checked
+    # against the ORIGINAL text (own-line, real newline required) rather
+    # than a generic "starts with this word" strip on the already-
+    # flattened candidate — a real title that happens to start with one
+    # of these words as actual title content ("Title Insurance
+    # Analyst") has no newline right after it, so it's correctly left
+    # untouched.
+    lead_m = re.match(
+        r'(?i)^(?:' + '|'.join(re.escape(w) for w in NEXT_FIELD_LABELS) + r')\s*\n',
+        candidate_raw
+    )
+    if lead_m:
+        candidate_raw = candidate_raw[lead_m.end():]
+    candidate = sanitize_text(candidate_raw)
     if not candidate or is_email_body(candidate) or len(candidate) > 80:
         return None
     return candidate
@@ -1299,7 +1419,20 @@ _HOTLIST_INDICATORS = re.compile(
     r'\bplease\s+share\s+(?:the\s+)?(?:jd|job\s+description)s?\b|'
     r'\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z]+\s+){0,2}requirements?\b|'
     r'\bsend\s+(?:me\s+)?your\s+(?:job\s+)?requirements?\b|'
-    r'\bcandidates?\s+available\b'
+    r'\bcandidates?\s+available\b|'
+    # BUG FIX ("Available Consultants" hotlist table treated as a real
+    # requirement, role ending up as just the raw subject line): "Please
+    # add my email ID to your distributing list and send daily
+    # requirements" — a real, common recruiter hotlist-signup ask —
+    # matched neither existing pattern above: the "add ... to" one
+    # requires a literal email address right after "add" (this says "my
+    # email ID" instead), and the "send requirements" one requires
+    # "requirements" before "daily basis" (this says "daily
+    # requirements", the reverse order). Both are just as common as the
+    # phrasing already covered.
+    r'\badd\s+(?:my\s+)?(?:email(?:\s*id)?|address)\s+to\s+(?:your\s+)?'
+    r'(?:distribut(?:ion|ing)|mailing)\s+list\b|'
+    r'\bsend\s+(?:me\s+)?daily\s+requirements?\b'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -2798,13 +2931,31 @@ def parse_requirement(
     if role and _looks_like_generic_role_header(role):
         role = None
     if not role:
+        # BUG FIX (ported from rap_python_cron's identical fix):
+        # role_from_subject() has no way to tell a real title apart from
+        # a generic broadcast phrase in the subject line itself ("New
+        # Job Opening", "Urgent Requirement", "Job Alert", "Job
+        # Opportunity") — it just returns whatever's there, cleaned up.
+        # Since it ran BEFORE role_from_body_lead() in this chain, that
+        # non-empty (but useless) result won over a real, specific title
+        # sitting right there in the body purely by running first —
+        # role_from_body_lead(), the correct fallback for exactly this
+        # case, never got a turn. Reject a subject-derived role that's
+        # just one of these generic phrases and let body_lead try first
+        # instead; only fall back to the generic phrase as an actual
+        # last resort if body_lead ALSO finds nothing (still better than
+        # "UNKNOWN").
+        _subject_role = clean_role(role_from_subject(safe_subject))
+        if _subject_role and _GENERIC_SUBJECT_ROLE_PATTERN.match(_subject_role.strip()):
+            _subject_role = None
         role = (
             clean_role(first_match(ROLE_PATTERNS, norm_body))
             or clean_role(role_from_bold_lead(norm_body))
             or clean_role(role_from_numbered_label(norm_body))
             or clean_role(first_match(ROLE_PATTERNS, full_text))
-            or clean_role(role_from_subject(safe_subject))
+            or _subject_role
             or clean_role(role_from_body_lead(norm_body))
+            or clean_role(role_from_subject(safe_subject))
         )
         if role and role.strip().lower().rstrip('.') in _employment_terms:
             role = None
@@ -3209,7 +3360,49 @@ def _looks_like_bare_job_title(line: str) -> bool:
         return False
     if line.lower() in _SECTION_HEADER_EXCLUSIONS:
         return False
+    # BUG FIX (role captured as "Location"/"Work Model"/"Contract" —
+    # confirmed on real, live requirement rows: two separate senders both
+    # produced role="Location", another produced role="Work Model", and
+    # two different itbtalent.com emails both produced role="Contract"):
+    # a template that puts the field LABEL on its own line with the
+    # value on the line(s) after it, instead of "Label: value" on one
+    # line — e.g.
+    #     Location
+    #     Onsite/Remote
+    # — has no colon on the label's own line at all, so NEXT_FIELD_
+    # PATTERN (which requires a trailing ":"/"-") never matches it, and
+    # the bare word "Location" then passed every other check here (a
+    # single short capitalized word) followed by a location-shaped
+    # value line right after it — exactly the "bare title + location"
+    # shape this function exists to detect. Same failure mode for a
+    # bare employment-type value ("Contract") sitting alone on its own
+    # line, immediately followed by a client/location-shaped line.
+    # Reject both: any line that IS (not just contains) a recognized
+    # field label word, or IS a bare employment-type keyword — reusing
+    # NEXT_FIELD_LABELS and EMPLOYMENT_KEYWORDS so this can't drift out
+    # of sync with what those already recognize.
+    if line.lower() in NEXT_FIELD_LABELS or line.lower() in _EMPLOYMENT_TYPE_BARE_WORDS:
+        return False
     if NEXT_FIELD_PATTERN.search(line):
+        return False
+    # BUG FIX (role captured as "H1B"/"USC"/"H4 EAD" — a "consultant
+    # hotlist" table's STATUS column, not a job title at all): a table
+    # like "SKILL SET | EXP | STATUS | RELOCATION" converts to plain
+    # text as one cell per line, so a status cell ("H1B") sitting alone
+    # on its own line, immediately followed by the RELOCATION cell on
+    # the next line ("Remote" — a genuine location-shaped string),
+    # matched this function's title check (single short capitalized
+    # "word") and the location check right after it — exactly the "bare
+    # title + location" shape this function looks for — so the
+    # segmenter split the table into a fake posting per row, each with
+    # the visa/work-auth code as its "role". Reject a line that's just
+    # visa/work-authorization shorthand up front: reuses the same
+    # _WORK_AUTH_TOKEN_PATTERN vocabulary the work-authorization
+    # extractor itself already relies on elsewhere, so this can't drift
+    # out of sync with what counts as a visa code, and a genuine job
+    # title never looks like this (real titles aren't bare 2-6 char
+    # all-caps/digit codes with nothing else on the line).
+    if len(line) <= 10 and _WORK_AUTH_TOKEN_PATTERN.search(line):
         return False
     words = line.split()
     if not (1 <= len(words) <= 7):
