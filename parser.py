@@ -150,7 +150,7 @@ def parse_requirement_text(subject: str, body: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 FIELD_BOUNDARIES = [
-    'Client', 'Location', 'Duration', 'Rate', 'Skills', 'Experience',
+    'Client', 'Client Name', 'Location', 'Duration', 'Rate', 'Skills', 'Experience',
     'Employment', 'Remote', 'Hybrid', 'Onsite', 'On-site', 'Contract',
     'Need', 'Looking for', 'Position', 'Opening', 'Role', 'Job Title',
     'Job Description', 'Responsibilities', 'Required Skills', 'Preferred Skills',
@@ -245,10 +245,93 @@ _GENERIC_SUBJECT_ROLE_PATTERN = re.compile(
     r'hiring)\s*$'
 )
 
+# BUG FIX ("role: 'Only Dallas/Fort Worth, TX will be considered'" and
+# "role: 'W2/ C2c'" / "role: 'Hiring W2/ C2c'" — both confirmed on real
+# requirement rows): _GENERIC_SUBJECT_ROLE_PATTERN above only recognizes
+# generic MARKETING filler segments ("Immediate Openings", "JD") — it has
+# no concept of an ELIGIBILITY/RESTRICTION segment ("Only local
+# candidates will be considered", "No relocation") or a bare
+# employment-type segment ("W2/ C2c", "C2C only"), both extremely common
+# as the FIRST pipe-separated segment in a multi-segment subject line,
+# ahead of the real title. Recognizes both shapes so the segment-picking
+# loop in role_from_subject() below can skip them and try the next
+# segment instead, the same way it already skips a marketing-filler
+# segment.
+_RESTRICTION_SUBJECT_SEGMENT_PATTERN = re.compile(
+    r'(?i)^(?:'
+    r'(?:hiring|need|urgent(?:ly)?|only)?\s*'
+    r'(?:w2|c2c|corp\s*-?\s*to\s*-?\s*corp|1099|full\s*-?\s*time|fte)'
+    r'(?:\s*(?:[/,]|or|and)\s*(?:w2|c2c|corp\s*-?\s*to\s*-?\s*corp|1099|full\s*-?\s*time|fte))*'
+    r'|'
+    r'only\b.*\bwill\s+(?:not\s+)?be\s+considered\b.*'
+    r'|'
+    r'.*\bwill\s+not\s+be\s+considered\b.*'
+    r'|'
+    r'no\s+relocation.*'
+    r'|'
+    r'local(?:s)?\s+only|only\s+local(?:s)?(?:\s+candidates?)?|need\s+only\s+local.*'
+    r'|'
+    # BUG FIX ("role: 'to Mt. Laurel, NJ only'" from "Local to Mt.
+    # Laurel, NJ only // Data Modeler" — confirmed on a real requirement
+    # row): a "Local to <place> only" eligibility-restriction segment
+    # wasn't covered by the bare "local(s) only" alternative above (that
+    # one only matches "local only"/"only local", not "local TO <a
+    # place> only" with a place name in between).
+    r'local\s+to\s+.*\bonly\b.*'
+    r'|'
+    # BUG FIX ("role: 'Contract Role'" from "Contract Role // Pega
+    # Developer + Certified LSA // ..." — confirmed on a real requirement
+    # row): a bare "<employment-type> Role" segment (no real title, just
+    # announcing the engagement type) commonly sits as its own segment
+    # ahead of the real title in a "//"-or-"|"-separated subject.
+    r'(?:contract|full\s*-?\s*time|part\s*-?\s*time|c2c|w2|1099|direct\s*hire)\s+role'
+    r'|'
+    # BUG FIX ("role: 'Direct'" from "Direct Client ::Software Quality
+    # Assurance Engineer III :::Lake Forest, IL" — confirmed on a real
+    # requirement row): "Direct Client" (announcing the sourcing/vendor
+    # relationship) is exactly the same kind of non-title filler segment
+    # as the employment-type ones above, just a different common phrase.
+    r'direct\s+client'
+    r')\s*$'
+)
+
 ROLE_PATTERNS = [
-    r'(?i)\bjob\s*title\s*[:\-]\s*(.+)',
-    r'(?i)\bjob\s*role\s*[:\-]\s*(.+)',
-    r'(?i)\bposition\s*[:\-]\s*(.+)',
+    # BUG FIX ("role: 'At least 6-8 years of overall IT experience,
+    # including at least 4...'" from a multi-posting email — confirmed on
+    # a real VLink requirement row, and independently corrupting the
+    # multi-posting segmenter too): every label pattern below used a bare
+    # trailing \s* right after the ":"/"-" separator. \s* matches ANY
+    # whitespace including newlines, so when a label sits at the END of
+    # its own line with nothing after it on that line (e.g. "...to be
+    # successful in this role:" followed by a BLANK line then a bullet
+    # list), \s* silently skipped straight across the blank line and
+    # landed on the next bullet's text as if it were the label's value —
+    # capturing a random qualifications bullet as the "role". Restricted
+    # every pattern's trailing separator to same-line whitespace plus AT
+    # MOST one newline ([ \t]*\n?[ \t]*) — this still supports the common
+    # "Label:\n<value on the very next line>" template (single newline,
+    # no gap) but can no longer cross an actual blank line to reach
+    # unrelated content further down. Same fix applied uniformly to every
+    # entry in this list since all of them shared the identical bug.
+    r'(?i)\bjob\s*title\s*[:\-][ \t]*\n?[ \t]*(.+)',
+    # BUG FIX ("role: 'Client Location'" / role missing entirely — from a
+    # two-column recruiter HTML table converted to plain text, e.g. "Job
+    # Title" / "Business Analyst with Capital Markets & IBOR" as separate
+    # table cells): cleaner.py's HTML-to-text conversion joins same-row
+    # table cells with a plain SPACE, not a colon — so a label cell right
+    # next to its value cell produces a line like "Job Title Business
+    # Analyst with Capital Markets & IBOR" with NO colon/dash separator
+    # at all. Every "job title"/"title" pattern above and below requires
+    # an explicit [:\-], so this extremely common table-template shape
+    # never matched any of them and role extraction fell through to a
+    # worse fallback. Anchored to the START of a line (so it can never
+    # fire on an incidental mid-sentence "job title" mention) and
+    # requires the very next thing to be a capitalized word — the same
+    # shape a real title always has, and prose never does right after
+    # this exact two-word phrase with no punctuation at all.
+    r'(?i)(?:^|\n)[ \t]*job\s*title\b[ \t]+(?=[A-Z])(.+)',
+    r'(?i)\bjob\s*role\s*[:\-][ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bposition\s*[:\-][ \t]*\n?[ \t]*(.+)',
     # BUG FIX ("role parsed as an ordinary sentence, e.g. 'if so, we can
     # connect and speak further'"): the dash form used to accept ANY
     # text after "role -", including plain sentence punctuation ("...
@@ -264,9 +347,34 @@ ROLE_PATTERNS = [
     # CLIENT_PATTERNS already uses for this exact class of problem — a
     # real job title ("Java Developer") is capitalized, an ordinary
     # sentence continuation ("if so, we can connect") is not.
-    r'(?i)\brole\s*:\s*(.+)',
-    r'(?i)\brole\s*\-\s*((?-i:[A-Z]).+)',
-    r'(?i)\bopening\s*[:\-]\s*(.+)',
+    r'(?i)\brole\s*:[ \t]*\n?[ \t]*(.+)',
+    # BUG FIX ("*Role*- *Databrick Architect*" — the label-side asterisk
+    # is already handled by _LABEL_ASTERISK_RE in normalize_text(), but
+    # the VALUE can independently be wrapped in its own emphasis too,
+    # e.g. "Role- *Databrick Architect*". The (?-i:[A-Z]) capital-letter
+    # guard existed specifically to reject ordinary sentence continuations
+    # (see this pattern's own BUG FIX above) — but it looked at the
+    # literal first character, and a leading "*" there isn't a capital
+    # letter, so a perfectly good, capitalized real title got rejected
+    # for the wrong reason. Tolerates one optional leading "*" before the
+    # capital-letter check without capturing it, so sanitize_text()'s own
+    # existing trailing/leading-asterisk stripper (see its own comment)
+    # still cleans up the matching close/trailing "*" as before.
+    # BUG FIX ("role: 'Based Access Control'" from an ordinary bullet
+    # "o Role-Based Access Control" describing a security concept, not a
+    # job-title label — confirmed on a real requirement row): \s* before
+    # AND after the dash allows ZERO whitespace on both sides, so any
+    # hyphenated compound word starting with "role" ("Role-Based",
+    # "Role-Driven", ...) matched just as well as a genuine "Role -
+    # <title>" label. A real label always has at least one whitespace
+    # character adjacent to the dash somewhere ("Role - Title", "Role-
+    # Title", "Role -Title"); a hyphenated compound adjective has NONE
+    # on either side. Requires whitespace before the dash OR after it
+    # (not necessarily both), which still matches every real-world label
+    # spacing style seen in this codebase's other BUG FIX examples while
+    # rejecting the zero-space compound-word case.
+    r'(?i)\brole(?:\s+-|-\s)[ \t]*\n?[ \t]*\*?((?-i:[A-Z]).+)',
+    r'(?i)\bopening\s*[:\-][ \t]*\n?[ \t]*(.+)',
     # BUG FIX ("Title – SAP BTP DMS Data Archiving Consultant" parsed as
     # UNKNOWN, or fell through entirely to a poor-quality subject-line
     # guess): a bare "Title:"/"Title –" label — no "Job" prefix — was
@@ -277,14 +385,19 @@ ROLE_PATTERNS = [
     # more common form in practice, and "title" is specific enough a word
     # that it doesn't share "requirement"'s false-positive risk from
     # generic prose.
-    r'(?i)\btitle\s*[:\-]\s*(.+)',
-    # BUG FIX ("QA Engineer requirement - San Jose" subject parsed the
-    # ROLE as "San Jose"): this used to allow a dash too, same as every
-    # other pattern here — but "requirement" is a far more generic word
-    # than "job title"/"position"/"role"/"opening", and "<title>
-    # requirement - <location/client>" is an extremely common subject-line
-    # phrasing where the dash has nothing to do with a "Requirement:"
-    # label at all. first_match() falls back to scanning
+    r'(?i)\btitle\s*[:\-][ \t]*\n?[ \t]*(.+)',
+    # BUG FIX ("role: 'Confirmation that the candidate agrees to the
+    # 3-day/week hybrid schedule at 4'" from an "Onsite Requirement:"
+    # numbered-checklist item deep in the body — confirmed on a real
+    # requirement row): "requirement" is a generic enough word that it
+    # shows up as the tail of all sorts of OTHER labels ("Onsite
+    # Requirement:", "Interview Requirement:", "System Requirement:")
+    # that have nothing to do with announcing the job title — \b before
+    # "requirement" only checks it's not glued to a letter, not that
+    # it's the START of the label. Anchored to the actual start of a
+    # line (only leading horizontal whitespace allowed before it) so it
+    # can only match a genuine standalone "Requirement:" label, never
+    # one of these qualified variants sitting mid-checklist.
     # subject+body combined (full_text) when the body alone has no
     # labeled title, so this pattern matching that incidental subject-
     # line dash won every time — extracting whatever followed the dash
@@ -292,7 +405,7 @@ ROLE_PATTERNS = [
     # Restricting to a colon only keeps the genuine "Requirement:
     # <title>" label case working while no longer firing on ordinary
     # prose that just happens to contain "requirement -".
-    r'(?i)\brequirement\s*:\s*(.+)',
+    r'(?i)(?:^|\n)[ \t]*requirement\s*:[ \t]*\n?[ \t]*(.+)',
     # BUG FIX ("Hiring: Salesforce FSC (Financial Services Cloud)Developer"
     # fell through to a poor/UNKNOWN result — the real title was sitting
     # right there behind an unrecognized label): "Hiring:" is a common
@@ -303,7 +416,7 @@ ROLE_PATTERNS = [
     # allowing a dash here would risk the same false-positive class that
     # fix exists to prevent; a colon is a much stronger, more deliberate
     # label signal.
-    r'(?i)\bhiring\s*:\s*(.+)',
+    r'(?i)\bhiring\s*:[ \t]*\n?[ \t]*(.+)',
     # BUG FIX ("Role Name: Gemini Enterprise SME/Lead" / "Role Name:
     # Guidewire PolicyCenter BSA Lead" fell through entirely, letting a
     # multi-posting email's own "Position -      1." SEQUENCE NUMBER
@@ -314,7 +427,7 @@ ROLE_PATTERNS = [
     # doesn't match \s*). Allowing a dash too, matching "title"/"role"
     # above — "role name" is specific/unambiguous enough that it doesn't
     # share "requirement"/"hiring"'s generic-prose false-positive risk.
-    r'(?i)\brole\s*name\s*[:\-]\s*(.+)',
+    r'(?i)\brole\s*name\s*[:\-][ \t]*\n?[ \t]*(.+)',
 ]
 
 # BUG FIX: some JD templates render section headers ("Good to Have",
@@ -362,6 +475,17 @@ _GENERIC_ROLE_SECTION_PATTERN = re.compile(
 _ROLE_SENTENCE_LEAD_WORDS = {
     'work', 'must', 'the', 'this', 'our', 'we', 'note', 'please',
     'candidate', 'candidates', 'good', 'nice', 'day', 'days',
+    # BUG FIX ("role: 'Hi Sir/Madam'" / "role: 'Hi Bench Team'" / "role:
+    # 'Hi'" — confirmed on real requirement rows): an email's opening
+    # salutation line is sometimes mistaken for the job title when it's
+    # the first bold/lead line in the body. A real job title is never a
+    # greeting.
+    'hi', 'hello', 'hey', 'dear', 'greetings',
+    # BUG FIX ("role: \"don't share me DevOps Profile\"" — confirmed on a
+    # real requirement row, from a standalone bold disclaimer line at the
+    # very top of the body): an instruction/disclaimer sentence, never a
+    # real title.
+    "don't", 'dont',
 }
 
 # BUG FIX ("role: 'Developer'" from a "Role name:      Developer" template
@@ -403,11 +527,70 @@ def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
         return True
     return False
 
+
+# BUG FIX ("role: 'Interview Mode: Video'" / "role: 'Visas: H1B, H4,
+# USC, TN & L2'" — both confirmed on real requirement rows, one from a
+# Steneral ServiceNow email with a stack of bold "Label: Value" lines
+# including a real "Role:" line, the other from a Fiona Solutions email
+# with just three clean labeled lines "Role:"/"Visas:"/"Location:" in
+# that exact order): in both cases the correct, unambiguous "Role:"
+# label was sitting right there in the email and the regex fallback
+# chain finds it correctly on its own -- these two specific failures
+# only reproduce through the AI extraction stage, which sits in front of
+# the regex fallback and can't be directly patched with a regex change.
+# This is a generic defensive backstop instead: whatever produced the
+# role value (AI or regex), reject it if that EXACT text also appears as
+# the value of one of these other, well-known non-role labels elsewhere
+# in the same email -- a real job title is essentially never character-
+# for-character identical to a visa list, an interview mode, a work-auth
+# statement, or a duration/rate, so this can't false-reject a genuine
+# title while still catching exactly this failure class regardless of
+# which stage produced it.
+_NON_ROLE_LABEL_VALUE_PATTERN = re.compile(
+    r'(?i)(?:^|\n)[ \t]*(?:visas?|interview\s*mode|work\s*auth(?:orization)?|'
+    r'duration|contract(?:\s*length)?|pay\s*rate|bill\s*rate|rate|'
+    r'employment\s*type|client\s*location)\s*[:\-][ \t]*([^\n]+)'
+)
+
+
+def _role_echoes_non_role_label(role_value: Optional[str], text: str) -> bool:
+    """True when `role_value` is actually the value of some OTHER labeled
+    field (Visas:, Interview Mode:, Work Authorization:, Duration:, ...)
+    elsewhere in the same email, rather than a real job title -- see the
+    BUG FIX comment on _NON_ROLE_LABEL_VALUE_PATTERN above."""
+    if not role_value or not text:
+        return False
+    role_key = role_value.strip().lower().rstrip('.')
+    if not role_key:
+        return False
+    for m in _NON_ROLE_LABEL_VALUE_PATTERN.finditer(text):
+        candidate = sanitize_text(m.group(1))
+        if candidate and candidate.strip().lower().rstrip('.') == role_key:
+            return True
+    return False
+
 CLIENT_PATTERNS = [
-    r'(?i)\bend\s*client\s*[:\-]\s*(.+)',
-    r'(?i)\bclient\s*[:\-]\s*(.+)',
-    r'(?i)\bcustomer\s*[:\-]\s*(.+)',
-    r'(?i)\bimplementation\s*(?:partner)?\s*[:\-]\s*(.+)',
+    # BUG FIX ("client: ':Software Quality Assurance Engineer III :::Lake
+    # Forest, IL...'" — the label matched on the FIRST colon of a "::"
+    # subject-segment delimiter (e.g. "Direct Client ::Software Quality
+    # Assurance..."), then captured everything from the SECOND colon
+    # onward as if it were the client name — confirmed on a real
+    # requirement row): every pattern below now requires the colon/dash
+    # separator NOT be immediately followed by another colon. A genuine
+    # "Client:" label is never itself followed by a second colon; a "::"
+    # segment delimiter always is.
+    r'(?i)\bend\s*client\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
+    # BUG FIX ("client: None" -- fell through entirely, letting a worse
+    # fallback further down in the extraction chain win instead --
+    # confirmed on a real requirement row, "Client Name: Virtusa/
+    # Confidential"): "Client Name:" is a common template label distinct
+    # from the bare "Client:" pattern below (which requires "client"
+    # immediately followed by the colon -- "Name" sitting in between
+    # doesn't match \s*).
+    r'(?i)\bclient\s*name\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bclient\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bcustomer\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bimplementation\s*(?:partner)?\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
     # "Client is Zensar" -- no colon at all, just prose. Tightly bounded to
     # 1-4 capitalized words (typical company-name shape) so it stops
     # naturally at the client name instead of running into the rest of the
@@ -502,8 +685,28 @@ SKILLS_PATTERNS = [
     # block (name, company, address) as if it were the skills list.
     # [ \t]* only matches same-line whitespace, so the colon/hyphen must
     # actually appear on (or right after) the same line as the label.
-    r'(?i)primary\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)required\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    # BUG FIX ("skills: ['through self-study', 'training', 'exploring new
+    # frameworks', 'tools', 'Contribute innovative ideas', 'user
+    # experience']" from a VBeyond iOS Developer email — confirmed on a
+    # real requirement row): every "<adjective> skills" label pattern in
+    # this list had an OPTIONAL colon/dash ([:\-]?), so it matched ANY
+    # incidental mid-sentence mention of the phrase, not just a real
+    # section header. The email's own "Continuous Learning and
+    # Innovation" bullet said "...improve your technical skills through
+    # self-study, training, and exploring new frameworks and tools." —
+    # nowhere near a real skills list — and this pattern happily matched
+    # right there, well before the actual "Requirements:" section further
+    # down, so THAT sentence fragment won as "the skills section" instead.
+    # Anchored every one of these patterns to the START of a line (same
+    # (?:^|\n) convention already used by STOP_PATTERN elsewhere in this
+    # file) and required the label be followed by an actual colon/dash OR
+    # sit alone at the end of its line (a bare header with the list
+    # starting on the next line) — never free-floating mid-sentence. A
+    # real "Technical Skills:" / "Required Skills" header is always its
+    # own line; ordinary prose mentioning "technical skills" never starts
+    # a line with those exact words.
+    r'(?i)(?:^|\n)[ \t]*primary\s*skills?\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)(?:^|\n)[ \t]*required\s*skills?\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     # BUG FIX ("skills undercounted — only a short 'Mandatory Skills'
     # one-liner used, a much richer 'Skill Requirements' bulleted section
     # further down in the same email completely ignored"): "Skill
@@ -512,9 +715,9 @@ SKILLS_PATTERNS = [
     # skills", "technical skills", "key skills" — all adjective/label
     # THEN "skills"), so it matched none of them and was never even
     # tried as a candidate section.
-    r'(?i)skill\s*requirements?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)technical\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)key\s*skills?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)(?:^|\n)[ \t]*skill\s*requirements?\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)(?:^|\n)[ \t]*technical\s*skills?\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)(?:^|\n)[ \t]*key\s*skills?\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     # BUG FIX: no trailing \b/plural meant this matched only the first 8
     # chars of "skillsets:", leaving a stray unconsumed "s" before the
     # real colon -- since the colon check here is optional, the whole
@@ -523,8 +726,8 @@ SKILLS_PATTERNS = [
     # (Qualifications, Responsibilities, everything) as if it were
     # "skills". sets?\b makes both "skill set:" and "skillsets:" resolve
     # to the real colon correctly.
-    r'(?i)skill\s*sets?\b[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
-    r'(?i)tech(?:nology|nical)?\s*stack[ \t]*[:\-]?\s*\n?\s*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)(?:^|\n)[ \t]*skill\s*sets?\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
+    r'(?i)(?:^|\n)[ \t]*tech(?:nology|nical)?\s*stack\b[ \t]*(?:[:\-]\s*|(?=\n|$))[ \t]*[•\-\*\u2022]?\s*(?!\s*(?:&|and\b))(.+)',
     # Bare "skills:" kept LAST and colon-REQUIRED (not optional) — this one is
     # generic enough that making it colon-optional would risk matching the
     # word "skills" inside unrelated sentences ("strong problem-solving and
@@ -731,6 +934,30 @@ def extract_work_authorization(text: str) -> Optional[str]:
     return None
 
 
+# BUG FIX ("location: 'NEED ONLY LOC, AL'" / "location: 'NEED ONLY
+# LOCAL, OR'" — confirmed on a real SailPoint requirement row):
+# BARE_LOCATION_PATTERN's "city" group matches ANY run of 1-3
+# capitalized-looking words with no vocabulary check at all — so an
+# ordinary recruiter boilerplate phrase like "NEED ONLY LOCAL OR NEARBY
+# STATE CANDIDATES..." false-matched as a city/state pair purely because
+# "OR" (the common English conjunction) is ALSO a valid 2-letter state
+# code (Oregon), with "NEED ONLY LOCAL" swallowed as the "city" in front
+# of it. The existing reject_first_words mechanism only ever checked the
+# FIRST word of the matched city phrase — useless here since the bogus
+# match can start one word later ("ONLY LOCAL" + "OR") just as easily
+# once the first candidate is rejected. This set covers common
+# recruiter/marketing filler words that are never part of a genuine city
+# name; a match is now rejected if ANY word in the captured city phrase
+# is one of these, not just the first.
+_LOCATION_FILLER_WORDS = {
+    'need', 'needed', 'only', 'local', 'locals', 'urgent', 'urgently',
+    'immediate', 'immediately', 'hiring', 'must', 'will', 'not', 'no',
+    'yes', 'and', 'nor', 'candidates', 'candidate', 'apply', 'submit',
+    'send', 'looking', 'seeking', 'required', 'requirement', 'requirements',
+    'nearby', 'state', 'states', 'or', 'note', 'please', 'thanks', 'regards',
+}
+
+
 def _find_city_state_match(text: str, reject_first_words=None):
     """
     Sliding-window search for the first VALIDATED "City, ST" / "City ST"
@@ -750,21 +977,16 @@ def _find_city_state_match(text: str, reject_first_words=None):
         if not m:
             return None
         code = resolve_state_code(m.group(2))
-        first_word = m.group(1).split()[0].lower()
-        # BUG FIX ("AWS Data Engineer, WA" swallowed whole as a fake
-        # City/State pair -- confirmed real case: "Hiring - AWS Data
-        # Engineer, WA" lost its entire title this way): BARE_LOCATION_
-        # PATTERN allows up to 3 capitalized words as the "city", with
-        # no gazetteer to tell a real city apart from the tail end of a
-        # job title that happens to sit directly before a 2-letter state
-        # abbreviation with no actual city in between. A real city name
-        # essentially never ends in a job-title category word -- reuse
-        # _GENERIC_BARE_ROLE_WORDS (already used elsewhere to recognize
-        # exactly these words) as a cheap, effective reject signal here.
-        last_word = m.group(1).split()[-1].lower()
+        city_words = [w.lower() for w in m.group(1).split()]
+        first_word = city_words[0] if city_words else ''
+        # Reject recruiter filler anywhere in the candidate city.
+        has_filler_word = any(w in _LOCATION_FILLER_WORDS for w in city_words)
+        # Also reject a job-title category at the end of a fake city match.
+        last_word = city_words[-1] if city_words else ''
         if (
             code
             and first_word not in reject_first_words
+            and not has_filler_word
             and last_word not in _GENERIC_BARE_ROLE_WORDS
             and not _looks_like_visa_status_context(text, m.start(), m.end())
         ):
@@ -935,6 +1157,30 @@ RUNAWAY_SENTENCE_PATTERN = re.compile(
 )
 
 
+# BUG FIX: see the "*Role*-" comment inside normalize_text() below for
+# the full story. Fixed, known label vocabulary only -- covers every
+# label word ROLE_PATTERNS/SKILLS_PATTERNS/LOCATION_PATTERNS/CLIENT_
+# PATTERNS/etc. already recognize, so a stray glued "*" can no longer
+# hide a real label from any of them. Two alternatives: a LEADING "*"
+# (with an optional trailing one consumed in the same match, e.g. the
+# common "*Label*" case) or a lone TRAILING "*" with no leading one
+# ("Label*"). Word-boundary anchored so it only strips asterisks
+# touching the label word itself, never a same-named word inside other
+# content.
+_ASTERISK_LABEL_WORDS = (
+    r'job\s*title|job\s*role|position|role\s*name|role|title|'
+    r'requirement|hiring|opening|location|client|customer|'
+    r'required\s*skills?|primary\s*skills?|key\s*skills?|technical\s*skills?|'
+    r'skill\s*requirements?|skill\s*sets?|skills?|mandatory\s*skills?|'
+    r'duration|rate|pay\s*rate|bill\s*rate|experience|'
+    r'work\s*model|work\s*mode|employment\s*type|visas?|interview\s*mode|'
+    r'work\s*auth(?:orization)?'
+)
+_LABEL_ASTERISK_RE = re.compile(
+    r'(?i)\*(' + _ASTERISK_LABEL_WORDS + r')\*?|(' + _ASTERISK_LABEL_WORDS + r')\*'
+)
+
+
 def normalize_text(text: str) -> str:
     """Fold fancy punctuation to ASCII and un-glue HTML-collapsed field labels."""
     if not text:
@@ -946,6 +1192,24 @@ def normalize_text(text: str) -> str:
     text = html.unescape(text)
     for bad, good in _PUNCT_MAP.items():
         text = text.replace(bad, good)
+    # BUG FIX ("skills: []" / role fell through to a worse fallback — from
+    # emails formatting field labels as markdown emphasis, e.g. "*Role*-
+    # *Databrick Architect*" or "*Required Skills*" on its own line —
+    # confirmed on real requirement rows via batch analysis against
+    # production data): every label pattern across this file (ROLE_
+    # PATTERNS, SKILLS_PATTERNS, LOCATION_PATTERNS, ...) matches the bare
+    # label word with \b word boundaries, but a literal "*" glued directly
+    # onto the word (no space) sits BETWEEN the label and its separator/
+    # line-boundary, breaking every one of those patterns at once even
+    # though a human reads "*Role*-" as obviously meaning "Role:". Strips
+    # a SINGLE asterisk immediately touching one of these known label
+    # words (on either side) before any label pattern ever runs, so every
+    # extractor benefits without needing its own asterisk-tolerant
+    # variant. Deliberately restricted to a fixed, known label vocabulary
+    # (not "any asterisk-wrapped word") so a genuinely emphasized normal
+    # word elsewhere in the JD (e.g. "*Kinaxis RapidResponse*" naming a
+    # real skill) is left completely untouched.
+    text = _LABEL_ASTERISK_RE.sub(lambda m: m.group(1) or m.group(2), text)
     # Un-glue labels AFTER punct-fold so en-dash variants are already '-'
     text = _GLUED_LABEL_PATTERN.sub(' ', text)
     # BUG FIX ("Endpoint EngineerJob DescriptionWe are looking...", role
@@ -1130,30 +1394,30 @@ def role_from_subject(subject: str) -> Optional[str]:
         if stripped == s:
             break
         s = stripped
-    # Split on pipe || or double-slash // bulk separators
+    # Split on pipe | (single or doubled) or double-slash // bulk separators
     #
-    # BUG FIX ("role: 'Openings'" — see _GENERIC_SUBJECT_ROLE_PATTERN's
+    # BUG FIX ("role: 'Only Dallas/Fort Worth, TX will be considered'"
+    # from "Only Dallas/Fort Worth, TX will be considered | Senior
+    # Network Engineer - Fort Worth, TX" — confirmed on a real
+    # requirement row): this used to require TWO OR MORE pipe characters
+    # (\|\|+) to trigger a split at all — a single "|" (just as common a
+    # separator convention as "||" in real recruiter subjects) never
+    # split the subject into segments in the first place, leaving the
+    # whole restriction-clause-plus-title string glued together as one
+    # candidate. Widened to \|+ (one or more) so a lone "|" splits too.
+    #
+    # BUG FIX ("role: 'Only Dallas/Fort Worth, TX will be considered'" /
+    # "role: 'Hiring W2/ C2c'" — see _RESTRICTION_SUBJECT_SEGMENT_PATTERN's
     # comment above): blindly taking segment [0] assumes the subject
     # convention is always "<Role> || <Location> || <Duration>" — try
     # each segment in order and use the first one that isn't just
     # generic filler instead, falling back to segment [0] if literally
     # every segment looks generic (same as the unconditional behavior
     # before this fix).
-    # BUG FIX: "|" and "//" were the only recognized segment separators
-    # -- an underscore surrounded by spaces, and 2+ consecutive dashes,
-    # are just as common a recruiter subject-line convention and were
-    # left glued into one giant segment.
-    # BUG FIX ("role: 'Sr. DBA Dallas TX 6 Months'" from "Sr. DBA |
-    # Dallas TX | 6 Months"): requiring TWO OR MORE consecutive pipes to
-    # split meant a single "|" -- the overwhelmingly common case --
-    # wasn't recognized as a separator at all; the whole string, pipes
-    # and all, fell through as one segment, and clean_role()'s generic
-    # punctuation-to-space normalization silently turned the surviving
-    # "|" characters into spaces further downstream, jamming three
-    # unrelated fields into one string. "|" is essentially never part of
-    # a real job title, so a single pipe is just as safe a separator as
-    # a double one.
-    _pipe_segments = re.split(r'\s*(?:\|+|//+)\s*|\s+_+\s+|-{2,}', s)
+    # Recognize common recruiter segment separators: pipes, double slashes,
+    # double colons, spaced underscores, and 2+ dashes. A single colon is
+    # deliberately excluded because it is normally a Label: Value separator.
+    _pipe_segments = re.split(r'\s*(?:\|+|//+|::+)\s*|\s+_+\s+|-{2,}', s)
     s = _pipe_segments[0]
     # BUG FIX: the generic-filler check below only recognizes a fixed
     # list of broadcast marketing phrases -- it has no concept of a
@@ -1184,6 +1448,7 @@ def role_from_subject(subject: str) -> Optional[str]:
         if (
             _seg_stripped
             and not _GENERIC_SUBJECT_ROLE_PATTERN.match(_seg_stripped)
+            and not _RESTRICTION_SUBJECT_SEGMENT_PATTERN.match(_seg_stripped)
             and not _bare_workmode_segment.match(_seg_stripped)
             and not _location_only_segment_prefix.match(_seg_stripped)
             and not _is_bare_employment_type_segment(_seg_stripped)
@@ -1316,7 +1581,9 @@ def role_from_subject(subject: str) -> Optional[str]:
         # matches, not the longest, so order here matters.
         r'local(?:s)?\s+(?:only\s+)?preferred|local(?:s)?\s+only|local|'
         r'trying\s+to\s+reach(?:\s+(?:out|to\s+you|you))?|reach(?:ing)?\s+out|'
-        r'immediate\s+interviews?|interviews?\s+(?:today|now|asap)|asap'
+        r'immediate\s+interviews?|interviews?\s+(?:today|now|asap)|asap|'
+        # "Have Interview Slots" is another common urgency/marketing opener.
+        r'have\s+(?:\d+\s+)?interview\s+slots?'
     )
     # Drop marketing keywords only at START — a mid-string match like
     # "Hiring!! Financial Data Analyst" would wipe the whole role with .*$
@@ -2357,6 +2624,36 @@ def _is_cta_or_contact_sentence(token: str) -> bool:
 
 
 def extract_skills(text: str) -> List[str]:
+    """Extract skills from text as a list. Thin wrapper around
+    _extract_skills_labeled() -- see that function for the real logic.
+
+    BUG FIX ("skills: []" for a real requirement row where the body's
+    own HTML-to-text conversion glued an entire bulleted skills list
+    into one unbroken run with NO whitespace at all between items --
+    e.g. "Must Have Skills:AndroidJavaKotlinObjective CProblem
+    SolvingRESTful (Rest-APIs)Testing" -- confirmed via batch analysis
+    against production data): the bare "skills:" label DID match here
+    (correctly), but the captured text has no comma/space/bullet
+    delimiter anywhere for the downstream splitter to break on, so it
+    stayed one giant token that the length cap then rejected outright --
+    an empty result, even though _extract_skills_labeled() found a real,
+    correctly-labeled section. Previously this exact case accidentally
+    produced a NON-empty but garbled result via a different, since-fixed
+    pattern matching a much longer unrelated span first (see "tech
+    stack"'s own BUG FIX comment) and winning on length -- fixing that
+    correctly rejected the bad match, but left nothing to replace it.
+    Falls back to the keyword scanner in this situation too (previously
+    it only ran when NO label matched at all), since it can never make
+    things worse: the keyword scanner works directly off known tech
+    names and doesn't depend on the run-on text having any delimiters.
+    """
+    labeled = _extract_skills_labeled(text)
+    if labeled:
+        return labeled
+    return extract_skills_from_keywords((text or '')[:6000])
+
+
+def _extract_skills_labeled(text: str) -> List[str]:
     """Extract skills from text as a list."""
     if not text:
         return []
@@ -2580,14 +2877,12 @@ def _extract_skill_tokens(sentence: str) -> List[str]:
     tokens = _split_respecting_parens(core, r',\s*|\s+and\s+')
     results = []
     for tok in tokens:
-        # BUG FIX ("skill: 'NET Development'"/"'NET 6/7/8'" instead of
-        # ".NET Development"/".NET 6/7/8"): str.strip('.') strips periods
-        # from BOTH ends, so a token that legitimately STARTS with a
-        # literal period -- ".NET" is a real, extremely common
-        # technology name, not sentence punctuation -- silently lost
-        # that leading "." here. Only the trailing sentence-ending
-        # period was ever intended to be stripped.
+        # Strip only sentence punctuation from the right; preserve leading
+        # periods because ".NET" is a legitimate technology name.
         tok = tok.strip().rstrip('.')
+        # Remove bullet/emphasis markup that can survive fallback splitting.
+        tok = re.sub(r'^[\-\u2013]\s*', '', tok).strip()
+        tok = tok.strip('*').strip()
         # Strip stray leading conjunction/hedge words a comma-split can leave
         # behind, e.g. ", and REST APIs" -> "and REST APIs" -> "REST APIs".
         tok = re.sub(r'(?i)^(?:and|preferably|or)\s+', '', tok).strip()
@@ -2845,6 +3140,28 @@ def _cap_real_words(text: str, max_words: int) -> str:
     return ' '.join(kept)
 
 
+# BUG FIX ("role: 'Data Solution Platform Architect'" — dropped a real,
+# meaningful "(Snowflake)" technology qualifier from the end of a title,
+# confirmed via full-dataset batch analysis against real production
+# data): clean_role()'s trailing-parenthetical stripper below exists to
+# drop administrative noise like "(Onsite Role)" or "(USC & H4 Only)",
+# but it was unconditional -- any "(...)" sitting at the very end of a
+# role got removed, including a genuine, meaningful qualifier like
+# "(Snowflake)" that recruiters commonly tack onto a title to name the
+# specific platform/technology. Checked against the same TECH_KEYWORDS
+# vocabulary the skills extractor already uses elsewhere in this file --
+# if the parenthetical's content contains a recognized technology/
+# product name, it's kept; otherwise it's still stripped exactly as
+# before.
+def _parenthetical_is_meaningful(content: str) -> bool:
+    if not content or not content.strip():
+        return False
+    for _kw, _pattern in _TECH_KEYWORD_PATTERNS:
+        if _pattern.search(content):
+            return True
+    return False
+
+
 def clean_role(role: Optional[str]) -> Optional[str]:
     """
     Clean role title.
@@ -2865,11 +3182,15 @@ def clean_role(role: Optional[str]) -> Optional[str]:
         return None
     role = crop_at_next_field(role)
     # Drop trailing parenthetical asides: "(Onsite Role)", "(USC & H4 Only)"
+    # — but see _parenthetical_is_meaningful()'s comment above: a
+    # technology/product name in the parenthetical is kept, not stripped.
     for _ in range(3):
-        stripped = re.sub(r'\s*\([^)]*\)\s*$', '', role).strip()
-        if stripped == role:
+        _m = re.search(r'\s*\(([^)]*)\)\s*$', role)
+        if not _m:
             break
-        role = stripped
+        if _parenthetical_is_meaningful(_m.group(1)):
+            break
+        role = role[:_m.start()].strip()
     # Drop leading marketing words: "Hiring!!", "Urgent -", "!!"
     role = re.sub(
         r'(?i)^\s*(?:hiring(?:\s*now)?|urgent|immediate|hot|new|open(?:ing)?|apply)'
@@ -2978,6 +3299,26 @@ _LOCATION_PREFERENCE_PATTERN = re.compile(
     r'in\s+or\s+near|candidates?\s+(?:in|near|located|based))\b'
 )
 
+# BUG FIX ("location: 'SAP'" from a SailPoint Developer email whose body
+# happened to list "...Active Directory, LDAP, JDBC, Delimited File, Web
+# Services, SAP, Oracle, and cloud applications..." as connector/
+# integration technologies — confirmed on a real requirement row): a bare
+# 2-6 letter all-caps enterprise-software/tech acronym is never itself a
+# real location value, but nothing validated that a non-AI OR AI-sourced
+# "location" was actually location-shaped before accepting it. A short
+# curated list of the acronyms most likely to appear near a location
+# field in a JD (identity/access-management and generic enterprise
+# jargon) — deliberately NOT the full TECH_KEYWORDS list, since that
+# includes multi-word/longer names ("React.js", "PostgreSQL") that could
+# never be mistaken for a location anyway and this only needs to catch
+# the short bare-acronym case.
+_LOCATION_NON_LOCATION_ACRONYMS = {
+    'sap', 'ldap', 'jdbc', 'rbac', 'sod', 'iiq', 'isc', 'mfa', 'sso',
+    'vpn', 'api', 'apis', 'crm', 'erp', 'etl', 'bi', 'rest', 'soap',
+    'json', 'xml', 'sql', 'saml', 'oauth', 'ad', 'hris', 'jd', 'atf',
+    'ci', 'cd', 'cicd',
+}
+
 
 def clean_location(location: Optional[str]) -> Optional[str]:
     """
@@ -2992,6 +3333,28 @@ def clean_location(location: Optional[str]) -> Optional[str]:
         return None
     location = sanitize_text(normalize_text(location))
     if not location:
+        return None
+    # BUG FIX ("location: 'SAP'" — see _LOCATION_NON_LOCATION_ACRONYMS'
+    # comment above): reject outright when the ENTIRE value is just one
+    # of these bare tech acronyms, regardless of which extractor (AI or
+    # regex) produced it — a real location is never a single bare
+    # 2-6 letter enterprise-software acronym. Returning None here lets
+    # the caller's existing "if not location: <try next fallback>" logic
+    # move on to a better candidate instead of keeping this one.
+    if location.strip().lower() in _LOCATION_NON_LOCATION_ACRONYMS:
+        return None
+    # BUG FIX ("location: 'design'" from an Adobe Architect email — the
+    # real location, "NYC, NY Hybrid 3 days", sat in a clean stacked-bold
+    # block near the top, but the AI extractor instead picked up a
+    # lowercase word from deep in an unrelated bulleted responsibility,
+    # "Design end-to-end experience architecture...", confirmed on a real
+    # requirement row): a genuine location value — a city name, a state,
+    # or a Remote/Hybrid/Onsite keyword — is always capitalized in normal
+    # recruiter-template usage. A value that starts with a lowercase
+    # letter is essentially always a stray word plucked out of running
+    # prose, not a real location. Same reject-and-let-the-caller-retry
+    # approach as the acronym check above.
+    if location[0].islower():
         return None
     # Same HTML-tag safety net as clean_role() — see _ANY_TAG_RE's comment.
     location = sanitize_text(_ANY_TAG_RE.sub(' ', location))
@@ -3328,6 +3691,11 @@ def parse_requirement(
         role = None
     if role and _looks_like_generic_role_header(role):
         role = None
+    # BUG FIX (see _role_echoes_non_role_label's comment above): catches
+    # the AI extractor grabbing a DIFFERENT field's labeled value
+    # (Visas:, Interview Mode:, ...) instead of the real "Role:" label.
+    if role and _role_echoes_non_role_label(role, full_text):
+        role = None
     if not role:
         # BUG FIX (ported from rap_python_cron's identical fix):
         # role_from_subject() has no way to tell a real title apart from
@@ -3370,6 +3738,8 @@ def parse_requirement(
                 if candidate.strip().lower().rstrip('.') in _employment_terms:
                     continue
                 if _looks_like_generic_role_header(candidate):
+                    continue
+                if _role_echoes_non_role_label(candidate, full_text):
                     continue
                 return candidate
             return None
@@ -3537,6 +3907,26 @@ def parse_requirement(
             location = find_city_state(norm_body, reject_first_words=_SIGNOFF_WORDS)
         if not location:
             location = find_city_state(normalize_text(safe_subject), reject_first_words=_SIGNOFF_WORDS)
+        # BUG FIX ("location: None" for ~150 real requirement rows out of a
+        # ~3,650-row sample — confirmed via batch analysis against real
+        # production data): a very common posting shape states ONLY a bare
+        # work-mode word ("...Remote", "!!Remote----Offshore", "(Onsite)")
+        # with no "Location:" label at all and no city/state anywhere in
+        # the email — e.g. "Need - Oracle EBS Technical Architect   Remote"
+        # or "UiPath & Selenium Automation Developer (Onsite)". Every tier
+        # above requires either a labeled field or a validated city/state
+        # pair, so this extremely common case fell all the way through to
+        # None even though the posting is completely unambiguous about
+        # being Remote/Hybrid/Onsite. Reuses the same earliest-match work-
+        # mode detector the dedicated work_mode field already relies on
+        # (see extract_work_mode() below) as a last-resort location value
+        # — a bare "Remote"/"Hybrid"/"Onsite" is itself a perfectly valid,
+        # commonly-used location value (clean_location() already handles
+        # it correctly when it comes from an explicit label).
+        if not location:
+            _bare_work_mode = extract_work_mode(full_text)
+            if _bare_work_mode != 'UNKNOWN':
+                location = _bare_work_mode.capitalize()
 
     # ── Rate ──────────────────────────────────────────────────────────────
     rate = clean_rate(_ai_field('rate'))
