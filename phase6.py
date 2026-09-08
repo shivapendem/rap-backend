@@ -496,7 +496,7 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     TEMPLATE_CONFIG = {
         "classic":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",     "certifications": "list"},
         "compact":    {"header": "default", "objective": "plain",    "skills": "table", "experience": "standard",   "education": "list",     "certifications": "list"},
-        "modern":     {"header": "default", "objective": "plain",    "skills": "table", "experience": "accent-box", "education": "table",    "certifications": "pills"},
+        "modern":     {"header": "default", "objective": "plain",    "skills": "table", "experience": "accent-box", "education": "list",    "certifications": "pills"},
         "executive":  {"header": "default", "objective": "centered", "skills": "table", "experience": "standard",   "education": "centered", "certifications": "centered"},
         "timeline":   {"header": "default", "objective": "plain",    "skills": "zebra", "experience": "timeline",   "education": "list",     "certifications": "list"},
     }

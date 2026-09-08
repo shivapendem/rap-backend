@@ -176,6 +176,15 @@ SKILL_CATEGORIES: list[tuple[str, list[str]]] = [
 ]
 
 
+def _skill_name(s):
+    """Skills are stored as plain strings in older profiles, but as
+    {"name", "isPrimary"} dicts in newer ones. Accept either so nothing
+    in this file crashes on whichever format a consultant data uses."""
+    if isinstance(s, dict):
+        return s.get("name", "")
+    return s if isinstance(s, str) else str(s or "")
+
+
 def categorize_skills_with_tier(primary: list[str], secondary: list[str]) -> list[dict]:
     """Same category-by-technology-type grouping as categorize_skills(),
     built from a consultant's primary (expert) and secondary
@@ -208,11 +217,11 @@ def categorize_skills_with_tier(primary: list[str], secondary: list[str]) -> lis
     unrelated tailored-resume/gap-analysis callers keep working exactly
     as before.
     """
-    primary_clean = [s.strip() for s in (primary or []) if s and s.strip()]
+    primary_clean = [_skill_name(s).strip() for s in (primary or []) if _skill_name(s).strip()]
     primary_lower = {s.lower() for s in primary_clean}
     secondary_clean = [
-        s.strip() for s in (secondary or [])
-        if s and s.strip() and s.strip().lower() not in primary_lower
+        _skill_name(s).strip() for s in (secondary or [])
+        if _skill_name(s).strip() and _skill_name(s).strip().lower() not in primary_lower
     ]
     categorized = categorize_skills(primary_clean + secondary_clean)
     return [
@@ -1171,7 +1180,7 @@ def generate_tailored_resume(
         for cat in real_tech_proficiencies:
             cat_skills = cat.get("skills")
             cat_list = cat_skills if isinstance(cat_skills, list) else str(cat_skills or "").split(",")
-            already_listed.update(s.strip().lower() for s in cat_list if s and s.strip())
+            already_listed.update(_skill_name(s).strip().lower() for s in cat_list if _skill_name(s).strip())
 
         jd_exact, jd_related = _match_skills_against_jd(real_skills, job_description)
         candidate_pool = list(dict.fromkeys([*real_skills, *all_tech_skills, *jd_exact, *jd_related]))
