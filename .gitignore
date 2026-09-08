@@ -9,3 +9,4 @@ test.db
 myenv/
 
 .env
+service-account-key.json
