@@ -185,7 +185,12 @@ STOP_PATTERNS = [
 STOP_PATTERN = re.compile('|'.join(STOP_PATTERNS), re.IGNORECASE)
 
 EMPLOYMENT_KEYWORDS = {
-    'C2C': ['c2c', 'corp to corp', 'corp-to-corp', 'corp2corp'],
+    # BUG FIX: "(C-C) : (3) AI Engineer/Banking..." / "Contract Status :
+    # C-C preferred or W2+ Referral" -- "C-C" (bare single-letter-dash-
+    # single-letter) is a common recruiter shorthand for Corp-to-Corp,
+    # distinct from "C2C"/"corp-to-corp"/"corp2corp" already covered
+    # below, and was missing entirely.
+    'C2C': ['c2c', 'corp to corp', 'corp-to-corp', 'corp2corp', 'c-c'],
     'W2': ['w2'],
     '1099': ['1099'],
     'FULLTIME': ['full time', 'full-time', 'fulltime', 'permanent', 'fte'],
@@ -232,7 +237,12 @@ _GENERIC_SUBJECT_ROLE_PATTERN = re.compile(
     # just a different filler word. Added as its own alternative since it's
     # a standalone abbreviation, not a pluralizable noun phrase like the
     # others in this list.
-    r'new\s+postings?|requirements?|openings?|positions?\s+available|jd)\s*$'
+    r'new\s+postings?|requirements?|openings?|positions?\s+available|jd|'
+    # BUG FIX ("role: None" from "Hiring || Cloud Architect ||
+    # Holtsville, NY"): "now hiring"/"we are hiring"/"urgent hiring" were
+    # already covered above, but a bare "Hiring" alone as its own
+    # leading segment wasn't.
+    r'hiring)\s*$'
 )
 
 ROLE_PATTERNS = [
@@ -741,9 +751,21 @@ def _find_city_state_match(text: str, reject_first_words=None):
             return None
         code = resolve_state_code(m.group(2))
         first_word = m.group(1).split()[0].lower()
+        # BUG FIX ("AWS Data Engineer, WA" swallowed whole as a fake
+        # City/State pair -- confirmed real case: "Hiring - AWS Data
+        # Engineer, WA" lost its entire title this way): BARE_LOCATION_
+        # PATTERN allows up to 3 capitalized words as the "city", with
+        # no gazetteer to tell a real city apart from the tail end of a
+        # job title that happens to sit directly before a 2-letter state
+        # abbreviation with no actual city in between. A real city name
+        # essentially never ends in a job-title category word -- reuse
+        # _GENERIC_BARE_ROLE_WORDS (already used elsewhere to recognize
+        # exactly these words) as a cheap, effective reject signal here.
+        last_word = m.group(1).split()[-1].lower()
         if (
             code
             and first_word not in reject_first_words
+            and last_word not in _GENERIC_BARE_ROLE_WORDS
             and not _looks_like_visa_status_context(text, m.start(), m.end())
         ):
             return m
@@ -926,6 +948,37 @@ def normalize_text(text: str) -> str:
         text = text.replace(bad, good)
     # Un-glue labels AFTER punct-fold so en-dash variants are already '-'
     text = _GLUED_LABEL_PATTERN.sub(' ', text)
+    # BUG FIX ("Endpoint EngineerJob DescriptionWe are looking...", role
+    # still came out UNKNOWN even after un-gluing with a plain space):
+    # _GLUED_LABEL_PATTERN above only un-glues a label followed by a
+    # colon/dash field-boundary marker -- here there's no punctuation at
+    # all on either side, title, label, and body just run straight
+    # together (a common ATS-template HTML-collapse artifact). A single
+    # inserted space fixed readability but left title+label+JD-body all
+    # on one giant run-on line with no blank-line boundary anywhere near
+    # the front -- exactly the boundary role_from_body_lead()'s "bare
+    # title line, then blank line, then prose" heuristic depends on to
+    # know where the title ends. "Job/Role/Position Description" is
+    # specific and common enough as a fixed template phrase, and
+    # functionally IS always a section break (never real title content),
+    # to safely insert a full blank-line break around it on sight.
+    text = re.sub(
+        r'(?<=[a-zA-Z])((?:Job|Role|Position)\s+Descriptions?)(?=[A-Za-z])',
+        r'\n\n\1\n\n', text
+    )
+    # BUG FIX (same email, same root cause, different symptom -- "skills"
+    # and "experience" indicators never fired for is_job_requirement_email
+    # either): this ATS template glues EVERY bullet item directly onto the
+    # next with zero separator throughout the whole JD ("Must-Have
+    # SkillsStrong Endpoint...", "5+ years experienceHands-on Kandji...").
+    # A GENERAL "insert a space before any uppercase letter" rule would be
+    # far too broad -- it would just as eagerly shred legitimate compound
+    # tech terms this exact JD also contains verbatim ("macOS",
+    # "PowerShell") into "mac OS"/"Power Shell". Scoped to only the two
+    # specific, unambiguous section-header words this template glues this
+    # way; neither is ever legitimately part of a compound tech term when
+    # immediately followed by an uppercase letter with no separator.
+    text = re.sub(r'\b(Skills|Experience)(?=[A-Z])', r'\1\n\n', text)
     text = _unglue_leading_city_state(text)
     text = _GLUED_WORKMODE_PATTERN.sub(' ', text)
     return text
@@ -1005,6 +1058,50 @@ def role_from_subject(subject: str) -> Optional[str]:
     s = normalize_text(subject)
     # Strip reply/forward prefixes
     s = re.sub(r'(?i)^\s*(re|fw|fwd)\s*:\s*', '', s).strip()
+    # BUG FIX ("ON HOLD!!!****: (C-C) : (3) AI Engineer/Banking - Peoples
+    # Bank..." parsed with the status banner glued onto the front of the
+    # role): recruiters commonly prefix a status-update banner (ON HOLD,
+    # FILLED, CLOSED, CANCELLED, REOPENED, UPDATED) ahead of the original
+    # "NEW REQ:"-style subject, often wrapped in asterisks/bangs. Nothing
+    # else strips this, so it survived straight into the final role.
+    s = re.sub(
+        r'(?i)^\s*[\*\s]*(?:on\s*hold|put\s*on\s*hold|filled|closed|'
+        r'cancell?ed|reopened|re-?opened|updated?|withdrawn|expired)'
+        # BUG FIX ("role: 'Please Disregard - Java Developer'" from
+        # "FILLED - Please Disregard - Java Developer - Dallas TX"):
+        # this only ever consumed a trailing COLON after the status
+        # word, not a dash -- an extremely common separator here too.
+        r'\s*[\*!]*\s*[:\-]?\s*',
+        '', s
+    ).strip()
+    # BUG FIX (same subject): "Please Disregard" directly follows the
+    # status banner in this common recruiter convention and is just as
+    # much noise as the banner itself.
+    s = re.sub(r'(?i)^\s*please\s+disregard\s*[:\-]?\s*', '', s).strip()
+    # BUG FIX ("role: 'New'" from "New Requirement: Senior Java
+    # Developer"): crop_at_next_field() (called below) treats
+    # "Requirement:" as if it were a real field label -- indistinguishable
+    # from "Location:"/"Client:" etc. by that shared, generic mechanism --
+    # and truncates everything after it, so by the time the marketing-
+    # phrase stripper further down gets a turn, the real title is already
+    # gone. Strip this specific broadcast-banner phrase early instead,
+    # same as the status-banner strip above.
+    s = re.sub(r'(?i)^\s*(?:urgent|new|immediate)\s+requirements?\s*[:\-]?\s*', '', s).strip()
+    # BUG FIX (same subject, next segment: "(C-C) : (3) AI Engineer/..."
+    # left dangling as "C-C) : (3) AI Engineer..." once the status banner
+    # above was stripped): subjects also commonly lead with a bracketed
+    # engagement-type ("(C2C)", "(C-C)", "(W2)") and/or headcount ("(3)")
+    # annotation ahead of the real title. clean_role's/this function's own
+    # trailing-parenthetical stripper only ever handles the END of the
+    # string, so these leading ones were never removed.
+    for _ in range(3):
+        stripped = re.sub(
+            r'(?i)^\s*\((?:c-?c|c2c|w-?2|1099|corp\s*-?\s*to\s*-?\s*corp|\d+)\)\s*:?\s*',
+            '', s
+        )
+        if stripped == s:
+            break
+        s = stripped
     # If an explicit label is present, use its value
     # BUG FIX ("Looking For_____Kafka Administrator" parsed as the role
     # verbatim): recruiter subjects commonly use "Looking for" as the
@@ -1042,13 +1139,81 @@ def role_from_subject(subject: str) -> Optional[str]:
     # generic filler instead, falling back to segment [0] if literally
     # every segment looks generic (same as the unconditional behavior
     # before this fix).
-    _pipe_segments = re.split(r'\s*(?:\|\|+|//+)\s*', s)
+    # BUG FIX: "|" and "//" were the only recognized segment separators
+    # -- an underscore surrounded by spaces, and 2+ consecutive dashes,
+    # are just as common a recruiter subject-line convention and were
+    # left glued into one giant segment.
+    # BUG FIX ("role: 'Sr. DBA Dallas TX 6 Months'" from "Sr. DBA |
+    # Dallas TX | 6 Months"): requiring TWO OR MORE consecutive pipes to
+    # split meant a single "|" -- the overwhelmingly common case --
+    # wasn't recognized as a separator at all; the whole string, pipes
+    # and all, fell through as one segment, and clean_role()'s generic
+    # punctuation-to-space normalization silently turned the surviving
+    # "|" characters into spaces further downstream, jamming three
+    # unrelated fields into one string. "|" is essentially never part of
+    # a real job title, so a single pipe is just as safe a separator as
+    # a double one.
+    _pipe_segments = re.split(r'\s*(?:\|+|//+)\s*|\s+_+\s+|-{2,}', s)
     s = _pipe_segments[0]
+    # BUG FIX: the generic-filler check below only recognizes a fixed
+    # list of broadcast marketing phrases -- it has no concept of a
+    # segment that's just a bare work-mode word, a location qualifier
+    # like "Only LOCAL to X", or a segment that's nothing but a bare
+    # validated City/State with no title content at all.
+    _bare_workmode_segment = re.compile(r'(?i)^(?:100%\s*)?(?:remote|hybrid|on-?site)(?:\s*only)?$')
+    _location_only_segment_prefix = re.compile(r'(?i)^only\s+local(?:s)?(?:\s+to)?\b|^local(?:s)?\s+only(?:\s+to)?\b')
+
+    def _is_bare_employment_type_segment(seg_stripped):
+        # BUG FIX ("role: 'C2C'" from "C2C || Senior Azure Infrastructure
+        # Automation Engineer || Newark, NJ"): a bare employment-type
+        # word/phrase as its own leading segment is just as common a
+        # convention as the work-mode/location-only cases already
+        # handled -- reuses the same word list extract_employment_types()
+        # itself is built on.
+        return seg_stripped.strip().lower().rstrip('.') in _EMPLOYMENT_TYPE_BARE_WORDS
+
+    def _is_bare_location_segment(seg_stripped):
+        m = _find_city_state_match(seg_stripped)
+        if not m:
+            return False
+        remainder = (seg_stripped[:m.start()] + seg_stripped[m.end():]).strip(' ,.-')
+        return not remainder
+
     for _seg in _pipe_segments:
         _seg_stripped = _seg.strip()
-        if _seg_stripped and not _GENERIC_SUBJECT_ROLE_PATTERN.match(_seg_stripped):
+        if (
+            _seg_stripped
+            and not _GENERIC_SUBJECT_ROLE_PATTERN.match(_seg_stripped)
+            and not _bare_workmode_segment.match(_seg_stripped)
+            and not _location_only_segment_prefix.match(_seg_stripped)
+            and not _is_bare_employment_type_segment(_seg_stripped)
+            and not _is_bare_location_segment(_seg_stripped)
+        ):
             s = _seg
             break
+    # BUG FIX ("Oracle Exadata DBA, Denver, CO - 100% Day 1 Onsite (Local
+    # Candidates Only)" parsed with the city/state AND work-mode still
+    # attached): a location introduced by a comma ("<Title>, City, ST ...")
+    # rather than a dash was never cropped at all -- only the dash-
+    # introduced case below was handled. Crop at the comma immediately
+    # before the first validated City/State match anywhere in the string,
+    # dropping everything from there to the end (the location and
+    # anything trailing it, e.g. work-mode/percentage noise).
+    _loc_m = _find_city_state_match(s)
+    if _loc_m:
+        _prefix = s[:_loc_m.start()].rstrip()
+        # BUG FIX ("role: None" from "Hiring - AWS Data Engineer, WA" --
+        # the entire real title got swallowed as if it were the CITY
+        # name): only apply this crop when the matched location is
+        # genuinely INTRODUCED by a comma already sitting in the string
+        # -- a real "<Title>, City, ST" shape has TWO commas -- never
+        # when the "city" the regex found is actually just the tail end
+        # of the title itself with no separating comma before it.
+        if _prefix.endswith(','):
+            _prefix = _prefix[:-1].rstrip()
+            if _prefix:
+                s = _prefix
+
     # Drop a trailing location/work-mode suffix after a bare dash, but cut
     # precisely AT the location trigger (a validated City/State match, or a
     # Remote/Hybrid/Onsite keyword) instead of blindly at the dash itself.
@@ -1137,6 +1302,7 @@ def role_from_subject(subject: str) -> Optional[str]:
     # Shared vocabulary so the leading and trailing stripers can't drift
     # out of sync with each other.
     _MARKETING_PHRASES = (
+        r'urgent\s+requirements?|new\s+requirements?|immediate\s+requirements?|'
         r'needed|need|required|urgent(?:ly)?|immediate(?:ly)?|hiring(?:\s+now)?|hot|hire|'
         r'opportunit(?:y|ies)|apply\s*now|apply|'
         # BUG FIX ("Local Preferred: ServiceNow Developer" left "Preferred:"
@@ -1150,7 +1316,7 @@ def role_from_subject(subject: str) -> Optional[str]:
         # matches, not the longest, so order here matters.
         r'local(?:s)?\s+(?:only\s+)?preferred|local(?:s)?\s+only|local|'
         r'trying\s+to\s+reach(?:\s+(?:out|to\s+you|you))?|reach(?:ing)?\s+out|'
-        r'immediate\s+interviews?|interviews?\s+(?:today|now|asap)'
+        r'immediate\s+interviews?|interviews?\s+(?:today|now|asap)|asap'
     )
     # Drop marketing keywords only at START — a mid-string match like
     # "Hiring!! Financial Data Analyst" would wipe the whole role with .*$
@@ -1178,6 +1344,14 @@ def role_from_subject(subject: str) -> Optional[str]:
     )
     for _ in range(4):
         stripped = _marketing_suffix_re.sub('', s)
+        if stripped == s:
+            break
+        s = stripped
+    _marketing_suffix_nodash_re = re.compile(
+        r'(?i)\s+(?:' + _MARKETING_PHRASES + r')\s*!*\s*$'
+    )
+    for _ in range(4):
+        stripped = _marketing_suffix_nodash_re.sub('', s)
         if stripped == s:
             break
         s = stripped
@@ -1484,7 +1658,15 @@ _HOTLIST_INDICATORS = re.compile(
     # (hyphenated, extremely common phrasing) never matched at all, since
     # \b requires a word/non-word transition and the hyphen breaks the
     # match. \s? / \-? between "hot" and "list" catches both spellings.
-    r'(?i)\bhot[\s\-]?list\b|'
+    # BUG FIX ("Sr. React Native Developer" JD misclassified as a
+    # hotlist broadcast, role came out UNKNOWN): a genuine single job
+    # posting's own boilerplate footer often reads "Please add
+    # hotlist@ampstek.com in your distribution list" -- the sender's own
+    # mailing-list mailbox happens to be NAMED "hotlist@...", which is a
+    # completely different thing from the email BEING a hotlist
+    # broadcast. Excludes the match when immediately followed by "@"
+    # (i.e. it's the local part of an email address, not the phrase).
+    r'(?i)\bhot[\s\-]?list\b(?!@)|'
     r'\bour\s+(?:consultants?|resources?|candidates?)\s+(?:are|is)\b|'
     r'\bconsultants?\s+(?:are\s+)?ready\s+to\s+join\b|'
     r'\bbench\s+(?:consultants?|resources?)\b|'
@@ -1541,9 +1723,27 @@ _HOTLIST_INDICATORS = re.compile(
 # EXPERIENCE" section header. Requires 2+ distinct headers to fire,
 # since any single one of these words alone occasionally shows up in a
 # real JD's filler text.
+#
+# BUG FIX ("Data Scientist" JD misclassified as a hotlist/resume, role
+# came out UNKNOWN): the plain phrase-anywhere search below matched
+# "...of impactful work experience in AI, ML, or NLP" -- completely
+# ordinary JD prose, not a section header at all -- alongside a
+# legitimate "Education:" label, hitting the 2+ threshold on a real
+# single-role posting. The class comment above already describes the
+# actual structural signal a resume header has (start of its own line,
+# or "HTML-glued" straight onto a colon/following word with no space)
+# -- the old regex just never enforced it. Now requires the phrase to
+# sit at the start of a line, or be immediately followed by a colon;
+# "work experience" buried mid-sentence satisfies neither. No \b after
+# the start-of-line alternative -- two adjacent letters (as in the
+# glued "PROFESSIONAL SUMMARYExperienced...") never form a word
+# boundary, so requiring one there would have defeated the whole point
+# of catching the glued case.
 _RESUME_SECTION_HEADERS = re.compile(
-    r'(?i)(?<!\w)professional\s+summary|(?<!\w)work\s+experience|'
-    r'(?<!\w)skills\s*(?:&|and)\s*certifications|(?<!\w)education'
+    r'(?im)^[ \t]*(?:professional\s+summary|work\s+experience|'
+    r'skills\s*(?:&|and)\s*certifications|education)|'
+    r'(?<!\w)(?:professional\s+summary|work\s+experience|'
+    r'skills\s*(?:&|and)\s*certifications|education)\s*:'
 )
 
 
@@ -1657,6 +1857,24 @@ def first_match(patterns: List[str], text: str) -> Optional[str]:
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             first_line = match.group(1).split('\n', 1)[0]
+            # BUG FIX ("role: 'Blue Yonder Consultant(SCPO Experience
+            # Mandatory, IBP Nice to'" -- cut off mid-parenthetical, the
+            # real value continues "have)" on the next physical line of
+            # the source email): the pattern's ".+" can't cross a
+            # newline at all, so the captured value itself already ends
+            # exactly where the line wraps -- the missing continuation
+            # lives just past match.end() in the ORIGINAL text, not
+            # inside the match. A long parenthetical qualifier is a
+            # common place for recruiter templates to wrap. Only pull in
+            # that next physical line to CLOSE an unbalanced paren, not
+            # the value's entire continuation, and only when that next
+            # line is short (a genuine wrapped fragment, not another
+            # paragraph/field) and actually contains the closing paren.
+            if first_line.count('(') > first_line.count(')'):
+                _after = text[match.end():match.end() + 80].lstrip('\n')
+                _next_line = _after.split('\n', 1)[0].strip()
+                if _next_line and len(_next_line) <= 40 and ')' in _next_line and ':' not in _next_line:
+                    first_line = first_line.rstrip() + ' ' + _next_line
             value = sanitize_text(first_line)
             if not value:
                 continue
@@ -1685,6 +1903,35 @@ def first_match(patterns: List[str], text: str) -> Optional[str]:
     return best_value
 
 
+# BUG FIX ("role: 'UNKNOWN'" from "Role: Contract\nJob Title: Business
+# Intelligence Developer\n..."): parse_requirement's own role-resolution
+# block already knows to reject a "Role:" value that's just an
+# employment-type word ("Contract", "C2C", "W2") -- the real title
+# usually sits under a separate "Job Title:"/"Position:" label elsewhere
+# in the same email. But first_match() only ever returns the SINGLE
+# earliest match across all ROLE_PATTERNS; once that one match gets
+# rejected by the caller, nothing re-scans this pattern source for the
+# NEXT, later match -- the whole source is abandoned and the fallback
+# chain moves on to progressively weaker mechanisms that may find
+# nothing at all. Wraps first_match() (reusing all of its existing
+# crop/is_email_body/length guards unchanged) in a small retry loop: on
+# a rejected match, slice past it and try again.
+def first_valid_role_match(patterns: List[str], text: str) -> Optional[str]:
+    remaining = text
+    for _ in range(3):
+        candidate = first_match(patterns, remaining)
+        if not candidate:
+            return None
+        cand_lower = candidate.strip().lower().rstrip('.')
+        if cand_lower not in _EMPLOYMENT_TYPE_BARE_WORDS and not _looks_like_generic_role_header(candidate):
+            return candidate
+        idx = remaining.lower().find(candidate.lower())
+        if idx == -1:
+            return None
+        remaining = remaining[idx + len(candidate):]
+    return None
+
+
 # Words that commonly follow "hybrid" in a TECHNICAL sense unrelated to
 # work arrangement (hybrid-cloud, hybrid identity architecture, etc.) --
 # used to reject those matches so bare "hybrid" isn't mistaken for a work
@@ -1693,6 +1940,31 @@ _HYBRID_NON_WORKMODE_CONTEXT = re.compile(
     r'(?i)^\s*[\-]?\s*(?:cloud|identity|architecture|infrastructure|'
     r'deployment|deployments|environment|environments|approach|strategy|'
     r'model|integration|integrations|connectivity|networking|network)\b'
+)
+
+# BUG FIX: "remote access solutions" / "remote desktop" / "remote support"
+# / "remote monitoring" -- IT/networking job DUTIES the role performs --
+# were being read as if "remote" stated the ROLE'S OWN work arrangement.
+# Same shape as _HYBRID_NON_WORKMODE_CONTEXT above, checked against the
+# words immediately AFTER "remote".
+_REMOTE_NON_WORKMODE_CONTEXT = re.compile(
+    r'(?i)^\s*(?:access|desktop|support|connectivity|monitoring|'
+    r'management|administration|troubleshooting|login|session|sessions|'
+    r'vpn|control|assistance|diagnostics)\b'
+)
+
+# BUG FIX ("work_mode: 'REMOTE'" from "Remote work is not an option; this
+# is 100% onsite"): none of the WORK_MODE_PATTERNS/context checks had any
+# negation awareness at all -- unlike extract_employment_types() below
+# (see _NEGATION_BEFORE), which already handles "No C2C"/"Not W2". Here
+# the negation sits AFTER the keyword ("Remote work is NOT an option"),
+# not before it, so a leading-negation check wouldn't catch this shape --
+# checked against the text immediately following the match instead.
+_WORKMODE_TRAILING_NEGATION = re.compile(
+    r'(?i)^\s*(?:work\s+)?(?:is\s+|isn\'?t\s+|is\s+not\s+)?'
+    r'(?:not\s+(?:an?\s+)?option|not\s+available|not\s+possible|'
+    r'no\s+longer\s+(?:an?\s+)?(?:option|available)|not\s+permitted|'
+    r'not\s+allowed)\b'
 )
 
 # BUG FIX: "Remote"/"Hybrid"/"Onsite" glued directly onto an adjacent
@@ -1736,6 +2008,12 @@ def extract_work_mode(text: str) -> str:
                     trailing = text_lower[m.end():m.end() + 25]
                     if _HYBRID_NON_WORKMODE_CONTEXT.search(trailing):
                         continue  # false positive -- try next occurrence
+                if mode == 'REMOTE':
+                    trailing = text_lower[m.end():m.end() + 25]
+                    if _REMOTE_NON_WORKMODE_CONTEXT.search(trailing):
+                        continue  # false positive -- try next occurrence
+                if _WORKMODE_TRAILING_NEGATION.search(text_lower[m.end():m.end() + 40]):
+                    continue  # negated -- try next occurrence
                 if best_pos is None or m.start() < best_pos:
                     best_pos = m.start()
                     best_mode = mode
@@ -2302,7 +2580,14 @@ def _extract_skill_tokens(sentence: str) -> List[str]:
     tokens = _split_respecting_parens(core, r',\s*|\s+and\s+')
     results = []
     for tok in tokens:
-        tok = tok.strip().strip('.')
+        # BUG FIX ("skill: 'NET Development'"/"'NET 6/7/8'" instead of
+        # ".NET Development"/".NET 6/7/8"): str.strip('.') strips periods
+        # from BOTH ends, so a token that legitimately STARTS with a
+        # literal period -- ".NET" is a real, extremely common
+        # technology name, not sentence punctuation -- silently lost
+        # that leading "." here. Only the trailing sentence-ending
+        # period was ever intended to be stripped.
+        tok = tok.strip().rstrip('.')
         # Strip stray leading conjunction/hedge words a comma-split can leave
         # behind, e.g. ", and REST APIs" -> "and REST APIs" -> "REST APIs".
         tok = re.sub(r'(?i)^(?:and|preferably|or)\s+', '', tok).strip()
@@ -2842,7 +3127,17 @@ _BOILERPLATE_FOOTER_PATTERN = re.compile(
     r'(?i)you received this message because you are subscribed to the google groups|'
     r'to unsubscribe from this group|'
     r'sign-up for your account with prohires|'
-    r'hire our it recruiter at just \$'
+    r'hire our it recruiter at just \$|'
+    # BUG FIX ("Technical Business Analyst" JD misclassified as a
+    # hotlist broadcast via its own footer, role came out UNKNOWN): a
+    # common recruiter footer convention asks the reader to reciprocally
+    # add the sender to their distribution list and share their own
+    # hotlist back. That phrase is a genuine hotlist-broadcast signal on
+    # its own, but it's boilerplate signature noise tacked onto an
+    # otherwise perfectly normal single-role JD, not a description of
+    # the CURRENT email. Truncating it here, like every other footer
+    # signature, keeps it from ever reaching is_hotlist_email() at all.
+    r'please\s+add\s+(?:my\s+)?email(?:\s*id)?\s+to\s+(?:your\s+)?distribution'
 )
 
 
@@ -3080,10 +3375,10 @@ def parse_requirement(
             return None
 
         role = _first_real_role(
-            clean_role(first_match(ROLE_PATTERNS, norm_body)),
+            clean_role(first_valid_role_match(ROLE_PATTERNS, norm_body)),
             clean_role(role_from_bold_lead(norm_body)),
             clean_role(role_from_numbered_label(norm_body)),
-            clean_role(first_match(ROLE_PATTERNS, full_text)),
+            clean_role(first_valid_role_match(ROLE_PATTERNS, full_text)),
             _subject_role,
             clean_role(role_from_body_lead(norm_body)),
             clean_role(role_from_subject(safe_subject)),
@@ -3172,7 +3467,20 @@ def parse_requirement(
                     or cand_lower in role_lower
                     or role_lower in cand_lower
                 )
-                if cand and len(cand) <= 40 and not is_email_body(cand) and not is_role_echo:
+                # BUG FIX ("client: 'No H1'" from "...$90-$110/HR Target -
+                # No H1" -- a visa-restriction note sitting in a quoted
+                # forwarded subject line inside the body, not a company
+                # name): this fallback's trigger side ("[A-Za-z ]{4,}") is
+                # deliberately loose so it can catch a plain "Role - Client"
+                # line with no real label at all -- but that means it also
+                # fires on ordinary rate/visa clauses ending in a dash, and
+                # a bare negation word ("No H1", "No OPT", "No C2C", "Not
+                # Applicable") looks exactly like a short capitalized
+                # company name to it. A real client name never starts with
+                # a bare negation, so reject on that alone.
+                _cand_first_word = cand_lower.split()[0].strip(',.:;') if cand_lower else ''
+                is_negation_phrase = _cand_first_word in ('no', 'not', 'none')
+                if cand and len(cand) <= 40 and not is_email_body(cand) and not is_role_echo and not is_negation_phrase:
                     client = cand
 
     # BUG FIX: reject a client value that's just the role/JD title's own
