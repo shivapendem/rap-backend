@@ -1413,7 +1413,7 @@ async def admin_create_consultant(
         email=payload.email,
         full_name=payload.name,
         role="CONSULTANT",
-        is_active=True,
+        is_authorized=True,
         # resume_info lives on User (not Consultant) — see generate_resume()
         # in resume_router.py, which reads target_user.resume_info to build
         # the AI resume draft. Previously this creation flow had no way to
