@@ -2050,11 +2050,29 @@ def is_job_requirement_email(text: str) -> bool:
     if not text:
         return False
     indicators = [
-        r'\bjob\s+title\b', r'\bposition\b', r'\bopening\b', r'\brequirement\b',
+        r'\bjob\s+title\b', r'\bposition\b', r'\bopening\b', r'\brequirements?\b',
         r'\bclient\b', r'\blocation\b', r'\brate\b', r'\bduration\b',
         r'\bcontract\b', r'\bskills\b', r'\bexperience\b',
         r'\$\d+', r'\bC2C\b', r'\bW2\b', r'\b1099\b',
-        r'\bremote\b', r'\bonsite\b', r'\bon-site\b', r'\bhybrid\b', r'\byears?\b'
+        r'\bremote\b', r'\bonsite\b', r'\bon-site\b', r'\bhybrid\b', r'\byears?\b',
+        # BUG FIX (ported from rap_python_cron's already-fixed copy of this
+        # same function -- the two parser.py files had diverged, and this
+        # file never received either fix): "role"/"title" -- arguably the
+        # single most fundamental job-posting signal there is -- were
+        # missing from this list entirely. This mattered most for a
+        # per-segment check on an individual posting split out of a
+        # multi-posting email: those segments are naturally short (just a
+        # title + location + duration, say), so they'd often clear this
+        # >=2 threshold on ONE indicator at most under the old list and
+        # get rejected outright. Also fixed the plural "requirements?"
+        # above (was singular-only "requirement\b") for the same reason
+        # -- "Requirements:" is by far the more common JD section heading.
+        # BUG FIX: bare "title" and "job title" above can match the SAME
+        # phrase ("job title" contains "title"), double-counting one
+        # piece of evidence as two indicators. Negative lookbehind stops
+        # bare "title" from re-matching the "job title" phrase already
+        # counted above.
+        r'\brole\b', r'(?<!job\s)\btitle\b',
     ]
     indicators_found = sum(
         1 for i in indicators if re.search(i, text, re.IGNORECASE)
@@ -2119,7 +2137,36 @@ _HOTLIST_INDICATORS = re.compile(
     # phrasing already covered.
     r'\badd\s+(?:my\s+)?(?:email(?:\s*id)?|address)\s+to\s+(?:your\s+)?'
     r'(?:distribut(?:ion|ing)|mailing)\s+list\b|'
-    r'\bsend\s+(?:me\s+)?daily\s+requirements?\b'
+    # BUG FIX ("HOTLIST OF Sr. Data Engineer candidates..." body-only
+    # detection missing it -- confirmed real case, is_hotlist_email() is
+    # deliberately called on the BODY ONLY in production, see
+    # requirements_sync.py): "We have highly skilled consultants
+    # available on the bench" and "Please find our available consultants
+    # below" are both extremely common bench-broadcast phrasings, but in
+    # the REVERSED word order from what was already covered --
+    # "available" before "consultants"/"bench", not after -- so neither
+    # `bench\s+consultants` nor `candidates?\s+available` (existing
+    # patterns above) matched. Bare "available consultants" (either
+    # order relative to "bench") is essentially never used to describe a
+    # single role being filled -- a real JD doesn't have "available
+    # consultants" of its own to offer.
+    r'\b(?:consultants?|resources?)\s+available\s+on\s+(?:the\s+)?bench\b|'
+    r'\bavailable\s+consultants?\b|'
+    r'\bplease\s+find\s+(?:our\s+)?available\s+(?:consultants?|candidates?|resources?)\b|'
+    r'\bsend\s+(?:me\s+)?daily\s+requirements?\b|'
+    # BUG FIX (real-world recruiter phrasing not yet covered): "I have a
+    # candidate/consultant available" and "My candidate/consultant is
+    # available" are common first-person variants of the exact same
+    # bench-broadcast pitch the "our consultants are available" pattern
+    # above already covers -- just with "I"/"my" instead of "our".
+    # Requiring "available" right after (rather than a bare "I have a
+    # candidate") is deliberate: "I have a candidate for this role, here
+    # is his resume" (a recruiter submitting ONE candidate against an
+    # existing posting, not broadcasting their bench) reads very
+    # differently and must NOT trip this -- tested against that exact
+    # phrasing to confirm it doesn't.
+    r'\bi\s+have\s+(?:a\s+)?(?:candidates?|consultants?)\s+available\b|'
+    r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -2182,6 +2229,76 @@ def is_hotlist_email(text: str) -> bool:
     if not text:
         return False
     return bool(_HOTLIST_INDICATORS.search(text)) or _looks_like_resume_body(text)
+
+
+# BUG FIX ("role: 'to Work - Senior US IT Recruiter'" from a candidate's
+# own "Open to Work" self-promotion email, confirmed real case): neither
+# is_job_requirement_email() nor is_hotlist_email() covers this shape --
+# it's not "supplying candidates for someone else to place" (hotlist),
+# it's a single individual describing THEIR OWN availability and asking
+# to be considered, in first person. It still uses ordinary staffing
+# vocabulary (experience, remote, visa types) so is_job_requirement_email
+# 's keyword-count gate can't tell it apart either -- it silently ran
+# full role/client/location extraction and produced garbage. Distinctive
+# first-person "I am looking for a role" framing, never used in a real
+# JD (a real JD describes a role for someone ELSE to fill, never the
+# sender's own job search) is checked for; deliberately excludes bare
+# "Work Preference:" alone -- a real JD can legitimately use that exact
+# label for its own on-site/remote requirement (confirmed false-positive
+# risk, tested and excluded) -- "Preferred Roles:" (plural, a candidate
+# listing several roles THEY would accept) doesn't have that ambiguity.
+_CANDIDATE_SELF_PROMO_INDICATORS = re.compile(
+    r'(?i)\bopen\s+to\s+work\b|'
+    r'\bi\s+am\s+(?:currently\s+)?(?:looking|seeking)\s+for\b[^\n.]{0,60}'
+    r'(?:opportunit|role|position)|'
+    r'\b(?:share|forward)\s+(?:any\s+)?(?:relevant|suitable)\s+openings?\s+'
+    r'(?:within|in|with)\s+(?:your|the)\s+(?:organization|company|network)\b|'
+    r'\bi\s+would\s+be\s+happy\s+to\s+share\s+my\s+(?:updated\s+)?resume\b|'
+    r'\bpreferred\s+roles?\s*:'
+)
+
+
+def is_candidate_self_promo_email(text: str) -> bool:
+    """True when a candidate/recruiter is advertising THEIR OWN
+    availability for work ("Open to Work" style), not describing an
+    actual role to be filled -- see _CANDIDATE_SELF_PROMO_INDICATORS."""
+    if not text:
+        return False
+    return bool(_CANDIDATE_SELF_PROMO_INDICATORS.search(text))
+
+
+# BUG FIX ("role: 'Jobs matching your criteria for...'" from an automated
+# job-board digest listing 13 unrelated jobs / "role: 'iLabor Daily
+# Digest...'" from an ATS system's own bulk requisition-release
+# notification -- both confirmed real cases): neither describes ONE job
+# to be filled -- each lists many, or is itself a notification ABOUT
+# postings elsewhere, not a JD. is_job_requirement_email()'s keyword-count
+# gate still fires on these (they're full of the same staffing vocabulary
+# any real JD table uses), so full single-posting extraction ran on
+# multi-row table text and produced nonsense. Covers both the job-board
+# "job agent" digest shape (jobagent@..., "N new jobs found by your job
+# agent", "Jobs matching your criteria") and the ATS bulk-notification
+# shape (iLabor360-style "Requisition List" / "Requisitions Released
+# from ... to ..." / "requisition(s) that have been released or
+# edited") -- distinct senders, same underlying problem: many postings
+# in one email rather than one.
+_JOB_DIGEST_INDICATORS = re.compile(
+    r'(?i)\bnew\s+jobs?\s+found\s+by\s+your\s+job\s+agent\b|'
+    r'\bjobs?\s+matching\s+your\s+criteria\b|'
+    r'\byour\s+job\s+agent\b|'
+    r'\brequisition(?:s|\(s\))?\s+(?:released|that\s+have\s+been\s+released)\b|'
+    r'\brequisition\s+list\b|'
+    r'\brequisitions?\s+released\s+from\b.{0,20}\bto\b'
+)
+
+
+def is_job_digest_email(text: str) -> bool:
+    """True for a multi-posting job-board digest ("N new jobs found...")
+    or an ATS's own bulk requisition-release notification -- neither is
+    a single job requirement to extract -- see _JOB_DIGEST_INDICATORS."""
+    if not text:
+        return False
+    return bool(_JOB_DIGEST_INDICATORS.search(text))
 
 
 def safe_extract_value(text: str, max_length: int = 200) -> Optional[str]:
