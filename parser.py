@@ -242,7 +242,23 @@ _GENERIC_SUBJECT_ROLE_PATTERN = re.compile(
     # Holtsville, NY"): "now hiring"/"we are hiring"/"urgent hiring" were
     # already covered above, but a bare "Hiring" alone as its own
     # leading segment wasn't.
-    r'hiring)\s*$'
+    r'hiring|'
+    # BUG FIX ("role: 'JOB'" from "JOB || ServiceNow Developer || Chicago,
+    # IL || Day-1- Onsitte" -- confirmed real case): a bare "JOB" leading
+    # segment (no "opening"/"posting"/"alert" attached) is just as common
+    # a convention as "JD" above, and was completely unrecognized -- it
+    # survived whole as if it were the real title.
+    r'job|'
+    # BUG FIX ("role: 'ONISTE ROLE'" from "ONISTE ROLE || Lead ServiceNow
+    # Admin @ Location: ... onsite role" -- confirmed real case, note the
+    # common recruiter typo "ONISTE" for "ONSITE", an adjacent-letter
+    # transposition): a bare workmode word immediately followed by "role"
+    # ("Onsite Role", "Remote Role") is a distinct leading-filler shape
+    # from both the bare-workmode check (_bare_workmode_segment, which
+    # requires the workmode word ALONE) and this pattern's existing
+    # entries. Lists the two common real-world misspellings explicitly
+    # alongside the correct spelling.
+    r'(?:on\s*-?\s*(?:site|iste|stie|siet)|remote|hybrid)\s+role)\s*$'
 )
 
 # BUG FIX ("role: 'Only Dallas/Fort Worth, TX will be considered'" and
@@ -549,7 +565,15 @@ def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
 _NON_ROLE_LABEL_VALUE_PATTERN = re.compile(
     r'(?i)(?:^|\n)[ \t]*(?:visas?|interview\s*mode|work\s*auth(?:orization)?|'
     r'duration|contract(?:\s*length)?|pay\s*rate|bill\s*rate|rate|'
-    r'employment\s*type|client\s*location)\s*[:\-][ \t]*([^\n]+)'
+    # BUG FIX ("role: 'Client Name: Virtusa/JPMC'" -- confirmed real
+    # case): this watch-list already caught a role value that was really
+    # the value of Visas:/Interview Mode:/Work Auth:/etc, but "client" and
+    # "client name" -- an extremely common adjacent label in the exact
+    # same stacked "Job Title:"/"Client Name:"/"Location:" template shape
+    # -- were never included, so the AI extractor grabbing that line
+    # whole (label included) instead of the real "Job Title:" line above
+    # it went completely uncaught by this defensive backstop.
+    r'employment\s*type|client\s*location|end\s*client|client\s*name|client)\s*[:\-][ \t]*([^\n]+)'
 )
 
 
@@ -566,6 +590,17 @@ def _role_echoes_non_role_label(role_value: Optional[str], text: str) -> bool:
     for m in _NON_ROLE_LABEL_VALUE_PATTERN.finditer(text):
         candidate = sanitize_text(m.group(1))
         if candidate and candidate.strip().lower().rstrip('.') == role_key:
+            return True
+        # BUG FIX ("role: 'Client Name: Virtusa/JPMC'" -- confirmed real
+        # case): the check above only ever compares role_value against
+        # the bare VALUE half of the other field's "Label: Value" line
+        # (e.g. just "Virtusa/JPMC") -- but the actual observed failure
+        # had the AI extractor grabbing the WHOLE line, label included,
+        # as the role. Also compares against the full matched line (with
+        # normal whitespace collapsed) so this label-included form is
+        # caught too, not just the bare-value form.
+        full_line = sanitize_text(m.group(0))
+        if full_line and full_line.strip().lower().rstrip('.') == role_key:
             return True
     return False
 
@@ -655,12 +690,76 @@ _CLIENT_LABEL_PRESENT_RE = re.compile(
     r'|\bimplementation\s*(?:partner)?\s+is\b'
 )
 
+# BUG FIX ("client: 'Requisition List Client Name Req'" from an HTML
+# table's own flattened column-header row -- confirmed real case): role
+# already has _looks_like_generic_role_header() to reject a value that's
+# just a section/column header rather than real content -- client had no
+# equivalent, so when the AI extractor was handed a flattened HTML table
+# (cells joined by spaces, losing their row/column structure) it could
+# echo the table's own header text back as if it were an actual client
+# name. Checked against a fixed set of known ATS/recruiter-template
+# column-header phrases; a real client name is essentially never
+# character-for-character identical to one of these.
+_GENERIC_CLIENT_HEADER_PHRASES = {
+    'client name', 'end client', 'requisition list', 'req #', 'req',
+    'job title', 'location', 'rate', 'c2c rate', 'bill rate', 'pay rate',
+    'notes', 'on your w2', 'on your w2?', '# of positions',
+    'number of positions', 'client', 'customer',
+}
+
+
+def _looks_like_generic_client_header(client_value: Optional[str]) -> bool:
+    """True when `client_value` is just an ATS/recruiter-template column
+    header (or a run of several concatenated ones) rather than a real
+    client/company name -- see _GENERIC_CLIENT_HEADER_PHRASES' comment."""
+    if not client_value:
+        return False
+    candidate = client_value.strip().rstrip('.').strip().lower()
+    if not candidate:
+        return False
+    if candidate in _GENERIC_CLIENT_HEADER_PHRASES:
+        return True
+    # A run of 2+ known header phrases concatenated with nothing but
+    # whitespace between them ("Requisition List Client Name Req") is
+    # just as clearly not a real client name as any single one alone.
+    words = candidate.split()
+    if len(words) >= 3:
+        matched_phrase_words = 0
+        remaining = candidate
+        for phrase in sorted(_GENERIC_CLIENT_HEADER_PHRASES, key=len, reverse=True):
+            if phrase in remaining:
+                matched_phrase_words += len(phrase.split())
+                remaining = remaining.replace(phrase, ' ', 1)
+        if matched_phrase_words >= max(2, len(words) - 1):
+            return True
+    return False
+
 LOCATION_PATTERNS = [
-    r'(?i)\bwork\s*locations?\s*[:\-]\s*(.+)',
-    r'(?i)\bplace\s*of\s*work\s*[:\-]\s*(.+)',
+    # BUG FIX ("location: 'Linkdein :'" from a "Your visa :\nYour location
+    # :\nLinkdein :" fill-in-the-blank template -- confirmed real case):
+    # every pattern here used a bare \s* after the label's colon/dash,
+    # which matches ANY whitespace including newlines -- so a genuinely
+    # BLANK labeled line (the template asking the candidate to fill in
+    # their own location, nothing typed in after the colon) let the match
+    # slide straight across the blank spot and down onto the NEXT line's
+    # label, capturing that whole label as if it were the location value.
+    # ROLE_PATTERNS hit this identical failure mode and was already fixed
+    # by restricting the separator to same-line whitespace plus at most
+    # one newline ([ \t]*\n?[ \t]*) -- this was never applied here.
+    # Beyond that, a negative lookahead rejects the match outright when
+    # the captured line itself is just a short "Word(s) :" shape with
+    # nothing else on it -- a real location value never ends in a bare
+    # trailing colon like that, only another field's empty label does, so
+    # this still catches the blank-template case even when crossing the
+    # single allowed newline.
+    r'(?i)\bwork\s*locations?\s*[:\-][ \t]*\n?[ \t]*'
+    r'(?!(?:[A-Za-z][a-zA-Z]*\s*){1,3}[:\-][ \t]*(?:\n|$))(.+)',
+    r'(?i)\bplace\s*of\s*work\s*[:\-][ \t]*\n?[ \t]*'
+    r'(?!(?:[A-Za-z][a-zA-Z]*\s*){1,3}[:\-][ \t]*(?:\n|$))(.+)',
     # BUG FIX: plural "Locations -Remote" was missed entirely (returned
     # null) because the pattern only accepted the singular form.
-    r'(?i)\blocations?\s*[:\-]\s*(.+)',
+    r'(?i)\blocations?\s*[:\-][ \t]*\n?[ \t]*'
+    r'(?!(?:[A-Za-z][a-zA-Z]*\s*){1,3}[:\-][ \t]*(?:\n|$))(.+)',
 ]
 
 RATE_PATTERNS = [
@@ -789,10 +888,27 @@ US_STATE_NAMES = {
     'wyoming':'WY','district of columbia':'DC',
 }
 
+# BUG FIX (used by BARE_LOCATION_PATTERN below): a real full state name is
+# always exactly one of these 51 known names -- built directly from
+# US_STATE_NAMES itself (title-cased, longest-first so a genuine two-word
+# state like "New York" matches whole rather than stopping at "New") so
+# the two can never drift out of sync. Used in place of a generic
+# "run of Title-Case words" pattern, which had no way to tell a real
+# state name apart from any other run of Title-Case recruiter prose that
+# happened to follow it (e.g. "...Missouri Need Only Local Candidate for
+# Face to Face Interview" -- confirmed real case -- got swallowed whole
+# as if all of it were the state name, corrupting resolve_state_code()
+# and causing the entire match, and the location cleanup that depends on
+# it, to fail).
+_FULL_STATE_NAME_ALTERNATION = '|'.join(
+    re.escape(_name.title())
+    for _name in sorted(US_STATE_NAMES.keys(), key=len, reverse=True)
+)
+
 # Matches "City, TX" / "City TX" / "City, Texas" — resolved through resolve_state_code()
 BARE_LOCATION_PATTERN = re.compile(
     r'\b([A-Z][a-zA-Z]+(?:[ \-][A-Z][a-zA-Z]+){0,2})\s*,?\s*'
-    r'([A-Z]{2}\b|[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)'
+    r'([A-Z]{2}\b|' + _FULL_STATE_NAME_ALTERNATION + r')'
 )
 
 # Street-level prefixes that precede a real city in addresses like
@@ -1067,6 +1183,20 @@ NEXT_FIELD_LABELS = [
     # _looks_like_bare_job_title() and got treated as if it were itself
     # the job title.
     'work model', 'work models',
+    # BUG FIX ("location: '...(IP will be tracked through assessment)Work
+    # Arrangement: Hybrid...Interview: Onsite...'" / "location: 'Fully
+    # Onsite Interview Process: 1 Round...Possibility for Extension:
+    # Yes'" -- both confirmed real cases, from HTML-flattened recruiter
+    # templates with zero whitespace between adjacent label:value
+    # segments): "Work Arrangement", "Interview"/"Interview Process", and
+    # "Possibility for Extension" are all common recruiter-template field
+    # labels that sit immediately after Location/Work Location in these
+    # templates, but none of them were recognized as field boundaries --
+    # so a captured Location value ran straight through all of them
+    # instead of stopping at the first one, as this list already does for
+    # "Duration:"/"Rate:"/etc.
+    'work arrangement', 'interview', 'interview process',
+    'possibility for extension',
     'work type', 'vendor',
     'recruiter', 'contact', 'phone', 'email', 'responsibilities',
     'qualifications', 'job description', 'role description',
@@ -1797,6 +1927,28 @@ def role_from_body_lead(norm_text: str) -> Optional[str]:
     )
     if greet_m:
         text = text[greet_m.end():].lstrip()
+    # BUG FIX ("role: 'Hope you are doing great!!!'" -- confirmed real
+    # case): the greeting strip above only ever removes ONE leading
+    # paragraph, matched against a fixed set of greeting-word triggers
+    # ("Hi,", "Hello,", ...). Recruiter templates commonly stack a second
+    # pleasantry line ("Hope you are doing great!!!") and/or a generic
+    # request line ("Please share suitable profile...") right after it,
+    # before the actual role content starts -- neither starts with any of
+    # those trigger words, so neither was recognized as boilerplate; the
+    # first one fell straight through to become "the role" via the
+    # blank-line heuristic below. Loops up to twice more against whatever
+    # is left after the first strip.
+    for _ in range(2):
+        pleasantry_m = re.match(
+            r'(?i)^\s*(?:hope|trust|wish(?:ing)?)\s+(?:you|this|everything)'
+            r'\b[^\n]{0,60}\n\s*\n'
+            r'|^\s*please\s+(?:share|review|find|see|go\s+through|check)'
+            r'\b[^\n]{0,80}\n\s*\n',
+            text
+        )
+        if not pleasantry_m:
+            break
+        text = text[pleasantry_m.end():].lstrip()
     cut = len(text)
     m = NEXT_FIELD_PATTERN.search(text)
     if m:
@@ -3192,8 +3344,23 @@ def clean_role(role: Optional[str]) -> Optional[str]:
             break
         role = role[:_m.start()].strip()
     # Drop leading marketing words: "Hiring!!", "Urgent -", "!!"
+    # BUG FIX ("role: 'to Work - Senior US IT Recruiter'" from "Open to
+    # Work - Senior US IT Recruiter | ..." / "role: 'Jobs matching your
+    # criteria for...'" from "New Jobs matching your criteria for ..." --
+    # both confirmed real cases): this unconditionally treated a leading
+    # "Open"/"New" as generic marketing filler ("Opening", "New
+    # Requirement") regardless of what followed -- but "Open to Work" (a
+    # candidate/job-seeker self-promotion phrase) and "New Jobs matching"
+    # (an automated job-board digest subject) are different, unrelated
+    # senses of the same words, and stripping "Open"/"New" off the front
+    # left a mangled fragment instead. Negative lookaheads exclude just
+    # these two specific known false-positive phrases; every other
+    # leading "Open"/"New" usage (the actual marketing-filler case this
+    # strip exists for) is stripped exactly as before.
     role = re.sub(
-        r'(?i)^\s*(?:hiring(?:\s*now)?|urgent|immediate|hot|new|open(?:ing)?|apply)'
+        r'(?i)^\s*(?:hiring(?:\s*now)?|urgent|immediate|hot|'
+        r'new(?!\s+jobs?\s+(?:matching|found|for\s+you))|'
+        r'open(?:ing)?(?!\s+to\s+work)|apply)'
         r'\b[\s:\-!.]*', '', role
     )
     role = re.sub(r'^[^0-9A-Za-z]+', '', role).strip()
@@ -3853,6 +4020,17 @@ def parse_requirement(
                 if cand and len(cand) <= 40 and not is_email_body(cand) and not is_role_echo and not is_negation_phrase:
                     client = cand
 
+    # BUG FIX ("client: 'Requisition List Client Name Req'" -- confirmed
+    # real case): reject a client value outright when it's just an
+    # ATS/recruiter-template column header (or several concatenated) --
+    # see _looks_like_generic_client_header()'s comment. Never gated on
+    # _CLIENT_LABEL_PRESENT_RE -- a value that's nothing but reproduced
+    # table-header text is never a real client name, regardless of
+    # whether some other genuine client signal also exists elsewhere in
+    # the email.
+    if client and _looks_like_generic_client_header(client):
+        client = None
+
     # BUG FIX: reject a client value that's just the role/JD title's own
     # technology or product name/acronym echoed back (e.g. role "Oracle
     # E-Business Suite (EBS) Upgrade" producing client "EBS", or role
@@ -3875,6 +4053,19 @@ def parse_requirement(
             _client_lower == _role_lower
             or _client_lower in _role_lower
             or _role_lower in _client_lower
+        ):
+            client = None
+        # BUG FIX ("client: 'Data Engineer - AI/ML - Louisville'" -- the
+        # subject line was "Data Engineer - AI/ML - Louisville, Kentucky
+        # (DAY 1 onsite)", and the body never named an end client at all,
+        # only the sending recruiter's own agency in passing prose --
+        # confirmed real case): same shape of AI-fabrication as the role
+        # echo just above, but sourced from the SUBJECT line instead of
+        # the role field. Checked the same way -- only when no genuine
+        # client label grounds the value -- against the raw subject text.
+        _subject_lower = (safe_subject or '').strip().lower()
+        if client and _client_lower and _subject_lower and (
+            _client_lower in _subject_lower
         ):
             client = None
 
