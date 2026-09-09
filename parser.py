@@ -1889,9 +1889,73 @@ def clean_whitespace(text: Optional[str]) -> Optional[str]:
         return None
     return ' '.join(text.split())
 
-def is_reply_email(subject: str) -> bool:
-    """Detect if an email is a reply/forward, which should never be treated as a fresh requirement."""
-    return bool(re.match(r'^\s*(re|fw|fwd)\s*:', subject or '', re.IGNORECASE))
+# BUG FIX ("did a real posting come in as a reply/forward and get
+# dropped?"): the previous version treated Re:/Fwd:/Fw: identically --
+# both hard-blocked from ever being a fresh requirement. That's correct
+# for a REPLY (thread back-and-forth -- "thanks", "sending resume",
+# quoting the same JD everyone already has), but wrong for a FORWARD:
+# in this domain, forwarding a JD to another recruiter/contact is a
+# normal, primary way a genuine posting circulates, not a sign it's
+# stale. Blanket-skipping every Fwd: silently dropped real requirements.
+# Split the two apart: is_reply_email() now only covers pure reply
+# shapes (Re: prefix, "On ... wrote:" quote intro, heavy '>' quoting) --
+# genuinely forward-shaped mail (Fwd:/Fw: prefix, "---Forwarded
+# message---", "Begin forwarded message:", or an Outlook forward header
+# block) is NOT auto-skipped here; it's left for is_job_requirement_email()
+# to decide based on content, same as any other email. Worst case a
+# re-forwarded duplicate posting reaches dedup.py and gets caught there --
+# a much safer failure mode than silently losing a real one. A subject
+# with BOTH markers (e.g. "Re: Fwd: Java Developer") is treated as a
+# forward: the forward marker wins, since the alternative (treating it
+# as a reply and skipping) risks losing content someone deliberately
+# forwarded onward.
+_REPLY_ONLY_BODY_MARKERS = [
+    r'-{2,}\s*original message\s*-{2,}',
+    r'\bon\s+.{5,80}?\s+wrote:',
+]
+
+_FORWARD_BODY_MARKERS = [
+    r'-{2,}\s*forwarded message\s*-{2,}',
+    r'^begin forwarded message:',
+    r'^from:\s*.+\n^sent:\s*.+\n^to:\s*.+\n^subject:\s*.+',
+]
+
+def is_forward_email(subject: str, body_text: str = "") -> bool:
+    """True for a forwarded email (Fwd:/Fw: or a forward-shaped body) --
+    NOT auto-excluded from being a fresh requirement; see the block
+    comment above."""
+    subject = subject or ""
+    # Match the whole leading chain of Re:/Fwd:/Fw: prefixes (not just the
+    # very first one), so "Re: Fwd: Java Developer" -- a reply sent within
+    # an already-forwarded thread -- is still recognized as a forward
+    # rather than only checking the first token ("Re:").
+    prefix_chain = re.match(r'^\s*(?:(?:re|fw|fwd)\s*:\s*)+', subject, re.IGNORECASE)
+    if prefix_chain and re.search(r'\bfwd?\s*:', prefix_chain.group(0), re.IGNORECASE):
+        return True
+    if not body_text:
+        return False
+    for pattern in _FORWARD_BODY_MARKERS:
+        if re.search(pattern, body_text, re.IGNORECASE | re.MULTILINE):
+            return True
+    return False
+
+def is_reply_email(subject: str, body_text: str = "") -> bool:
+    """Detect if an email is a pure reply (not a forward -- see
+    is_forward_email()), which should never be treated as a fresh
+    requirement."""
+    subject = subject or ""
+    if is_forward_email(subject, body_text):
+        return False
+    if re.match(r'^\s*re\s*:', subject, re.IGNORECASE):
+        return True
+    if not body_text:
+        return False
+    for pattern in _REPLY_ONLY_BODY_MARKERS:
+        if re.search(pattern, body_text, re.IGNORECASE | re.MULTILINE):
+            return True
+    if len(re.findall(r'^\s*>', body_text, re.MULTILINE)) >= 3:
+        return True
+    return False
 
 def is_job_requirement_email(text: str) -> bool:
     """Return True when enough job-requirement indicators are found."""

@@ -219,7 +219,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 2000) -> dict:
             if row["reply_to"]:
                 headers["reply_to"] = row["reply_to"]
 
-            if is_reply_email(subject):
+            if is_reply_email(subject, body):
                 skipped_not_a_requirement += 1
                 continue
 
