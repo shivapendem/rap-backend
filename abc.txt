@@ -1074,3 +1074,48 @@ LEFT OUTER JOIN consultants c ON c.id = a.consultant_id
 LEFT OUTER JOIN users u ON u.id = a.recruiter_id;
 
 CREATE INDEX concurrently IF NOT EXISTS idx_requirements_received_date ON requirements (received_date DESC);
+
+
+
+
+BEGIN;
+
+-- 1. Delete matches tied to the requirements generated from the top 100 emails
+DELETE FROM requirement_consultant_matches 
+WHERE requirement_id IN (
+    SELECT id FROM requirements WHERE raw_email_id IN (
+        SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100
+    )
+);
+
+-- 2. Delete the actual requirements generated from the top 100 emails
+DELETE FROM requirements 
+WHERE raw_email_id IN (
+    SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100
+);
+
+-- 3. Reset the state of the top 100 emails so the cron sees them as "new"
+UPDATE gmail_emails 
+SET status_desc = 'Pending', category = NULL, reason = NULL, processed = false 
+WHERE id IN (
+    SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100
+);
+
+COMMIT;
+
+-- Fix received_date for recently created requirements that are invisible in the UI:
+UPDATE requirements 
+SET received_date = CAST(gmail_emails.date AS timestamp with time zone)
+FROM gmail_emails 
+WHERE requirements.raw_email_id = gmail_emails.id 
+  AND requirements.received_date IS NULL;
+
+
+
+
+-- Reset top 100 emails for reprocessing
+BEGIN;
+DELETE FROM requirement_consultant_matches WHERE requirement_id IN (SELECT id FROM requirements WHERE raw_email_id IN (SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100));
+DELETE FROM requirements WHERE raw_email_id IN (SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100);
+UPDATE gmail_emails SET status_desc = 'Pending', category = NULL, reason = NULL, processed = false WHERE id IN (SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100);
+COMMIT;
