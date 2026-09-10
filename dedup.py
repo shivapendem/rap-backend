@@ -29,8 +29,33 @@ NEAR_DUPLICATE_WINDOW_HOURS = 72
 def normalize_text(value: str) -> str:
     """Normalize text for comparison."""
     value = (value or "").lower().strip()
+    # BUG FIX ("8 byte-for-byte identical emails from the same sender,
+    # 9 minutes apart, same subject -- ALL 8 saved as separate
+    # requirements, none flagged as a duplicate" -- confirmed real case
+    # from a production data export): a marketing-automation/ATS mailer
+    # resent the exact same JD to the same recipient repeatedly; diffing
+    # the 8 bodies showed the ONLY difference between them was the
+    # per-send click-tracking URL's unique token embedded in a "Click
+    # here to submit your profile" link -- literally every other
+    # character was identical. Since this function never stripped URLs,
+    # that one differing token alone was enough to change the SHA256
+    # hash on every single resend, which changes jd_hash, which changes
+    # dedup_key, so is_duplicate() never had a chance to catch it.
+    # Stripping URLs before hashing (hash-only -- the stored
+    # job_description text elsewhere is untouched) makes the hash
+    # reflect the actual JD content again, not a tracking pixel.
+    value = re.sub(r'https?://\S+', ' ', value)
+    # BUG FIX ("body[0] vs body[1]: 4 differing tokens -- only
+    # difference was [cid:image001.jpg@01DD411F.A89C2560] vs
+    # [cid:image001.jpg@01DD411D.CA06C040]" -- confirmed real case, same
+    # data export as the URL fix above): Outlook regenerates a unique
+    # Content-ID for an embedded signature/logo image on every single
+    # send, even when sending the identical email to the identical
+    # recipient multiple times. Same failure mode as the tracking-URL
+    # case immediately above, just a different noise source.
+    value = re.sub(r'\[cid:[^\]]*\]', ' ', value)
     value = re.sub(r'\s+', ' ', value)
-    return value
+    return value.strip()
 
 
 def create_jd_hash(cleaned_jd: str) -> str:

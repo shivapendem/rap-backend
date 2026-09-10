@@ -2324,7 +2324,9 @@ _HOTLIST_INDICATORS = re.compile(
     # hotlist@ampstek.com in your distribution list" -- the sender's own
     # mailing-list mailbox happens to be NAMED "hotlist@...", which is a
     # completely different thing from the email BEING a hotlist
-    # broadcast. Excludes the match when immediately followed by "@"
+    # broadcast. The bare \b before "hot" doesn't stop this: a word
+    # boundary exists just as validly between a space and "h" as it does
+    # anywhere else. Excludes the match when immediately followed by "@"
     # (i.e. it's the local part of an email address, not the phrase).
     r'(?i)\bhot[\s\-]?list\b(?!@)|'
     r'\bour\s+(?:consultants?|resources?|candidates?)\s+(?:are|is)\b|'
@@ -2430,32 +2432,201 @@ _HOTLIST_INDICATORS = re.compile(
     # phrasing to confirm it doesn't.
     r'\bi\s+have\s+(?:a\s+)?(?:candidates?|consultants?)\s+available\b|'
     r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b|'
-    r'\b(?:consultants?|resources?|candidates?)\s+available\s+on\s+(?:the\s+)?bench\b|'
-    # BUG FIX ("...our available genuine Candidates..." confirmed real
-    # case, IT Career Inc; "Please see our available genuine Candidates
-    # for your requirements..." confirmed real case): the bare "available
-    # consultants?" pattern required the noun immediately after
-    # "available" with nothing in between -- an inserted adjective like
-    # "genuine" (or "certified", "qualified", etc.) broke the match
-    # entirely, and only "consultants"/"resources" were recognized as
-    # nouns, not "candidates". Allows up to 2 filler words between
-    # "available" and the noun, and widens the noun list to include
-    # "candidates?" -- same cap already used elsewhere in this pattern
-    # set for the same reason.
-    r'\bavailable\s+(?:\w+\s+){0,2}(?:consultants?|candidates?|resources?)\b|'
-    # BUG FIX: only the verb "find" was recognized ("please find our
-    # available..."); "see"/"check out" are just as common a lead-in for
-    # this exact pitch.
-    r'\bplease\s+(?:find|see|check\s+out)\s+(?:our\s+)?available\s+(?:\w+\s+){0,2}'
-    r'(?:consultants?|candidates?|resources?)\b|'
-    # BUG FIX ("please find below details of our W2 Candidates, who are
-    # available immediately for contract roles on C2C" — confirmed real
-    # case): a very common hotlist opening line names the candidate
-    # batch via "details of our <employment-type> Candidates" rather
-    # than putting "available" directly next to the noun at all --
-    # "available" instead sits several words later ("who are available
-    # immediately"), out of reach of either pattern above.
-    r'\bdetails\s+of\s+our\s+(?:\w+\s+){0,3}(?:candidates?|consultants?|resources?)\b|'
+    # BUG FIX ("...our W2 Candidates, who are available immediately..."
+    # confirmed real case, Sravani/Techwizens; "...consultants who are
+    # readily available..." confirmed real case, CSCS): every existing
+    # "available" pattern above requires the noun and "available" to sit
+    # right next to each other. Real bench pitches very commonly insert a
+    # relative clause -- "candidates, who are available", "consultants who
+    # are readily available" -- which none of them catch. This is checked
+    # as its own pattern rather than widened filler on the existing ones
+    # because "who is/are available" is an unambiguous bench-broadcast
+    # construction on its own -- a real JD describes ONE role, it doesn't
+    # refer to plural "candidates/consultants who are available".
+    r'\b(?:consultants?|candidates?|resources?)\s*,?\s+who\s+(?:are|is)\s+'
+    r'(?:readily\s+|currently\s+)?available\b|'
+    # BUG FIX ("Please share your C2C roles..." confirmed real case, Blue
+    # Space Technologies, appears across multiple broadcasts; "...share
+    # your daily C2C/C2H positions with us" confirmed real case, IT
+    # Career Inc): a recruiter asking the READER to share ROLES/positions
+    # is the opposite direction of a real job requirement -- a genuine JD
+    # already IS the role being shared, it never asks the reader to send
+    # roles back. Distinct from the existing "please share the JD" and
+    # "send your requirements" patterns above, which don't cover "share
+    # your roles/positions" phrasing.
+    r'\bshare\s+your\s+(?:daily\s+)?(?:c2c\s*/?\s*c2h|c2c|c2h)?\s*'
+    r'(?:roles?|requirements?|positions?)\b|'
+    # BUG FIX ROUND 2 ("Kindly share your open requirements..." --
+    # untested candidate phrasing, added proactively): the pattern above
+    # only allowed "daily" or a c2c/c2h token between "your" and the
+    # object noun. Widened to a generic 0-2-word filler cap (matching the
+    # convention used elsewhere in this pattern set) and added
+    # "openings" as a recognized object -- both direction-safe for the
+    # same reason as the "if you have any requirements/openings" fix
+    # above.
+    r'\bshare\s+your\s+(?:[a-z]+\s+){0,2}(?:roles?|requirements?|positions?|openings?)\b|'
+    # BUG FIX ROUND 2 (bare "please share requirements", no "your" --
+    # untested candidate phrasing, e.g. "...please share requirements"):
+    # every "share...requirements" pattern above requires "your"
+    # explicitly. A real JD never asks the reader to "share the
+    # requirements" in any form, since the JD already contains them --
+    # direction-safe on its own without needing "your".
+    r'\bplease\s+share\s+(?:the\s+)?requirements?\b|'
+    # BUG FIX ROUND 2 ("We would love to submit our consultants to your
+    # open positions" -- untested candidate phrasing, added proactively):
+    # distinct from "our consultants are/is available" above -- "submit"
+    # is the verb here, not "are/is". Unambiguously recruiter-source
+    # pitch language; a real JD is never the one doing the submitting.
+    r'\bsubmit\s+our\s+(?:consultants?|candidates?|resources?)\b|'
+    # BUG FIX ("...include my email siva@careits.com in your daily
+    # requirements distribution" confirmed real case, Care IT Services;
+    # "Please add me to your mailing list" same email): "requirements
+    # distribution" and "add me to your mailing list" are both
+    # recruiter-signup phrasings distinct from the existing "add
+    # <email> to requirements" pattern above (that one requires a literal
+    # email address glued right after "add" -- this phrasing reverses the
+    # structure entirely, asking to be added generically first).
+    r'\brequirements?\s+distribution\b|'
+    r'\badd\s+me\s+to\s+your\s+mailing\s+list\b|'
+    # BUG FIX ("...if you'd like to receive his resume, please reply to
+    # this email with job details..." confirmed real case, Thoughtwave
+    # Software): a single-candidate bench pitch offering to SEND a
+    # resume in exchange for the reader's job details -- the reverse
+    # direction of a real JD, which never offers up a candidate's resume
+    # or asks the reader to reply with details of their own opening.
+    r'\bif\s+you\W?d\s+like\s+to\s+receive\s+(?:his|her|their)\s+resume\b|'
+    r'\bplease\s+reply\s+(?:to\s+this\s+email\s+)?with\s+(?:the\s+)?'
+    r'(?:job\s+)?details\b|'
+    # BUG FIX ("Consultant Name / Technology / Visa" table with no
+    # qualifying sentence at all -- confirmed real case, Techrakers
+    # broadcast): a plain bench-consultant listing table can carry NONE
+    # of the phrase-level signals above, just column headers. "Consultant
+    # Name" as an exact two-word phrase is deliberately required (rather
+    # than bare "consultant") -- a real JD commonly says "the consultant
+    # must have..." but essentially never uses "Consultant Name" as its
+    # own two-word phrase, since a JD describes one role, not a roster of
+    # named consultants. Requires "Consultant Name" to be followed,
+    # within a bounded span, by both a "Technology"/"Skill Set" column
+    # and a "Visa" column -- tested against realistic JD prose that
+    # merely mentions "consultant", "technology" and "visa" scattered
+    # separately (no false match, since it lacks the "Consultant Name"
+    # anchor) to confirm this doesn't fire on genuine postings.
+    r'\bconsultant\s*name\b[\s\S]{0,150}?\b(?:technology|skill\s*sets?)\b'
+    r'[\s\S]{0,300}?\bvisa\b|'
+    # BUG FIX ROUND 2 (sender signature carries a "Bench Sales" job title
+    # -- untested candidate phrasing, added proactively): the single
+    # clearest signal available is often the SENDER's own stated role,
+    # not body phrasing at all -- "Bench Sales Recruiter", "US IT Bench
+    # Sales", "Sr. Bench Sales Manager" etc. This job title is
+    # essentially unique to people whose job is selling bench
+    # consultants; no genuine JD sender (account manager, technical
+    # recruiter, hiring manager) signs off this way. Tested against
+    # realistic non-bench-sales signatures ("Technical Recruiter",
+    # "Senior Talent Acquisition Specialist") to confirm those don't trip
+    # this.
+    r'\bbench\s+sales\b|'
+    # BUG FIX ROUND 2 ("Please go through the profile and let us know
+    # your thoughts" -- untested candidate phrasing, added proactively):
+    # a recruiter-pitch review ask distinct from anything above.
+    r'\bgo\s+through\s+the\s+profiles?\b|'
+    # BUG FIX ROUND 2 (regression found via real-corpus batch testing:
+    # "Ideal Candidate Profile" / "Desired Candidate Profile" is a
+    # completely standard JD section heading listing the soft-skills/
+    # traits an employer wants -- e.g. "...12+ years required...Ideal
+    # Candidate Profile: Highly organized and execution-focused..." --
+    # confirmed false positives on two real, fully-detailed JDs, "Opening
+    # for Scrum Master - NYC" and "Gen AI/Agentic AI Lead / AI Architect".
+    # The original bare "consultant/candidate profile" noun-phrase match
+    # couldn't tell that heading apart from a genuine bench pitch offering
+    # up a specific candidate's profile ("I'm sharing a strong SAP PP/QM
+    # Consultant profile for your review"). Rather than blacklist
+    # "ideal"/"desired" (which would miss other heading variants), this
+    # now requires an actual OFFERING verb within a few words before the
+    # phrase -- sharing/attached/find/see/review/below/following -- which
+    # is what genuinely distinguishes "here is a candidate's profile for
+    # you" from a JD's own descriptive heading. Tested against both real
+    # false-positive cases (neither has an offering verb nearby -- "Ideal"
+    # alone precedes it) and against the original confirmed true positives
+    # (all still match) to confirm this doesn't reintroduce the leak it
+    # was fixing.
+    r'\b(?:sharing|share|attached|find|see|review|below|following)\b'
+    r'(?:\s+\S+){0,4}\s+(?:consultant|candidate)\s+profiles?\b|'
+    # BUG FIX ROUND 2 ("Kindly utilize this resource for any matching
+    # requirements" -- untested candidate phrasing, added proactively):
+    # tested against "this role will utilize resources across multiple
+    # teams" (plural "resources", a plausible genuine-JD sentence) to
+    # confirm the singular-only match here doesn't trip on it.
+    r'\butilize\s+(?:this\s+)?(?:resource|consultant|candidate)\b|'
+    # BUG FIX ROUND 2 ("Please find attached resume of our Java
+    # consultant..." / "Attached is the resume of our Senior DevOps
+    # consultant..." -- untested candidate phrasing, added proactively):
+    # offering up a THIRD PARTY's resume as an attachment -- the reverse
+    # direction of a real JD, which never attaches or references
+    # "the resume of" someone else. Distinct from the existing "if
+    # you'd like to receive his resume" pattern above (that one is
+    # conditional/offered; this one states the resume is already
+    # attached).
+    r'\bplease\s+find\s+attached\s+(?:the\s+)?resume\b|'
+    r'\battached\s+is\s+(?:the\s+)?resume\s+of\b|'
+    # BUG FIX ROUND 2 ("We are pleased to share the below profile for
+    # your review" -- untested candidate phrasing, added proactively):
+    # distinctive bench-broadcast framing not covered by any pattern
+    # above.
+    r'\bpleased\s+to\s+share\s+(?:the\s+)?(?:below|following)\s+profiles?\b|'
+    # BUG FIX ("Sharing an experienced Data Engineer who is currently
+    # available for new opportunities... Please share any matching
+    # requirements. The candidate is available for immediate
+    # interviews." -- confirmed real case): a single-candidate
+    # bench-broadcast in THIRD person ("sharing a <role> who is
+    # available", "the candidate is available") reads exactly like a
+    # real JD once it's dressed in the same Role:/Experience:/Location:/
+    # Work Authorization: label shape a real posting uses -- none of the
+    # first-person ("I have"/"my candidate") or literal-"hotlist"
+    # patterns above catch it, since it's neither. "Available for new
+    # opportunities" and "the candidate is available" are never phrases
+    # a real JD would use about the OPENING -- a job doesn't have "new
+    # opportunities" of its own, and a JD never refers to "the
+    # candidate" (that's the recruiter's own person, not the client's
+    # role). "Please share any matching requirements" is the same
+    # bench-broadcast ask as "please share the JD"/"send your
+    # requirements" above, just with "matching" instead.
+    r'\bavailable\s+for\s+new\s+opportunit(?:y|ies)\b|'
+    r'\bcurrently\s+available\s+for\s+(?:new\s+)?opportunit(?:y|ies)\b|'
+    r'\bthe\s+candidate\s+is\s+available\b|'
+    r'\bplease\s+share\s+(?:any\s+)?matching\s+requirements?\b|'
+    # BUG FIX (a batch of confirmed real cases still slipping through as
+    # real job postings): several more common ways a recruiter offers
+    # ONE candidate's profile rather than describing an actual opening --
+    #   - "profile of our consultant who is available for immediate
+    #     joining" -- "available" 3+ words after "consultant" this time.
+    #   - "sharing the updated profile of one of our consultants" --
+    #     announces the email's own purpose (here's a resume).
+    #   - "we have an immediate joiner available" -- "joiner" is a
+    #     person, not a role being offered.
+    #   - "share suitable (job) requirements (matching this profile)".
+    #   - "go through the (below) consultant/candidate profile" --
+    #     directly asks the reader to review a PERSON's profile.
+    r'\bprofile\s+of\s+(?:our|my|the)\s+consultants?\b|'
+    r'\b(?:consultants?|candidates?)\s+who\s+(?:is|are)\s+available\b|'
+    r'\bsharing\s+(?:the\s+)?updated\s+profile\s+of\b|'
+    r'\bimmediate\s+joiners?\s+available\b|'
+    r'\bwe\s+have\s+(?:an?\s+)?immediate\s+joiners?\b|'
+    r'\bshare\s+suitable\s+(?:job\s+)?requirements?\b|'
+    r'\brequirements?\s+matching\s+this\s+profile\b|'
+    r'\bgo\s+through\s+the\s+(?:below\s+)?(?:consultant|candidate)\s+profile\b|'
+    # BUG FIX (broader batch of confirmed real cases -- one of which,
+    # "Available Resources Weekly", was a genuine false-positive that
+    # made it all the way through to is_likely_requirement=True):
+    #   - "let us know if any of these match your requirements".
+    #   - "Available Resources - This Week" / "... Weekly".
+    #   - "consultants are ready for deployment".
+    #   - "resumes of our/the consultants".
+    #   - "consultant list" / "bench report".
+    r'\bmatch(?:es)?\s+your\s+requirements?\b|'
+    r'\bavailable\s+resources?\s*[-:]?\s*(?:this\s+week|weekly|today)\b|'
+    r'\bconsultants?\s+(?:are\s+)?ready\s+for\s+deployment\b|'
+    r'\bresumes?\s+of\s+(?:our|the)\s+consultants?\b|'
+    r'\bconsultants?\s+list\b|\bbench\s+report\b'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
