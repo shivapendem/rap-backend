@@ -2392,7 +2392,61 @@ _HOTLIST_INDICATORS = re.compile(
     # differently and must NOT trip this -- tested against that exact
     # phrasing to confirm it doesn't.
     r'\bi\s+have\s+(?:a\s+)?(?:candidates?|consultants?)\s+available\b|'
-    r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b'
+    r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b|'
+    # BUG FIX ("Sharing an experienced Data Engineer who is currently
+    # available for new opportunities... Please share any matching
+    # requirements. The candidate is available for immediate
+    # interviews." -- confirmed real case): a single-candidate
+    # bench-broadcast in THIRD person ("sharing a <role> who is
+    # available", "the candidate is available") reads exactly like a
+    # real JD once it's dressed in the same Role:/Experience:/Location:/
+    # Work Authorization: label shape a real posting uses -- none of the
+    # first-person ("I have"/"my candidate") or literal-"hotlist"
+    # patterns above catch it, since it's neither. "Available for new
+    # opportunities" and "the candidate is available" are never phrases
+    # a real JD would use about the OPENING -- a job doesn't have "new
+    # opportunities" of its own, and a JD never refers to "the
+    # candidate" (that's the recruiter's own person, not the client's
+    # role). "Please share any matching requirements" is the same
+    # bench-broadcast ask as "please share the JD"/"send your
+    # requirements" above, just with "matching" instead.
+    r'\bavailable\s+for\s+new\s+opportunit(?:y|ies)\b|'
+    r'\bcurrently\s+available\s+for\s+(?:new\s+)?opportunit(?:y|ies)\b|'
+    r'\bthe\s+candidate\s+is\s+available\b|'
+    r'\bplease\s+share\s+(?:any\s+)?matching\s+requirements?\b|'
+    # BUG FIX (a batch of confirmed real cases still slipping through as
+    # real job postings): several more common ways a recruiter offers
+    # ONE candidate's profile rather than describing an actual opening --
+    #   - "profile of our consultant who is available for immediate
+    #     joining" -- "available" 3+ words after "consultant" this time.
+    #   - "sharing the updated profile of one of our consultants" --
+    #     announces the email's own purpose (here's a resume).
+    #   - "we have an immediate joiner available" -- "joiner" is a
+    #     person, not a role being offered.
+    #   - "share suitable (job) requirements (matching this profile)".
+    #   - "go through the (below) consultant/candidate profile" --
+    #     directly asks the reader to review a PERSON's profile.
+    r'\bprofile\s+of\s+(?:our|my|the)\s+consultants?\b|'
+    r'\b(?:consultants?|candidates?)\s+who\s+(?:is|are)\s+available\b|'
+    r'\bsharing\s+(?:the\s+)?updated\s+profile\s+of\b|'
+    r'\bimmediate\s+joiners?\s+available\b|'
+    r'\bwe\s+have\s+(?:an?\s+)?immediate\s+joiners?\b|'
+    r'\bshare\s+suitable\s+(?:job\s+)?requirements?\b|'
+    r'\brequirements?\s+matching\s+this\s+profile\b|'
+    r'\bgo\s+through\s+the\s+(?:below\s+)?(?:consultant|candidate)\s+profile\b|'
+    # BUG FIX (broader batch of confirmed real cases -- one of which,
+    # "Available Resources Weekly", was a genuine false-positive that
+    # made it all the way through to is_likely_requirement=True):
+    #   - "let us know if any of these match your requirements".
+    #   - "Available Resources - This Week" / "... Weekly".
+    #   - "consultants are ready for deployment".
+    #   - "resumes of our/the consultants".
+    #   - "consultant list" / "bench report".
+    r'\bmatch(?:es)?\s+your\s+requirements?\b|'
+    r'\bavailable\s+resources?\s*[-:]?\s*(?:this\s+week|weekly|today)\b|'
+    r'\bconsultants?\s+(?:are\s+)?ready\s+for\s+deployment\b|'
+    r'\bresumes?\s+of\s+(?:our|the)\s+consultants?\b|'
+    r'\bconsultants?\s+list\b|\bbench\s+report\b'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -2845,6 +2899,43 @@ def extract_work_mode(text: str) -> str:
                     best_mode = mode
                 break  # earliest valid match for this pattern is enough
     return best_mode
+
+
+# BUG FIX ("location: None" for postings that only state a locality
+# RESTRICTION -- "Locals only", "Local to Dallas, TX", "Must be local",
+# "Locals preferred" -- with no "Location:" label, no validated
+# City/State pair, and no Remote/Hybrid/Onsite keyword anywhere else):
+# every location tier before this one requires one of those three
+# shapes, so this common recruiter phrasing fell through to None even
+# though the posting is unambiguous about requiring a local candidate.
+# If a place name follows "local to", surface it ("Local to Dallas,
+# TX"); otherwise a bare restriction phrase still counts as a real (if
+# vague) location value rather than nothing at all.
+_LOCALS_WITH_PLACE_PATTERN = re.compile(
+    r'(?i)\blocal\s+to\s+([A-Za-z][A-Za-z .]{1,40}?)'
+    r'(?=\s*(?:only|preferred|candidates?|resources?|consultants?|\.|,|;|$|\n))'
+)
+_BARE_LOCALS_RESTRICTION_PATTERN = re.compile(
+    r'(?i)\blocals?\s+only\b|\bonly\s+locals?\b|\bmust\s+be\s+local\b|'
+    r'\blocals?\s+preferred\b|\blocal\s+candidates?\s+only\b|'
+    r'\blocal\s+candidates?\s+preferred\b'
+)
+
+
+def extract_locals_restriction(text: str) -> Optional[str]:
+    """Best-effort location value from a bare locality RESTRICTION
+    statement ("Locals only", "Local to Dallas, TX", "Must be local"),
+    used as a last-resort location fallback."""
+    if not text:
+        return None
+    m = _LOCALS_WITH_PLACE_PATTERN.search(text)
+    if m:
+        place = sanitize_text(m.group(1))
+        if place:
+            return f"Local to {place}"
+    if _BARE_LOCALS_RESTRICTION_PATTERN.search(text):
+        return "Locals Only"
+    return None
 
 
 # Negation words immediately before a keyword mean it is being excluded —
@@ -3640,30 +3731,67 @@ def calculate_confidence(parsed: Dict[str, Any]) -> float:
     Calculate confidence based on extracted fields.
     This function signature must remain unchanged for backend compatibility.
 
-    Intentional: if `role` is not found (stays 'UNKNOWN'), confidence is
-    forced to 0.0 regardless of how many other fields were extracted. A row
-    with no identifiable role is treated as not a usable requirement even if
-    location/rate/etc. are present.
+    4-field workflow -- employment_types, location, work_authorization,
+    role. 'skills' and 'client'/'rate' are dropped entirely from this
+    calculation.
+
+    Step 1 -- check the 3 primary fields FIRST: employment_types,
+    location, work_authorization. Count how many of these 3 are
+    present/valid. location itself also recognizes a bare locality
+    RESTRICTION ("Locals only", "Local to Dallas, TX", "Must be local")
+    as valid even with no city/state pair or work-mode keyword present
+    -- see extract_locals_restriction().
+
+    Step 2 -- THEN check role. It's a MANDATORY gate, not just one
+    point among many: it must be present AND structurally look like a
+    real job title (see _looks_like_generic_role_header) -- not just
+    "not UNKNOWN". If it fails this check, confidence is 0.0
+    immediately regardless of how many of the 3 primary fields were
+    found in Step 1 -- a posting with no identifiable real title is
+    never treated as usable no matter how complete the rest of the
+    extraction is.
+
+    Step 3 -- once role passes, combine: role itself plus each of the 3
+    primary fields is worth an equal 1/4 of the total score:
+        role passes + all 3 present   -> 1.0  (4/4)
+        role passes + 2 of 3 present  -> 0.75 (3/4)
+        role passes + 1 of 3 present  -> 0.5  (2/4)
+        role passes + 0 of 3 present  -> 0.25 (1/4)
+        role fails (any case)         -> 0.0
+
+    is_likely_requirement's threshold of 0.75 (see below, where this is
+    used) means a posting needs role PLUS at least 2 of the 3 primary
+    fields -- i.e. 3 of the 4 total fields -- to count as a real job
+    posting.
     """
     if not parsed:
         return 0.0
-    
-    important_fields = ['client', 'location', 'rate', 'employment_types', 'role', 'skills']
-    valid_fields = 0
-    
-    for field in important_fields:
+
+    # Step 1 -- primary fields first.
+    primary_fields = ['employment_types', 'location', 'work_authorization']
+    valid_count = 0
+    for field in primary_fields:
         value = parsed.get(field)
-        if field == 'employment_types' or field == 'skills':
+        if field == 'employment_types':
             if value and isinstance(value, list) and value != ['UNKNOWN']:
-                valid_fields += 1
+                valid_count += 1
         else:
             if value and value != 'UNKNOWN' and not is_email_body(str(value)):
-                valid_fields += 1
-                
-    if parsed.get('role') and parsed['role'] != 'UNKNOWN':
-        if valid_fields >= 1:
-            return min(round(valid_fields / len(important_fields), 2), 1.0)
-    return 0.0
+                valid_count += 1
+
+    # Step 2 -- then the role gate.
+    role = parsed.get('role')
+    role_is_real_title = (
+        bool(role)
+        and role != 'UNKNOWN'
+        and not is_email_body(str(role))
+        and not _looks_like_generic_role_header(role)
+    )
+    if not role_is_real_title:
+        return 0.0
+
+    # Step 3 -- combine.
+    return round((1 + valid_count) / 4, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -4574,6 +4702,14 @@ def parse_requirement(
             _bare_work_mode = extract_work_mode(full_text)
             if _bare_work_mode != 'UNKNOWN':
                 location = _bare_work_mode.capitalize()
+        # BUG FIX: a posting can restrict candidates by locality ("Locals
+        # only", "Local to Dallas, TX", "Must be local", "Locals
+        # preferred") with no actual "Location:" label, no validated
+        # City/State pair, and no Remote/Hybrid/Onsite keyword anywhere
+        # else in the email -- reuses extract_locals_restriction() as a
+        # final fallback tier.
+        if not location:
+            location = extract_locals_restriction(full_text)
 
     # ── Rate ──────────────────────────────────────────────────────────────
     rate = clean_rate(_ai_field('rate'))
@@ -4755,7 +4891,14 @@ def parse_requirement(
     }
 
     parsed['parse_confidence'] = calculate_confidence(parsed)
-    parsed['is_likely_requirement'] = parsed['parse_confidence'] >= 0.3
+    # BUG FIX (threshold raised from 0.3 to 0.75 to match the new 4-field
+    # confidence workflow -- see calculate_confidence()'s docstring):
+    # under the old 6-field average, 0.3 meant "role + 1 other field".
+    # Under the new role-is-mandatory / 4-field scheme, 0.75 means "role
+    # passes its real-title check AND at least 2 of {employment_types,
+    # location, work_authorization} are present" -- i.e. 3 of the 4
+    # total fields, per spec.
+    parsed['is_likely_requirement'] = parsed['parse_confidence'] >= 0.75
 
     # Final guard — never return email body content in any field
     for key, value in parsed.items():
