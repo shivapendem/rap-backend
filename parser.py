@@ -2069,7 +2069,24 @@ _REPLY_ONLY_BODY_MARKERS = [
 _FORWARD_BODY_MARKERS = [
     r'-{2,}\s*forwarded message\s*-{2,}',
     r'^begin forwarded message:',
-    r'^from:\s*.+\n^sent:\s*.+\n^to:\s*.+\n^subject:\s*.+',
+    # BUG FIX ("Re: Python AI Engineer..." -- a full, genuine JD quoted
+    # under a bare "Re:" reply -- confirmed real case, silently dropped
+    # as "Reply or Forward email"): this 4-line block required an exact
+    # From:/Sent:/To:/Subject: sequence, but Outlook doesn't always
+    # include a "To:" line in its quoted-header block (e.g. when the
+    # original went to a distribution address rather than a named
+    # recipient) -- this real email's quoted header was only From:/
+    # Sent:/Subject:, three lines, and the required fourth line made the
+    # whole pattern silently fail to match, so is_forward_email()
+    # returned False and the email fell through to is_reply_email(),
+    # which saw the bare "Re:" subject and auto-skipped the entire
+    # quoted JD. The "To:" line is now optional. This doesn't loosen
+    # anything else -- the From:/Sent:/Subject: sequence is exactly as
+    # strict as before, so unrelated three-line text (e.g. a paragraph
+    # that separately happens to start lines with "From my perspective",
+    # "Sent the update", "Subject to review") still won't match unless it
+    # actually forms that literal consecutive header block.
+    r'^from:\s*.+\n^sent:\s*.+\n(?:^to:\s*.+\n)?^subject:\s*.+',
 ]
 
 def is_forward_email(subject: str, body_text: str = "") -> bool:
@@ -2170,7 +2187,10 @@ _HOTLIST_INDICATORS = re.compile(
     r'(?i)\bhot[\s\-]?list\b(?!@)|'
     r'\bour\s+(?:consultants?|resources?|candidates?)\s+(?:are|is)\b|'
     r'\bconsultants?\s+(?:are\s+)?ready\s+to\s+join\b|'
-    r'\bbench\s+(?:consultants?|resources?)\b|'
+    # BUG FIX: only matched "bench consultants"/"bench resources" --
+    # "bench Candidates" (confirmed real case, Mounica/Consigatech
+    # broadcast) is just as common a variant and wasn't covered.
+    r'\bbench\s+(?:consultants?|resources?|candidates?)\b|'
     r'\bbench\s*list\b|'
     r'\bconsultants?\s+coming\s+out\s+of\s+(?:the\s+)?projects?\b|'
     r'\badd\s+[\w.+\-]+@[\w.\-]+\s+to\s+(?:your\s+)?requirements?\b|'
@@ -2186,7 +2206,21 @@ _HOTLIST_INDICATORS = re.compile(
     # JD IS the requirement, it never asks the reader to "share the JD"
     # or "send your requirements" in return.
     r'\bplease\s+share\s+(?:the\s+)?(?:jd|job\s+description)s?\b|'
-    r'\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z]+\s+){0,2}requirements?\b|'
+    # BUG FIX ("...check if you have any C2C requirements..." -- confirmed
+    # real case, Mounica/Consigatech): the filler-word class between "any"
+    # and "requirements" was [a-z]+, which only matches letters -- it
+    # silently rejected any filler token containing a digit, like "C2C" or
+    # "H1B". [a-z0-9]+ keeps the same 0-2-word cap but no longer breaks on
+    # the single most common staffing-domain filler word there is.
+    # BUG FIX ROUND 2 ("...if you have any openings matching this skill
+    # set..." -- untested candidate phrasing, added proactively): only
+    # "requirements" was accepted as the object noun; "openings" is just
+    # as common and carries the same direction-safe guarantee -- a real
+    # JD already IS the opening, it never asks the reader whether THEY
+    # have openings. Tested against a genuine multi-opening JD digest
+    # ("We have multiple openings for Senior Java Developers...") to
+    # confirm the different sentence shape there doesn't trip this.
+    r'\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z0-9]+\s+){0,2}(?:requirements?|openings?)\b|'
     r'\bsend\s+(?:me\s+)?your\s+(?:job\s+)?requirements?\b|'
     r'\bcandidates?\s+available\b|'
     # BUG FIX ("Available Consultants" hotlist table treated as a real
@@ -2215,7 +2249,14 @@ _HOTLIST_INDICATORS = re.compile(
     # single role being filled -- a real JD doesn't have "available
     # consultants" of its own to offer.
     r'\b(?:consultants?|resources?)\s+available\s+on\s+(?:the\s+)?bench\b|'
-    r'\bavailable\s+consultants?\b|'
+    # BUG FIX ("...our available genuine Candidates..." -- confirmed real
+    # case, IT Career Inc): the bare "available consultants?" pattern
+    # required the noun immediately after "available" with nothing in
+    # between -- an inserted adjective like "genuine" (or "certified",
+    # "qualified", etc.) broke the match entirely. Allows up to 2 filler
+    # words between "available" and the noun, same cap already used
+    # elsewhere in this pattern set for the same reason.
+    r'\bavailable\s+(?:[a-z]+\s+){0,2}(?:consultants?|candidates?|resources?)\b|'
     r'\bplease\s+find\s+(?:our\s+)?available\s+(?:consultants?|candidates?|resources?)\b|'
     r'\bsend\s+(?:me\s+)?daily\s+requirements?\b|'
     # BUG FIX (real-world recruiter phrasing not yet covered): "I have a
@@ -2230,7 +2271,148 @@ _HOTLIST_INDICATORS = re.compile(
     # differently and must NOT trip this -- tested against that exact
     # phrasing to confirm it doesn't.
     r'\bi\s+have\s+(?:a\s+)?(?:candidates?|consultants?)\s+available\b|'
-    r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b'
+    r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b|'
+    # BUG FIX ("...our W2 Candidates, who are available immediately..."
+    # confirmed real case, Sravani/Techwizens; "...consultants who are
+    # readily available..." confirmed real case, CSCS): every existing
+    # "available" pattern above requires the noun and "available" to sit
+    # right next to each other. Real bench pitches very commonly insert a
+    # relative clause -- "candidates, who are available", "consultants who
+    # are readily available" -- which none of them catch. This is checked
+    # as its own pattern rather than widened filler on the existing ones
+    # because "who is/are available" is an unambiguous bench-broadcast
+    # construction on its own -- a real JD describes ONE role, it doesn't
+    # refer to plural "candidates/consultants who are available".
+    r'\b(?:consultants?|candidates?|resources?)\s*,?\s+who\s+(?:are|is)\s+'
+    r'(?:readily\s+|currently\s+)?available\b|'
+    # BUG FIX ("Please share your C2C roles..." confirmed real case, Blue
+    # Space Technologies, appears across multiple broadcasts; "...share
+    # your daily C2C/C2H positions with us" confirmed real case, IT
+    # Career Inc): a recruiter asking the READER to share ROLES/positions
+    # is the opposite direction of a real job requirement -- a genuine JD
+    # already IS the role being shared, it never asks the reader to send
+    # roles back. Distinct from the existing "please share the JD" and
+    # "send your requirements" patterns above, which don't cover "share
+    # your roles/positions" phrasing.
+    r'\bshare\s+your\s+(?:daily\s+)?(?:c2c\s*/?\s*c2h|c2c|c2h)?\s*'
+    r'(?:roles?|requirements?|positions?)\b|'
+    # BUG FIX ROUND 2 ("Kindly share your open requirements..." --
+    # untested candidate phrasing, added proactively): the pattern above
+    # only allowed "daily" or a c2c/c2h token between "your" and the
+    # object noun. Widened to a generic 0-2-word filler cap (matching the
+    # convention used elsewhere in this pattern set) and added
+    # "openings" as a recognized object -- both direction-safe for the
+    # same reason as the "if you have any requirements/openings" fix
+    # above.
+    r'\bshare\s+your\s+(?:[a-z]+\s+){0,2}(?:roles?|requirements?|positions?|openings?)\b|'
+    # BUG FIX ROUND 2 (bare "please share requirements", no "your" --
+    # untested candidate phrasing, e.g. "...please share requirements"):
+    # every "share...requirements" pattern above requires "your"
+    # explicitly. A real JD never asks the reader to "share the
+    # requirements" in any form, since the JD already contains them --
+    # direction-safe on its own without needing "your".
+    r'\bplease\s+share\s+(?:the\s+)?requirements?\b|'
+    # BUG FIX ROUND 2 ("We would love to submit our consultants to your
+    # open positions" -- untested candidate phrasing, added proactively):
+    # distinct from "our consultants are/is available" above -- "submit"
+    # is the verb here, not "are/is". Unambiguously recruiter-source
+    # pitch language; a real JD is never the one doing the submitting.
+    r'\bsubmit\s+our\s+(?:consultants?|candidates?|resources?)\b|'
+    # BUG FIX ("...include my email siva@careits.com in your daily
+    # requirements distribution" confirmed real case, Care IT Services;
+    # "Please add me to your mailing list" same email): "requirements
+    # distribution" and "add me to your mailing list" are both
+    # recruiter-signup phrasings distinct from the existing "add
+    # <email> to requirements" pattern above (that one requires a literal
+    # email address glued right after "add" -- this phrasing reverses the
+    # structure entirely, asking to be added generically first).
+    r'\brequirements?\s+distribution\b|'
+    r'\badd\s+me\s+to\s+your\s+mailing\s+list\b|'
+    # BUG FIX ("...if you'd like to receive his resume, please reply to
+    # this email with job details..." confirmed real case, Thoughtwave
+    # Software): a single-candidate bench pitch offering to SEND a
+    # resume in exchange for the reader's job details -- the reverse
+    # direction of a real JD, which never offers up a candidate's resume
+    # or asks the reader to reply with details of their own opening.
+    r'\bif\s+you\W?d\s+like\s+to\s+receive\s+(?:his|her|their)\s+resume\b|'
+    r'\bplease\s+reply\s+(?:to\s+this\s+email\s+)?with\s+(?:the\s+)?'
+    r'(?:job\s+)?details\b|'
+    # BUG FIX ("Consultant Name / Technology / Visa" table with no
+    # qualifying sentence at all -- confirmed real case, Techrakers
+    # broadcast): a plain bench-consultant listing table can carry NONE
+    # of the phrase-level signals above, just column headers. "Consultant
+    # Name" as an exact two-word phrase is deliberately required (rather
+    # than bare "consultant") -- a real JD commonly says "the consultant
+    # must have..." but essentially never uses "Consultant Name" as its
+    # own two-word phrase, since a JD describes one role, not a roster of
+    # named consultants. Requires "Consultant Name" to be followed,
+    # within a bounded span, by both a "Technology"/"Skill Set" column
+    # and a "Visa" column -- tested against realistic JD prose that
+    # merely mentions "consultant", "technology" and "visa" scattered
+    # separately (no false match, since it lacks the "Consultant Name"
+    # anchor) to confirm this doesn't fire on genuine postings.
+    r'\bconsultant\s*name\b[\s\S]{0,150}?\b(?:technology|skill\s*sets?)\b'
+    r'[\s\S]{0,300}?\bvisa\b|'
+    # BUG FIX ROUND 2 (sender signature carries a "Bench Sales" job title
+    # -- untested candidate phrasing, added proactively): the single
+    # clearest signal available is often the SENDER's own stated role,
+    # not body phrasing at all -- "Bench Sales Recruiter", "US IT Bench
+    # Sales", "Sr. Bench Sales Manager" etc. This job title is
+    # essentially unique to people whose job is selling bench
+    # consultants; no genuine JD sender (account manager, technical
+    # recruiter, hiring manager) signs off this way. Tested against
+    # realistic non-bench-sales signatures ("Technical Recruiter",
+    # "Senior Talent Acquisition Specialist") to confirm those don't trip
+    # this.
+    r'\bbench\s+sales\b|'
+    # BUG FIX ROUND 2 ("Please go through the profile and let us know
+    # your thoughts" -- untested candidate phrasing, added proactively):
+    # a recruiter-pitch review ask distinct from anything above.
+    r'\bgo\s+through\s+the\s+profiles?\b|'
+    # BUG FIX ROUND 2 (regression found via real-corpus batch testing:
+    # "Ideal Candidate Profile" / "Desired Candidate Profile" is a
+    # completely standard JD section heading listing the soft-skills/
+    # traits an employer wants -- e.g. "...12+ years required...Ideal
+    # Candidate Profile: Highly organized and execution-focused..." --
+    # confirmed false positives on two real, fully-detailed JDs, "Opening
+    # for Scrum Master - NYC" and "Gen AI/Agentic AI Lead / AI Architect".
+    # The original bare "consultant/candidate profile" noun-phrase match
+    # couldn't tell that heading apart from a genuine bench pitch offering
+    # up a specific candidate's profile ("I'm sharing a strong SAP PP/QM
+    # Consultant profile for your review"). Rather than blacklist
+    # "ideal"/"desired" (which would miss other heading variants), this
+    # now requires an actual OFFERING verb within a few words before the
+    # phrase -- sharing/attached/find/see/review/below/following -- which
+    # is what genuinely distinguishes "here is a candidate's profile for
+    # you" from a JD's own descriptive heading. Tested against both real
+    # false-positive cases (neither has an offering verb nearby -- "Ideal"
+    # alone precedes it) and against the original confirmed true positives
+    # (all still match) to confirm this doesn't reintroduce the leak it
+    # was fixing.
+    r'\b(?:sharing|share|attached|find|see|review|below|following)\b'
+    r'(?:\s+\S+){0,4}\s+(?:consultant|candidate)\s+profiles?\b|'
+    # BUG FIX ROUND 2 ("Kindly utilize this resource for any matching
+    # requirements" -- untested candidate phrasing, added proactively):
+    # tested against "this role will utilize resources across multiple
+    # teams" (plural "resources", a plausible genuine-JD sentence) to
+    # confirm the singular-only match here doesn't trip on it.
+    r'\butilize\s+(?:this\s+)?(?:resource|consultant|candidate)\b|'
+    # BUG FIX ROUND 2 ("Please find attached resume of our Java
+    # consultant..." / "Attached is the resume of our Senior DevOps
+    # consultant..." -- untested candidate phrasing, added proactively):
+    # offering up a THIRD PARTY's resume as an attachment -- the reverse
+    # direction of a real JD, which never attaches or references
+    # "the resume of" someone else. Distinct from the existing "if
+    # you'd like to receive his resume" pattern above (that one is
+    # conditional/offered; this one states the resume is already
+    # attached).
+    r'\bplease\s+find\s+attached\s+(?:the\s+)?resume\b|'
+    r'\battached\s+is\s+(?:the\s+)?resume\s+of\b|'
+    # BUG FIX ROUND 2 ("We are pleased to share the below profile for
+    # your review" -- untested candidate phrasing, added proactively):
+    # distinctive bench-broadcast framing not covered by any pattern
+    # above.
+    r'\bpleased\s+to\s+share\s+(?:the\s+)?(?:below|following)\s+profiles?\b'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -2276,15 +2458,58 @@ _RESUME_SECTION_HEADERS = re.compile(
     r'skills\s*(?:&|and)\s*certifications|education)\s*:'
 )
 
+# BUG FIX ("HOTLIST(DevOps, SRE Engineer looking Project all over USA,
+# H1B)" -- confirmed real case, RWaltz/Paul(SUDIEEP)): this was a
+# candidate's full resume pasted as the email body (thousands of words of
+# work history), but it uses "Professional Experience" / "Technical
+# Skills" as its own section labels rather than the four literal phrases
+# _RESUME_SECTION_HEADERS recognizes, so the 2-header threshold never
+# fired and the whole resume ran through full JD extraction. Adding
+# "professional experience"/"technical skills" as recognized headers was
+# considered and rejected -- both are common, legitimate labels in a
+# real JD too ("Professional Experience Required: 5+ years", "Technical
+# Skills: Java, AWS"), so it would trade this false negative for a new
+# false positive on genuine postings.
+#
+# Instead this targets what's actually unique to a resume: 3+ distinct
+# "MM/YYYY - MM/YYYY" (or "- Till Date" / "- Present") employment date
+# ranges, i.e. an actual work-history timeline. A real single-role JD may
+# mention one contract duration ("06/2026 - 12/2026") or occasionally two
+# project-phase dates, but a candidate's resume listing successive past
+# jobs is the only shape that produces three or more of these -- tested
+# against realistic JD duration/timeline phrasing (including a
+# deliberately adversarial two-phase project timeline) to confirm neither
+# trips this at the 3+ threshold.
+# BUG FIX ROUND 2 (RWaltz resume date ranges still not detected in the
+# real email -- confirmed real case): the leading \b in
+# _EMPLOYMENT_DATE_RANGE required a word/non-word transition right before
+# the digit, but this resume's HTML-flattened text glues the date
+# directly onto the preceding word with no space at all ("Platform
+# Engineer04/2025- Till date", "Operations03/2023 -03/2025") -- letters
+# and digits are both \w characters, so no boundary exists between them,
+# and the leading \b silently rejected every glued date. Dropped the
+# leading \b (the trailing \b is kept and still works, since a date range
+# is always followed by a space or punctuation, never another digit
+# glued on). Tested against digit strings that happen to contain a
+# similar shape (a reference number, a phone extension) to confirm this
+# doesn't produce spurious partial matches.
+_EMPLOYMENT_DATE_RANGE = re.compile(
+    r'(?i)\d{1,2}/\d{4}\s*[-\u2013]\s*(?:\d{1,2}/\d{4}|till\s*date|present|current)\b'
+)
+
 
 def _looks_like_resume_body(text: str) -> bool:
-    """True when `text` has 2+ distinct resume-style section headers
-    (see _RESUME_SECTION_HEADERS docstring above) -- i.e. this is a
+    """True when `text` has 2+ distinct resume-style section headers, or
+    3+ distinct past-employment date ranges (see _RESUME_SECTION_HEADERS
+    and _EMPLOYMENT_DATE_RANGE docstrings above) -- i.e. this is a
     candidate's resume/profile, not a job requirement JD."""
     if not text:
         return False
     hits = {m.group(0).lower() for m in _RESUME_SECTION_HEADERS.finditer(text)}
-    return len(hits) >= 2
+    if len(hits) >= 2:
+        return True
+    date_ranges = {m.group(0) for m in _EMPLOYMENT_DATE_RANGE.finditer(text)}
+    return len(date_ranges) >= 3
 
 
 def is_hotlist_email(text: str) -> bool:
@@ -3851,12 +4076,43 @@ _BOILERPLATE_FOOTER_PATTERN = re.compile(
     r'please\s+add\s+(?:my\s+)?email(?:\s*id)?\s+to\s+(?:your\s+)?distribution'
 )
 
+# BUG FIX ("JR Project Manager SC Locals Only..." and "Datacenter Lead
+# Madison, WI..." both real, fully-detailed single-role JDs -- silently
+# dropped as newsletter/spam, confirmed on a real batch export): this
+# portal (PROHIRES POWERHOUSE) puts its unsubscribe/mailing-list-signup
+# boilerplate at the very TOP of the body, not the bottom -- e.g. "Remove/
+# unsubscribe | Update your contact and subscribed mailing list(s) |
+# Subscribe to mailing list(s) to receive requirements & resumes". The
+# existing _BOILERPLATE_FOOTER_PATTERN above only handles TRAILING
+# footers (it truncates everything from the match point to the end of
+# the text) -- naively adding this phrase to that same pattern would
+# truncate the ENTIRE email, including the real JD that follows it.
+# This is a separate, narrow pattern for known LEADING boilerplate: it
+# excises just the matched header span itself (not everything after it),
+# and only looks in the first 600 characters, so it can never accidentally
+# eat real JD content deeper in a normal email. Once this span is
+# removed, regex_classifier.py's NEWSLETTER_KEYWORDS check (which looks
+# for the word "unsubscribe" anywhere in the body) no longer sees it and
+# stops misfiring on emails from this portal.
+_LEADING_BOILERPLATE_HEADER_PATTERN = re.compile(
+    r'(?i)remove\s*/\s*unsubscribe\s*\|\s*update\s+your\s+contact\s+and\s+subscribed\s+'
+    r'mailing\s+list\(s\)\s*\|\s*subscribe\s+to\s+mailing\s+list\(s\)\s+to\s+receive\s+'
+    r'requirements?\s*&\s*resumes'
+)
+
 
 def strip_boilerplate_footer(text: str) -> str:
-    """Truncate `text` at the earliest known boilerplate-footer signature,
-    if any. Leaves text unchanged when no footer is detected."""
+    """Truncate `text` at the earliest known TRAILING boilerplate-footer
+    signature, if any, and excise any known LEADING boilerplate header
+    (see _LEADING_BOILERPLATE_HEADER_PATTERN above) -- the two use
+    different strip strategies (truncate-to-end vs excise-just-the-span)
+    because one sits at the bottom of the email and one at the top.
+    Leaves text unchanged when neither is detected."""
     if not text:
         return text
+    lead_m = _LEADING_BOILERPLATE_HEADER_PATTERN.search(text[:600])
+    if lead_m:
+        text = text[:lead_m.start()] + text[lead_m.end():]
     m = _BOILERPLATE_FOOTER_PATTERN.search(text)
     if m:
         return text[:m.start()]
