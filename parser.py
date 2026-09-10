@@ -2430,147 +2430,32 @@ _HOTLIST_INDICATORS = re.compile(
     # phrasing to confirm it doesn't.
     r'\bi\s+have\s+(?:a\s+)?(?:candidates?|consultants?)\s+available\b|'
     r'\bmy\s+(?:candidate|consultant)\s+is\s+available\b|'
-    # BUG FIX ("...our W2 Candidates, who are available immediately..."
-    # confirmed real case, Sravani/Techwizens; "...consultants who are
-    # readily available..." confirmed real case, CSCS): every existing
-    # "available" pattern above requires the noun and "available" to sit
-    # right next to each other. Real bench pitches very commonly insert a
-    # relative clause -- "candidates, who are available", "consultants who
-    # are readily available" -- which none of them catch. This is checked
-    # as its own pattern rather than widened filler on the existing ones
-    # because "who is/are available" is an unambiguous bench-broadcast
-    # construction on its own -- a real JD describes ONE role, it doesn't
-    # refer to plural "candidates/consultants who are available".
-    r'\b(?:consultants?|candidates?|resources?)\s*,?\s+who\s+(?:are|is)\s+'
-    r'(?:readily\s+|currently\s+)?available\b|'
-    # BUG FIX ("Please share your C2C roles..." confirmed real case, Blue
-    # Space Technologies, appears across multiple broadcasts; "...share
-    # your daily C2C/C2H positions with us" confirmed real case, IT
-    # Career Inc): a recruiter asking the READER to share ROLES/positions
-    # is the opposite direction of a real job requirement -- a genuine JD
-    # already IS the role being shared, it never asks the reader to send
-    # roles back. Distinct from the existing "please share the JD" and
-    # "send your requirements" patterns above, which don't cover "share
-    # your roles/positions" phrasing.
-    r'\bshare\s+your\s+(?:daily\s+)?(?:c2c\s*/?\s*c2h|c2c|c2h)?\s*'
-    r'(?:roles?|requirements?|positions?)\b|'
-    # BUG FIX ROUND 2 ("Kindly share your open requirements..." --
-    # untested candidate phrasing, added proactively): the pattern above
-    # only allowed "daily" or a c2c/c2h token between "your" and the
-    # object noun. Widened to a generic 0-2-word filler cap (matching the
-    # convention used elsewhere in this pattern set) and added
-    # "openings" as a recognized object -- both direction-safe for the
-    # same reason as the "if you have any requirements/openings" fix
-    # above.
-    r'\bshare\s+your\s+(?:[a-z]+\s+){0,2}(?:roles?|requirements?|positions?|openings?)\b|'
-    # BUG FIX ROUND 2 (bare "please share requirements", no "your" --
-    # untested candidate phrasing, e.g. "...please share requirements"):
-    # every "share...requirements" pattern above requires "your"
-    # explicitly. A real JD never asks the reader to "share the
-    # requirements" in any form, since the JD already contains them --
-    # direction-safe on its own without needing "your".
-    r'\bplease\s+share\s+(?:the\s+)?requirements?\b|'
-    # BUG FIX ROUND 2 ("We would love to submit our consultants to your
-    # open positions" -- untested candidate phrasing, added proactively):
-    # distinct from "our consultants are/is available" above -- "submit"
-    # is the verb here, not "are/is". Unambiguously recruiter-source
-    # pitch language; a real JD is never the one doing the submitting.
-    r'\bsubmit\s+our\s+(?:consultants?|candidates?|resources?)\b|'
-    # BUG FIX ("...include my email siva@careits.com in your daily
-    # requirements distribution" confirmed real case, Care IT Services;
-    # "Please add me to your mailing list" same email): "requirements
-    # distribution" and "add me to your mailing list" are both
-    # recruiter-signup phrasings distinct from the existing "add
-    # <email> to requirements" pattern above (that one requires a literal
-    # email address glued right after "add" -- this phrasing reverses the
-    # structure entirely, asking to be added generically first).
-    r'\brequirements?\s+distribution\b|'
-    r'\badd\s+me\s+to\s+your\s+mailing\s+list\b|'
-    # BUG FIX ("...if you'd like to receive his resume, please reply to
-    # this email with job details..." confirmed real case, Thoughtwave
-    # Software): a single-candidate bench pitch offering to SEND a
-    # resume in exchange for the reader's job details -- the reverse
-    # direction of a real JD, which never offers up a candidate's resume
-    # or asks the reader to reply with details of their own opening.
-    r'\bif\s+you\W?d\s+like\s+to\s+receive\s+(?:his|her|their)\s+resume\b|'
-    r'\bplease\s+reply\s+(?:to\s+this\s+email\s+)?with\s+(?:the\s+)?'
-    r'(?:job\s+)?details\b|'
-    # BUG FIX ("Consultant Name / Technology / Visa" table with no
-    # qualifying sentence at all -- confirmed real case, Techrakers
-    # broadcast): a plain bench-consultant listing table can carry NONE
-    # of the phrase-level signals above, just column headers. "Consultant
-    # Name" as an exact two-word phrase is deliberately required (rather
-    # than bare "consultant") -- a real JD commonly says "the consultant
-    # must have..." but essentially never uses "Consultant Name" as its
-    # own two-word phrase, since a JD describes one role, not a roster of
-    # named consultants. Requires "Consultant Name" to be followed,
-    # within a bounded span, by both a "Technology"/"Skill Set" column
-    # and a "Visa" column -- tested against realistic JD prose that
-    # merely mentions "consultant", "technology" and "visa" scattered
-    # separately (no false match, since it lacks the "Consultant Name"
-    # anchor) to confirm this doesn't fire on genuine postings.
-    r'\bconsultant\s*name\b[\s\S]{0,150}?\b(?:technology|skill\s*sets?)\b'
-    r'[\s\S]{0,300}?\bvisa\b|'
-    # BUG FIX ROUND 2 (sender signature carries a "Bench Sales" job title
-    # -- untested candidate phrasing, added proactively): the single
-    # clearest signal available is often the SENDER's own stated role,
-    # not body phrasing at all -- "Bench Sales Recruiter", "US IT Bench
-    # Sales", "Sr. Bench Sales Manager" etc. This job title is
-    # essentially unique to people whose job is selling bench
-    # consultants; no genuine JD sender (account manager, technical
-    # recruiter, hiring manager) signs off this way. Tested against
-    # realistic non-bench-sales signatures ("Technical Recruiter",
-    # "Senior Talent Acquisition Specialist") to confirm those don't trip
-    # this.
-    r'\bbench\s+sales\b|'
-    # BUG FIX ROUND 2 ("Please go through the profile and let us know
-    # your thoughts" -- untested candidate phrasing, added proactively):
-    # a recruiter-pitch review ask distinct from anything above.
-    r'\bgo\s+through\s+the\s+profiles?\b|'
-    # BUG FIX ROUND 2 (regression found via real-corpus batch testing:
-    # "Ideal Candidate Profile" / "Desired Candidate Profile" is a
-    # completely standard JD section heading listing the soft-skills/
-    # traits an employer wants -- e.g. "...12+ years required...Ideal
-    # Candidate Profile: Highly organized and execution-focused..." --
-    # confirmed false positives on two real, fully-detailed JDs, "Opening
-    # for Scrum Master - NYC" and "Gen AI/Agentic AI Lead / AI Architect".
-    # The original bare "consultant/candidate profile" noun-phrase match
-    # couldn't tell that heading apart from a genuine bench pitch offering
-    # up a specific candidate's profile ("I'm sharing a strong SAP PP/QM
-    # Consultant profile for your review"). Rather than blacklist
-    # "ideal"/"desired" (which would miss other heading variants), this
-    # now requires an actual OFFERING verb within a few words before the
-    # phrase -- sharing/attached/find/see/review/below/following -- which
-    # is what genuinely distinguishes "here is a candidate's profile for
-    # you" from a JD's own descriptive heading. Tested against both real
-    # false-positive cases (neither has an offering verb nearby -- "Ideal"
-    # alone precedes it) and against the original confirmed true positives
-    # (all still match) to confirm this doesn't reintroduce the leak it
-    # was fixing.
-    r'\b(?:sharing|share|attached|find|see|review|below|following)\b'
-    r'(?:\s+\S+){0,4}\s+(?:consultant|candidate)\s+profiles?\b|'
-    # BUG FIX ROUND 2 ("Kindly utilize this resource for any matching
-    # requirements" -- untested candidate phrasing, added proactively):
-    # tested against "this role will utilize resources across multiple
-    # teams" (plural "resources", a plausible genuine-JD sentence) to
-    # confirm the singular-only match here doesn't trip on it.
-    r'\butilize\s+(?:this\s+)?(?:resource|consultant|candidate)\b|'
-    # BUG FIX ROUND 2 ("Please find attached resume of our Java
-    # consultant..." / "Attached is the resume of our Senior DevOps
-    # consultant..." -- untested candidate phrasing, added proactively):
-    # offering up a THIRD PARTY's resume as an attachment -- the reverse
-    # direction of a real JD, which never attaches or references
-    # "the resume of" someone else. Distinct from the existing "if
-    # you'd like to receive his resume" pattern above (that one is
-    # conditional/offered; this one states the resume is already
-    # attached).
-    r'\bplease\s+find\s+attached\s+(?:the\s+)?resume\b|'
-    r'\battached\s+is\s+(?:the\s+)?resume\s+of\b|'
-    # BUG FIX ROUND 2 ("We are pleased to share the below profile for
-    # your review" -- untested candidate phrasing, added proactively):
-    # distinctive bench-broadcast framing not covered by any pattern
-    # above.
-    r'\bpleased\s+to\s+share\s+(?:the\s+)?(?:below|following)\s+profiles?\b'
+    r'\b(?:consultants?|resources?|candidates?)\s+available\s+on\s+(?:the\s+)?bench\b|'
+    # BUG FIX ("...our available genuine Candidates..." confirmed real
+    # case, IT Career Inc; "Please see our available genuine Candidates
+    # for your requirements..." confirmed real case): the bare "available
+    # consultants?" pattern required the noun immediately after
+    # "available" with nothing in between -- an inserted adjective like
+    # "genuine" (or "certified", "qualified", etc.) broke the match
+    # entirely, and only "consultants"/"resources" were recognized as
+    # nouns, not "candidates". Allows up to 2 filler words between
+    # "available" and the noun, and widens the noun list to include
+    # "candidates?" -- same cap already used elsewhere in this pattern
+    # set for the same reason.
+    r'\bavailable\s+(?:\w+\s+){0,2}(?:consultants?|candidates?|resources?)\b|'
+    # BUG FIX: only the verb "find" was recognized ("please find our
+    # available..."); "see"/"check out" are just as common a lead-in for
+    # this exact pitch.
+    r'\bplease\s+(?:find|see|check\s+out)\s+(?:our\s+)?available\s+(?:\w+\s+){0,2}'
+    r'(?:consultants?|candidates?|resources?)\b|'
+    # BUG FIX ("please find below details of our W2 Candidates, who are
+    # available immediately for contract roles on C2C" — confirmed real
+    # case): a very common hotlist opening line names the candidate
+    # batch via "details of our <employment-type> Candidates" rather
+    # than putting "available" directly next to the noun at all --
+    # "available" instead sits several words later ("who are available
+    # immediately"), out of reach of either pattern above.
+    r'\bdetails\s+of\s+our\s+(?:\w+\s+){0,3}(?:candidates?|consultants?|resources?)\b|'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -3066,6 +2951,43 @@ def extract_work_mode(text: str) -> str:
                     best_mode = mode
                 break  # earliest valid match for this pattern is enough
     return best_mode
+
+
+# BUG FIX ("location: None" for postings that only state a locality
+# RESTRICTION -- "Locals only", "Local to Dallas, TX", "Must be local",
+# "Locals preferred" -- with no "Location:" label, no validated
+# City/State pair, and no Remote/Hybrid/Onsite keyword anywhere else):
+# every location tier before this one requires one of those three
+# shapes, so this common recruiter phrasing fell through to None even
+# though the posting is unambiguous about requiring a local candidate.
+# If a place name follows "local to", surface it ("Local to Dallas,
+# TX"); otherwise a bare restriction phrase still counts as a real (if
+# vague) location value rather than nothing at all.
+_LOCALS_WITH_PLACE_PATTERN = re.compile(
+    r'(?i)\blocal\s+to\s+([A-Za-z][A-Za-z .]{1,40}?)'
+    r'(?=\s*(?:only|preferred|candidates?|resources?|consultants?|\.|,|;|$|\n))'
+)
+_BARE_LOCALS_RESTRICTION_PATTERN = re.compile(
+    r'(?i)\blocals?\s+only\b|\bonly\s+locals?\b|\bmust\s+be\s+local\b|'
+    r'\blocals?\s+preferred\b|\blocal\s+candidates?\s+only\b|'
+    r'\blocal\s+candidates?\s+preferred\b'
+)
+
+
+def extract_locals_restriction(text: str) -> Optional[str]:
+    """Best-effort location value from a bare locality RESTRICTION
+    statement ("Locals only", "Local to Dallas, TX", "Must be local"),
+    used as a last-resort location fallback."""
+    if not text:
+        return None
+    m = _LOCALS_WITH_PLACE_PATTERN.search(text)
+    if m:
+        place = sanitize_text(m.group(1))
+        if place:
+            return f"Local to {place}"
+    if _BARE_LOCALS_RESTRICTION_PATTERN.search(text):
+        return "Locals Only"
+    return None
 
 
 # Negation words immediately before a keyword mean it is being excluded —
@@ -3861,30 +3783,67 @@ def calculate_confidence(parsed: Dict[str, Any]) -> float:
     Calculate confidence based on extracted fields.
     This function signature must remain unchanged for backend compatibility.
 
-    Intentional: if `role` is not found (stays 'UNKNOWN'), confidence is
-    forced to 0.0 regardless of how many other fields were extracted. A row
-    with no identifiable role is treated as not a usable requirement even if
-    location/rate/etc. are present.
+    4-field workflow -- employment_types, location, work_authorization,
+    role. 'skills' and 'client'/'rate' are dropped entirely from this
+    calculation.
+
+    Step 1 -- check the 3 primary fields FIRST: employment_types,
+    location, work_authorization. Count how many of these 3 are
+    present/valid. location itself also recognizes a bare locality
+    RESTRICTION ("Locals only", "Local to Dallas, TX", "Must be local")
+    as valid even with no city/state pair or work-mode keyword present
+    -- see extract_locals_restriction().
+
+    Step 2 -- THEN check role. It's a MANDATORY gate, not just one
+    point among many: it must be present AND structurally look like a
+    real job title (see _looks_like_generic_role_header) -- not just
+    "not UNKNOWN". If it fails this check, confidence is 0.0
+    immediately regardless of how many of the 3 primary fields were
+    found in Step 1 -- a posting with no identifiable real title is
+    never treated as usable no matter how complete the rest of the
+    extraction is.
+
+    Step 3 -- once role passes, combine: role itself plus each of the 3
+    primary fields is worth an equal 1/4 of the total score:
+        role passes + all 3 present   -> 1.0  (4/4)
+        role passes + 2 of 3 present  -> 0.75 (3/4)
+        role passes + 1 of 3 present  -> 0.5  (2/4)
+        role passes + 0 of 3 present  -> 0.25 (1/4)
+        role fails (any case)         -> 0.0
+
+    is_likely_requirement's threshold of 0.75 (see below, where this is
+    used) means a posting needs role PLUS at least 2 of the 3 primary
+    fields -- i.e. 3 of the 4 total fields -- to count as a real job
+    posting.
     """
     if not parsed:
         return 0.0
-    
-    important_fields = ['client', 'location', 'rate', 'employment_types', 'role', 'skills']
-    valid_fields = 0
-    
-    for field in important_fields:
+
+    # Step 1 -- primary fields first.
+    primary_fields = ['employment_types', 'location', 'work_authorization']
+    valid_count = 0
+    for field in primary_fields:
         value = parsed.get(field)
-        if field == 'employment_types' or field == 'skills':
+        if field == 'employment_types':
             if value and isinstance(value, list) and value != ['UNKNOWN']:
-                valid_fields += 1
+                valid_count += 1
         else:
             if value and value != 'UNKNOWN' and not is_email_body(str(value)):
-                valid_fields += 1
-                
-    if parsed.get('role') and parsed['role'] != 'UNKNOWN':
-        if valid_fields >= 1:
-            return min(round(valid_fields / len(important_fields), 2), 1.0)
-    return 0.0
+                valid_count += 1
+
+    # Step 2 -- then the role gate.
+    role = parsed.get('role')
+    role_is_real_title = (
+        bool(role)
+        and role != 'UNKNOWN'
+        and not is_email_body(str(role))
+        and not _looks_like_generic_role_header(role)
+    )
+    if not role_is_real_title:
+        return 0.0
+
+    # Step 3 -- combine.
+    return round((1 + valid_count) / 4, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -4826,6 +4785,14 @@ def parse_requirement(
             _bare_work_mode = extract_work_mode(full_text)
             if _bare_work_mode != 'UNKNOWN':
                 location = _bare_work_mode.capitalize()
+        # BUG FIX: a posting can restrict candidates by locality ("Locals
+        # only", "Local to Dallas, TX", "Must be local", "Locals
+        # preferred") with no actual "Location:" label, no validated
+        # City/State pair, and no Remote/Hybrid/Onsite keyword anywhere
+        # else in the email -- reuses extract_locals_restriction() as a
+        # final fallback tier.
+        if not location:
+            location = extract_locals_restriction(full_text)
 
     # ── Rate ──────────────────────────────────────────────────────────────
     rate = clean_rate(_ai_field('rate'))
@@ -5007,7 +4974,14 @@ def parse_requirement(
     }
 
     parsed['parse_confidence'] = calculate_confidence(parsed)
-    parsed['is_likely_requirement'] = parsed['parse_confidence'] >= 0.3
+    # BUG FIX (threshold raised from 0.3 to 0.75 to match the new 4-field
+    # confidence workflow -- see calculate_confidence()'s docstring):
+    # under the old 6-field average, 0.3 meant "role + 1 other field".
+    # Under the new role-is-mandatory / 4-field scheme, 0.75 means "role
+    # passes its real-title check AND at least 2 of {employment_types,
+    # location, work_authorization} are present" -- i.e. 3 of the 4
+    # total fields, per spec.
+    parsed['is_likely_requirement'] = parsed['parse_confidence'] >= 0.75
 
     # Final guard — never return email body content in any field
     for key, value in parsed.items():
