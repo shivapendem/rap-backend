@@ -377,6 +377,28 @@ ROLE_PATTERNS = [
     r'(?i)(?:^|\n)[ \t]*job\s*title\b[ \t]+(?=[A-Z])(.+)',
     r'(?i)\bjob\s*role\s*[:\-][ \t]*\n?[ \t]*(.+)',
     r'(?i)\bposition\s*[:\-][ \t]*\n?[ \t]*(.+)',
+    # BUG FIX ("We are looking for a Senior Network Security Analyst for
+    # our client." -- confirmed real case, role came out UNKNOWN despite
+    # location/employment_type/experience all extracting correctly):
+    # this exact sentence shape -- stating the title conversationally
+    # instead of via a "Role:"/"Job Title:" label -- had NO pattern
+    # anywhere in this list at all; the only "looking for" handling
+    # anywhere in the codebase was a SUBJECT-line strip in
+    # role_from_subject(), never a body extractor. Captures up to the
+    # first period or a trailing "for our/the/this client" clause,
+    # whichever comes first.
+    #
+    # BUG FIX ROUND 2 ("We are looking for SAP FICO Consultant,Need a SAP
+    # Finance consultant with hands-on experience of SAP BPC." --
+    # confirmed real case, a genuine posting rejected because its role
+    # came out as this entire run-on clause instead of just "SAP FICO
+    # Consultant"): a comma-separated recruiter template often chains
+    # straight into the NEXT sentence's own lead-in ("...Consultant,Need
+    # a...") with no period anywhere nearby -- the original version only
+    # stopped at a period, so with none in reach it swept the whole
+    # run-on clause into the role. A comma is just as valid a stop point.
+    r"(?i)\bwe'?re\s+looking\s+for\s+(?:an?\s+)?([^.,\n]+?)(?:\s+for\s+(?:our|the|this)\s+client\b|[.,]|\n|$)",
+    r"(?i)\bwe\s+are\s+looking\s+for\s+(?:an?\s+)?([^.,\n]+?)(?:\s+for\s+(?:our|the|this)\s+client\b|[.,]|\n|$)",
     # BUG FIX ("role parsed as an ordinary sentence, e.g. 'if so, we can
     # connect and speak further'"): the dash form used to accept ANY
     # text after "role -", including plain sentence punctuation ("...
@@ -562,6 +584,30 @@ _GENERIC_BARE_ROLE_WORDS = {
 }
 
 
+# BUG FIX ("role: 'Quick question about invoice'" -- an ordinary,
+# completely unrelated administrative email's subject line, used
+# verbatim as a last-resort fallback role): ordinary administrative-
+# email vocabulary and question phrasing that a real job title never
+# contains.
+_NON_TITLE_SENTENCE_PATTERN = re.compile(
+    r'(?i)\?\s*$|'
+    # BUG FIX ("SWIFT Payment Protocol Network Developer" -- a real,
+    # legitimate FinTech/banking job title -- confirmed false positive
+    # on real production data): bare "payment" or "invoice" as single
+    # standalone words are FAR too common in real job titles across the
+    # banking/payments/finance domain to use as a bare trigger. Narrowed
+    # to the actual multi-word ADMINISTRATIVE phrase shapes an unrelated
+    # business email uses.
+    r'\b(?:invoice\s+number|confirm\s+(?:the|your)\s+invoice|'
+    r'invoice\s+(?:attached|for\s+last\s+month)|'
+    r'payment\s+confirmation|regarding\s+(?:your|the)\s+(?:invoice|payment)|'
+    r'calendar\s+invite|meeting\s+reminder|schedule\s+a\s+call|'
+    r'follow(?:ing)?\s+up\s+on|checking\s+in|circling\s+back|out\s+of\s+office)\b|'
+    r'^\s*(?:quick|urgent)\s+question\b|'
+    r'^\s*(?:can|could|would|do|did|will)\s+you\b'
+)
+
+
 def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
     """True when `role_value` is a known generic JD section-header phrase,
     is just a bare job-category placeholder word, or is structurally not
@@ -580,6 +626,8 @@ def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
     if first_word.isdigit():
         return True
     if first_word in _ROLE_SENTENCE_LEAD_WORDS:
+        return True
+    if _NON_TITLE_SENTENCE_PATTERN.search(candidate):
         return True
     return False
 
@@ -947,7 +995,20 @@ _FULL_STATE_NAME_ALTERNATION = '|'.join(
 
 # Matches "City, TX" / "City TX" / "City, Texas" — resolved through resolve_state_code()
 BARE_LOCATION_PATTERN = re.compile(
-    r'\b([A-Z][a-zA-Z]+(?:[ \-][A-Z][a-zA-Z]+){0,2})\s*,?\s*'
+    r'\b([A-Z][a-zA-Z]+(?:[ \-][A-Z][a-zA-Z]+){0,2})'
+    # BUG FIX ("New York, #NY" from a GVR Infotek React Developer
+    # broadcast -- confirmed real case, ported from the identical fix in
+    # the cron copy of this file): hashtag-social-style recruiter
+    # templates commonly prefix the state code with a literal "#" (e.g.
+    # "#NY", "#TX") the same way they prefix skills ("#React",
+    # "#DevOps"). The "#" tolerance is added ONLY on the comma branch,
+    # not the bare-whitespace branch -- allowing it on both would let an
+    # ordinary hashtag SKILL list with no comma at all (e.g. "Strong
+    # #DevOps #OR #AWS skills") match "DevOps" + "#OR" as a fake
+    # city/state pair purely because "OR" happens to also be a real
+    # state code. A real location is essentially always comma-separated
+    # from its state; a hashtag skill list never is.
+    r'(?:\s*,\s*#?\s*|\s+)'
     r'([A-Z]{2}\b|' + _FULL_STATE_NAME_ALTERNATION + r')'
 )
 
@@ -1032,6 +1093,24 @@ _WORK_AUTH_TOKEN_PATTERN = re.compile(
 )
 
 
+# BUG FIX ("work_authorization: 'N/A'" counted as a real, valid value --
+# confirmed real case, boosted a completely unrelated email's confidence
+# to 1.0): "N/A"/"Not Applicable"/"TBD"/"None" are explicit PLACEHOLDER
+# values meaning "no value was actually given here" -- shared across any
+# field cleaner that wants it.
+_PLACEHOLDER_VALUE_PATTERN = re.compile(
+    r'(?i)^\s*(?:n/?a|not\s+applicable|tbd|to\s+be\s+determined|none|n/?a\.?)\s*$'
+)
+
+
+def _is_placeholder_value(value: Optional[str]) -> bool:
+    """True when `value` is an explicit "no real value given" placeholder
+    (N/A, Not Applicable, TBD, None) rather than an actual answer."""
+    if not value:
+        return False
+    return bool(_PLACEHOLDER_VALUE_PATTERN.match(value.strip()))
+
+
 def clean_work_authorization(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -1042,7 +1121,7 @@ def clean_work_authorization(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     value = crop_at_next_field(value)
-    if not value or is_email_body(value):
+    if not value or is_email_body(value) or _is_placeholder_value(value):
         return None
     if len(value) > 100:
         value = _cap_real_words(value, 15)
@@ -1909,6 +1988,22 @@ def role_from_subject(subject: str) -> Optional[str]:
     s = re.sub(r'[\-\u2013,:;.]+\s*$', '', s).strip()
     s = sanitize_text(s)
     if not s:
+        # BUG FIX ("URGENT HIRING!!--FASTMOVING--Mainframe/COBOL
+        # Developer--work on-site in Austin, TX or Warren, MI --C2C &
+        # W2" -- confirmed real case, a real posting with a real title
+        # two segments later): the pipe/dash-segment selection loop
+        # above only rejects a segment as filler by matching it against
+        # generic/restriction patterns BEFORE any marketing-phrase
+        # stripping happens -- it has no way to know in advance that a
+        # segment which doesn't literally match either pattern ("URGENT
+        # HIRING!!") will still turn out to be 100% marketing filler
+        # once the prefix/suffix marketing-phrase stripper above
+        # (correctly) empties it out completely. Retry against the
+        # remaining segments -- only recurses when there IS a next
+        # segment, so a subject that's genuinely nothing but marketing
+        # filler still correctly returns None in the end.
+        if len(_pipe_segments) > 1:
+            return role_from_subject('|'.join(_pipe_segments[1:]))
         return None
     return s if len(s) <= 80 else s[:77] + '...'
 
@@ -2296,6 +2391,16 @@ def is_job_requirement_email(text: str) -> bool:
         # bare "title" from re-matching the "job title" phrase already
         # counted above.
         r'\brole\b', r'(?<!job\s)\btitle\b',
+        # BUG FIX ("Role: Salesforce Developer / Work Authorization: USC,
+        # GC only / Please share suitable profiles" -- confirmed real
+        # case, rejected before role/field extraction ever ran): this
+        # email has TWO genuine structured labels, but "work
+        # authorization" and "visa" -- both extremely strong,
+        # unambiguous job-posting-domain signals, arguably as strong as
+        # "role" or "C2C"/"W2" already in this list -- were simply
+        # missing from it entirely, so this gate only credited 1 hit
+        # ("role") and rejected a real posting outright.
+        r'\bwork\s+authorization\b', r'\bvisa\b',
     ]
     indicators_found = sum(
         1 for i in indicators if re.search(i, text, re.IGNORECASE)
@@ -2549,8 +2654,21 @@ _HOTLIST_INDICATORS = re.compile(
     # alone precedes it) and against the original confirmed true positives
     # (all still match) to confirm this doesn't reintroduce the leak it
     # was fixing.
+    # BUG FIX ROUND 3 ("Kindly share relevant candidate profiles if you
+    # have any that match the required skill set." -- a completely
+    # ordinary real-JD closing line, confirmed false positive on a real,
+    # fully-detailed Azure Data Platform Architect posting): "share" was
+    # included as an offering verb from Round 2 above, but "share
+    # candidate profileS" (plural, generic) is exactly how a REAL JD
+    # asks recruiters to submit candidates for ITS OWN opening -- a
+    # hotlist's offering, by contrast, is singular and specific --
+    # "sharing THE candidate's profile". Narrowed to require the profile
+    # be introduced with a definite/possessive/descriptive determiner
+    # immediately before it AND be singular (a trailing "s" now excludes
+    # the match).
     r'\b(?:sharing|share|attached|find|see|review|below|following)\b'
-    r'(?:\s+\S+){0,4}\s+(?:consultant|candidate)\s+profiles?\b|'
+    r'(?:\s+\S+){0,3}\s+(?:the|this|that|my|our|a\s+strong|an?\s+excellent)\s+'
+    r'(?:\S+\s+){0,3}(?:consultant|candidate)(?:\'s)?\s+profile\b(?!s)|'
     # BUG FIX ROUND 2 ("Kindly utilize this resource for any matching
     # requirements" -- untested candidate phrasing, added proactively):
     # tested against "this role will utilize resources across multiple
@@ -2623,10 +2741,33 @@ _HOTLIST_INDICATORS = re.compile(
     #   - "resumes of our/the consultants".
     #   - "consultant list" / "bench report".
     r'\bmatch(?:es)?\s+your\s+requirements?\b|'
+    # BUG FIX ("Please reach out for any matching requirements" --
+    # confirmed real case, part of a candidate-roster table broadcast).
+    r'\breach\s+out\s+(?:to\s+us\s+)?for\s+(?:any\s+)?(?:matching\s+)?requirements?\b|'
+    # BUG FIX ("Please have a look at the details, and feel free to
+    # reach out if you have any questions or need any clarification." --
+    # a completely ordinary, harmless closing courtesy line on a real
+    # JD, confirmed false positive on a real IBM Sterling OMS Technical
+    # Lead posting): narrowed to require hotlist-specific object nouns
+    # after "have" -- requirements/openings/a fit -- rather than any
+    # reason at all.
+    r'\breach\s+out\s+if\s+you\s+have\s+(?:any\s+)?(?:matching\s+)?'
+    r'(?:requirements?|openings?|(?:a\s+)?fit)\b|'
     r'\bavailable\s+resources?\s*[-:]?\s*(?:this\s+week|weekly|today)\b|'
     r'\bconsultants?\s+(?:are\s+)?ready\s+for\s+deployment\b|'
-    r'\bresumes?\s+of\s+(?:our|the)\s+consultants?\b|'
-    r'\bconsultants?\s+list\b|\bbench\s+report\b'
+    # BUG FIX ("resumes of consultants available immediately" -- no
+    # "our"/"the" before "consultants" -- confirmed real case).
+    r'\bresumes?\s+of\s+(?:our|the\s+)?consultants?\b|'
+    r'\bconsultants?\s+list\b|\bbench\s+report\b|'
+    # BUG FIX ("Please share matching openings" -- confirmed real case).
+    r'\bshare\s+matching\s+openings?\b|'
+    # BUG FIX ("Would like to submit the below candidate for any
+    # matching roles" -- confirmed real case).
+    r'\bsubmit\s+(?:the\s+)?(?:below\s+)?candidates?\s+for\s+(?:any\s+)?matching\s+roles?\b|'
+    # BUG FIX ("The below consultant is looking for a new assignment" --
+    # confirmed real case).
+    r'\b(?:consultants?|candidates?)\s+(?:is|are)\s+looking\s+for\s+(?:a\s+)?new\s+assignments?\b|'
+    r'\blooking\s+for\s+(?:a\s+)?new\s+assignment\b'
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -2726,12 +2867,100 @@ def _looks_like_resume_body(text: str) -> bool:
     return len(date_ranges) >= 3
 
 
+# BUG FIX ("Name | Technology | Experience | Visa | Location |
+# Availability" candidate-roster table not detected as a hotlist --
+# confirmed real case): a single PIPE-delimited line containing 3+ of
+# these column-header words is a near-perfect fingerprint for a
+# hotlist/bench-broadcast roster table -- a real single-posting JD
+# never has a header row of its own naming multiple candidates'
+# attributes side by side like this. Restricted to requiring a literal
+# "|" (not comma) after an earlier version false-positived on an
+# ordinary JD closing sentence that happened to comma-list several
+# things ("...along with the candidate's contact details, current
+# location, visa status, and availability.") -- a real JD sentence
+# never contains a pipe, while commas appear in ordinary prose
+# constantly.
+_ROSTER_HEADER_WORDS = re.compile(
+    r'(?i)\b(name|technology|experience|visa|location|availability|'
+    r'skill\s*set|current\s+location|working\s+on|willing\s+to\s+relocate)\b'
+)
+
+
+def _looks_like_candidate_roster_table(text: str) -> bool:
+    """True when a line in `text` reads like a multi-candidate roster's
+    own pipe-delimited column-header row -- see the BUG FIX comment
+    above.
+
+    BUG FIX ("Java Technical Lead Location: Saint Louis, MO..." -- a
+    complete, genuine, several-thousand-character real JD -- false-
+    positived as a roster table, confirmed real case): once HTML is
+    flattened to plain text, an entire multi-paragraph email routinely
+    collapses into ONE single line with no newlines at all -- so "a line
+    containing a pipe + 3 roster words anywhere in it" degenerates into
+    "does this whole email contain a pipe ANYWHERE (e.g. an ordinary
+    footer signature like 'Company | Email | City, ST') AND mention
+    visa/location/experience/availability anywhere else" -- true of
+    nearly every real, well-written JD. A genuine roster header row is
+    not just "a line with a pipe and some header words in it somewhere"
+    -- each pipe-delimited CELL in a real header row essentially IS just
+    one header word ("Name", "Technology", "Visa"), not a full sentence.
+    Split on "|" and count cells that are SHORT and consist mostly of
+    one of these words, rather than scanning the raw line text.
+    """
+    if not text:
+        return False
+    for line in text.splitlines():
+        if '|' not in line:
+            continue
+        cells = line.split('|')
+        header_cell_count = 0
+        for cell in cells:
+            cell = cell.strip()
+            if not cell or len(cell) > 30:
+                continue
+            if _ROSTER_HEADER_WORDS.search(cell):
+                header_cell_count += 1
+        if header_cell_count >= 3:
+            return True
+    return False
+
+
+# BUG FIX ("Name: Raj Kumar\nExperience: 8 Years\nVisa: H1B\nAvailable
+# Immediately" -- confirmed real case): a body opening with a "Name:"
+# label followed by a capitalized person-name is uniquely a candidate
+# summary -- a real JD is never introduced by the CANDIDATE's own name
+# as its first labeled field. Anchored to the START of the (already
+# whitespace-flattened) text with re.match() rather than embedded in
+# _HOTLIST_INDICATORS (that pattern set has no MULTILINE flag and is
+# checked against norm_body where newlines are already collapsed to
+# spaces), and an unanchored bare "name:" would risk matching a
+# legitimate "Recruiter Name:"/"Contact Name:" signature line deep in a
+# real JD's footer.
+_LEADING_NAME_LABEL_PATTERN = re.compile(
+    r'(?i)^\s*(?:candidate\s+|consultant\s+)?name\s*:\s*[A-Z][a-z]+\s+[A-Z][a-z]+\b'
+)
+
+
+def _starts_with_candidate_name_label(text: str) -> bool:
+    """True when `text` opens with a "Name:"/"Candidate Name:"/
+    "Consultant Name:" label followed by a capitalized person name --
+    see the BUG FIX comment above."""
+    if not text:
+        return False
+    return bool(_LEADING_NAME_LABEL_PATTERN.match(text))
+
+
 def is_hotlist_email(text: str) -> bool:
     """True for recruiter 'available consultants' broadcasts -- the
     opposite of a job requirement email. See _HOTLIST_INDICATORS above."""
     if not text:
         return False
-    return bool(_HOTLIST_INDICATORS.search(text)) or _looks_like_resume_body(text)
+    return (
+        bool(_HOTLIST_INDICATORS.search(text))
+        or _looks_like_resume_body(text)
+        or _looks_like_candidate_roster_table(text)
+        or _starts_with_candidate_name_label(text)
+    )
 
 
 # BUG FIX ("role: 'to Work - Senior US IT Recruiter'" from a candidate's
@@ -2841,7 +3070,16 @@ _NON_REQUIREMENT_BROADCAST_INDICATORS = re.compile(
     r'\bview\s+in\s+browser\b|'
     r'\bmanage\s+your\s+(?:subscription|email\s+preferences|'
     r'notification\s+settings)\b|'
-    r'\byou\s+are\s+receiving\s+this\s+(?:email|newsletter)\s+because\b|'
+    # BUG FIX ("You are receiving this email because you posted your
+    # resume on jobs portals and indicated that you wish to be contacted
+    # for job opportunities." -- confirmed real case, a genuine
+    # individual job-alert notification, not a newsletter): this exact
+    # CAN-SPAM-style consent/unsubscribe disclosure is legally required
+    # boilerplate on countless ordinary, legitimate job-alert emails.
+    # Narrowed to require the reason specifically be subscription/signup
+    # language, the actual newsletter-specific signal.
+    r'\byou\s+are\s+receiving\s+this\s+(?:email|newsletter)\s+because\s+you\s+'
+    r'(?:subscribed|signed\s+up|(?:are\s+)?(?:a\s+)?subscri)\b|'
     r'\bbook\s+a\s+(?:free\s+)?demo\b|'
     r'\bboost\s+your\s+(?:recruiting|hiring|sourcing)\s+pipeline\b|'
     r'\bsign\s*up\s+for\s+(?:a\s+)?(?:free\s+)?trial\b|'
@@ -2862,10 +3100,112 @@ def is_non_requirement_broadcast_email(text: str) -> bool:
     these describe a single job opening to extract, even though they
     share enough staffing vocabulary to otherwise clear
     is_job_requirement_email()'s gate. See
-    _NON_REQUIREMENT_BROADCAST_INDICATORS."""
+    _NON_REQUIREMENT_BROADCAST_INDICATORS.
+
+    BUG FIX ("To subscribe or unsubscribe:
+    https://send.empowerprofessionals.com/newsletter/subscribe/..." --
+    confirmed real case, a genuine Product Analytics Strategist posting
+    misclassified): a mass-mailer's own unsubscribe-link URL path
+    routinely contains the literal word "newsletter" (the mailing
+    PLATFORM's naming, not a description of this email's content).
+    Strip URLs before checking.
+    """
     if not text:
         return False
+    text = re.sub(r'https?://\S+', ' ', text)
     return bool(_NON_REQUIREMENT_BROADCAST_INDICATORS.search(text))
+
+
+# BUG FIX ("Java Developer | Contract | Dallas, TX | H1B only" with a
+# thin/generic or empty body -- confirmed real case, rejected entirely
+# before any field extraction ran): is_job_requirement_email()'s
+# keyword-count gate only recognizes generic LABEL words -- it has no
+# concept of a well-formed, pipe/dash/slash-separated subject line that
+# packs the actual VALUES with no label words at all. Runs a
+# lightweight extraction pass across subject+body BEFORE the keyword-
+# count fallback: if 3+ of {role, employment_type, location,
+# work_authorization} genuinely extract to something real, accept
+# regardless of the keyword tally. Two safety nets (verified via a
+# dedicated adversarial mock-test sweep) keep this from being a blanket
+# loosening: (1) text after a sign-off marker is excluded from the
+# lightweight extraction -- a recruiter's own signature-block content
+# must never count as evidence; (2) even with 3+ fields found, a
+# negative/stale/candidate-framing signal blocks the bypass outright.
+_NEGATIVE_FRAMING_SIGNAL_PATTERN = re.compile(
+    r'(?i)\bno\s+longer\s+active\b|'
+    r'\b(?:position|role|requirement)\s+(?:has\s+been\s+)?(?:filled|closed)\b|'
+    r'\bclosed\s+(?:last|this)\s+week\b|'
+    r'\bexploring\s+new\s+options\b|'
+    r'\bappreciate\s+any\s+leads\b|'
+    r'\bimmediate\s+joiner\b|'
+    r'\bopen\s+to\s+relocate\s+for\s+the\s+right\s+opportunity\b|'
+    r'\bvisa(?:\s+status)?\s*:?\s*n/?a\b|'
+    r'\bnow\s+exploring\b|'
+    r'\bemployment\s+type\s*:?\s*(?:\w+[\s\-]*)?\(?\s*(?:internal|n/?a)\)?\b'
+)
+
+
+def _has_negative_framing_signal(full_text: str) -> bool:
+    """True when `full_text` contains a stale/closed/candidate-framing
+    signal that should block the structured-signal bypass even when 3+
+    fields are found."""
+    if not full_text:
+        return False
+    return bool(_NEGATIVE_FRAMING_SIGNAL_PATTERN.search(full_text))
+
+
+def _crop_before_signature_block(text: str) -> str:
+    """Return only the portion of `text` BEFORE a sign-off marker
+    (Regards/Thanks/Sincerely -- see SIGNATURE_PATTERN)."""
+    if not text:
+        return text or ''
+    m = SIGNATURE_PATTERN.search(text)
+    return text[:m.start()] if m else text
+
+
+def _structured_field_signal_count(subject: str, body: str) -> int:
+    """Lightweight count of how many of {role, employment_type,
+    location, work_authorization} genuinely extract to something real,
+    scanning subject+body with the recruiter's own signature block
+    excluded."""
+    body_before_sig = _crop_before_signature_block(body)
+    full_text = normalize_text(f"{subject}\n{body_before_sig}")
+
+    role = role_from_subject(subject) or first_match(ROLE_PATTERNS, normalize_text(body_before_sig))
+    role_ok = bool(role) and not _looks_like_generic_role_header(role)
+
+    emp = extract_employment_types(full_text)
+    emp_ok = bool(emp) and emp != ['UNKNOWN']
+
+    work_mode = extract_work_mode(full_text)
+    loc = find_city_state(full_text) or (work_mode if work_mode != 'UNKNOWN' else None)
+    loc_ok = bool(loc)
+
+    wa = extract_work_authorization(full_text)
+    wa_ok = bool(wa) and not _is_placeholder_value(wa)
+
+    return sum([role_ok, emp_ok, loc_ok, wa_ok])
+
+
+def is_confirmed_job_posting(subject: str, body: str, full_text: str, norm_body: str) -> bool:
+    """The single decision point for 'is this worth parsing as a job
+    posting at all', checked BEFORE any AI or regex field extraction
+    runs. Combines every exclusion check with the structured-field
+    bypass above."""
+    if (
+        is_hotlist_email(norm_body)
+        or is_candidate_self_promo_email(norm_body)
+        or is_job_digest_email(norm_body)
+        or is_non_requirement_broadcast_email(full_text)
+    ):
+        return False
+
+    if _structured_field_signal_count(subject, body) >= 3:
+        if _has_negative_framing_signal(full_text):
+            return False
+        return True
+
+    return is_job_requirement_email(full_text)
 
 
 def safe_extract_value(text: str, max_length: int = 200) -> Optional[str]:
@@ -3494,6 +3834,46 @@ def _is_cta_or_contact_sentence(token: str) -> bool:
     if word_count > 4 and (_EMAIL_ADDR_PATTERN.search(stripped) or PHONE_PATTERN.search(stripped)):
         return True
     return False
+
+
+# BUG FIX ("role: 'Full Stack Developer'" with a full, genuine JD body
+# but role + ZERO of {employment_types, location, work_authorization} --
+# confirmed real case): when a posting states literally no employment-
+# type/location/work-authorization field anywhere, but the body is
+# unmistakably JD-shaped (a Responsibilities:/Requirements:/
+# Qualifications: section header, 2+ bullet-point lines, or a cluster of
+# 2+ recognizable tech-skill keywords), that's still a real posting --
+# not every genuine JD states all three of those fields.
+_JD_SHAPE_SECTION_HEADER = re.compile(
+    r'(?i)\b(responsibilities|requirements|qualifications|key\s+skills)\b'
+    r'\s*[:\-]?\s*$|'
+    r'\b(responsibilities|requirements)\s+(?:include|are)\b|'
+    # BUG FIX ("ResponsibilitiesLead Model N Revenue & Pricing Management
+    # initiatives..." / "Required SkillsMust Have8+ years of
+    # experience..." -- confirmed real case): HTML-to-text conversion
+    # routinely destroys ALL structural whitespace between a section
+    # header and its content -- gluing "Responsibilities" directly onto
+    # the sentence that follows it. A header immediately followed by a
+    # capital letter with NO space matches neither pattern above.
+    r'\b(?:responsibilities|requirements|required\s+skills|preferred\s+skills|'
+    r'qualifications|key\s+skills)(?=[A-Z])',
+    re.MULTILINE
+)
+_JD_SHAPE_BULLET_LINE = re.compile(r'(?im)^\s*[-*•]\s+\S')
+
+
+def looks_like_jd_shaped_body(text: str) -> bool:
+    """True when `text` structurally reads like a real JD even with none
+    of employment_types/location/work_authorization stated -- see the
+    BUG FIX comment above."""
+    if not text:
+        return False
+    if _JD_SHAPE_SECTION_HEADER.search(text):
+        return True
+    if len(_JD_SHAPE_BULLET_LINE.findall(text)) >= 2:
+        return True
+    skills = extract_skills(text)
+    return bool(skills) and len(skills) >= 2
 
 
 def extract_skills(text: str) -> List[str]:
@@ -4259,6 +4639,10 @@ def clean_location(location: Optional[str]) -> Optional[str]:
     location = sanitize_text(normalize_text(location))
     if not location:
         return None
+    # BUG FIX: same placeholder-value problem as work_authorization's
+    # "N/A" case -- "Location: N/A"/"TBD" is an explicit non-answer.
+    if _is_placeholder_value(location):
+        return None
     # BUG FIX ("location: 'SAP'" — see _LOCATION_NON_LOCATION_ACRONYMS'
     # comment above): reject outright when the ENTIRE value is just one
     # of these bare tech acronyms, regardless of which extractor (AI or
@@ -4334,6 +4718,18 @@ def clean_location(location: Optional[str]) -> Optional[str]:
     )
     if _clause_m:
         location = location[:_clause_m.start()].strip()
+    # BUG FIX ("location: 'New York, #NY - Hybrid, 3 Days Onsite Onsite
+    # Interview Required*** USC,GC ,GC EAD ,H4 EAD are Highly preferred'"
+    # -- confirmed real case, GVR Infotek, ported from the identical fix
+    # in the cron copy of this file): even after the city/state and
+    # comma-clause crops above, a glued-HTML template can still run the
+    # location straight into an UNLABELED, no-comma sentence -- these
+    # recruiter templates conventionally use a run of "***" as an
+    # informal section separator in place of the newline HTML-flattening
+    # destroyed -- crop there too, same as the labeled/clause crops above.
+    _asterisk_m = re.search(r'\*{2,}', location)
+    if _asterisk_m:
+        location = location[:_asterisk_m.start()].strip()
     if len(location) > 50:
         location = location[:47] + '...'
     # Same emoji-glyph-glued-to-next-label cleanup as clean_role() -- see
@@ -4534,13 +4930,14 @@ def parse_requirement(
     # posting. is_job_requirement_email() stays on full_text (a POSITIVE
     # signal -- subject words like "Requirement"/"Contract" genuinely help
     # there); is_hotlist_email() is scoped to norm_body only.
-    if (
-        not is_job_requirement_email(full_text)
-        or is_hotlist_email(norm_body)
-        or is_candidate_self_promo_email(norm_body)
-        or is_job_digest_email(norm_body)
-        or is_non_requirement_broadcast_email(full_text)
-    ):
+    # BUG FIX (gate consolidated into is_confirmed_job_posting(), see
+    # that function's BUG FIX comment for the full reasoning): the four
+    # checks that used to be inlined directly here now live in one
+    # shared decision point, PLUS the new structured-field bypass for
+    # well-formed pipe/dash/slash-separated subjects with a thin or
+    # empty body that the old is_job_requirement_email() keyword-count
+    # gate alone was silently rejecting.
+    if not is_confirmed_job_posting(safe_subject, safe_body_for_parsing, full_text, norm_body):
         return {
             'role': 'UNKNOWN',
             'client': None,
@@ -4553,7 +4950,17 @@ def parse_requirement(
             'vendor': None,
             'vendor_contact': None,
             'experience': None,
+            # BUG FIX: this early-return dict was missing
+            # 'work_authorization', 'parsing_model', and 'parsing_log'
+            # entirely -- every OTHER return path from this function
+            # includes all three. Any caller that reads
+            # row['work_authorization'] unconditionally across ALL
+            # parse_requirement() results gets a KeyError on every
+            # single rejected email.
+            'work_authorization': None,
             'skills': [],
+            'parsing_model': None,
+            'parsing_log': ['Rejected before extraction: hotlist/self-promo/digest/newsletter/marketing/notification/auto-reply.'],
             'parse_confidence': 0.0,
             'is_likely_requirement': False
         }
@@ -5145,14 +5552,30 @@ def parse_requirement(
     }
 
     parsed['parse_confidence'] = calculate_confidence(parsed)
-    # BUG FIX (threshold raised from 0.3 to 0.75 to match the new 4-field
-    # confidence workflow -- see calculate_confidence()'s docstring):
-    # under the old 6-field average, 0.3 meant "role + 1 other field".
-    # Under the new role-is-mandatory / 4-field scheme, 0.75 means "role
-    # passes its real-title check AND at least 2 of {employment_types,
-    # location, work_authorization} are present" -- i.e. 3 of the 4
-    # total fields, per spec.
-    parsed['is_likely_requirement'] = parsed['parse_confidence'] >= 0.75
+    # BUG FIX (threshold lowered from 0.75 to 0.5, i.e. role + only 1 of
+    # {employment_types, location, work_authorization} instead of 2):
+    # role + 2-of-3 was proven (via a dedicated mock-test sweep) to
+    # silently drop real postings that legitimately state only ONE of
+    # these three fields. Loosening this was previously rejected because
+    # it let a candidate-roster hotlist table through -- but that was
+    # traced to a genuine is_hotlist_email() detection gap, now fixed
+    # directly at the source (see _looks_like_candidate_roster_table()
+    # and the new _HOTLIST_INDICATORS phrases). With that root cause
+    # fixed, loosening this threshold no longer reopens that leak.
+    parsed['is_likely_requirement'] = parsed['parse_confidence'] >= 0.5
+    # BUG FIX: even role + 1-of-3 still misses a posting that states
+    # NONE of employment_types/location/work_authorization at all, if
+    # the body is otherwise unmistakably JD-shaped -- see
+    # looks_like_jd_shaped_body()'s docstring. Only checked as a
+    # fallback when role itself already passed its own check
+    # (parse_confidence > 0 guarantees this) and the field-count path
+    # alone wasn't enough.
+    if (
+        not parsed['is_likely_requirement']
+        and parsed['parse_confidence'] > 0.0
+        and looks_like_jd_shaped_body(safe_body)
+    ):
+        parsed['is_likely_requirement'] = True
 
     # Final guard — never return email body content in any field
     for key, value in parsed.items():
