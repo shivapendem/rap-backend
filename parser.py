@@ -341,6 +341,17 @@ _RESTRICTION_SUBJECT_SEGMENT_PATTERN = re.compile(
 )
 
 ROLE_PATTERNS = [
+    # BUG FIX ("Role 1: AS/400 Developer" / "Role 2: Senior Data
+    # Engineer" ... / "Role:1 Guidewire Claim Center Integration Lead" --
+    # confirmed real cases, a multi-role broadcast where NEITHER this
+    # list's plain "Role:" label NOR role_from_numbered_label() (expects
+    # the opposite order -- "Role: 1" then the title on the NEXT line)
+    # matched at all): a sequence number sitting BETWEEN "Role" and the
+    # separator, with the title on the SAME line after it. Requires at
+    # least one non-whitespace character captured on the same line -- if
+    # nothing follows, this simply doesn't match and falls through to
+    # role_from_numbered_label() as before.
+    r'(?im)^[ \t]*role\s*[:\-]?\s*\d+\s*[.):\-]?[ \t]+(\S.*)',
     # BUG FIX ("role: 'At least 6-8 years of overall IT experience,
     # including at least 4...'" from a multi-posting email — confirmed on
     # a real VLink requirement row, and independently corrupting the
@@ -1157,6 +1168,26 @@ def extract_work_authorization(text: str) -> Optional[str]:
     )
     for m in _WORK_AUTH_TOKEN_PATTERN.finditer(text[:6000]):
         tok = re.sub(r'\s+', ' ', m.group(0)).strip()
+        # BUG FIX ("performance bottleneck identification across CPU,
+        # memory, threads, GC, database queries, network latency..." --
+        # a genuine, fully-detailed real JD's own technical skills list,
+        # confirmed real case, work_authorization came out "GC" for a
+        # posting that never mentions visa status anywhere at all): bare
+        # "GC" is genuinely ambiguous -- Green Card in a staffing
+        # context, but just as commonly "Garbage Collection" (an
+        # ordinary JVM/performance-engineering term). When "GC"
+        # specifically (not "GC-EAD", which is unambiguous) is
+        # immediately surrounded by other technical/systems vocabulary
+        # rather than visa/staffing vocabulary, skip it.
+        if tok.lower() == 'gc':
+            window = text[max(0, m.start() - 40):m.end() + 40].lower()
+            if re.search(
+                r'\b(?:cpu|memory|threads?|heap|jvm|database|db\b|query|'
+                r'queries|latency|collector|collection|garbage|thread\s+'
+                r'pool|network|microservices?|pipeline)\b',
+                window
+            ):
+                continue
         window_before = text[max(0, m.start() - 30):m.start()]
         negated = bool(_NEGATION_CUE.search(window_before)) and not tok.lower().startswith('no ')
         display = f"No {tok}" if negated else tok
@@ -1836,21 +1867,45 @@ def role_from_subject(subject: str) -> Optional[str]:
     # The old blind cut assumed anything capitalized after a dash was a
     # location, so "Senior Technical Leads - PeopleSoft, Remote" lost
     # "PeopleSoft" (real title content, not a location) along with "Remote".
-    dash_m = re.search(r'\s*-\s([A-Z][a-zA-Z].*)$', s)
-    if dash_m:
-        tail = dash_m.group(1)
+    # BUG FIX ("Urgent - Senior Developer D365-Power Platform-Azure -
+    # C2C/1099/W2" -- confirmed real case): re.search() only ever checked
+    # the FIRST " - X" occurrence -- with two dashes present, the first
+    # one's tail is the ENTIRE rest of the string, matching none of the
+    # triggers on its own, so the function gave up without ever looking
+    # at the second, actually-croppable dash. Find every dash POSITION
+    # first (a lookahead, not consuming the tail), then try each one's
+    # own tail against the triggers, LAST dash first.
+    _dash_positions = list(re.finditer(r'\s*-\s(?=[A-Z][a-zA-Z0-9])', s))
+    for _dash_pos_m in reversed(_dash_positions):
+        dash_m_start = _dash_pos_m.start()
+        tail = s[_dash_pos_m.end():]
         mode_m = re.search(r'(?i)\b(remote|hybrid|onsite|on-site|on\s+location)\b', tail)
         loc_m = _find_city_state_match(tail)
-        candidates = [m.start() for m in (mode_m, loc_m) if m]
+        # BUG FIX ("role: 'Senior Developer D365-Power Platform-Azure -
+        # C2C/1099/W2'" -- confirmed real case): a bare employment-type
+        # list ("C2C/1099/W2") is exactly the same kind of non-title
+        # suffix as a trailing location, but wasn't a recognized trigger
+        # at all. Matched only when the ENTIRE tail is just employment-
+        # type tokens (anchored start-to-end).
+        emp_m = re.match(
+            r'(?i)^(?:c2c|w2|1099|contract(?:or)?|full[\s\-]?time|fte|'
+            r'corp[\s\-]?to[\s\-]?corp)'
+            r'(?:\s*(?:[/,&]|and|or)\s*(?:c2c|w2|1099|contract(?:or)?|'
+            r'full[\s\-]?time|fte|corp[\s\-]?to[\s\-]?corp))*'
+            r'(?:\s+only)?\s*$',
+            tail
+        )
+        candidates = [m.start() for m in (mode_m, loc_m, emp_m) if m]
         if candidates:
             trigger_pos = min(candidates)
             if trigger_pos == 0:
-                s = s[:dash_m.start()].strip()
+                s = s[:dash_m_start].strip()
             else:
                 keep = tail[:trigger_pos].strip().strip(',').strip()
-                s = (s[:dash_m.start()].strip() + (' - ' + keep if keep else '')).strip()
-        # else: nothing in the tail looks like a real location/work-mode
-        # trigger -- leave s unchanged rather than guessing.
+                s = (s[:dash_m_start].strip() + (' - ' + keep if keep else '')).strip()
+            break
+        # else: nothing in this dash's tail looks like a real trigger --
+        # try the next (further left) dash instead of giving up entirely.
 
     # BUG FIX ("role: 'QA Automation with Telecom Billing Experience for
     # Alpharetta, GA (Onsite) - f...'" -- ran the full 80-char fallback
@@ -2141,10 +2196,25 @@ def role_from_body_lead(norm_text: str) -> Optional[str]:
     if not norm_text:
         return None
     text = norm_text
-    header_slice = text[:2000]
+    # BUG FIX ("role: 'To unsubscribe from future emails or to update
+    # your email preferences click here'" -- confirmed real case): this
+    # used to skip to the position after the LAST email address found
+    # ANYWHERE in the first 2000 characters, unconditionally -- fine for
+    # its intended shape ("From: Name, Company email@x.com Reply to:
+    # email@x.com" at the very START), but a short email's own
+    # SIGNATURE email also falls inside that same 2000-char window,
+    # jumping clean past ALL of the real content. Only do this skip when
+    # the match shape actually looks like the header block this was
+    # built for -- a "From:"/"Reply to:" label sitting close to the
+    # email address -- not just any email address anywhere in a large
+    # window.
+    header_slice = text[:600]
     email_matches = list(_EMAIL_ADDR_PATTERN.finditer(header_slice))
     if email_matches:
-        text = text[email_matches[-1].end():]
+        last_match = email_matches[-1]
+        nearby = text[max(0, last_match.start() - 60):last_match.start()]
+        if re.search(r'(?i)\b(?:from|reply\s*to)\s*:?\s*$', nearby):
+            text = text[last_match.end():]
     text = text.lstrip()
     # BUG FIX (ported from rap_python_cron's identical fix — role
     # captured as "Hi,"/"Hello,"/a bare greeting even when the real role
@@ -2433,7 +2503,18 @@ _HOTLIST_INDICATORS = re.compile(
     # boundary exists just as validly between a space and "h" as it does
     # anywhere else. Excludes the match when immediately followed by "@"
     # (i.e. it's the local part of an email address, not the phrase).
-    r'(?i)\bhot[\s\-]?list\b(?!@)|'
+    # BUG FIX ("We are looking Workday Solutions Engineer Consultant
+    # please let me know if you have any consultant also please share me
+    # updated Hotlist as well." -- a genuine, fully-detailed real single
+    # job requirement, confirmed real case): a bare "hotlist" match
+    # anywhere rejected this real posting purely because of one
+    # incidental secondary ask tacked onto an otherwise completely real
+    # JD ("...also please share me updated Hotlist as well" -- a REQUEST
+    # for a hotlist directed at the reader, not an offer of one). Moved
+    # out of this combined regex into its own context-aware check (see
+    # _has_genuine_hotlist_mention() below) so "share/send me a/the/
+    # updated hotlist" (asking FOR one) can be told apart from an email
+    # that IS one.
     r'\bour\s+(?:consultants?|resources?|candidates?)\s+(?:are|is)\b|'
     r'\bconsultants?\s+(?:are\s+)?ready\s+to\s+join\b|'
     # BUG FIX: only matched "bench consultants"/"bench resources" --
@@ -2629,7 +2710,17 @@ _HOTLIST_INDICATORS = re.compile(
     # realistic non-bench-sales signatures ("Technical Recruiter",
     # "Senior Talent Acquisition Specialist") to confirm those don't trip
     # this.
-    r'\bbench\s+sales\b|'
+    # BUG FIX ("Dear Bench Sales Team, ... Please share suitable
+    # candidates who have strong experience... Title: GCP Cloud
+    # Migration Architect..." -- a genuine, fully-detailed real job
+    # requirement, confirmed real case): a bare "bench sales" match
+    # anywhere in the text caught this real posting purely because it
+    # was ADDRESSED to a distribution list literally named "Bench Sales
+    # Team". Moved out of this combined regex into its own context-aware
+    # check (see _has_genuine_bench_sales_signature() below) so a
+    # salutation like "Dear Bench Sales Team" can be told apart from
+    # someone actually signing off AS a Bench Sales recruiter offering
+    # their own consultant.
     # BUG FIX ROUND 2 ("Please go through the profile and let us know
     # your thoughts" -- untested candidate phrasing, added proactively):
     # a recruiter-pitch review ask distinct from anything above.
@@ -2767,7 +2858,16 @@ _HOTLIST_INDICATORS = re.compile(
     # BUG FIX ("The below consultant is looking for a new assignment" --
     # confirmed real case).
     r'\b(?:consultants?|candidates?)\s+(?:is|are)\s+looking\s+for\s+(?:a\s+)?new\s+assignments?\b|'
-    r'\blooking\s+for\s+(?:a\s+)?new\s+assignment\b'
+    r'\blooking\s+for\s+(?:a\s+)?new\s+assignment\b',
+    # BUG FIX (matches the identical fix in the cron copy of this file --
+    # a bare inline "(?i)" written into whichever alternative happened
+    # to be first was silently lost when that alternative got removed
+    # while fixing the "hotlist"/"bench sales" false positives above,
+    # which downgraded this entire massive regex to case-SENSITIVE
+    # matching. Passing re.IGNORECASE as an explicit compile() flag here
+    # instead makes case-insensitivity immune to which alternative
+    # happens to be listed first, now or after any future edit.
+    re.IGNORECASE
 )
 
 # BUG FIX ("HOTLIST(AI ENGINEER LOOKING PROJECT ALL OVER USA...)" parsed as
@@ -2950,6 +3050,55 @@ def _starts_with_candidate_name_label(text: str) -> bool:
     return bool(_LEADING_NAME_LABEL_PATTERN.match(text))
 
 
+# BUG FIX (see the two BUG FIX comments above where these bare-word
+# alternatives used to sit inline in _HOTLIST_INDICATORS): both
+# "hotlist" and "bench sales" are strong hotlist signals in ONE
+# direction (an email announcing/offering one) but completely ordinary
+# in the OPPOSITE direction (asking someone else for one, or addressing
+# a distribution list by that name) -- a plain bare-word match can't
+# tell those apart, so each gets its own small context check instead.
+_HOTLIST_REQUEST_PHRASE_PATTERN = re.compile(
+    r'(?i)\b(?:share|send)\s+(?:me\s+)?(?:an?\s+|the\s+|your\s+|updated\s+)*$'
+)
+_BARE_HOTLIST_WORD_PATTERN = re.compile(r'(?i)\bhot[\s\-]?list\b(?!@)')
+
+
+def _has_genuine_hotlist_mention(text: str) -> bool:
+    """True when `text` contains a "hotlist" mention that ISN'T just the
+    tail end of a "share/send me a/the/updated hotlist" REQUEST phrase
+    (asking the reader to provide one) -- see the BUG FIX comment above
+    _HOTLIST_INDICATORS."""
+    if not text:
+        return False
+    for m in _BARE_HOTLIST_WORD_PATTERN.finditer(text):
+        preceding = text[max(0, m.start() - 60):m.start()]
+        if _HOTLIST_REQUEST_PHRASE_PATTERN.search(preceding):
+            continue
+        return True
+    return False
+
+
+_BENCH_SALES_SALUTATION_PATTERN = re.compile(
+    r'(?i)\b(?:dear|hi|hello|greetings)[,]?\s*$'
+)
+_BARE_BENCH_SALES_PATTERN = re.compile(r'(?i)\bbench\s+sales\b')
+
+
+def _has_genuine_bench_sales_signature(text: str) -> bool:
+    """True when `text` contains a "bench sales" mention that ISN'T just
+    a salutation addressing a distribution list by that name ("Dear
+    Bench Sales Team") -- see the BUG FIX comment above
+    _HOTLIST_INDICATORS."""
+    if not text:
+        return False
+    for m in _BARE_BENCH_SALES_PATTERN.finditer(text):
+        preceding = text[max(0, m.start() - 30):m.start()]
+        if _BENCH_SALES_SALUTATION_PATTERN.search(preceding):
+            continue
+        return True
+    return False
+
+
 def is_hotlist_email(text: str) -> bool:
     """True for recruiter 'available consultants' broadcasts -- the
     opposite of a job requirement email. See _HOTLIST_INDICATORS above."""
@@ -2960,6 +3109,8 @@ def is_hotlist_email(text: str) -> bool:
         or _looks_like_resume_body(text)
         or _looks_like_candidate_roster_table(text)
         or _starts_with_candidate_name_label(text)
+        or _has_genuine_hotlist_mention(text)
+        or _has_genuine_bench_sales_signature(text)
     )
 
 
@@ -2981,7 +3132,21 @@ def is_hotlist_email(text: str) -> bool:
 # listing several roles THEY would accept) doesn't have that ambiguity.
 _CANDIDATE_SELF_PROMO_INDICATORS = re.compile(
     r'(?i)\bopen\s+to\s+work\b|'
-    r'\bi\s+am\s+(?:currently\s+)?(?:looking|seeking)\s+for\b[^\n.]{0,60}'
+    # BUG FIX ("I am currently looking for candidates for this role. the
+    # job description aligns with your experience..." -- a genuine,
+    # fully-detailed real Full Stack Engineer (Sitecore AI) posting,
+    # confirmed real case): "I am looking for ... role/opportunity" was
+    # always read as the SENDER promoting themselves for a job -- but
+    # "I am looking for CANDIDATES for this role" is the exact opposite
+    # meaning, a recruiter seeking PEOPLE to fill their own opening.
+    # Excluded via a negative lookahead: if a candidate/consultant/
+    # talent word shows up between "looking for" and "role/opportunity/
+    # position", this is someone seeking candidates, not promoting
+    # themselves, regardless of which of those trailing words follows.
+    r'\bi\s+am\s+(?:currently\s+)?(?:looking|seeking)\s+for\b'
+    r'(?![^\n.]{0,60}\b(?:candidates?|consultants?|resources?|talent|'
+    r'someone|people)\b)'
+    r'[^\n.]{0,60}'
     r'(?:opportunit|role|position)|'
     r'\b(?:share|forward)\s+(?:any\s+)?(?:relevant|suitable)\s+openings?\s+'
     r'(?:within|in|with)\s+(?:your|the)\s+(?:organization|company|network)\b|'
@@ -4718,6 +4883,25 @@ def clean_location(location: Optional[str]) -> Optional[str]:
     )
     if _clause_m:
         location = location[:_clause_m.start()].strip()
+    # BUG FIX ("location: 'Candidate MUST reside within the DC Metro
+    # area - Hybrid (Onsite & Remote) - 4 days onsite per week.'" --
+    # confirmed real case): the clause-crop above only fires when the
+    # trigger word is introduced by a COMMA -- but a requirement clause
+    # just as often opens the location value directly, with no comma at
+    # all ("Candidate MUST reside...", "Must be local to..."). When one
+    # of the same trigger words sits right at the START of the string,
+    # fall back to whichever single work-mode keyword (Remote/Hybrid/
+    # Onsite) is still findable anywhere in the original sentence.
+    elif re.match(
+        r'(?i)^(?:must|should|need(?:s|ed)?|requir(?:es?|ed|ing)|prior|'
+        r'available|will|who|candidates?|consultants?|experience|overlap|'
+        r'ability|strong|able\s+to|open\s+to)\b',
+        location
+    ):
+        _mode_fallback_m = re.search(
+            r'(?i)\b(remote|hybrid|onsite|on-site|on\s+location)\b', location
+        )
+        location = _mode_fallback_m.group(1).title() if _mode_fallback_m else ''
     # BUG FIX ("location: 'New York, #NY - Hybrid, 3 Days Onsite Onsite
     # Interview Required*** USC,GC ,GC EAD ,H4 EAD are Highly preferred'"
     # -- confirmed real case, GVR Infotek, ported from the identical fix
