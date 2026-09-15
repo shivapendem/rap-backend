@@ -17,7 +17,7 @@ from sqlalchemy import func, or_
 from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
 from auth import get_current_user
-from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3
+from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3, get_s3_file_metadata
 from claude_service import generate_tailored_resume, categorize_skills_with_tier
 from phase8_ai_usage_service import save_claude_rate_limits
 from resume_validation import get_missing_resume_fields, missing_fields_message
@@ -2488,6 +2488,42 @@ async def download_base_resume(
     # start, e.g. it's a genuine Spaces object key) -- NOT for a local
     # file that failed to read, which is now handled above and never
     # falls through to here.
+    #
+    # BUG FIX ("View downloads/shows 'file wasn't available', but works
+    # on the very next click" — persisting even after the frontend added
+    # its own retry-on-503): that frontend retry only ever fires for the
+    # LOCAL-FILE branch above, which is a dev/legacy path. In production,
+    # consultants.base_resume_file_path is already an S3 key by the time
+    # anyone edits their profile (see the PERF FIX comment on
+    # _regenerate_base_resume_docx_file above), so every real request
+    # here was hitting THIS branch — which had no retry protection at
+    # all. generate_presigned_url() happily signs a URL for a key
+    # regardless of whether an object actually exists at it yet; the
+    # background regen (_regen_in_background) can still be mid-upload
+    # (or, for a consultant's very first-ever regen, hasn't uploaded
+    # anything at that key at all yet) when a View request lands, and
+    # Google's viewer then 404s trying to fetch that URL — the literal
+    # "file wasn't available on site" being seen. Verify the object is
+    # actually there first (a HEAD request, same call already used for
+    # attachment sizes in the Email Preview modal), with the same brief
+    # retry-then-503 shape as the local-file branch above, so a request
+    # that lands mid-regen gets a 503 the frontend already knows to
+    # retry — instead of a 200 pointing at a URL that's about to 404.
+    # Applies to BOTH View and the real Download button (force_stream) —
+    # download_file_from_s3 below has exactly the same race otherwise.
+    size = None
+    for attempt in range(4):
+        size, _ = await asyncio.to_thread(get_s3_file_metadata, stored)
+        if size is not None:
+            break
+        if attempt < 3:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    if size is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Your resume is being updated — please try View again in a moment.",
+        )
+
     if not force_stream:
         presigned = generate_presigned_url(stored)
         print(f"[base-resume-view-debug] (S3-key branch) stored={stored!r} presigned_url={presigned!r}")
