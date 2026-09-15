@@ -7,6 +7,37 @@
 from typing import Optional
 
 
+# BUG FIX ("T: <company number> EXT +1 4693924030 EXT 107" — the extension
+# repeating the whole phone number in an employer/recruiter's signature):
+# the Signature Settings page (SignatureSettingsPage.tsx) stores a
+# person's "Extension" as ONE combined column — "<extensionBase phone
+# number> EXT <extensionNumber>" (see that page's joinExtension/
+# splitExtension, EXT_SEPARATOR = " EXT ") — extensionBase there is a
+# secondary/alternate phone number, unrelated to and never used by this
+# signature's own "T: {COMPANY_LINE_NUMBER}" line. permission_service.py's
+# get_handling_recruiter used to hand that WHOLE combined string straight
+# through as employer_extension, so build_signature_text/html appended
+# "EXT " in front of the entire stored value — extensionBase and all —
+# instead of just the real extension digits after it. Splitting on the
+# same separator and keeping only the part after it recovers just the
+# actual extension.
+EXTENSION_FIELD_SEPARATOR = " EXT "
+
+
+def extract_extension_digits(raw: Optional[str]) -> Optional[str]:
+    """Given a User.extension column value — which may be a bare
+    extension ("107") or the combined "<base number> EXT <ext>" format
+    the Signature Settings page stores — return just the actual
+    extension digits to show after "EXT " in a signature. None/blank
+    input returns None."""
+    if not raw:
+        return None
+    idx = raw.find(EXTENSION_FIELD_SEPARATOR)
+    ext = raw[idx + len(EXTENSION_FIELD_SEPARATOR):] if idx != -1 else raw
+    ext = ext.strip()
+    return ext or None
+
+
 DEFAULT_TEMPLATE = """Hi {vendor_contact_name},
 
 I hope you are doing well.
@@ -44,6 +75,11 @@ COMPANY_NAME = "Savantis Intelli Solutions"
 COMPANY_TAGLINE = "Quality is not an act, it is a habit."
 COMPANY_ADDRESS = "Dallas, Texas, USA"
 COMPANY_LINE_NUMBER = "+1 469-392-4030"
+# Static, same for every recruiter — like COMPANY_ADDRESS/COMPANY_LINE_NUMBER
+# above, not a per-consultant profile field, so it's added here rather than
+# as a new database column. Shown as a link under the Employer Details
+# block's LinkedIn line, matching the reference signature layout.
+COMPANY_WEBSITE = "www.savantisintelli.com"
 # Referenced as <img src="cid:{COMPANY_BANNER_CID}"> in build_signature_html
 # below, and attached inline (Content-ID header, not a regular attachment)
 # by gmail_send_service.build_mime_message — see BANNER_IMAGE_PATH there.
@@ -103,7 +139,8 @@ def build_signature_text(
         if employer_phone:
             lines.append(f"D: {employer_phone}")
         if employer_extension:
-            lines.append(f"T: {COMPANY_LINE_NUMBER} EXT {employer_extension}")
+            lines.append(f"T: {COMPANY_LINE_NUMBER}")
+            lines.append(f"EXT {employer_extension}")
         lines.append("")
 
     lines.append("Best regards,")
@@ -118,7 +155,8 @@ def build_signature_text(
     if direct_number:
         lines.append(f"D: {direct_number}")
     if extension:
-        lines.append(f"T: {COMPANY_LINE_NUMBER} EXT {extension}")
+        lines.append(f"T: {COMPANY_LINE_NUMBER}")
+        lines.append(f"EXT {extension}")
     lines.append(f"A: {COMPANY_ADDRESS}")
 
     lines.append("")
@@ -174,7 +212,11 @@ def build_signature_html(
     if direct_number:
         contact_rows.append(f'<b>D:</b> {esc(direct_number)}')
     if extension:
-        contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)} EXT {esc(extension)}')
+        # CHANGE ("move the EXT number to a new line"): was one row
+        # ("T: <company number> EXT <extension>") — split into its own
+        # <br>-separated row below the phone number instead.
+        contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)}')
+        contact_rows.append(f'EXT {esc(extension)}')
     contact_rows.append(f'<b>A:</b> {esc(COMPANY_ADDRESS)}')
     contact_html = "<br>".join(contact_rows)
 
@@ -198,13 +240,23 @@ def build_signature_html(
         if employer_phone:
             employer_contact_rows.append(f'<b>D:</b> {esc(employer_phone)}')
         if employer_extension:
-            employer_contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)} EXT {esc(employer_extension)}')
+            # CHANGE ("move the EXT number to a new line" — this is the
+            # row shown in the screenshot, "T: <number> EXT <number> EXT
+            # <ext>" reading as one glued-together line): split into its
+            # own <br>-separated row below the phone number.
+            employer_contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)}')
+            employer_contact_rows.append(f'EXT {esc(employer_extension)}')
         employer_contact_html = "<br>".join(employer_contact_rows)
 
         employer_linkedin_html = (
             f'<div style="margin-top:8px;"><a href="{esc(employer_linkedin_url)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(employer_linkedin_url)}</a></div>'
             if employer_linkedin_url else ""
         )
+        # CHANGE (match reference layout): a company website link under
+        # LinkedIn, same style. COMPANY_WEBSITE is a fixed constant (like
+        # COMPANY_ADDRESS above), not a per-recruiter field — same for
+        # every Employer Details block, always shown.
+        employer_website_html = f'<div style="margin-top:4px;"><a href="https://{esc(COMPANY_WEBSITE)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(COMPANY_WEBSITE)}</a></div>'
         # CHANGED: smaller than the name above it (was inheriting the
         # table's 13px, same size as the name) so it reads as a
         # subordinate label, not competing with it.
@@ -223,6 +275,7 @@ def build_signature_html(
       <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(employer_name)}</div>
       {employer_title_html}
       {employer_linkedin_html}
+      {employer_website_html}
     </td>
     <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
       {employer_contact_html}

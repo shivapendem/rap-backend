@@ -8,6 +8,8 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from email_template import extract_extension_digits
+
 
 async def resolve_apply_consultant(
     db: AsyncSession,
@@ -194,6 +196,9 @@ async def get_handling_recruiter(db: AsyncSession, consultant) -> dict | None:
         "employer_title": getattr(recruiter, "designation", None) or "Recruiter",
         "employer_email": recruiter.email or "",
         "employer_phone": getattr(recruiter, "mobile_number", None),
-        "employer_extension": getattr(recruiter, "extension", None),
+        # BUG FIX ("EXT +1 4693924030 EXT 107" in the signature): see
+        # extract_extension_digits in email_template.py — recruiter.extension
+        # is stored as "<base number> EXT <ext>", not a bare extension.
+        "employer_extension": extract_extension_digits(getattr(recruiter, "extension", None)),
         "employer_linkedin_url": getattr(recruiter, "linkedin_url", None),
     }
