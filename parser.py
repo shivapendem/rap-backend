@@ -50,8 +50,8 @@ PARSE_REQUIREMENT_TOOL = {
             },
             "employment_types": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["C2C", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
-                "description": "One or more of C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN."
+                "items": {"type": "string", "enum": ["C2H", "C2C", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
+                "description": "One or more of C2H, C2C, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN."
             },
             "experience": {"type": ["string", "null"], "description": "e.g. '8+ years'."},
             "skills": {
@@ -191,10 +191,11 @@ EMPLOYMENT_KEYWORDS = {
     # distinct from "C2C"/"corp-to-corp"/"corp2corp" already covered
     # below, and was missing entirely.
     'C2C': ['c2c', 'corp to corp', 'corp-to-corp', 'corp2corp', 'c-c'],
+    'C2H': ['c2h', 'contract to hire', 'contract-to-hire', 'c-t-h', 'contract to hire (c2h)', 'contract-to-hire (c2h)', 'contract to perm', 'contract-to-perm', 'c2p'],
     'W2': ['w2'],
     '1099': ['1099'],
     'FULLTIME': ['full time', 'full-time', 'fulltime', 'permanent', 'fte'],
-    'CONTRACT': ['contract', 'contractual', 'contract-to-hire']
+    'CONTRACT': ['contract', 'contractual']
 }
 
 # Flat set of every employment-type keyword string above, used by
@@ -352,6 +353,15 @@ ROLE_PATTERNS = [
     # nothing follows, this simply doesn't match and falls through to
     # role_from_numbered_label() as before.
     r'(?im)^[ \t]*role\s*[:\-]?\s*\d+\s*[.):\-]?[ \t]+(\S.*)',
+    # BUG FIX ("1. AI Engineer - Alpharetta, GA" / "2. AI Engineer -
+    # Coppell, TX" -- confirmed real case, a multi-role broadcast where
+    # the numbered list has NO "Role"/"Position" label -- just a bare
+    # sequence number, a period, the title, then a dash and a City, ST
+    # location on the SAME line): deliberately narrow -- requires the
+    # line to END in a City, ST pattern -- so an ordinary numbered
+    # REQUIREMENT bullet is never mistaken for a title.
+    r'(?im)^[ \t]*\d+\.\s+([A-Z][^,\n]{2,50}?)\s*[-\u2013]\s*'
+    r'[A-Z][a-zA-Z\s]+,\s*[A-Z]{2}\s*$',
     # BUG FIX ("role: 'At least 6-8 years of overall IT experience,
     # including at least 4...'" from a multi-posting email — confirmed on
     # a real VLink requirement row, and independently corrupting the
@@ -1020,7 +1030,16 @@ BARE_LOCATION_PATTERN = re.compile(
     # state code. A real location is essentially always comma-separated
     # from its state; a hashtag skill list never is.
     r'(?:\s*,\s*#?\s*|\s+)'
-    r'([A-Z]{2}\b|' + _FULL_STATE_NAME_ALTERNATION + r')'
+    # BUG FIX ("Location:Dallas, TXLong Term ContractStart: ASAP" --
+    # confirmed real case, entire location value swallowed everything up
+    # to "ASAP"; ported from the identical fix in the cron copy of this
+    # file): the state code required a trailing \b, but HTML-flattening
+    # routinely glues the next field directly onto the state code with
+    # zero separator ("TXLong"). "X" and "L" are both word characters,
+    # so no \b exists between them, and the WHOLE match failed outright.
+    # Accept either a real \b OR being immediately followed by another
+    # capital letter (a glued Title-Case word boundary).
+    r'([A-Z]{2}(?:\b|(?=[A-Z]))|' + _FULL_STATE_NAME_ALTERNATION + r')'
 )
 
 # Street-level prefixes that precede a real city in addresses like
@@ -1588,6 +1607,15 @@ def crop_at_next_field(value: str) -> str:
     # "Location:" either way. With its one provable case redundant and
     # its unique case actively destructive, there's no scenario left
     # where keeping this rule helps.
+    # BUG FIX ("Job Description- Senior GIS Programmer / Systems Analyst"
+    # -- confirmed real case, role came out completely empty/UNKNOWN for
+    # a real, fully-detailed posting; ported from the identical fix in
+    # the cron copy of this file): when the earliest stop-match starts
+    # at position 0 (nothing at all precedes it), cutting there returns
+    # an EMPTY string -- cropping to empty is never more useful than
+    # keeping the original text uncropped.
+    if cut == 0:
+        return value.strip()
     return value[:cut].strip()
 
 
@@ -1622,6 +1650,15 @@ def role_from_subject(subject: str) -> Optional[str]:
     # status banner in this common recruiter convention and is just as
     # much noise as the banner itself.
     s = re.sub(r'(?i)^\s*please\s+disregard\s*[:\-]?\s*', '', s).strip()
+    # BUG FIX ("Job Description- Senior GIS Programmer / Systems
+    # Analyst" -- confirmed real case; ported from the identical fix in
+    # the cron copy of this file): a subject commonly leads with the
+    # section-header phrase "Job Description"/"Position Description"/
+    # "Role Description" ahead of a dash, then the actual title.
+    s = re.sub(
+        r'(?i)^\s*(?:job|position|role)\s+description\s*[:\-]\s*',
+        '', s
+    ).strip()
     # BUG FIX ("role: \"C2C IT Requirements - Let's Connect\"" —
     # confirmed real case): a trailing recruiter-networking call-to-
     # action ("- Let's Connect", "- Lets Connect") is pure filler, never
@@ -1973,6 +2010,14 @@ def role_from_subject(subject: str) -> Optional[str]:
     # Shared vocabulary so the leading and trailing stripers can't drift
     # out of sync with each other.
     _MARKETING_PHRASES = (
+        # BUG FIX ("Exciting Remote Opportunity: Sr. Structural Engineer -
+        # Nuclear" -- confirmed real case): a 3-word marketing lead-in
+        # phrase followed by a colon -- "Remote" in the middle isn't
+        # itself a marketing word, so the word-by-word stripper below
+        # could never fully clear this combination. Added as one
+        # combined phrase.
+        r'(?:exciting|amazing|great|fantastic|awesome)\s+(?:remote\s+)?'
+        r'opportunit(?:y|ies)|'
         r'urgent\s+requirements?|new\s+requirements?|immediate\s+requirements?|'
         r'needed|need|required|urgent(?:ly)?|immediate(?:ly)?|hiring(?:\s+now)?|hot|hire|'
         r'opportunit(?:y|ies)|apply\s*now|apply|'
@@ -2314,6 +2359,16 @@ def is_email_body(text: str) -> bool:
     sentences = re.split(r'[.!?]\s+', text)
     if len(sentences) > 2 and len(text) > 100:
         return True
+    # BUG FIX ("Job Description- Senior GIS Programmer" -- confirmed real
+    # case, role came out 'UNKNOWN' for a genuine, fully-detailed real
+    # posting; ported from the identical fix in the cron copy of this
+    # file): this phrase-based check fired regardless of text LENGTH -- a
+    # short, clearly title-shaped 39-character string merely starting
+    # with a "Job Description-" label prefix tripped the same heuristic
+    # meant to catch an entire multi-paragraph email body. Add the same
+    # length guard the sentence-count check above already uses.
+    if len(text) <= 100:
+        return False
     email_patterns = [
         r'job\s+description', r'responsibilities', r'qualifications',
         r'benefits', r'about\s+company', r'thank\s+you', r'best\s+regards'
@@ -2650,7 +2705,22 @@ _HOTLIST_INDICATORS = re.compile(
     # "openings" as a recognized object -- both direction-safe for the
     # same reason as the "if you have any requirements/openings" fix
     # above.
-    r'\bshare\s+your\s+(?:[a-z]+\s+){0,2}(?:roles?|requirements?|positions?|openings?)\b|'
+    # BUG FIX ("Please find the below JD and share your Profile...
+    # Role: : SAP S/4HANA Finance SME..." -- a genuine, fully-detailed
+    # real posting, confirmed real case; ported from the identical fix
+    # already applied in the cron copy of this file): the 0-2-word
+    # filler gap let ANY word sit between "your" and "roles/
+    # requirements", including "profile" -- which has a completely
+    # different, unrelated meaning ("share your profile" = send your own
+    # resume/details, a normal ask on a real JD) -- and \s+ crossed a
+    # blank line straight into an unrelated "Role:" LABEL from later in
+    # the same JD, matching a phrase that was never actually one
+    # sentence at all. Narrowed the filler to the specific adjectives
+    # that actually make "share your ___ roles/requirements" a coherent
+    # hotlist-solicitation phrase, and switched \s+ to [ \t]+ so the
+    # match can never cross a line break.
+    r'\bshare\s+your\s+(?:(?:current|open|active|available|latest|new)[ \t]+)?'
+    r'(?:roles?|requirements?|positions?|openings?)\b|'
     # BUG FIX ROUND 2 (bare "please share requirements", no "your" --
     # untested candidate phrasing, e.g. "...please share requirements"):
     # every "share...requirements" pattern above requires "your"
@@ -3058,7 +3128,17 @@ def _starts_with_candidate_name_label(text: str) -> bool:
 # a distribution list by that name) -- a plain bare-word match can't
 # tell those apart, so each gets its own small context check instead.
 _HOTLIST_REQUEST_PHRASE_PATTERN = re.compile(
-    r'(?i)\b(?:share|send)\s+(?:me\s+)?(?:an?\s+|the\s+|your\s+|updated\s+)*$'
+    r'(?i)\b(?:share|send)\s+(?:me\s+)?(?:an?\s+|the\s+|your\s+|updated\s+)*$|'
+    # BUG FIX ("Hi Partner, Hope you're doing great! I came across your
+    # Hotlist and wanted to share an exciting opportunity." -- a genuine,
+    # fully-detailed real GCP Platform Engineer posting, confirmed real
+    # case; ported from the identical fix in the cron copy of this
+    # file): "I came across YOUR hotlist" references the READER's own
+    # hotlist (something the sender happened to see), not a description
+    # of what THIS email is, and not a request for one either -- it's
+    # simply how this recruiter opens before pivoting to a real opening
+    # of their own. Excluded the same way as the request phrasing above.
+    r'\b(?:came\s+across|saw|noticed|found|received)\s+your\s*$'
 )
 _BARE_HOTLIST_WORD_PATTERN = re.compile(r'(?i)\bhot[\s\-]?list\b(?!@)')
 
@@ -5819,7 +5899,18 @@ def _find_role_label_anchors(text: str) -> List[tuple]:
             if not value or is_email_body(value) or len(value) > 200:
                 continue
             line_start = text.rfind('\n', 0, m.start()) + 1
-            anchors.append((m.start(), line_start, value, False))
+            # BUG FIX ("1. AI Engineer - Alpharetta, GA" / "2. AI Engineer
+            # - Coppell, TX" -- confirmed real case, two distinct postings
+            # collapsed into one; ported from the identical fix in the
+            # cron copy of this file): the dedup key used just the
+            # captured TITLE (group 1, deliberately cropped to exclude
+            # location for clean single-role extraction elsewhere) -- so
+            # two different postings sharing the same title text but
+            # different locations produced an IDENTICAL dedup value and
+            # the second got silently discarded as a restatement. Use the
+            # full match text (group 0) as the dedup fingerprint instead.
+            dedup_value = sanitize_text(m.group(0))[:200] or value
+            anchors.append((m.start(), line_start, value, False, dedup_value))
     anchors.sort(key=lambda a: a[0])
     return anchors
 
@@ -5885,6 +5976,14 @@ def _looks_like_bare_job_title(line: str) -> bool:
     # NEXT_FIELD_LABELS and EMPLOYMENT_KEYWORDS so this can't drift out
     # of sync with what those already recognize.
     if line.lower() in NEXT_FIELD_LABELS or line.lower() in _EMPLOYMENT_TYPE_BARE_WORDS:
+        return False
+    # BUG FIX ("role: 'Job ID: JP00114625'" -- confirmed real case, ported
+    # from the identical fix in the cron copy of this file): "Job ID:
+    # JP00114625" has content after its colon and is immediately followed
+    # by a "Location:" line -- exactly the bare-title-then-location shape
+    # this function exists to detect, but a Job/Req/Position ID is never
+    # a title.
+    if re.match(r'(?i)^(?:job|req|position|requisition)\s*(?:id|#|no\.?)\s*:', line):
         return False
     if NEXT_FIELD_PATTERN.search(line):
         return False
@@ -5980,7 +6079,7 @@ def _find_bare_title_anchors(text: str) -> List[tuple]:
         while j < n and not lines[j].strip():
             j += 1
         if j > i + 1 and j < n and _looks_like_location_line(lines[j]):
-            anchors.append((offsets[i], offsets[i], lines[i].strip(), True))
+            anchors.append((offsets[i], offsets[i], lines[i].strip(), True, lines[i].strip()))
     return anchors
 
 
@@ -6004,13 +6103,36 @@ def split_into_requirement_segments(body_text: str, max_segments: int = 10) -> L
         return [body_text]
 
     accepted: list = []
-    for pos, line_start, value, is_bare in raw_anchors:
+    seen_values: set = set()
+    for pos, line_start, value, is_bare, dedup_value in raw_anchors:
+        normalized_value = dedup_value.strip().lower()
         if accepted:
-            prev_pos, _prev_line_start, prev_value, _prev_bare = accepted[-1]
-            if pos - prev_pos < _ANCHOR_MIN_GAP and value.strip().lower() == prev_value.strip().lower():
+            prev_pos, _prev_line_start, _prev_value, _prev_bare, prev_dedup = accepted[-1]
+            if pos - prev_pos < _ANCHOR_MIN_GAP and normalized_value == prev_dedup.strip().lower():
                 # Same role restated close together — not a second posting.
                 continue
-        accepted.append((pos, line_start, value, is_bare))
+        # BUG FIX (single real email processed 3x by the parser -- 3x
+        # OpenAI/Claude token usage -- for one genuine posting; ported
+        # from the identical fix in the cron copy of this file): the gap
+        # check above only ever compared a new anchor against the
+        # IMMEDIATELY PRECEDING accepted one, and only suppressed a
+        # restatement within _ANCHOR_MIN_GAP (120 chars). A forwarded/
+        # quoted copy of the same email further down the body, or a
+        # "Position Details" recap section restating the same role, sits
+        # far past that gap -- so the exact same job title created a
+        # SECOND (or third) accepted anchor, and this function turned one
+        # genuine posting into 2-3 segments, each independently re-run
+        # through the full OpenAI -> Claude -> spaCy chain in
+        # parse_requirements(). Comparing against EVERY already-accepted
+        # value (not just the last one), with no distance limit, means
+        # the exact same role text anywhere in the email is always
+        # treated as a restatement of a posting already captured, never a
+        # new one. A genuinely different role title still creates its own
+        # anchor exactly as before -- this only suppresses exact repeats.
+        if normalized_value in seen_values:
+            continue
+        accepted.append((pos, line_start, value, is_bare, dedup_value))
+        seen_values.add(normalized_value)
 
     if len(accepted) < 2:
         return [body_text]
@@ -6018,7 +6140,7 @@ def split_into_requirement_segments(body_text: str, max_segments: int = 10) -> L
     accepted = accepted[:max_segments]
 
     segments = []
-    for i, (_, line_start, value, is_bare) in enumerate(accepted):
+    for i, (_, line_start, value, is_bare, _dedup) in enumerate(accepted):
         seg_end = accepted[i + 1][1] if i + 1 < len(accepted) else len(body_text)
         segment = body_text[line_start:seg_end].strip()
         if is_bare:
