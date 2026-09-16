@@ -697,8 +697,13 @@ async def get_openai_usage(
     
     api_key = os.getenv("OPENAI_ADMIN_API_KEY")
     if not api_key:
-        api_key = "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"
-
+        logging.getLogger(__name__).warning("OPENAI_ADMIN_API_KEY is not set in .env")
+        return OpenAIUsageDTO(
+            tokens_limit=0,
+            tokens_remaining=0,
+            tokens_used_pct=0.0,
+            tokens_reset="End of Month"
+        )
     # Fetch usage for the current calendar month
     now = datetime.now(timezone.utc)
     start_date = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
