@@ -36,7 +36,7 @@ from models import (
     AppSetting,
 )
 from phase8_audit_service import log_action, build_metadata_preview
-from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost, get_claude_rate_limits
+from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost, get_openai_rate_limits
 from phase8_cache import cache_get, cache_set, check_redis_health
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
@@ -141,7 +141,7 @@ class ReviewActionRequest(BaseModel):
     correction_data: Optional[dict] = None
 
 
-class ClaudeUsageDTO(BaseModel):
+class OpenAIUsageDTO(BaseModel):
     tokens_limit: int
     tokens_remaining: int
     tokens_used_pct: float
@@ -683,14 +683,14 @@ async def update_ai_budget(
         budget_used_pct=round(used_pct, 2),
     )
 
-@router.get("/ai-usage/claude", response_model=ClaudeUsageDTO)
-async def get_claude_usage(
+@router.get("/ai-usage/openai", response_model=OpenAIUsageDTO)
+async def get_openai_usage(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin)
 ):
-    """Get the latest recorded Claude API rate limit information."""
+    """Get the latest recorded OpenAI API rate limit information."""
 
-    limits = await get_claude_rate_limits(db)
+    limits = await get_openai_rate_limits(db)
     limit = limits["tokens_limit"]
     remaining = limits["tokens_remaining"]
 
@@ -698,7 +698,7 @@ async def get_claude_usage(
     if limit > 0:
         used_pct = ((limit - remaining) / limit) * 100.0
 
-    return ClaudeUsageDTO(
+    return OpenAIUsageDTO(
         tokens_limit=limit,
         tokens_remaining=remaining,
         tokens_used_pct=round(used_pct, 2),

@@ -400,9 +400,8 @@ MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
     # Best-effort telemetry — powers the admin AI Usage screen. Never fatal.
     if db is not None and rate_limits:
         try:
-            from phase8_ai_usage_service import save_claude_rate_limits
-
-            await save_claude_rate_limits(db, rate_limits)
+            from phase8_ai_usage_service import save_openai_rate_limits
+            await save_openai_rate_limits(db, rate_limits)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to persist Claude rate limits: %s", exc)
 

@@ -19,7 +19,7 @@ from models import User, Resume, ConsultantExperience, Consultant, RecruiterCons
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3, get_s3_file_metadata
 from claude_service import generate_tailored_resume, categorize_skills_with_tier
-from phase8_ai_usage_service import save_claude_rate_limits
+from phase8_ai_usage_service import save_openai_rate_limits
 from resume_validation import get_missing_resume_fields, missing_fields_message
 from phase3 import _extract_text_from_docx
 
@@ -382,7 +382,7 @@ async def generate_resume_from_template(
         from claude_service import generate_template_values
         generated_data, rate_limits, usage_info = generate_template_values(resume_info, request.job_description or "General Role")
         if rate_limits:
-            await save_claude_rate_limits(db, rate_limits)
+            await save_openai_rate_limits(db, rate_limits)
         if usage_info:
             from phase8_ai_usage_service import log_ai_usage
             await log_ai_usage(
@@ -608,7 +608,7 @@ async def generate_resume(
             resume_info, request.job_description or "General Role", target_role=request.target_role
         )
         if rate_limits:
-            await save_claude_rate_limits(db, rate_limits)
+            await save_openai_rate_limits(db, rate_limits)
         if usage_info:
             from phase8_ai_usage_service import log_ai_usage
             await log_ai_usage(
@@ -1972,7 +1972,7 @@ async def get_base_resume_content(
                 parse_resume_text_to_structured_data, consultant.base_resume_text
             )
             if rate_limits:
-                await save_claude_rate_limits(db, rate_limits)
+                await save_openai_rate_limits(db, rate_limits)
             if usage_info:
                 # usage_info is only non-None when the AI call actually
                 # succeeded — only THEN persist the result. Otherwise
@@ -2715,7 +2715,7 @@ async def get_resume(
                 parse_resume_text_to_structured_data, raw_text
             )
             if rate_limits:
-                await save_claude_rate_limits(db, rate_limits)
+                await save_openai_rate_limits(db, rate_limits)
             if usage_info:
                 # Only persist when the AI call actually succeeded — see
                 # the matching comment in get_base_resume_content for why

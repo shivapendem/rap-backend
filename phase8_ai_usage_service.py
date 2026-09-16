@@ -93,15 +93,15 @@ async def log_ai_usage(
     await db.commit()
     return cost
 
-async def save_claude_rate_limits(db: AsyncSession, limits: dict):
-    """Save Claude rate limit headers to AppSettings."""
+async def save_openai_rate_limits(db: AsyncSession, limits: dict):
+    """Save OpenAI rate limit headers to AppSettings."""
     keys_to_save = [
         "tokens-limit", "tokens-remaining", "tokens-reset",
         "requests-limit", "requests-remaining", "requests-reset"
     ]
     for key in keys_to_save:
         if limits.get(key) is not None:
-            full_key = f"claude_ratelimit_{key}"
+            full_key = f"openai_ratelimit_{key}"
             val = str(limits[key])
             result = await db.execute(select(AppSetting).where(AppSetting.key == full_key))
             setting = result.scalars().first()
@@ -111,12 +111,12 @@ async def save_claude_rate_limits(db: AsyncSession, limits: dict):
                 db.add(AppSetting(key=full_key, value=val))
     await db.commit()
 
-async def get_claude_rate_limits(db: AsyncSession) -> dict:
-    """Retrieve Claude rate limit headers from AppSettings."""
+async def get_openai_rate_limits(db: AsyncSession) -> dict:
+    """Retrieve OpenAI rate limit headers from AppSettings."""
     keys_to_load = [
-        "claude_ratelimit_tokens-limit", 
-        "claude_ratelimit_tokens-remaining", 
-        "claude_ratelimit_tokens-reset"
+        "openai_ratelimit_tokens-limit", 
+        "openai_ratelimit_tokens-remaining", 
+        "openai_ratelimit_tokens-reset"
     ]
     result = await db.execute(select(AppSetting).where(AppSetting.key.in_(keys_to_load)))
     settings = result.scalars().all()
@@ -127,11 +127,11 @@ async def get_claude_rate_limits(db: AsyncSession) -> dict:
         "tokens_reset": ""
     }
     for s in settings:
-        if s.key == "claude_ratelimit_tokens-limit":
+        if s.key == "openai_ratelimit_tokens-limit":
             limits["tokens_limit"] = int(s.value) if s.value.isdigit() else 0
-        elif s.key == "claude_ratelimit_tokens-remaining":
+        elif s.key == "openai_ratelimit_tokens-remaining":
             limits["tokens_remaining"] = int(s.value) if s.value.isdigit() else 0
-        elif s.key == "claude_ratelimit_tokens-reset":
+        elif s.key == "openai_ratelimit_tokens-reset":
             limits["tokens_reset"] = s.value
             
     return limits

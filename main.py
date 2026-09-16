@@ -555,10 +555,9 @@ app.include_router(phase_users_router)
 
 # BUG FIX: phase8.py mounts under "/api/v1/admin" (see its own
 # APIRouter(prefix=...) declaration), but the frontend's AI Usage screen
-# calls "/api/admin/ai-usage/claude" instead, missing the "/v1" segment,
-# and 404s.
-#
-# IMPORTANT: this is intentionally a single, exact-path redirect, NOT a
+# calls "/api/admin/ai-usage/openai" instead, missing the "/v1" segment,
+# which causes a 404 and the "Failed to load OpenAI usage." red banner.
+# This redirect intercepts that specific path and forwards it correctly., NOT a
 # blanket "/api/admin/*" catch-all. "/api/admin/" is also the real,
 # legitimate prefix for many OTHER unrelated routes already in this
 # codebase (see phase2.py's raw-emails/gmail-emails/gmail-accounts routes,
@@ -571,10 +570,10 @@ app.include_router(phase_users_router)
 # widen this into a wildcard.
 from fastapi.responses import RedirectResponse
 
-@app.get("/api/admin/ai-usage/claude", include_in_schema=False)
-async def _ai_usage_claude_prefix_compat_redirect(request: Request):
+@app.get("/api/admin/ai-usage/openai", include_in_schema=False)
+async def _ai_usage_openai_prefix_compat_redirect(request: Request):
     query = f"?{request.url.query}" if request.url.query else ""
-    return RedirectResponse(url=f"/api/v1/admin/ai-usage/claude{query}", status_code=307)
+    return RedirectResponse(url=f"/api/v1/admin/ai-usage/openai{query}", status_code=307)
 
 from resume_router import router as resume_router  # noqa: E402
 app.include_router(resume_router)
