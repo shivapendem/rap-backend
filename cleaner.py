@@ -14,9 +14,45 @@ NOISE_PATTERNS = [
     r'(?im)^.*remove/unsubscribe.*$',
     r'(?is)to unsubscribe from this group.*',
     r'(?is)you received this message because.*',
-    r'(?is)-----original message-----.*',
-    r'(?is)---+\s*forwarded message\s*---+.*',
-    r'(?is)on .+ wrote:.*',
+    # BUG FIX ("No job description available" on the Apply page): these
+    # three markers had the SAME unbounded-".*"-plus-dotall problem the
+    # from/sent/to/subject fix right below already documents and fixes
+    # -- but that fix never got a chance to run, because these three
+    # patterns run FIRST in this list and, matching the exact same
+    # header text, wiped everything (including the from/sent/to/subject
+    # block AND the real JD after it) before the safer pattern ever saw
+    # it. Every requirement forwarded the normal way -- "---- Forwarded
+    # message ----" / "-----Original Message-----" followed by the
+    # actual posting -- lost its entire job_description here, not just
+    # in the sign-off case. Bounded to the marker's own line only, same
+    # as the fix below; the from/sent/to/subject block that typically
+    # follows is still cleaned up by that next pattern, and the real
+    # content after it now survives.
+    r'(?im)^[ \t]*-----\s*original message\s*-----[^\n]*\n?',
+    r'(?im)^[ \t]*-{2,}\s*forwarded message\s*-{2,}[^\n]*\n?',
+    # BUG FIX (regression found in review): required "On ... wrote:" on
+    # a single line, which real mail clients (Outlook, some webmail)
+    # often wrap across two lines ("On <date>, <name>\nwrote:"). That
+    # failed to match at all, leaving both header lines as cosmetic
+    # leftover noise in job_description. Widened to tolerate one wrap --
+    # bounded to a fixed small character budget (never unbounded, never
+    # dotall to end-of-string) so it still can't consume a real JD that
+    # happens to follow.
+    r'(?im)^[ \t]*on\s[^\n]{0,120}?\n?[^\n]{0,40}?\bwrote\s*:[^\n]*\n?',
+    # BUG FIX (regression found in review): "On ... wrote:" only strips
+    # the quote-header line itself (see above), which correctly lets a
+    # forwarded JD pasted after it survive -- but it also meant old,
+    # irrelevant quoted reply-chain chatter ("Thanks, will loop back",
+    # "Any update on this?") sitting below that header now leaked into
+    # job_description, since nothing else removed it. Plain-text mail
+    # clients universally prefix quoted prior-message lines with ">"
+    # (nested replies get ">>", ">>>", etc.) -- that prefix is the
+    # actual, unambiguous signal that a line is OLD quoted
+    # correspondence rather than pasted/forwarded content (real JDs are
+    # never sent this way). Stripping every ">"-prefixed line removes
+    # that chatter regardless of how many reply hops deep it is, without
+    # touching a forwarded JD (which is never quote-prefixed).
+    r'(?im)^[ \t]*>[ \t]?.*$\n?',
     # BUG FIX: the trailing ".*" here was unbounded AND (?s) makes "."
     # match newlines, so once a forwarded-message header block was found,
     # this deleted EVERYTHING from that point to the end of the string --
@@ -47,10 +83,37 @@ NOISE_PATTERNS = [
     # plus everything after — mirrors parser.py's own FIELD_BOUNDARIES
     # sign-off words, but anchored to line boundaries so it doesn't eat "in
     # regards to ..." or "thanks for the update" appearing mid-sentence.
-    r'(?ism)^[ \t]*(?:thanks\s*(?:&|and)?\s*(?:regards|best)|warm(?:est)?\s*regards|'
+    #
+    # BUG FIX ("No job description available" on the Apply page): the
+    # trailing ".*" here was unbounded AND (?s) makes "." match newlines,
+    # so once a sign-off line was found, this deleted EVERYTHING from
+    # that point to the end of the string — not just the signature
+    # block. Recruiters routinely forward a requirement with their own
+    # short "Thanks, <name>" sign-off ABOVE the pasted/quoted original
+    # posting (forward-then-paste, not reply-then-quote), so this wiped
+    # the entire real job description, leaving job_description = "" and
+    # "No job description available" on the Apply page even though the
+    # email plainly contained a JD.
+    #
+    # Bounded to a short signature block: the sign-off line plus at most
+    # 8 following lines, stopping immediately at a blank line or at any
+    # line that looks like real content resuming — a forwarded-message
+    # marker (----/====/____ rule, "From:/Sent:/To:/Subject:") or a
+    # labeled job field ("Role:", "Location:", "Client:", etc.). A
+    # genuine signature (name, title, company, phone, email) is still
+    # fully removed; a forwarded JD sitting right after it is not.
+    # (Cap raised from 5 to 8 -- a regression review found real
+    # signatures with name/title/company/address/direct/mobile/fax/email
+    # routinely run 6-8 lines, leaking their tail line(s) into
+    # job_description under the old cap.)
+    r'(?im)^[ \t]*(?:thanks\s*(?:&|and)?\s*(?:regards|best)|warm(?:est)?\s*regards|'
     r'kind\s*regards|best\s*regards|regards|many\s+thanks|sincerely\s+yours|'
     r'sincerely|yours\s+(?:truly|sincerely|faithfully)?|thank\s+you|thanks|best)'
-    r'\s*[,.:]*[ \t]*$\n?.*',
+    r'\s*[,.:]*[ \t]*$\n?'
+    r'(?:(?!\n)(?!-{3,}|_{3,}|={3,}|from\s*:|sent\s*:|to\s*:|subject\s*:|role\s*:|'
+    r'title\s*:|location\s*:|client\s*:|rate\s*:|duration\s*:|vendor\s*:|'
+    r'experience\s*:|job\s*description\s*:|requirement\s*:|position\s*:|'
+    r'skills?\s*:)[^\n]*\n?){0,8}',
 ]
 
 
