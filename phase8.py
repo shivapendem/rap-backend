@@ -713,7 +713,7 @@ async def get_openai_usage(
     end_date = datetime(now.year, now.month, last_day, 23, 59, 59, tzinfo=timezone.utc)
     end_time = int(end_date.timestamp())
 
-    base_url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}&limit=100"
+    base_url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}&limit=31"
     url = base_url
     
     total_tokens = 0
