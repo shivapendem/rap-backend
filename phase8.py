@@ -713,12 +713,15 @@ async def get_openai_usage(
     end_date = datetime(now.year, now.month, last_day, 23, 59, 59, tzinfo=timezone.utc)
     end_time = int(end_date.timestamp())
 
-    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}"
+    base_url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}&limit=100"
+    url = base_url
     
     total_tokens = 0
+    loop_count = 0
     try:
         async with httpx.AsyncClient() as client:
-            while url:
+            while url and loop_count < 10:
+                loop_count += 1
                 response = await client.get(url, headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
@@ -730,11 +733,7 @@ async def get_openai_usage(
                             total_tokens += res.get("input_tokens", 0) + res.get("output_tokens", 0) + res.get("num_tokens", 0)
                     
                     if data.get("has_more") and data.get("next_page"):
-                        # Use the next_page token (or next URL if provided)
-                        # The OpenAI API docs say you pass `after` for pagination, but next_page is sometimes returned.
-                        # Wait, the OpenAI pagination uses `after=...` for cursor.
                         next_cursor = data.get("next_page")
-                        base_url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}"
                         url = f"{base_url}&after={next_cursor}"
                     else:
                         break
