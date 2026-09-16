@@ -695,7 +695,7 @@ async def get_openai_usage(
     from datetime import datetime, timezone
     import calendar
     
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
     if not api_key:
         api_key = "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"
 
@@ -713,15 +713,29 @@ async def get_openai_usage(
     total_tokens = 0
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }, timeout=10.0)
-            if response.status_code == 200:
-                data = response.json()
-                for bucket in data.get("data", []):
-                    for res in bucket.get("results", []):
-                        total_tokens += res.get("input_tokens", 0) + res.get("output_tokens", 0) + res.get("num_tokens", 0)
+            while url:
+                response = await client.get(url, headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }, timeout=10.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    for bucket in data.get("data", []):
+                        for res in bucket.get("results", []):
+                            total_tokens += res.get("input_tokens", 0) + res.get("output_tokens", 0) + res.get("num_tokens", 0)
+                    
+                    if data.get("has_more") and data.get("next_page"):
+                        # Use the next_page token (or next URL if provided)
+                        # The OpenAI API docs say you pass `after` for pagination, but next_page is sometimes returned.
+                        # Wait, the OpenAI pagination uses `after=...` for cursor.
+                        next_cursor = data.get("next_page")
+                        base_url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}"
+                        url = f"{base_url}&after={next_cursor}"
+                    else:
+                        break
+                else:
+                    logging.getLogger(__name__).error(f"OpenAI usage API returned {response.status_code}: {response.text}")
+                    break
     except Exception as e:
         logging.getLogger(__name__).error(f"Error fetching OpenAI usage: {e}")
 
