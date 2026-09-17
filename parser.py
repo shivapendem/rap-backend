@@ -3959,6 +3959,36 @@ def extract_employment_types(text: str) -> List[str]:
     return found_types if found_types else ["UNKNOWN"]
 
 
+# BUG FIX ("requirement shows both a 'C2C' tag and a 'Contract' tag for
+# the same posting" — confirmed real case, e.g. "Java Developer - C2C
+# Contract - Dallas TX"): C2C (Corp-to-Corp) IS a contract engagement,
+# it's not a distinct employment type from CONTRACT — the two keyword
+# groups in EMPLOYMENT_KEYWORDS just happen to fire independently of
+# each other, so any posting that mentions both surface words (extremely
+# common recruiter phrasing: "C2C contract", "Contract - C2C only")
+# ended up with BOTH tags saved, and this applied whether the list came
+# from the regex extractor above OR from an AI parser (openai/gemini/
+# qwen/claude/local_llm all share the same {"C2C","CONTRACT",...} enum
+# and can just as easily return both). Applied once here, at the single
+# point downstream where the two paths' output is finally combined
+# (see parse_requirement() below), rather than patching each extractor
+# separately. When both are present, "CONTRACT" is dropped and "C2C" —
+# the more specific, more informative of the two — is kept.
+def normalize_employment_types(employment_types: Optional[List[str]]) -> List[str]:
+    """Collapse semantically-duplicate employment-type tags.
+
+    'C2C' and 'CONTRACT' mean the same engagement when both are present
+    for one requirement; only 'C2C' is kept. Also de-dupes any other
+    repeated entries while preserving original order.
+    """
+    if not employment_types:
+        return employment_types
+    deduped = list(dict.fromkeys(employment_types))  # de-dupe, keep order
+    if "C2C" in deduped and "CONTRACT" in deduped:
+        deduped = [t for t in deduped if t != "CONTRACT"]
+    return deduped
+
+
 # BUG FIX: "Candidate should NOT be more than 15 years of experience" (a
 # maximum cap) was being returned as if it were the real required
 # experience level -- it's the only phrase in the email literally
@@ -5888,6 +5918,9 @@ def parse_requirement(
 
     ai_employment_types = _ai_field('employment_types', unknown_value=['UNKNOWN'])
     employment_types = ai_employment_types or extract_employment_types(full_text)
+    # De-dupe semantically-identical tags (e.g. "C2C" + "CONTRACT" both
+    # present for the same posting) — see normalize_employment_types().
+    employment_types = normalize_employment_types(employment_types)
 
     experience = _ai_field('experience') or extract_experience(full_text)
 

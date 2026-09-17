@@ -16,6 +16,7 @@ import csv
 import io
 import math
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -40,6 +41,11 @@ from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, 
 from phase8_cache import cache_get, cache_set, check_redis_health
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
+
+# Admin team's local calendar day for date-only filters below — was IST,
+# now CST (US Central). Real IANA zone (not a fixed offset) so CST/CDT
+# daylight-saving transitions are handled correctly.
+_CST_ZONE = ZoneInfo("America/Chicago")
 
 
 # ---------------------------------------------------------------------------
@@ -529,16 +535,16 @@ async def list_errors(
             # used to treat date_filter as a UTC calendar day, but the
             # table renders occurred_at in the browser's local time
             # (ErrorTable.tsx: new Date(...).toLocaleString() with no
-            # explicit UTC), and this app's admins are IST-based. UTC
-            # midnight is 5:30 AM IST, so the last ~5.5 hours of a UTC
-            # day are already "tomorrow" in IST — those rows got pulled
-            # into the wrong day's filter while displaying under the
-            # next date. Interpret the selected date as an IST calendar
-            # day instead, matching what's actually shown in the table.
-            IST_OFFSET = timedelta(hours=5, minutes=30)
-            start_local = datetime.combine(d, datetime.min.time())
-            start_dt = (start_local - IST_OFFSET).replace(tzinfo=timezone.utc)
-            end_dt = start_dt + timedelta(days=1)
+            # explicit UTC), and this app's admins are CST-based (US
+            # Central time). Interpret the selected date as a CST/CDT
+            # calendar day instead, matching what's actually shown in
+            # the table. Uses a real zoneinfo timezone rather than a
+            # fixed offset so the CST (UTC-6) / CDT (UTC-5) daylight-
+            # saving switch is handled automatically instead of being
+            # off by an hour for roughly half the year.
+            start_local = datetime.combine(d, datetime.min.time(), tzinfo=_CST_ZONE)
+            start_dt = start_local.astimezone(timezone.utc)
+            end_dt = (start_local + timedelta(days=1)).astimezone(timezone.utc)
             filters.append(ProcessingError.occurred_at >= start_dt)
             filters.append(ProcessingError.occurred_at < end_dt)
         except ValueError:

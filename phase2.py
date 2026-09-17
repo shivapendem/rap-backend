@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -737,20 +738,22 @@ async def reparse_email(
 
 # BUG FIX ("date_from shows a full UTC timestamp in the Network tab, and
 # the filtered results were wrong" — confirmed: date_from=2026-08-27
-# T00:00:00Z, a full 5.5h off from the actual start of that IST calendar
-# day): this endpoint used to require the CALLER to build a full ISO
-# timestamp (date_from.replace("Z", "+00:00") then
-# datetime.fromisoformat(...)) — the frontend was doing that by naively
-# appending "T00:00:00Z", silently treating the date as UTC midnight
-# when every caller actually means an IST calendar day. Now accepts a
-# bare "YYYY-MM-DD" (as well as still accepting a full timestamp, for
-# any other caller that already sends one) and does the IST conversion
-# here instead, matching the same interval this admin team already
-# works in everywhere else in this app. A bare date_from becomes the
-# start of that day in IST; a bare date_to becomes the end of that same
-# day in IST (23:59:59.999999) — not the start of it, since date <=
-# :date_to would otherwise exclude nearly the entire day.
-_IST_OFFSET = timedelta(hours=5, minutes=30)
+# T00:00:00Z, off from the actual start of that CST calendar day): this
+# endpoint used to require the CALLER to build a full ISO timestamp
+# (date_from.replace("Z", "+00:00") then datetime.fromisoformat(...)) —
+# the frontend was doing that by naively appending "T00:00:00Z", silently
+# treating the date as UTC midnight when every caller actually means a
+# CST (US Central) calendar day. Now accepts a bare "YYYY-MM-DD" (as
+# well as still accepting a full timestamp, for any other caller that
+# already sends one) and does the CST conversion here instead, matching
+# the same interval this admin team already works in everywhere else in
+# this app. A bare date_from becomes the start of that day in CST; a
+# bare date_to becomes the end of that same day in CST (23:59:59.999999)
+# — not the start of it, since date <= :date_to would otherwise exclude
+# nearly the entire day. Uses a real IANA zone (America/Chicago) rather
+# than a fixed offset so the CST (UTC-6) / CDT (UTC-5) daylight-saving
+# switch is handled automatically.
+_CST_ZONE = ZoneInfo("America/Chicago")
 
 
 def _parse_admin_date_filter(value: str, end_of_day: bool) -> datetime:
@@ -758,11 +761,11 @@ def _parse_admin_date_filter(value: str, end_of_day: bool) -> datetime:
     if "T" in value or " " in value:
         # Already a full timestamp — parse as before, unchanged.
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    ist_naive = datetime.fromisoformat(value)
+    cst_naive = datetime.fromisoformat(value)
     if end_of_day:
-        ist_naive = ist_naive.replace(hour=23, minute=59, second=59, microsecond=999999)
-    ist_aware = ist_naive.replace(tzinfo=timezone(_IST_OFFSET))
-    return ist_aware.astimezone(timezone.utc)
+        cst_naive = cst_naive.replace(hour=23, minute=59, second=59, microsecond=999999)
+    cst_aware = cst_naive.replace(tzinfo=_CST_ZONE)
+    return cst_aware.astimezone(timezone.utc)
 
 
 @router.get(
