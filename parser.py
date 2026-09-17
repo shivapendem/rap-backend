@@ -646,7 +646,16 @@ def _looks_like_generic_role_header(role_value: Optional[str]) -> bool:
     first_word = candidate.split()[0].lower().strip(',.:;')
     if first_word.isdigit():
         return True
-    if first_word in _ROLE_SENTENCE_LEAD_WORDS:
+    # BUG FIX ("Work front Designer" -- confirmed real case, a genuine
+    # Adobe Workfront-related posting, role rejected entirely; ported
+    # from the identical fix in the cron copy of this file): "work" is
+    # a recognized sentence-lead word, but here it's the accidentally-
+    # spaced first half of "Workfront" (a real product name), not a
+    # sentence starting with the verb "work".
+    if first_word == 'work' and len(candidate.split()) > 1 \
+            and candidate.split()[1].lower().strip(',.:;') == 'front':
+        pass
+    elif first_word in _ROLE_SENTENCE_LEAD_WORDS:
         return True
     if _NON_TITLE_SENTENCE_PATTERN.search(candidate):
         return True
@@ -2621,7 +2630,14 @@ _HOTLIST_INDICATORS = re.compile(
     # have openings. Tested against a genuine multi-opening JD digest
     # ("We have multiple openings for Senior Java Developers...") to
     # confirm the different sentence shape there doesn't trip this.
-    r'\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z0-9]+\s+){0,2}(?:requirements?|openings?)\b|'
+    #
+    # BUG FIX ROUND 2 ("Please find the job description below and let
+    # me know if you have any requirements." -- a genuine, fully-
+    # detailed real posting, confirmed real case; ported from the
+    # identical fix in the cron copy of this file): moved to a context-
+    # aware check (see _has_genuine_if_you_have_requirements_mention()
+    # below) that skips this phrase when it's the tail of a "please
+    # find the job description below and..." lead-in.
     r'\bsend\s+(?:me\s+)?your\s+(?:job\s+)?requirements?\b|'
     # BUG FIX ("Please let me know if you have any suitable candidates
     # available." -- confirmed real case; ported from the identical fix
@@ -3079,6 +3095,9 @@ _ROSTER_HEADER_WORDS = re.compile(
 )
 
 
+_REPEATED_NAME_FIELD_LABEL = re.compile(r'(?im)^\s*[*_]*name\s*[:\-][*_]*\s*\S')
+
+
 def _looks_like_candidate_roster_table(text: str) -> bool:
     """True when a line in `text` reads like a multi-candidate roster's
     own pipe-delimited column-header row -- see the BUG FIX comment
@@ -3115,6 +3134,16 @@ def _looks_like_candidate_roster_table(text: str) -> bool:
                 header_cell_count += 1
         if header_cell_count >= 3:
             return True
+    # BUG FIX ("Name: Revanth ... Technology: Senior Enterprise
+    # Architect... Name: Sreedhar ..." -- a genuine multi-candidate
+    # bench list, confirmed real case; ported from the identical fix in
+    # the cron copy of this file): this format has no pipes at all --
+    # each field is its own colon-labeled line, repeated once per
+    # candidate. A real single-posting JD never has "Name:" as its own
+    # labeled field at all, let alone more than once -- 2+ occurrences
+    # is an unambiguous multi-candidate roster fingerprint.
+    if len(_REPEATED_NAME_FIELD_LABEL.findall(text)) >= 2:
+        return True
     return False
 
 
@@ -3191,10 +3220,23 @@ def _has_genuine_bench_sales_signature(text: str) -> bool:
     """True when `text` contains a "bench sales" mention that ISN'T just
     a salutation addressing a distribution list by that name ("Dear
     Bench Sales Team") -- see the BUG FIX comment above
-    _HOTLIST_INDICATORS."""
+    _HOTLIST_INDICATORS.
+
+    BUG FIX (ported from the identical fix in the cron copy of this
+    file): "Bench Sales Recruiter" as someone's own JOB TITLE in their
+    signature block doesn't reliably indicate hotlist content -- finding
+    real client requirements to fill IS a bench-sales recruiter's job.
+    Excluded the same way as the salutation case: a "bench sales"
+    mention that falls AFTER the signature-block marker is a signature
+    title, not a hotlist announcement.
+    """
     if not text:
         return False
+    _sig_m = SIGNATURE_PATTERN.search(text)
+    _sig_start = _sig_m.start() if _sig_m else len(text)
     for m in _BARE_BENCH_SALES_PATTERN.finditer(text):
+        if m.start() >= _sig_start:
+            continue
         preceding = text[max(0, m.start() - 30):m.start()]
         if _BENCH_SALES_SALUTATION_PATTERN.search(preceding):
             continue
@@ -3236,6 +3278,35 @@ def _has_genuine_available_candidates_mention(text: str) -> bool:
     return False
 
 
+# BUG FIX ("Please find the job description below and let me know if
+# you have any requirements." -- ported from the identical fix in the
+# cron copy of this file): "if you have any requirements/openings" is a
+# strong hotlist signal on its own, but a real JD's sender can equally
+# close with this exact phrase as an ordinary networking courtesy.
+_IF_YOU_HAVE_REQUIREMENTS_PATTERN = re.compile(
+    r'(?i)\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z0-9]+\s+){0,2}'
+    r'(?:requirements?|openings?)\b'
+)
+_JD_LEADIN_BEFORE_REQUIREMENTS = re.compile(
+    r'(?i)\bplease\s+find\s+(?:the\s+)?(?:job\s+description|jd)\s+below\s+and\s+'
+    r'(?:let\s+me\s+know\s+)?$'
+)
+
+
+def _has_genuine_if_you_have_requirements_mention(text: str) -> bool:
+    """True when `text` contains "if you have any requirements/openings"
+    that ISN'T just the tail of a "please find the job description
+    below and..." lead-in -- see the BUG FIX comment above."""
+    if not text:
+        return False
+    for m in _IF_YOU_HAVE_REQUIREMENTS_PATTERN.finditer(text):
+        preceding = text[max(0, m.start() - 80):m.start()]
+        if _JD_LEADIN_BEFORE_REQUIREMENTS.search(preceding):
+            continue
+        return True
+    return False
+
+
 def is_hotlist_email(text: str) -> bool:
     """True for recruiter 'available consultants' broadcasts -- the
     opposite of a job requirement email. See _HOTLIST_INDICATORS above."""
@@ -3248,6 +3319,7 @@ def is_hotlist_email(text: str) -> bool:
         or _starts_with_candidate_name_label(text)
         or _has_genuine_hotlist_mention(text)
         or _has_genuine_available_candidates_mention(text)
+        or _has_genuine_if_you_have_requirements_mention(text)
         or _has_genuine_bench_sales_signature(text)
     )
 
@@ -3437,6 +3509,37 @@ def is_non_requirement_broadcast_email(text: str) -> bool:
     return bool(_NON_REQUIREMENT_BROADCAST_INDICATORS.search(text))
 
 
+# BUG FIX ("Thank you for submitting your candidate for the Java
+# Developer role in Dallas, TX. After careful review, the client has
+# decided to move forward with other candidates at this time." --
+# confirmed real case, wrongly accepted as a real posting with a
+# garbled role; ported from the identical fix in the cron copy of this
+# file): a rejection/status-update email responding to a PREVIOUS
+# candidate submission is neither a hotlist, self-promo, digest, nor
+# marketing broadcast -- none of the existing exclusion checks cover
+# this category at all.
+_REJECTION_STATUS_UPDATE_INDICATORS = re.compile(
+    r'(?i)\b(?:decided|chosen|elected)\s+to\s+(?:move\s+forward|proceed)\s+with\s+'
+    r'(?:another|other)\s+candidates?\b|'
+    r'\bwill\s+not\s+be\s+moving\s+forward\s+with\s+(?:your|the)\s+candidates?\b|'
+    r'\b(?:position|role|requirement)\s+has\s+been\s+filled\s+by\s+(?:another|a\s+different)'
+    r'\s+candidate\b|'
+    r'\bclient\s+has\s+selected\s+(?:another|a\s+different)\s+candidate\b|'
+    r'\bwe\s+regret\s+to\s+inform\s+you\b|'
+    r'\byour\s+candidate\s+(?:was|has\s+been)\s+not\s+selected\b|'
+    r'\bthank\s+you\s+for\s+submitting\s+your\s+candidate\b.{0,120}'
+    r'(?:decided|move\s+forward\s+with\s+other|not\s+selected)'
+)
+
+
+def is_rejection_or_status_update_email(text: str) -> bool:
+    """True for a rejection/decline notification responding to a
+    PREVIOUS candidate submission -- see the BUG FIX comment above."""
+    if not text:
+        return False
+    return bool(_REJECTION_STATUS_UPDATE_INDICATORS.search(text))
+
+
 # BUG FIX ("Java Developer | Contract | Dallas, TX | H1B only" with a
 # thin/generic or empty body -- confirmed real case, rejected entirely
 # before any field extraction ran): is_job_requirement_email()'s
@@ -3518,6 +3621,7 @@ def is_confirmed_job_posting(subject: str, body: str, full_text: str, norm_body:
         or is_candidate_self_promo_email(norm_body)
         or is_job_digest_email(norm_body)
         or is_non_requirement_broadcast_email(full_text)
+        or is_rejection_or_status_update_email(full_text)
     ):
         return False
 
