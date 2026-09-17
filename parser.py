@@ -1628,6 +1628,14 @@ def role_from_subject(subject: str) -> Optional[str]:
     if not subject:
         return None
     s = normalize_text(subject)
+    # BUG FIX ("🚨 New Requirement – Senior Kafka Engineer 🚨..." --
+    # confirmed real case, role came out as just "🚨 New"; ported from
+    # the identical fix in the cron copy of this file): a leading
+    # decorative emoji sits at position 0 and is NOT whitespace, so
+    # every `^\s*<banner phrase>` strip below silently failed to match
+    # whenever one preceded the real banner text. Strip any run of
+    # leading emoji/decorative symbols and punctuation once, up front.
+    s = re.sub(r'^[\U0001F300-\U0001FAFF\u2600-\u27BF\s\-:|]+', '', s).strip()
     # Strip reply/forward prefixes
     s = re.sub(r'(?i)^\s*(re|fw|fwd)\s*:\s*', '', s).strip()
     # BUG FIX ("ON HOLD!!!****: (C-C) : (3) AI Engineer/Banking - Peoples
@@ -1678,6 +1686,14 @@ def role_from_subject(subject: str) -> Optional[str]:
     # gone. Strip this specific broadcast-banner phrase early instead,
     # same as the status-banner strip above.
     s = re.sub(r'(?i)^\s*(?:urgent|new|immediate)\s+requirements?\s*[:\-]?\s*', '', s).strip()
+    # BUG FIX ("Immediate Interview -  AI Engineer Fort worth, TX..." --
+    # confirmed real case; ported from the identical fix in the cron
+    # copy of this file): "Interview" is a recognized NEXT_FIELD_LABEL,
+    # so crop_at_next_field() below treats a leading "Immediate
+    # Interview -" banner as if "Interview -" introduced a NEW field
+    # starting right there. Strip this banner phrase early, same as
+    # "New Requirement:" above.
+    s = re.sub(r'(?i)^\s*(?:urgent|immediate)\s+interviews?\s*[:\-]?\s*', '', s).strip()
     # BUG FIX ("role: \"We're looking for UiPath RPA Developer\"" —
     # confirmed real case): the "looking for" handling further down only
     # recognizes it as a LABEL ("Looking For: <title>" / "Looking
@@ -2607,7 +2623,11 @@ _HOTLIST_INDICATORS = re.compile(
     # confirm the different sentence shape there doesn't trip this.
     r'\bif\s+you\s+have\s+(?:any\s+)?(?:[a-z0-9]+\s+){0,2}(?:requirements?|openings?)\b|'
     r'\bsend\s+(?:me\s+)?your\s+(?:job\s+)?requirements?\b|'
-    r'\bcandidates?\s+available\b|'
+    # BUG FIX ("Please let me know if you have any suitable candidates
+    # available." -- confirmed real case; ported from the identical fix
+    # in the cron copy of this file): bare "candidates available" moved
+    # to a context-aware check below (see
+    # _has_genuine_available_candidates_mention()).
     # BUG FIX ("Available Consultants" hotlist table treated as a real
     # requirement, role ending up as just the raw subject line): "Please
     # add my email ID to your distributing list and send daily
@@ -2684,8 +2704,10 @@ _HOTLIST_INDICATORS = re.compile(
     # because "who is/are available" is an unambiguous bench-broadcast
     # construction on its own -- a real JD describes ONE role, it doesn't
     # refer to plural "candidates/consultants who are available".
-    r'\b(?:consultants?|candidates?|resources?)\s*,?\s+who\s+(?:are|is)\s+'
-    r'(?:readily\s+|currently\s+)?available\b|'
+    # BUG FIX (ported from the identical fix in the cron copy of this
+    # file): "who is/are available" moved to the same context-aware
+    # check as "candidates available" above -- "please share candidates
+    # who are available" is a request, not an offer.
     # BUG FIX ("Please share your C2C roles..." confirmed real case, Blue
     # Space Technologies, appears across multiple broadcasts; "...share
     # your daily C2C/C2H positions with us" confirmed real case, IT
@@ -2886,7 +2908,8 @@ _HOTLIST_INDICATORS = re.compile(
     #   - "go through the (below) consultant/candidate profile" --
     #     directly asks the reader to review a PERSON's profile.
     r'\bprofile\s+of\s+(?:our|my|the)\s+consultants?\b|'
-    r'\b(?:consultants?|candidates?)\s+who\s+(?:is|are)\s+available\b|'
+    # BUG FIX (duplicate pattern, ported/removed the same as the cron
+    # copy of this file).
     r'\bsharing\s+(?:the\s+)?updated\s+profile\s+of\b|'
     r'\bimmediate\s+joiners?\s+available\b|'
     r'\bwe\s+have\s+(?:an?\s+)?immediate\s+joiners?\b|'
@@ -3179,6 +3202,40 @@ def _has_genuine_bench_sales_signature(text: str) -> bool:
     return False
 
 
+# BUG FIX (ported from the identical fix in the cron copy of this file):
+# "candidates available" and "candidates who are available" are strong
+# hotlist signals in ONE direction (a sender announcing their own bench)
+# but completely ordinary in the OPPOSITE direction (asking the reader
+# to submit available people for THIS role). A bare match can't tell
+# those apart, so this checks the text immediately before the match for
+# a request-shaped lead-in.
+_AVAILABLE_CANDIDATES_PATTERN = re.compile(
+    r'(?i)\bcandidates?\s+available\b|'
+    r'\b(?:consultants?|candidates?|resources?)\s*,?\s+who\s+(?:are|is)\s+'
+    r'(?:readily\s+|currently\s+)?available\b'
+)
+_AVAILABLE_CANDIDATES_REQUEST_LEADIN = re.compile(
+    r'(?i)\b(?:if\s+you\s+have(?:\s+any)?|do\s+you\s+have(?:\s+any)?|'
+    r'let\s+me\s+know\s+if\s+you\s+have(?:\s+any)?|'
+    r'(?:please\s+)?(?:share|submit|send))'
+    r'(?:\s+(?:me\s+)?(?:suitable|any|updated|your))*\s*$'
+)
+
+
+def _has_genuine_available_candidates_mention(text: str) -> bool:
+    """True when `text` contains a "candidates available"/"candidates who
+    are available" mention that ISN'T just the tail of a request
+    directed at the reader -- see the BUG FIX comment above."""
+    if not text:
+        return False
+    for m in _AVAILABLE_CANDIDATES_PATTERN.finditer(text):
+        preceding = text[max(0, m.start() - 60):m.start()]
+        if _AVAILABLE_CANDIDATES_REQUEST_LEADIN.search(preceding):
+            continue
+        return True
+    return False
+
+
 def is_hotlist_email(text: str) -> bool:
     """True for recruiter 'available consultants' broadcasts -- the
     opposite of a job requirement email. See _HOTLIST_INDICATORS above."""
@@ -3190,6 +3247,7 @@ def is_hotlist_email(text: str) -> bool:
         or _looks_like_candidate_roster_table(text)
         or _starts_with_candidate_name_label(text)
         or _has_genuine_hotlist_mention(text)
+        or _has_genuine_available_candidates_mention(text)
         or _has_genuine_bench_sales_signature(text)
     )
 
@@ -3278,17 +3336,35 @@ _JOB_DIGEST_INDICATORS = re.compile(
     # on our team") is never caught by this.
     r'\b\d+\s+new\s+jobs?\s+(?:alerts?|found|matching|available)\b|'
     r'\bjob\s+alerts?\b.{0,15}\bpreferences\b|'
-    r'\bupdate\s+your\s+job\s+alert\s+preferences\b'
+    r'\bupdate\s+your\s+job\s+alert\s+preferences\b|'
+    # BUG FIX ("PMCS Daily Hot Jobs" -- confirmed real case; ported from
+    # the identical fix in the cron copy of this file): this vendor's
+    # own framing phrase for a daily multi-job batch broadcast.
+    r'\bcurrent\s+list\s+of\s+active\s+(?:top\s+)?jobs\b'
+)
+# BUG FIX (same PMCS case): the structural fingerprint of this template
+# is a repeated "DD-Mon-YYYY - <Title>" line appearing 3+ times.
+_DATED_JOB_LISTING_LINE = re.compile(
+    r'\b\d{1,2}-[A-Za-z]{3}-\d{2,4}\s*-\s*[A-Z][a-zA-Z]'
 )
 
 
 def is_job_digest_email(text: str) -> bool:
     """True for a multi-posting job-board digest ("N new jobs found...")
     or an ATS's own bulk requisition-release notification -- neither is
-    a single job requirement to extract -- see _JOB_DIGEST_INDICATORS."""
+    a single job requirement to extract -- see _JOB_DIGEST_INDICATORS.
+
+    BUG FIX (ported from the identical fix in the cron copy of this
+    file): also treat 3+ repeats of a "DD-Mon-YYYY - Title" dated
+    line-item as a digest fingerprint.
+    """
     if not text:
         return False
-    return bool(_JOB_DIGEST_INDICATORS.search(text))
+    if _JOB_DIGEST_INDICATORS.search(text):
+        return True
+    if len(_DATED_JOB_LISTING_LINE.findall(text)) >= 3:
+        return True
+    return False
 
 
 # BUG FIX ("role: 'Weekly Tech Newsletter'" / "role: 'Boost your
@@ -4092,7 +4168,7 @@ def _is_cta_or_contact_sentence(token: str) -> bool:
 _JD_SHAPE_SECTION_HEADER = re.compile(
     r'(?i)\b(responsibilities|requirements|qualifications|key\s+skills)\b'
     r'\s*[:\-]?\s*$|'
-    r'\b(responsibilities|requirements)\s+(?:include|are)\b|'
+    r'\b(responsibilities|requirements)\s+(?:will\s+)?(?:include|are)\b|'
     # BUG FIX ("ResponsibilitiesLead Model N Revenue & Pricing Management
     # initiatives..." / "Required SkillsMust Have8+ years of
     # experience..." -- confirmed real case): HTML-to-text conversion
@@ -4101,7 +4177,12 @@ _JD_SHAPE_SECTION_HEADER = re.compile(
     # the sentence that follows it. A header immediately followed by a
     # capital letter with NO space matches neither pattern above.
     r'\b(?:responsibilities|requirements|required\s+skills|preferred\s+skills|'
-    r'qualifications|key\s+skills)(?=[A-Z])',
+    r'qualifications|key\s+skills)(?=[A-Z])|'
+    # BUG FIX ("The role involves: Building traffic-replay tooling..."
+    # -- confirmed real case; ported from the identical fix in the cron
+    # copy of this file): a colon-introduced "The/This role involves:"
+    # phrase is functionally identical to a "Responsibilities:" header.
+    r'\b(?:the|this)\s+role\s+involves\s*:',
     re.MULTILINE
 )
 _JD_SHAPE_BULLET_LINE = re.compile(r'(?im)^\s*[-*•]\s+\S')
