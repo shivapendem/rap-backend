@@ -887,7 +887,19 @@ async def get_requirements(
             raise HTTPException(status_code=422, detail="Invalid consultant_id format")
         if filter_consultant_ids:
             matched_consultant_subq = select(RequirementConsultantMatch.requirement_id).where(
-                RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids)
+                RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids),
+                # BUG FIX (Requirements page showed hundreds of unrelated
+                # requirements — "IT Help Desk Analyst", "Java Developer",
+                # etc. — for a consultant whose real matches, per Pending
+                # Applications, were all "AI Engineer"-type roles): this
+                # subquery had no status filter at all, so filtering by a
+                # consultant surfaced every requirement they'd EVER had a
+                # RequirementConsultantMatch row for — including old rows
+                # the engine has since marked NOT_ELIGIBLE, REJECTED, or
+                # already APPLIED — not just their current real matches.
+                # Same status the Requirements page's own match count and
+                # Pending Applications both already filter to.
+                RequirementConsultantMatch.status == "MATCHING",
             )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
 
@@ -906,20 +918,7 @@ async def get_requirements(
         # array membership. Falls back to a no-op filter on the SQLite dev
         # path where this column is stored as JSON text instead.
         if DATABASE_URL.startswith("postgresql"):
-            EMPLOYMENT_TYPE_BUCKET_EXPANSION = {
-                "C2C": ["C2C", "CONTRACT", "C2H"],
-                "W2": ["W2"],
-                "1099": ["1099"],
-                "FULLTIME": ["FULLTIME"],
-                "FULL_TIME": ["FULLTIME"],
-            }
-            raw_types = EMPLOYMENT_TYPE_BUCKET_EXPANSION.get(
-                employment_type.upper(), [employment_type]
-            )
-            if len(raw_types) == 1:
-                query = query.where(Requirement.employment_types.any(raw_types[0]))
-            else:
-                query = query.where(Requirement.employment_types.overlap(raw_types))
+            query = query.where(Requirement.employment_types.any(employment_type))
 
     if search:
         # BUG FIX: only matched role/vendor_email — searching by client,
