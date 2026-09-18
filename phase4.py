@@ -72,8 +72,8 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # which is exactly what pushed past the request timeout.
 #
 # MATCHING_LOGIC_VERSION tags every row with the code version it was last
-# validated under (stored in the existing JSONB score_breakdown /
-# matching_info fields — no schema migration needed). A row already
+# validated under (stored in the existing JSONB score_breakdown field —
+# no schema migration needed). A row already
 # tagged with the CURRENT version gets skipped fast, restoring the old
 # performance for the common case (nothing changed since the last run).
 # A row from before a logic change (untagged, or tagged with an older
@@ -702,6 +702,19 @@ def score_role(
 
     req_tokens = _tokenize_role(_clear_role_text(requirement_role))
     req_domain = req_tokens - GENERIC_ROLE_WORDS
+    # BUG FIX ("SRE" vs "Site Reliability Engineer" scored 71.7, "PM" vs
+    # "Project Manager" scored 57.5 — below the PASS threshold, for what
+    # should be as exact a match as SYNONYMS can represent): when an
+    # acronym like "sre"/"pm" expands into its spelled-out words, the
+    # BARE ACRONYM TOKEN ITSELF stays in req_domain as one of the words
+    # that must overlap — but it can never literally appear in a
+    # consultant's title who wrote the term out in full, so it silently
+    # drags the domain ratio's denominator down every time the other side
+    # didn't happen to use the same abbreviation. The spelled-out
+    # expansion words are the real, comparable domain signal; the bare
+    # acronym is redundant once expanded (an acronym-vs-acronym match
+    # still scores fully via those same expansion words on both sides).
+    req_domain -= {t for t in req_domain if t in SYNONYMS and SYNONYMS[t] <= req_tokens}
     req_generic = req_tokens & GENERIC_ROLE_WORDS
 
     # (e) Requirement title is bare-generic (no domain word at all, e.g.
@@ -737,11 +750,30 @@ def score_role(
             # not a flat 0 and not a full match either.
             return _title_skill_topup(0.0, cap=NO_ROLE_SIGNAL_CAP)
         else:
+            # BUG FIX ("Data Engineer" / "Power BI Developer" / "SDET"
+            # scored a flat neutral 50 against a Salesforce-only or
+            # Java-only consultant): a multi-word title can reduce to an
+            # EMPTY domain purely as a side effect of GENERIC_ROLE_WORDS
+            # stripping every one of its words (e.g. "data"+"engineer"
+            # are both generic) — that's not the same as the title
+            # genuinely having no stated specialization. Before falling
+            # back to "unknown, be neutral", check for ANY overlap using
+            # the full (pre-strip) word set — even shared generic words
+            # are real evidence of the same job function.
+            if req_tokens and (req_tokens & pref_tokens):
+                overlap_ratio = len(req_tokens & pref_tokens) / len(req_tokens)
+                return _title_skill_topup(round(overlap_ratio * BARE_GENERIC_CAP, 2), cap=BARE_GENERIC_CAP)
+            if req_tokens and len(req_tokens) > 1:
+                # A real multi-word title that shares NOTHING at all with
+                # the consultant's role history — treat like any other
+                # stated-but-non-overlapping specialization, not as "no
+                # signal". Role is mandatory.
+                return _title_skill_topup(0.0, cap=NO_ROLE_SIGNAL_CAP)
             # No domain word stated at all (e.g. plain "Full Stack
-            # Developer" once its skill clause is stripped) — genuinely
-            # unknown, not a conflict. Skills can nudge the neutral
-            # baseline up toward a soft maybe, capped below a confident
-            # match.
+            # Developer" once its skill clause is stripped, or a single
+            # bare generic word) — genuinely unknown, not a conflict.
+            # Skills can nudge the neutral baseline up toward a soft
+            # maybe, capped below a confident match.
             return _title_skill_topup(50.0, cap=BARE_GENERIC_CAP)
 
     domain_overlap = req_domain & pref_tokens
@@ -889,6 +921,23 @@ def score_employment_type(requirement_types: Optional[List[str]], consultant_typ
     return 100.0 if overlap else 0.0
 
 
+STATE_ABBREVIATIONS: dict[str, str] = {
+    "al": "alabama", "ak": "alaska", "az": "arizona", "ar": "arkansas",
+    "ca": "california", "co": "colorado", "ct": "connecticut", "de": "delaware",
+    "fl": "florida", "ga": "georgia", "hi": "hawaii", "id": "idaho",
+    "il": "illinois", "in": "indiana", "ia": "iowa", "ks": "kansas",
+    "ky": "kentucky", "la": "louisiana", "me": "maine", "md": "maryland",
+    "ma": "massachusetts", "mi": "michigan", "mn": "minnesota", "ms": "mississippi",
+    "mo": "missouri", "mt": "montana", "ne": "nebraska", "nv": "nevada",
+    "nh": "new hampshire", "nj": "new jersey", "nm": "new mexico", "ny": "new york",
+    "nc": "north carolina", "nd": "north dakota", "oh": "ohio", "ok": "oklahoma",
+    "or": "oregon", "pa": "pennsylvania", "ri": "rhode island", "sc": "south carolina",
+    "sd": "south dakota", "tn": "tennessee", "tx": "texas", "ut": "utah",
+    "vt": "vermont", "va": "virginia", "wa": "washington", "wv": "west virginia",
+    "wi": "wisconsin", "wy": "wyoming", "dc": "district of columbia",
+}
+
+
 def score_location(requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]) -> float:
     """
     Location/work mode compatibility.
@@ -925,9 +974,40 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
         if not consultant.preferred_locations:
             score += 60.0
         else:
-            req_loc = requirement.location.lower()
+            req_loc = requirement.location.lower().strip()
             pref_locs = consultant.preferred_locations.lower()
-            if req_loc in pref_locs:
+            # BUG FIX (state-code false positives): a raw substring check
+            # ("ca" in pref_locs) collides constantly with ordinary
+            # English — "CA" (California) matched any consultant who
+            # listed "North Carolina"; "OR" (Oregon) matched "Florida";
+            # "IN" (Indiana) matched "Austin". Word-boundary matching on
+            # each individual location phrase (split on the usual list
+            # delimiters) keeps the intended behavior — a full city/
+            # region name still matches inside a longer "City, ST" value
+            # — while requiring a short code like a state abbreviation to
+            # appear as its own token. A small explicit abbreviation<->
+            # full-name table (STATE_ABBREVIATIONS, see matching_engine.py)
+            # handles "CA" vs "California" properly instead of relying on
+            # substring luck that only worked for a few states by
+            # coincidence and silently failed for most others (TX/Texas,
+            # NY/New York).
+            pref_phrases = [p.strip() for p in re.split(r'[,;/]', pref_locs) if p.strip()]
+
+            def _phrase_matches(phrase: str) -> bool:
+                if (
+                    re.search(r'\b' + re.escape(phrase) + r'\b', req_loc) is not None
+                    or re.search(r'\b' + re.escape(req_loc) + r'\b', phrase) is not None
+                ):
+                    return True
+                req_full = STATE_ABBREVIATIONS.get(req_loc)
+                phrase_full = STATE_ABBREVIATIONS.get(phrase)
+                if req_full and re.search(r'\b' + re.escape(req_full) + r'\b', phrase):
+                    return True
+                if phrase_full and re.search(r'\b' + re.escape(phrase_full) + r'\b', req_loc):
+                    return True
+                return False
+
+            if any(_phrase_matches(p) for p in pref_phrases):
                 score += 60.0
 
     # Work mode match — compare against most recent experience entry's work_mode
@@ -1335,63 +1415,26 @@ def score_match(
 
 async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
     """
-    Score all active consultants against one requirement.
+    Score all active consultants against one requirement. Single engine —
+    this file's own validate_match()/score_match() (unchanged) are called
+    directly; there is no second table (JobMatch, deleted) and no
+    delegation to a second pipeline anymore.
 
-    Every consultant runs through validate_match()'s Stage 0-4 eligibility
-    pipeline first (role/responsibilities -> employment type -> work auth ->
-    experience -> location, each short-circuiting). Only consultants who
-    pass ALL stages get a RequirementConsultantMatch row at all — MATCH_THRESHOLD
-    is no longer a row-creation gate; score_match()'s weighted total is now
-    purely a RANKING signal among already-eligible consultants (it still
-    decides ASSIGNED vs NEAR_MISS for the narrow role-score band, see below).
-    Rerunning does not duplicate — UNIQUE constraint on (requirement_id, consultant_id)
-    combined with explicit existence check ensures idempotency. A consultant
-    who used to qualify but no longer does on this rerun has their stale row
-    DELETED rather than left untouched (previously: stale rows were never
-    cleaned up, so a disqualified consultant kept passing the "is this
-    requirement assigned to them" existence check used elsewhere).
-    Returns count of ASSIGNED (non-NEAR_MISS) matches created or updated.
+    Every consultant runs through validate_match()'s Stage 0-4 gate.
+    Ineligible consultants get status=NOT_ELIGIBLE (row kept for audit,
+    never deleted). Eligible consultants get status=MATCHING regardless
+    of role-match tier — NEAR_MISS is no longer a status, just an
+    informational `tier` field on the row.
 
-    PERFORMANCE: batches all per-consultant lookups into 2 queries total
-    (experiences, existing matches) regardless of consultant count, instead of
-    issuing one query per consultant inside the loop. This keeps the query count
-    constant — O(1) round trips — whether there are 10 or 10,000 active consultants.
-
-    SINGLE-SOURCE-OF-COMPUTATION (removes the Pipeline A/B double scoring
-    cost): this function used to run its own validate_match()+score_match()
-    loop here — the exact same scoring Pipeline B (matching_router.py's
-    run_matching_for_requirement()) already runs for the same
-    (requirement, consultant) pairs to populate JobMatch. That meant every
-    trigger of Pipeline A (admin "Rematch", requirements_sync.py's
-    auto-match, phase2.py's reparse) paid the full CPU cost of scoring
-    twice. This now still decides, using its OWN RequirementConsultantMatch
-    state, WHICH consultants actually need a fresh answer this round (the
-    protected-status and MATCHING_LOGIC_VERSION fast-skips below are
-    unchanged) — but for that subset, it calls Pipeline B's
-    run_matching_for_requirement() ONCE with collect_results=[...] and
-    reads the already-computed validation/score back out of that list
-    instead of recomputing it. Pipeline B still gets its own JobMatch
-    upsert out of the same single pass; Pipeline A just consumes
-    ("references") the results rather than owning a second scoring loop.
+    Returns the current count of MATCHING rows for this requirement.
     """
     req_result = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
     requirement = req_result.scalars().first()
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
-    # BUG FIX ("which engine is more accurate" — this was the answer):
-    # this was the LAST of four occurrences of the exact same gap found
-    # this session (requirements_sync.py, phase2.py's reparse, and this
-    # one — the CORE Pipeline A function itself, called by every
-    # Pipeline A trigger: admin "Rematch", requirements_sync.py,
-    # phase2.py's reparse). Unlike Pipeline B's run_matching_for_requirement(),
-    # which now receives a pre-filtered roster at all 3 of its call sites,
-    # this queried Consultant.status == "ACTIVE" alone — no User join, no
-    # role == "CONSULTANT" check, no is_authorized check — so Pipeline A
-    # could still match a requirement against a deactivated user's or a
-    # non-consultant-role user's Consultant profile. Matches the same
-    # filter now applied consistently everywhere else. (User is already
-    # imported at module level above — no new import needed.)
+    from sqlalchemy.exc import IntegrityError
+
     consultants_result = await db.execute(
         select(Consultant)
         .join(User, Consultant.user_id == User.id)
@@ -1401,264 +1444,72 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
             User.is_authorized == True,
         )
     )
-    consultants = consultants_result.scalars().all()
+    roster = consultants_result.scalars().all()
+    roster_ids = {c.id for c in roster}
 
-    if not consultants:
+    if not roster:
         logger.info("No active consultants found — skipping match for requirement_id=%s", requirement_id)
         return 0
 
-    consultant_ids = [c.id for c in consultants]
-
-    # ── Batch query 1: ALL experience rows for ALL consultants in ONE query ──
     exp_result = await db.execute(
-        select(ConsultantExperience).where(ConsultantExperience.consultant_id.in_(consultant_ids))
+        select(ConsultantExperience).where(ConsultantExperience.consultant_id.in_(list(roster_ids)))
     )
     experiences_by_consultant: dict[int, list[ConsultantExperience]] = {}
     for exp in exp_result.scalars().all():
         experiences_by_consultant.setdefault(exp.consultant_id, []).append(exp)
 
-    # ── Batch query 2: ALL existing RequirementConsultantMatch AND
-    # JobMatch rows for this requirement in ONE query (double outer-join
-    # from Consultant). CORRECTNESS requires checking BOTH tables'
-    # staleness (see _jobmatch_is_stale below) — combining them into one
-    # query here, instead of two separate SELECTs, keeps this function at
-    # its original "2 total queries" cost regardless of consultant count,
-    # rather than adding a permanent third query to every single call
-    # (which would otherwise compound badly in match_all_requirements'
-    # per-requirement bulk loop).
-    from models import JobMatch
-    combined_result = await db.execute(
-        select(Consultant.id, RequirementConsultantMatch, JobMatch)
-        .select_from(Consultant)
-        .outerjoin(
-            RequirementConsultantMatch,
-            (RequirementConsultantMatch.requirement_id == requirement_id)
-            & (RequirementConsultantMatch.consultant_id == Consultant.id),
+    existing_result = await db.execute(
+        select(RequirementConsultantMatch).where(
+            RequirementConsultantMatch.requirement_id == requirement_id
         )
-        .outerjoin(
-            JobMatch,
-            (JobMatch.requirement_id == requirement_id)
-            & (JobMatch.consultant_id == Consultant.id),
-        )
-        .where(Consultant.id.in_(consultant_ids))
     )
-    existing_matches_by_consultant: dict[int, RequirementConsultantMatch] = {}
-    existing_jobmatch_by_consultant: dict[int, JobMatch] = {}
-    for cons_id, rcm_row, jm_row in combined_result.all():
-        if rcm_row is not None:
-            existing_matches_by_consultant[cons_id] = rcm_row
-        if jm_row is not None:
-            existing_jobmatch_by_consultant[cons_id] = jm_row
+    existing_by_consultant = {m.consultant_id: m for m in existing_result.scalars().all()}
 
-    def _jobmatch_is_stale(jm: Optional["JobMatch"]) -> bool:
-        if jm is None:
-            return True
-        if jm.status in ("APPLIED", "REJECTED"):
-            return False  # human-owned on Pipeline B's side; Pipeline B itself will leave it alone regardless
-        return not (jm.matching_info and jm.matching_info.get("_version") == MATCHING_LOGIC_VERSION)
+    requirement_skills = _requirement_skills(requirement)
 
-    assignment_count = 0
-    near_miss_count = 0
-
-    # ── Pre-filter pass — decides WHICH consultants need a fresh answer
-    # this round, checking BOTH tables (see Batch query 2 above), and
-    # separately tracks WHICH of those are allowed to have that answer
-    # WRITTEN into RequirementConsultantMatch. A consultant whose RCM row
-    # is protected (RESUME_GENERATED/READY_TO_APPLY/APPLIED/REJECTED)
-    # never has that row touched — not even its score fields — but if
-    # JobMatch is stale for them, they're still sent through scoring so
-    # Pipeline B can refresh JobMatch out of the same pass; their result
-    # is simply never applied back to RCM (see rcm_writable_ids below).
-    consultants_needing_scoring: list[Consultant] = []
-    rcm_writable_ids: set[int] = set()
-
-    for consultant in consultants:
-        existing = existing_matches_by_consultant.get(consultant.id)
-        jm_stale = _jobmatch_is_stale(existing_jobmatch_by_consultant.get(consultant.id))
-
-        # BUG FIX: this had no guard at all before validating/deleting an
-        # existing row — a match already advanced to RESUME_GENERATED,
-        # READY_TO_APPLY, APPLIED, or REJECTED could be silently DELETED
-        # outright if a rescore later decided it no longer qualifies
-        # (e.g. after a scoring-logic change). Same protective check
-        # already applied in matching_router.py's Pipeline B — only rows
-        # still owned by the matching engine itself (ASSIGNED, NEAR_MISS,
-        # or a previously INVALIDATED one) are ever re-evaluated.
-        if existing and existing.status in ("RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"):
-            if existing.status == "ASSIGNED":
-                assignment_count += 1
-            if jm_stale:
-                # RCM itself is never touched for a protected row (see
-                # rcm_writable_ids — not added here) — only included so
-                # Pipeline B can catch JobMatch up in the same pass.
-                consultants_needing_scoring.append(consultant)
+    needs_scoring = []
+    for consultant in roster:
+        existing = existing_by_consultant.get(consultant.id)
+        if existing is None:
+            needs_scoring.append(consultant)
             continue
+        if existing.status in ("APPLIED", "REJECTED"):
+            continue  # frozen — human decision, engine never touches it again
+        if existing.status == "MATCHING" and existing.score_breakdown and \
+                existing.score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+            continue  # already current, nothing to do
+        needs_scoring.append(consultant)  # stale version, or was NOT_ELIGIBLE
 
-        # PERFORMANCE (Run Engine/Match All timing out at 300s): skip the
-        # full validate_match()+score_match() recomputation for a row
-        # already checked under the CURRENT matching logic — see
-        # MATCHING_LOGIC_VERSION above. Only a row from before a logic
-        # change (untagged, or tagged with an older version) pays the
-        # full re-check cost; everything already up to date stays fast,
-        # restoring the old existing_pairs-skip performance for the
-        # common case where nothing has actually changed since last run.
-        if existing and existing.score_breakdown and existing.score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
-            if jm_stale:
-                # RCM is current — recomputing it is redundant (same
-                # inputs, same result) but harmless, and lets JobMatch
-                # catch up too. Don't count here; the consumption loop
-                # below counts it once the pass completes, to avoid
-                # double-counting against the increments a few lines up.
-                consultants_needing_scoring.append(consultant)
-                rcm_writable_ids.add(consultant.id)
-                continue
-            if existing.status == "NEAR_MISS":
-                near_miss_count += 1
-            elif existing.status == "ASSIGNED":
-                assignment_count += 1
-            continue
+    for consultant in needs_scoring:
+        experiences = experiences_by_consultant.get(consultant.id, [])
 
-        consultants_needing_scoring.append(consultant)
-        rcm_writable_ids.add(consultant.id)
-
-    # ── Delegate the actual scoring to Pipeline B — ONE pass, shared with
-    # its own JobMatch upsert, instead of Pipeline A recomputing it. ──
-    if consultants_needing_scoring:
-        from matching_router import run_matching_for_requirement  # deferred: avoids a circular import at module load time
-        from sqlalchemy.exc import IntegrityError
-
-        results: list = []
-        await run_matching_for_requirement(
-            db,
-            requirement,
-            consultants_needing_scoring,
-            existing_pairs=set(),  # write-only bookkeeping inside that function; Pipeline A has no use for it
-            experiences_by_consultant=experiences_by_consultant,
-            existing_by_consultant=existing_jobmatch_by_consultant,  # already fetched above — skips a redundant JobMatch query inside Pipeline B
-            collect_results=results,
-            # Explicit for clarity: Pipeline A wants this trigger (admin
-            # "Rematch"/"Match All", requirements_sync.py, phase2.py's
-            # reparse) to ALSO refresh JobMatch/"Pending Applications" out
-            # of the same single scoring pass, same as before this
-            # refactor. Pass persist=False here instead if that side
-            # effect on JobMatch is ever not wanted for a given trigger.
-            persist=True,
+        validation = validate_match(
+            requirement, consultant, experiences,
+            requirement_skills=requirement_skills,
         )
 
-        for entry in results:
-            consultant = entry["consultant"]
+        existing = existing_by_consultant.get(consultant.id)
 
-            if consultant.id not in rcm_writable_ids:
-                # Included only so Pipeline B could refresh JobMatch for a
-                # protected RequirementConsultantMatch row — never write
-                # back to RCM (not even score fields) for these; already
-                # counted above from RCM's own existing state.
-                continue
-
-            existing = existing_matches_by_consultant.get(consultant.id)
-
-            if entry["eligible"] is None:
-                # Defensive only — run_matching_for_requirement() now
-                # always computes and returns a real True/False eligible
-                # answer for every consultant it's given when
-                # collect_results is passed (including the
-                # APPLIED/REJECTED-on-JobMatch case; only the JobMatch
-                # write itself is suppressed there, not the computation).
-                # This branch should be unreachable; kept as a safe
-                # fallback — leave Pipeline A's own row untouched rather
-                # than guess — in case that contract is ever violated.
-                logger.warning(
-                    "match_requirement: requirement_id=%s consultant_id=%s got no eligible verdict from "
-                    "run_matching_for_requirement() — leaving existing RequirementConsultantMatch row untouched",
-                    requirement_id, consultant.id,
+        if not validation["eligible"]:
+            if existing is not None:
+                existing.status = "NOT_ELIGIBLE"
+                existing.match_reason = (
+                    f"No longer eligible — failed at stage '{validation['stage_failed']}': {validation['reason']}"
                 )
-                if existing and existing.status == "ASSIGNED":
-                    assignment_count += 1
-                elif existing and existing.status == "NEAR_MISS":
-                    near_miss_count += 1
-                continue
+            continue
 
-            if not entry["eligible"]:
-                validation = entry["validation"]
-                logger.info(
-                    "match_requirement: requirement_id=%s consultant_id=%s REJECTED at stage=%s (%s)",
-                    requirement_id, consultant.id, validation["stage_failed"], validation["reason"],
-                )
-                # BUG FIX: match history is mandatory — never delete a row,
-                # mark it INVALIDATED instead so it drops out of the counted
-                # ASSIGNED/NEAR_MISS totals (and out of the admin Requirements
-                # page's ats_match_count) while the row and its original
-                # reasoning stay in the table. Same fix already applied to
-                # Pipeline B (matching_router.py).
-                if existing and existing.status != "INVALIDATED":
-                    existing.status = "INVALIDATED"
-                    existing.match_reason = (
-                        f"No longer eligible — failed at stage '{validation['stage_failed']}': {validation['reason']}"
-                    )
-                    await db.flush()
-                continue
+        result = score_match(
+            requirement, consultant, experiences,
+            requirement_skills=requirement_skills,
+        )
+        result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
+        tier_value = "NEAR_MISS" if validation["tier"] == "NEAR_MISS_CANDIDATE" else "STRONG"
 
-            validation = entry["validation"]
-            result = entry["result"]
-            result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
-
-            # NEAR_MISS_CANDIDATE (soft 10-70% role match) only actually becomes
-            # a NEAR_MISS row if the final blended score ALSO misses threshold —
-            # if other factors compensated for the imperfect role match, it's a
-            # legitimate normal pass instead. A role tier of PASS (>=70%) is
-            # always a normal pass regardless of the final total, same as the
-            # role-matching-fix spec states.
-            if validation["tier"] == "NEAR_MISS_CANDIDATE" and result["total"] < MATCH_THRESHOLD:
-                new_status = "NEAR_MISS"
-            else:
-                new_status = "ASSIGNED"
-
-            try:
-                async with db.begin_nested():
-                    if existing:
-                        existing.match_score = result["total"]
-                        existing.skill_score = result["skill_score"]
-                        existing.role_score = result["role_score"]
-                        existing.experience_score = result["experience_score"]
-                        existing.employment_score = result["employment_score"]
-                        existing.location_score = result["location_score"]
-                        existing.auth_score = result["auth_score"]
-                        existing.matched_skills = result["matched_skills"]
-                        existing.missing_skills = result["missing_skills"]
-                        existing.match_reason = result["match_reason"]
-                        existing.score_breakdown = result["score_breakdown"]
-                        # Never clobber a workflow status an admin/recruiter has
-                        # already advanced (RESUME_GENERATED, READY_TO_APPLY,
-                        # APPLIED, REJECTED) — only move between the two
-                        # matching-engine-owned statuses themselves.
-                        if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
-                            existing.status = new_status
-                    else:
-                        db.add(RequirementConsultantMatch(
-                            requirement_id=requirement_id,
-                            consultant_id=consultant.id,
-                            match_score=result["total"],
-                            skill_score=result["skill_score"],
-                            role_score=result["role_score"],
-                            experience_score=result["experience_score"],
-                            employment_score=result["employment_score"],
-                            location_score=result["location_score"],
-                            auth_score=result["auth_score"],
-                            matched_skills=result["matched_skills"],
-                            missing_skills=result["missing_skills"],
-                            match_reason=result["match_reason"],
-                            score_breakdown=result["score_breakdown"],
-                            status=new_status,
-                        ))
-                    await db.flush()
-            except IntegrityError:
-                stmt = select(RequirementConsultantMatch).where(
-                    RequirementConsultantMatch.requirement_id == requirement_id,
-                    RequirementConsultantMatch.consultant_id == consultant.id
-                )
-                res = await db.execute(stmt)
-                existing = res.scalars().first()
-                if existing:
+        try:
+            async with db.begin_nested():
+                if existing is not None:
+                    existing.status = "MATCHING"
+                    existing.tier = tier_value
                     existing.match_score = result["total"]
                     existing.skill_score = result["skill_score"]
                     existing.role_score = result["role_score"]
@@ -1670,81 +1521,86 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                     existing.missing_skills = result["missing_skills"]
                     existing.match_reason = result["match_reason"]
                     existing.score_breakdown = result["score_breakdown"]
-                    if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
-                        existing.status = new_status
-                    await db.flush()
+                else:
+                    new_match = RequirementConsultantMatch(
+                        requirement_id=requirement_id,
+                        consultant_id=consultant.id,
+                        status="MATCHING",
+                        tier=tier_value,
+                        match_score=result["total"],
+                        skill_score=result["skill_score"],
+                        role_score=result["role_score"],
+                        experience_score=result["experience_score"],
+                        employment_score=result["employment_score"],
+                        location_score=result["location_score"],
+                        auth_score=result["auth_score"],
+                        matched_skills=result["matched_skills"],
+                        missing_skills=result["missing_skills"],
+                        match_reason=result["match_reason"],
+                        score_breakdown=result["score_breakdown"],
+                    )
+                    db.add(new_match)
+                    existing_by_consultant[consultant.id] = new_match
+                await db.flush()
+        except IntegrityError:
+            stmt = select(RequirementConsultantMatch).where(
+                RequirementConsultantMatch.requirement_id == requirement_id,
+                RequirementConsultantMatch.consultant_id == consultant.id,
+            )
+            res = await db.execute(stmt)
+            row = res.scalars().first()
+            if row:
+                row.status = "MATCHING"
+                row.tier = tier_value
+                row.match_score = result["total"]
+                row.skill_score = result["skill_score"]
+                row.role_score = result["role_score"]
+                row.experience_score = result["experience_score"]
+                row.employment_score = result["employment_score"]
+                row.location_score = result["location_score"]
+                row.auth_score = result["auth_score"]
+                row.matched_skills = result["matched_skills"]
+                row.missing_skills = result["missing_skills"]
+                row.match_reason = result["match_reason"]
+                row.score_breakdown = result["score_breakdown"]
+                existing_by_consultant[consultant.id] = row
+                await db.flush()
 
-            if new_status == "NEAR_MISS":
-                near_miss_count += 1
-            else:
-                assignment_count += 1
+    # Sweep: any existing MATCHING row whose consultant fell out of the
+    # active roster since last run.
+    for consultant_id_key, existing in existing_by_consultant.items():
+        if consultant_id_key not in roster_ids and existing.status == "MATCHING":
+            existing.status = "NOT_ELIGIBLE"
+            existing.match_reason = "consultant no longer active/authorized"
 
-    # BUG FIX: match_requirement() upserted rows into
-    # requirement_consultant_matches correctly, but never wrote back to
-    # requirements.ats_match_count — the column the admin Requirements
-    # table actually displays. Matching genuinely worked; the visible
-    # count just never reflected it (stuck at whatever seed.py's random
-    # demo value or the column default of 0 was). assignment_count here
-    # counts only normal ASSIGNED matches (not NEAR_MISS) — NEAR_MISS rows
-    # are meant for a separate view/tab per the role-matching-fix spec, so
-    # they're deliberately kept out of the headline admin count.
-    requirement.ats_match_count = assignment_count
+    match_count = sum(1 for m in existing_by_consultant.values() if m.status == "MATCHING")
+    requirement.ats_match_count = match_count
 
     await db.commit()
     logger.info(
-        "Matched requirement_id=%s — %d consultants scored, %d ASSIGNED, %d NEAR_MISS (3 total queries)",
-        requirement_id, len(consultants), assignment_count, near_miss_count,
+        "Matched requirement_id=%s — %d consultants scored, %d MATCHING",
+        requirement_id, len(needs_scoring), match_count,
     )
-    return assignment_count
+    return match_count
 
 
 async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     """
     Inverse of match_requirement: score ONE consultant against all
-    still-open requirements and upsert into requirement_consultant_matches.
-    Called automatically when a consultant updates their profile so their
-    matches reflect the new skills/roles/etc. without an admin re-run.
-    Returns the number of requirements where they now meet MATCH_THRESHOLD.
+    still-open requirements. Same single-engine logic as
+    match_requirement() above — this file's own validate_match()/
+    score_match() are called directly, no second table, no delegation.
 
-    PERFORMANCE FIX (root cause of "saving one field on My Profile takes
-    8+ seconds / freezes the whole app"): match_requirement() above scales
-    with ACTIVE CONSULTANT count (typically small), but this function
-    scales with OPEN REQUIREMENT count — 44,000+ in production. The old
-    version pulled every open Requirement as a FULL ORM object (every
-    column, including large JSON/text fields) and looked up existing
-    matches via `.in_(req_ids)` with all 44,000+ ids as literal SQL
-    parameters — on every single save, even though the very next check
-    (the MATCHING_LOGIC_VERSION tag) was about to skip almost all of them
-    anyway.
+    PERFORMANCE (kept from the original fix): this scales with OPEN
+    REQUIREMENT count (44,000+ in production), unlike match_requirement()
+    which scales with active-consultant count. A first lightweight JOIN
+    fetches only (id, status, score_breakdown) — no large columns, no
+    giant IN-list — to cheaply decide which requirements actually need
+    (re)scoring; full Requirement objects are hydrated ONLY for that
+    smaller subset.
 
-    Fix: a first lightweight JOIN fetches only (id, status,
-    score_breakdown) — no large columns, no giant IN-list — to cheaply
-    decide which requirements actually need (re)scoring, still reading
-    the version tag out of score_breakdown's JSON exactly as before (no
-    schema change). Full Requirement objects are then hydrated ONLY for
-    that smaller subset. Skip/count semantics are unchanged — same
-    protected-status guard, same version-tag skip, same counting — this
-    only changes what gets fetched, and how much of it.
-
-    CORRECTNESS: that same lightweight JOIN now ALSO left-joins JobMatch
-    (Pipeline B's table) so a requirement is only skipped entirely when
-    BOTH tables already have a current answer for this consultant — not
-    just RequirementConsultantMatch. Without this, a requirement whose
-    RCM row was already settled but whose JobMatch row was stale/missing
-    would never get rescored via this function again, leaving JobMatch
-    permanently behind for that slice. A protected RCM row
-    (RESUME_GENERATED/READY_TO_APPLY/APPLIED/REJECTED) is still NEVER
-    written to, even when it's sent through scoring purely so Pipeline B
-    can catch JobMatch up — see rcm_writable_ids below.
-
-    A second, separate fix below (the periodic `await asyncio.sleep(0)`)
-    addresses a related but distinct problem: validate_match()/
-    score_match() are synchronous CPU-bound Python with few or no
-    `await` points inside a long run of rejections. Since Python's
-    asyncio event loop is single-threaded, a long uninterrupted stretch
-    of that work blocks EVERYTHING else on the process — including
-    sending back the HTTP response for the save that triggered this
-    background task — not just this task itself.
+    Returns the number of requirements where this consultant now has
+    status=MATCHING.
     """
     cons_result = await db.execute(select(Consultant).where(Consultant.id == consultant_id))
     consultant = cons_result.scalars().first()
@@ -1758,30 +1614,18 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
 
     # Lightweight pass: which open requirements actually need scoring?
     # LEFT JOIN so a requirement with no existing match row for this
-    # consultant still comes back (status/score_breakdown as NULL/None),
-    # matching the original "existing = None" case exactly. ALSO
-    # left-joins JobMatch (Pipeline B's table) in the SAME query — see
-    # CORRECTNESS note below — so this stays at one lightweight query
-    # total, not two.
-    from models import JobMatch
+    # consultant still comes back (status/score_breakdown as NULL/None).
     lightweight_result = await db.execute(
         select(
             Requirement.id,
             RequirementConsultantMatch.status,
             RequirementConsultantMatch.score_breakdown,
-            JobMatch.status,
-            JobMatch.matching_info,
         )
         .select_from(Requirement)
         .outerjoin(
             RequirementConsultantMatch,
             (RequirementConsultantMatch.requirement_id == Requirement.id)
             & (RequirementConsultantMatch.consultant_id == consultant_id),
-        )
-        .outerjoin(
-            JobMatch,
-            (JobMatch.requirement_id == Requirement.id)
-            & (JobMatch.consultant_id == consultant_id),
         )
         .where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
     )
@@ -1790,61 +1634,17 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
         await db.commit()
         return 0
 
-    def _jm_lightweight_is_stale(jm_status, jm_matching_info) -> bool:
-        if jm_status is None:
-            return True
-        if jm_status in ("APPLIED", "REJECTED"):
-            return False  # human-owned on Pipeline B's side; Pipeline B itself will leave it alone regardless
-        return not (jm_matching_info and jm_matching_info.get("_version") == MATCHING_LOGIC_VERSION)
-
     match_count = 0
-    near_miss_count = 0
     ids_needing_scoring: list[int] = []
-    rcm_writable_ids: set[int] = set()
 
-    for req_id, existing_status, existing_score_breakdown, jm_status, jm_matching_info in lightweight_rows:
-        jm_stale = _jm_lightweight_is_stale(jm_status, jm_matching_info)
-
-        # BUG FIX: same protective guard as match_requirement() above —
-        # never touch a row already advanced to RESUME_GENERATED,
-        # READY_TO_APPLY, APPLIED, or REJECTED. (Identical to the
-        # original per-row check — just evaluated here, before deciding
-        # whether a full Requirement object is even needed.)
-        if existing_status in ("RESUME_GENERATED", "READY_TO_APPLY", "APPLIED", "REJECTED"):
-            if existing_status == "ASSIGNED":
-                match_count += 1
-            if jm_stale:
-                # CORRECTNESS: RequirementConsultantMatch is protected and
-                # never gets touched below (see rcm_writable_ids — not
-                # added here) — but JobMatch is stale/missing for this
-                # pair, so still send it through scoring purely so
-                # Pipeline B can catch JobMatch up in the same pass.
-                # Without this, a consultant whose RCM row settled first
-                # would never get JobMatch refreshed via this call again.
-                ids_needing_scoring.append(req_id)
+    for req_id, existing_status, existing_score_breakdown in lightweight_rows:
+        if existing_status in ("APPLIED", "REJECTED"):
+            continue  # frozen — human decision, engine never touches it again
+        if existing_status == "MATCHING" and existing_score_breakdown and \
+                existing_score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+            match_count += 1
             continue
-
-        # PERFORMANCE: same version-tag skip as match_requirement() above —
-        # skip full re-validation for a row already checked under the
-        # current matching logic.
-        if existing_score_breakdown and existing_score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
-            if jm_stale:
-                # RCM is current — recomputing it is redundant (same
-                # inputs, same result) but harmless, and lets JobMatch
-                # catch up too. Don't count here; the consumption loop
-                # below counts it once the pass completes, to avoid
-                # double-counting against the increments a few lines down.
-                ids_needing_scoring.append(req_id)
-                rcm_writable_ids.add(req_id)
-                continue
-            if existing_status == "NEAR_MISS":
-                near_miss_count += 1
-            elif existing_status == "ASSIGNED":
-                match_count += 1
-            continue
-
         ids_needing_scoring.append(req_id)
-        rcm_writable_ids.add(req_id)
 
     if not ids_needing_scoring:
         await db.commit()
@@ -1854,17 +1654,14 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
         )
         return match_count
 
+    from sqlalchemy.exc import IntegrityError
+
     # Full Requirement objects ONLY for the (typically much smaller)
-    # subset that genuinely needs scoring — this is the expensive fetch,
-    # now scoped to a delta instead of every open requirement.
-    #
-    # CHUNKED (see _chunk_ids() above): ids_needing_scoring can still hold
-    # every open requirement in the worst case (right after a
-    # MATCHING_LOGIC_VERSION bump). A single .in_(ids_needing_scoring) at
-    # that scale can exceed Postgres's bind-parameter limit and take the
-    # process down. Batching keeps every individual query well within the
-    # limit; requirements/existing_by_req end up identical to the
-    # single-query version, just assembled across a few round trips.
+    # subset that genuinely needs scoring.
+    # CHUNKED — ids_needing_scoring can hold every open requirement in
+    # the worst case (right after a MATCHING_LOGIC_VERSION bump); a
+    # single .in_() at that scale can exceed Postgres's bind-parameter
+    # limit.
     requirements: list[Requirement] = []
     for _chunk in _chunk_ids(ids_needing_scoring):
         _chunk_result = await db.execute(select(Requirement).where(Requirement.id.in_(_chunk)))
@@ -1880,130 +1677,43 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
         )
         existing_by_req.update({m.requirement_id: m for m in _chunk_result.scalars().all()})
 
-    # SINGLE-SOURCE-OF-COMPUTATION (removes the Pipeline A/B double scoring
-    # cost — see match_requirement() above for the full rationale): each
-    # requirement in this already-filtered delta is scored by calling
-    # Pipeline B's run_matching_for_requirement() with a single-consultant
-    # roster and collect_results=[...], instead of this function running
-    # its own validate_match()/score_match() here. Pipeline B still gets
-    # its own JobMatch upsert out of that same call; this just reads the
-    # one collected result back out instead of recomputing it.
-    from matching_router import run_matching_for_requirement  # deferred: avoids a circular import at module load time
-    from sqlalchemy.exc import IntegrityError
-
-    # PERFORMANCE: run_matching_for_requirement() would, by default, run
-    # its own JobMatch SELECT scoped to this one consultant on EVERY call
-    # below — one query per requirement in ids_needing_scoring, which is
-    # exactly the per-requirement round-trip cost this function's own
-    # PERFORMANCE FIX (see docstring) was written to eliminate. That
-    # subset can be large (e.g. right after a MATCHING_LOGIC_VERSION
-    # bump, it's every open requirement). Fetch this consultant's
-    # existing JobMatch rows for the whole delta in ONE query up front
-    # instead, and hand each call its own single-row slice via
-    # existing_by_consultant= so its internal query is skipped entirely.
-    # CHUNKED — same reasoning as the two batches above.
-    jobmatch_by_requirement: dict[int, JobMatch] = {}
-    for _chunk in _chunk_ids(ids_needing_scoring):
-        _chunk_result = await db.execute(
-            select(JobMatch).where(
-                JobMatch.consultant_id == consultant_id,
-                JobMatch.requirement_id.in_(_chunk),
-            )
-        )
-        jobmatch_by_requirement.update({m.requirement_id: m for m in _chunk_result.scalars().all()})
-
     for i, requirement in enumerate(requirements):
-        # PERFORMANCE FIX (root cause of "the whole app stalls during a
-        # save"): validate_match()/score_match() are plain synchronous
-        # CPU-bound Python — no `await` inside them — and a rejected
-        # requirement with no existing row to touch skips db.flush()
-        # entirely, so a long run of those has NO yield points at all.
-        # Yielding briefly every 50 items costs nothing measurable (this
-        # loop is now typically just the delta needing rescoring) but
-        # lets the event loop interleave other pending work — like
-        # finishing an HTTP response — instead of freezing everything
-        # else for the loop's entire duration.
+        # PERFORMANCE: validate_match()/score_match() are synchronous
+        # CPU-bound Python with no await points — yield briefly every 50
+        # items so this doesn't freeze the whole event loop (including
+        # the HTTP response for the profile save that triggered this).
         if i % 50 == 0:
             await asyncio.sleep(0)
 
         existing = existing_by_req.get(requirement.id)
+        requirement_skills = _requirement_skills(requirement)
 
-        results: list = []
-        existing_for_this_req = (
-            {consultant_id: jobmatch_by_requirement[requirement.id]}
-            if requirement.id in jobmatch_by_requirement else {}
-        )
-        await run_matching_for_requirement(
-            db,
-            requirement,
-            [consultant],
-            existing_pairs=set(),
-            experiences_by_consultant={consultant_id: experiences},
-            existing_by_consultant=existing_for_this_req,
-            collect_results=results,
-            # Explicit for clarity — same choice as match_requirement()
-            # above: this trigger (a consultant saving their profile)
-            # also refreshes JobMatch/"Pending Applications" out of the
-            # same pass, closing the coverage gap this codebase's own
-            # history already flagged as wanted (see
-            # run_matching_for_consultant()'s docstring in
-            # matching_router.py). Pass persist=False here instead if
-            # that side effect is ever not wanted for this trigger.
-            persist=True,
+        validation = validate_match(
+            requirement, consultant, experiences,
+            requirement_skills=requirement_skills,
         )
 
-        if requirement.id not in rcm_writable_ids:
-            # Included only so Pipeline B could refresh JobMatch for a
-            # protected RequirementConsultantMatch row — never write back
-            # to RCM (not even score fields) for these; already counted
-            # above from RCM's own existing state.
-            continue
-
-        entry = results[0] if results else None
-
-        if entry is None:
-            # We passed exactly one consultant into run_matching_for_requirement(),
-            # so results should always have exactly one entry — this
-            # should be unreachable (see match_requirement()'s identical
-            # defensive branch above). Leave Pipeline A's own row
-            # untouched rather than guess.
-            logger.warning(
-                "match_consultant: consultant_id=%s requirement_id=%s got no result at all from "
-                "run_matching_for_requirement() — leaving existing RequirementConsultantMatch row untouched",
-                consultant_id, requirement.id,
-            )
-            if existing and existing.status == "ASSIGNED":
-                match_count += 1
-            elif existing and existing.status == "NEAR_MISS":
-                near_miss_count += 1
-            continue
-
-        if not entry["eligible"]:
-            validation = entry["validation"]
-            logger.info(
-                "match_consultant: consultant_id=%s requirement_id=%s REJECTED at stage=%s (%s)",
-                consultant_id, requirement.id, validation["stage_failed"], validation["reason"],
-            )
-            if existing and existing.status != "INVALIDATED":
-                existing.status = "INVALIDATED"
+        if not validation["eligible"]:
+            if existing is not None and existing.status != "NOT_ELIGIBLE":
+                existing.status = "NOT_ELIGIBLE"
                 existing.match_reason = (
                     f"No longer eligible — failed at stage '{validation['stage_failed']}': {validation['reason']}"
                 )
                 await db.flush()
             continue
 
-        validation = entry["validation"]
-        result = entry["result"]
+        result = score_match(
+            requirement, consultant, experiences,
+            requirement_skills=requirement_skills,
+        )
         result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
-
-        if validation["tier"] == "NEAR_MISS_CANDIDATE" and result["total"] < MATCH_THRESHOLD:
-            new_status = "NEAR_MISS"
-        else:
-            new_status = "ASSIGNED"
+        tier_value = "NEAR_MISS" if validation["tier"] == "NEAR_MISS_CANDIDATE" else "STRONG"
 
         try:
             async with db.begin_nested():
                 if existing:
+                    existing.status = "MATCHING"
+                    existing.tier = tier_value
                     existing.match_score = result["total"]
                     existing.skill_score = result["skill_score"]
                     existing.role_score = result["role_score"]
@@ -2015,12 +1725,12 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                     existing.missing_skills = result["missing_skills"]
                     existing.match_reason = result["match_reason"]
                     existing.score_breakdown = result["score_breakdown"]
-                    if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
-                        existing.status = new_status
                 else:
                     db.add(RequirementConsultantMatch(
                         requirement_id=requirement.id,
                         consultant_id=consultant_id,
+                        status="MATCHING",
+                        tier=tier_value,
                         match_score=result["total"],
                         skill_score=result["skill_score"],
                         role_score=result["role_score"],
@@ -2032,41 +1742,37 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                         missing_skills=result["missing_skills"],
                         match_reason=result["match_reason"],
                         score_breakdown=result["score_breakdown"],
-                        status=new_status,
                     ))
                 await db.flush()
         except IntegrityError:
             stmt = select(RequirementConsultantMatch).where(
                 RequirementConsultantMatch.requirement_id == requirement.id,
-                RequirementConsultantMatch.consultant_id == consultant_id
+                RequirementConsultantMatch.consultant_id == consultant_id,
             )
             res = await db.execute(stmt)
-            existing = res.scalars().first()
-            if existing:
-                existing.match_score = result["total"]
-                existing.skill_score = result["skill_score"]
-                existing.role_score = result["role_score"]
-                existing.experience_score = result["experience_score"]
-                existing.employment_score = result["employment_score"]
-                existing.location_score = result["location_score"]
-                existing.auth_score = result["auth_score"]
-                existing.matched_skills = result["matched_skills"]
-                existing.missing_skills = result["missing_skills"]
-                existing.match_reason = result["match_reason"]
-                existing.score_breakdown = result["score_breakdown"]
-                if existing.status in ("ASSIGNED", "NEAR_MISS", "INVALIDATED"):
-                    existing.status = new_status
+            row = res.scalars().first()
+            if row:
+                row.status = "MATCHING"
+                row.tier = tier_value
+                row.match_score = result["total"]
+                row.skill_score = result["skill_score"]
+                row.role_score = result["role_score"]
+                row.experience_score = result["experience_score"]
+                row.employment_score = result["employment_score"]
+                row.location_score = result["location_score"]
+                row.auth_score = result["auth_score"]
+                row.matched_skills = result["matched_skills"]
+                row.missing_skills = result["missing_skills"]
+                row.match_reason = result["match_reason"]
+                row.score_breakdown = result["score_breakdown"]
                 await db.flush()
 
-        if new_status == "NEAR_MISS":
-            near_miss_count += 1
-        else:
-            match_count += 1
+        match_count += 1
 
     await db.commit()
     logger.info(
-        "Auto-matched consultant_id=%s across %d open requirements — %d ASSIGNED, %d NEAR_MISS",
-        consultant_id, len(requirements), match_count, near_miss_count,
+        "Auto-matched consultant_id=%s across %d open requirements — %d MATCHING",
+        consultant_id, len(requirements), match_count,
     )
     return match_count
 

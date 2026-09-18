@@ -60,7 +60,6 @@ from models import (
     RequirementConsultantMatch,
     GeneratedResume,
     Application,
-    JobMatch,
 )
 from auth import get_current_user
 
@@ -227,30 +226,39 @@ def _employment_types_for_recruiter(values: Optional[List[str]]) -> List[str]:
     return [mapping.get(v.upper(), v.upper()) for v in values]
 
 
-def _match_status_to_consultant_requirement_status(match_status: Optional[str]) -> str:
-    """consultant.ts RequirementStatus: MATCHED | RESUME_READY | APPLIED | NEEDS_REVIEW."""
-    mapping = {
-        "ASSIGNED": "MATCHED",
-        "RESUME_GENERATED": "RESUME_READY",
-        "READY_TO_APPLY": "RESUME_READY",
-        "APPLIED": "APPLIED",
-        "REJECTED": "NEEDS_REVIEW",
-    }
-    return mapping.get(match_status or "", "MATCHED")
+def _match_status_to_consultant_requirement_status(match_status: Optional[str], resume_status: Optional[str] = None) -> str:
+    """
+    consultant.ts RequirementStatus: MATCHED | RESUME_READY | APPLIED | NEEDS_REVIEW.
+    (NEAR_MISS removed — a soft role match is now just a MATCHING row with
+    tier="NEAR_MISS" on the backend; it's no longer a distinct status/tab.)
+
+    `status` (MATCHING/APPLIED/REJECTED/NOT_ELIGIBLE) and `resume_status`
+    (None/RESUME_GENERATED/READY_TO_APPLY) are independent columns now —
+    resume_status only matters while status is still MATCHING; once
+    APPLIED, `status` alone decides the badge.
+    """
+    if match_status == "APPLIED":
+        return "APPLIED"
+    if match_status == "REJECTED":
+        return "NEEDS_REVIEW"
+    if match_status == "MATCHING" and resume_status in ("RESUME_GENERATED", "READY_TO_APPLY"):
+        return "RESUME_READY"
+    return "MATCHED"
 
 
-def _match_status_to_recruiter_requirement_status(match_status: Optional[str], requirement_status: str) -> str:
-    """recruiter.types.ts RequirementStatus: New | Matched | Resume Ready | Applied | Needs Review | Rejected."""
+def _match_status_to_recruiter_requirement_status(
+    match_status: Optional[str], requirement_status: str, resume_status: Optional[str] = None
+) -> str:
+    """recruiter.types.ts RequirementStatus: New | Matched | Resume Ready | Applied | Rejected."""
     if match_status is None:
         return "New" if requirement_status == "NEW" else "Matched"
-    mapping = {
-        "ASSIGNED": "Matched",
-        "RESUME_GENERATED": "Resume Ready",
-        "READY_TO_APPLY": "Resume Ready",
-        "APPLIED": "Applied",
-        "REJECTED": "Rejected",
-    }
-    return mapping.get(match_status, "Matched")
+    if match_status == "APPLIED":
+        return "Applied"
+    if match_status == "REJECTED":
+        return "Rejected"
+    if match_status == "MATCHING" and resume_status in ("RESUME_GENERATED", "READY_TO_APPLY"):
+        return "Resume Ready"
+    return "Matched"
 
 
 def _parse_vendor_contact(raw: Optional[str]) -> dict:
@@ -832,7 +840,7 @@ async def get_consultant_requirements(
 
     rows: List[ConsultantRequirementResponse] = []
     for match, req, resume in results:
-        frontend_status = _match_status_to_consultant_requirement_status(match.status)
+        frontend_status = _match_status_to_consultant_requirement_status(match.status, match.resume_status)
         if status_filter and frontend_status != status_filter:
             continue
 
@@ -1198,7 +1206,7 @@ async def get_consultant_requirements_for_recruiter(
             employmentTypes=_employment_types_for_recruiter(req.employment_types),
             workMode=_work_mode_for_recruiter(req.work_mode),
             receivedDate=req.received_date.isoformat() if req.received_date else "",
-            status=_match_status_to_recruiter_requirement_status(match.status, req.status),
+            status=_match_status_to_recruiter_requirement_status(match.status, req.status, match.resume_status),
             jobDescription=req.job_description or "",
             parsedFields=RecruiterParsedFieldsDTO(
                 experience=str((req.parsed_fields or {}).get("experience", "")) if req.parsed_fields else "",
@@ -1245,14 +1253,8 @@ async def get_requirement_detail(
     """Returns full requirement including job_description for the detail modal."""
     req = await _validate_requirement_id_exists(db, requirement_id)
 
-    # Consultants can only view requirements assigned to them. Two
-    # separate matching systems exist in this codebase —
-    # RequirementConsultantMatch (the dashboard/requirements matched
-    # view) and JobMatch (the matching engine, used by "Pending
-    # Applications") — and they don't share rows. A consultant applying
-    # from Pending Applications was always rejected here because only
-    # RequirementConsultantMatch was checked; accept either as valid
-    # proof of assignment.
+    # Consultants can only view requirements assigned to them —
+    # RequirementConsultantMatch is the single source of truth for that.
     if current_user.role == "CONSULTANT":
         consultant = await _get_consultant_for_user(db, current_user)
         match = (await db.execute(
@@ -1262,14 +1264,7 @@ async def get_requirement_detail(
             )
         )).scalars().first()
         if not match:
-            job_match = (await db.execute(
-                select(JobMatch).where(
-                    JobMatch.requirement_id == requirement_id,
-                    JobMatch.consultant_id == consultant.id,
-                )
-            )).scalars().first()
-            if not job_match:
-                raise HTTPException(status_code=403, detail="Requirement not assigned to you")
+            raise HTTPException(status_code=403, detail="Requirement not assigned to you")
 
     return RequirementDetailResponse(
         id=str(req.id),

@@ -46,14 +46,8 @@ from models import User, Requirement, Email
 from auth import get_current_user
 from pipeline import process_email
 from parser import parse_requirement
-from cleaner import clean_requirement_text, html_to_text, is_junk_plain_text, strip_css_junk
+from cleaner import clean_requirement_text, html_to_text
 from dedup import create_jd_hash, build_dedup_key, save_requirement
-# Same HTML-vs-plain-text detection the parsing pipeline already uses
-# (pipeline.py, requirements_sync.py) — imported rather than reimplemented,
-# so the Raw Email Viewer converts a given email exactly the same way the
-# parser did, instead of drifting out of sync with a second, separate
-# HTML-detection rule of its own.
-from requirements_sync import _looks_like_html
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +201,18 @@ async def get_requirement_detail(
     # of parsed_fields instead.
     parsed_fields = requirement.parsed_fields or {}
 
+    # Live count — not the cached ats_match_count column, which only ever
+    # refreshed when this specific requirement was rematched. Matches the
+    # exact same query the requirements list and Pending Applications use.
+    from models import RequirementConsultantMatch as _RCM
+    match_count_result = await db.execute(
+        select(func.count()).select_from(_RCM).where(
+            _RCM.requirement_id == requirement_id,
+            _RCM.status == "MATCHING",
+        )
+    )
+    live_match_count = match_count_result.scalar_one()
+
     return RequirementDetailResponse(
         id=str(requirement.id),
         role=requirement.role,
@@ -224,7 +230,7 @@ async def get_requirement_detail(
         job_description=requirement.job_description,
         parsed_fields=requirement.parsed_fields,
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
-        ats_match_count=requirement.ats_match_count,
+        ats_match_count=live_match_count,
         status=requirement.status,
         received_date=requirement.received_date.isoformat() if requirement.received_date else None,
     )
@@ -327,53 +333,6 @@ async def parse_text_endpoint(
 # All columns included as per table structure
 # ---------------------------------------------------------------------------
 
-def _build_display_body(body_text: Optional[str], body_html: Optional[str]) -> str:
-    """
-    BUG FIX ("raw mail" showing full HTML source — tags, <style> blocks,
-    the whole document — instead of readable text): the Raw Email Viewer
-    (RawEmailModal.tsx) put whichever of body_text/body_html it got
-    straight into a <pre>, verbatim. Many recruiter/ATS senders (e.g.
-    Quantum World Technologies' templated postings) send HTML-only email
-    with no text/plain MIME part at all — decode_gmail_body /
-    gmail_reader.py leave body_text as "" for these, which is a fact
-    about the source email, not a bug — so the viewer's own fallback
-    chain (frontend's fetchRawEmail: body_text || body_html) landed on
-    raw body_html and displayed it as literal text.
-
-    This does NOT touch how body_text/body_html are stored or how the
-    parsing pipeline reads them — requirements_sync.py's own
-    _looks_like_html/is_junk_plain_text checks still see the original,
-    unmodified columns, exactly as before. It only computes a
-    human-readable rendering for on-screen viewing, reusing the exact
-    same detection/conversion the parser already trusts (identical to
-    the inline selection logic in pipeline.py's manual-reparse path) so
-    what the person sees here matches what the parser actually saw.
-    """
-    body_text = body_text or ""
-    body_html = body_html or ""
-
-    if _looks_like_html(body_text):
-        candidate = html_to_text(body_text)
-    elif body_text and not is_junk_plain_text(body_text):
-        candidate = body_text
-    elif body_html:
-        candidate = html_to_text(body_html)
-    elif body_text:
-        candidate = strip_css_junk(body_text)
-    else:
-        candidate = ""
-
-    # BUG FIX (regression guard): the frontend's fetchRawEmail does
-    # `raw.body || raw.body_text || raw.body_html || "(empty)"`. An empty
-    # string here is falsy, so if a real HTML email happens to yield no
-    # visible text (e.g. a purely image/table layout with no text nodes)
-    # the chain would fall through PAST this field to raw.body_html --
-    # silently reintroducing the exact raw-markup display this function
-    # exists to prevent. Returning a non-empty, explicit message instead
-    # of "" guarantees this field always wins that fallback chain.
-    return candidate.strip() or "(no readable text content in this email)"
-
-
 @router.get(
     "/api/admin/raw-emails/{email_id}",
     summary="Get raw email — checks gmail_emails first, falls back to emails table",
@@ -437,11 +396,9 @@ async def get_raw_email(
     # BUG FIX: this endpoint used to block CONSULTANT entirely, so the
     # "View Raw" button on the consultant's own Requirements page always
     # 403'd. Consultants can view raw email content, but ONLY for a
-    # requirement they're actually matched to (checking both match
-    # tables, same dual-check used for the Apply eligibility fix) — not
-    # arbitrary emails by ID.
+    # requirement they're actually matched to — not arbitrary emails by ID.
     if current_user.role == "CONSULTANT":
-        from models import Consultant, RequirementConsultantMatch, JobMatch
+        from models import Consultant, RequirementConsultantMatch
         cons_result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
         consultant = cons_result.scalars().first()
         if not consultant:
@@ -452,13 +409,7 @@ async def get_raw_email(
             .where(Requirement.raw_email_id == email_id_int, RequirementConsultantMatch.consultant_id == consultant.id)
         )
         if not owns_req.scalars().first():
-            owns_req_job = await db.execute(
-                select(Requirement.id)
-                .join(JobMatch, JobMatch.requirement_id == Requirement.id)
-                .where(Requirement.raw_email_id == email_id_int, JobMatch.consultant_id == consultant.id)
-            )
-            if not owns_req_job.scalars().first():
-                raise HTTPException(status_code=403, detail="This email isn't linked to a requirement matched to you.")
+            raise HTTPException(status_code=403, detail="This email isn't linked to a requirement matched to you.")
 
     result = await db.execute(
         text("""
@@ -475,14 +426,7 @@ async def get_raw_email(
     )
     row = result.mappings().first()
     if row:
-        return {
-            "source": "gmail_emails",
-            # Readable rendering for the viewer, alongside the untouched
-            # raw body_text/body_html columns (still included via the
-            # spread below) — see _build_display_body's docstring.
-            "body": _build_display_body(row["body_text"], row["body_html"]),
-            **dict(row),
-        }
+        return {"source": "gmail_emails", **dict(row)}
 
     # Fall back to the emails table — this is the correct source for any
     # requirement created after the raw_email_id FK fix.
@@ -504,10 +448,6 @@ async def get_raw_email(
         "cc_addresses": email.cc_addresses,
         "bcc_addresses": email.bcc_addresses,
         "reply_to": email.reply_to_address,
-        # Readable rendering for the viewer — see _build_display_body's
-        # docstring; body_text/body_html below stay the untouched raw
-        # columns, exactly as before.
-        "body": _build_display_body(email.body_text, email.body_html),
         "body_text": email.body_text,
         "body_html": email.body_html,
         "date": email.received_at,
@@ -758,64 +698,10 @@ async def reparse_email(
     # always leaves the requirement with a real match count.
     if requirement_id is not None:
         try:
+            # Single engine — one call refreshes RequirementConsultantMatch
+            # directly; there's no second table left to catch up separately.
             from phase4 import match_requirement
             await match_requirement(db, requirement_id)
-
-            # COVERAGE GAP FIX (not a matching-condition change): this only
-            # ever ran Pipeline A above. Pipeline B — the JobMatch table
-            # that actually drives Pending Applications — never got
-            # refreshed after a manual reparse, so a role/skills/employment
-            # type correction made here was invisible on that screen until
-            # an admin separately clicked "Run Engine". Same call
-            # requirements_sync.py already makes for a brand-new
-            # requirement — applying it here too for a re-parsed one.
-            # BUG FIX ("Reparse failed (500): local variable 'Requirement'
-            # referenced before assignment"): this local `from models
-            # import` re-imported Requirement (and User) even though both
-            # are already imported at module level (see the top of this
-            # file). Python treats any name assigned anywhere in a
-            # function -- including via a later local import -- as local
-            # to that function for its ENTIRE scope, from the very first
-            # line. That silently turned every earlier use of
-            # `Requirement` in this function (e.g. the existing-requirement
-            # lookup in Step 4, well before this line even runs) into a
-            # reference to a not-yet-assigned local variable instead of
-            # the module-level import, crashing every single reparse
-            # attempt. Consultant and JobMatch aren't imported at module
-            # level, so they still need to be imported here -- only the
-            # two redundant, bug-causing names are removed.
-            from models import Consultant, JobMatch
-            from matching_router import run_matching_for_requirement
-            req_res = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
-            req_obj = req_res.scalars().first()
-            if req_obj:
-                # BUG FIX ("Reparse"-triggered matches scored against
-                # deactivated/non-consultant users): same fix already
-                # applied to requirements_sync.py's own copy of this exact
-                # query — this used Consultant.status == "ACTIVE" alone,
-                # with no User join at all, unlike the bulk "Run Engine"
-                # background run (matching_router.py's
-                # _run_matching_engine_background), which also requires
-                # User.role == "CONSULTANT" and User.is_authorized ==
-                # True. All three call sites feed the same
-                # run_matching_for_requirement(), so this one was still
-                # scoring a re-parsed requirement against a broader,
-                # inconsistent roster than the manual "Run Engine" button
-                # uses. Matches that filter exactly.
-                cons_res = await db.execute(
-                    select(Consultant)
-                    .join(User, Consultant.user_id == User.id)
-                    .where(
-                        Consultant.status == "ACTIVE",
-                        User.role == "CONSULTANT",
-                        User.is_authorized == True,
-                    )
-                )
-                consultants = cons_res.scalars().all()
-                existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
-                existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
-                await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
-                await db.commit()
         except Exception as match_err:
             print(f"[reparse_email] auto-match FAILED for requirement_id={requirement_id}: {match_err}")
             from error_logger import log_db_error

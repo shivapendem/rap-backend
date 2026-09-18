@@ -906,7 +906,20 @@ async def get_requirements(
         # array membership. Falls back to a no-op filter on the SQLite dev
         # path where this column is stored as JSON text instead.
         if DATABASE_URL.startswith("postgresql"):
-            query = query.where(Requirement.employment_types.any(employment_type))
+            EMPLOYMENT_TYPE_BUCKET_EXPANSION = {
+                "C2C": ["C2C", "CONTRACT", "C2H"],
+                "W2": ["W2"],
+                "1099": ["1099"],
+                "FULLTIME": ["FULLTIME"],
+                "FULL_TIME": ["FULLTIME"],
+            }
+            raw_types = EMPLOYMENT_TYPE_BUCKET_EXPANSION.get(
+                employment_type.upper(), [employment_type]
+            )
+            if len(raw_types) == 1:
+                query = query.where(Requirement.employment_types.any(raw_types[0]))
+            else:
+                query = query.where(Requirement.employment_types.overlap(raw_types))
 
     if search:
         # BUG FIX: only matched role/vendor_email — searching by client,
@@ -977,7 +990,14 @@ async def get_requirements(
         matches_q = (
             select(RequirementConsultantMatch.requirement_id, Consultant.full_name)
             .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
-            .where(RequirementConsultantMatch.requirement_id.in_(req_ids))
+            .where(
+                RequirementConsultantMatch.requirement_id.in_(req_ids),
+                # Only currently-matching rows count as "matched" here —
+                # a REJECTED/NOT_ELIGIBLE/APPLIED row is history, not an
+                # active match, and showing it in this column (or in the
+                # count) is exactly the stale-count bug this replaces.
+                RequirementConsultantMatch.status == "MATCHING",
+            )
         )
         if current_user.role == "RECRUITER":
             assigned_result = await db.execute(
@@ -1004,7 +1024,12 @@ async def get_requirements(
             matches_by_req.setdefault(req_id, []).append(name)
 
         for r in reqs:
+            # Live count, not the cached ats_match_count column — this is
+            # what removes the discrepancy with Pending Applications for
+            # good: both now come from the exact same query (status ==
+            # "MATCHING"), computed at request time, every time.
             r.matched_consultants = matches_by_req.get(r.id, [])
+            r.ats_match_count = len(r.matched_consultants)
 
         # Which of those matched consultants already have a real SENT
         # application for this requirement — powers the "highlight

@@ -2589,39 +2589,19 @@ async def get_consultants_for_resumes(
 
     matched_consultant_ids = None
     if requirement_id:
-        from models import RequirementConsultantMatch, JobMatch
+        from models import RequirementConsultantMatch
 
-        # BUG FIX ("wrong candidate/email after applying from a Pending
-        # Applications match"): this used to check RequirementConsultantMatch
-        # only — a completely separate table from JobMatch (populated by
-        # the AI matching engine in matching_router.py, which is what
-        # Pending Applications actually shows matches from). Nothing ever
-        # writes a JobMatch row into RequirementConsultantMatch, so a
-        # consultant shown as a real match in Pending Applications could
-        # be entirely absent from this list. ApplyToRequirementPage
-        # resolves the consultantId passed in the URL by looking it up in
-        # this exact list — if it's missing, that resolution silently
-        # fails and the page falls back to a different consultant
-        # (consultants?.[0]) instead, which is why the "active user"
-        # shown didn't match who was actually clicked, the wrong
-        # candidate got applied as, and the send went from the wrong
-        # Gmail address. Union both sources so any consultant matched
-        # through either system shows up correctly.
+        # RequirementConsultantMatch is the single source of truth for
+        # "is this consultant matched to this requirement" now — no more
+        # union with a second table. Excludes REJECTED the same way the
+        # old JobMatch-side filter did.
         rcm_result = await db.execute(
             select(RequirementConsultantMatch.consultant_id).where(
-                RequirementConsultantMatch.requirement_id == requirement_id
+                RequirementConsultantMatch.requirement_id == requirement_id,
+                RequirementConsultantMatch.status != "REJECTED",
             )
         )
-        jobmatch_result = await db.execute(
-            select(JobMatch.consultant_id).where(
-                JobMatch.requirement_id == requirement_id,
-                JobMatch.status != "REJECTED",
-            )
-        )
-        matched_consultant_ids = list({
-            *(row[0] for row in rcm_result.all()),
-            *(row[0] for row in jobmatch_result.all()),
-        })
+        matched_consultant_ids = list({row[0] for row in rcm_result.all()})
         if not matched_consultant_ids:
             return []
 
