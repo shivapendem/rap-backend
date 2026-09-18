@@ -601,7 +601,27 @@ _ROLE_SENTENCE_LEAD_WORDS = {
 _GENERIC_BARE_ROLE_WORDS = {
     'developer', 'engineer', 'architect', 'administrator', 'analyst',
     'consultant', 'manager', 'lead', 'programmer', 'specialist',
-    'designer', 'tester', 'scientist', 'scrum master',
+    'designer', 'tester', 'scientist',
+    # BUG FIX ("role: full subject line" instead of "Scrum Master" --
+    # confirmed real case, and the root cause of a duplicate-requirement
+    # bug: the same email parsed once via AI (getting a clean "Scrum
+    # Master") and once via this regex fallback produced two DIFFERENT
+    # role strings for identical content, so is_duplicate()'s
+    # vendor_email+role+jd_hash dedup key never matched between the two,
+    # and both got saved as separate Requirement rows): "scrum master"
+    # was listed here as if it were a bare, too-generic-to-stand-alone
+    # category word like "developer" or "manager" -- but unlike those,
+    # "Scrum Master" is already a complete, specific, extremely common
+    # job title in its own right; it needs no additional qualifier the
+    # way "Developer" or "Lead" do. This file's own history elsewhere
+    # (see the bench-sales false-positive fix above, which cites
+    # "Opening for Scrum Master - NYC" as an example of a genuine real
+    # posting) already treats "Scrum Master" as a legitimate title --
+    # this set contradicted that. Removed so a correctly-labeled
+    # "Title: Scrum Master" / "Role: Scrum Master" line is accepted
+    # like any other real title instead of being rejected and falling
+    # through to a much worse last-resort fallback (the raw subject
+    # line).
 }
 
 
@@ -6010,8 +6030,27 @@ def parse_requirement(
         or not vendor_name
         or from_domain in _PERSONAL_WEBMAIL_DOMAINS
     )
+    # BUG FIX ("Client field incorrectly showing the vendor's own company
+    # name when no real client is named" -- confirmed real case): the
+    # duplicate-suppression guard right below only ever compared `client`
+    # against `vendor_name` -- but vendor_name only picks up the SENDER'S
+    # COMPANY name (extract_vendor_from_body's body_company, e.g. "Quantum
+    # World Technologies Inc." from a "Thanks & Regards / <Name> /
+    # <Company>" sign-off) when the header itself looked untrustworthy
+    # (personal webmail, or no real display name). The common, well-formed
+    # case -- a recruiter emailing from their own real name at their own
+    # company domain, e.g. "Vijendra <vijendra@quantumworldit.com>" -- is
+    # exactly the case this comment says is "never touched": the header is
+    # trusted, extract_vendor_from_body() never even ran, so the parser had
+    # no idea what the vendor's own company was and couldn't catch the
+    # client extractor latching onto it from the signature block. Run
+    # extract_vendor_from_body() unconditionally (it's a pure regex read,
+    # no side effects) so `vendor_company` is always known to the guard
+    # below; vendor_name/vendor_email themselves are still only OVERRIDDEN
+    # by the body when the header was untrustworthy, exactly as before.
+    body_name, body_company, body_email = extract_vendor_from_body(safe_body)
+    vendor_company = body_company
     if header_looks_untrustworthy:
-        body_name, body_company, body_email = extract_vendor_from_body(safe_body)
         if body_email:
             vendor_email = body_email
         if body_name:
@@ -6021,16 +6060,26 @@ def parse_requirement(
 
     # BUG FIX ("client incorrectly set to vendor/recruiting company when
     # no real client is named" -- confirmed real case): only overrides
-    # when no genuine "Client:" label grounds the value.
-    if client and vendor_name and not _CLIENT_LABEL_PRESENT_RE.search(full_text):
+    # when no genuine "Client:" label grounds the value. Checks BOTH
+    # vendor_name (the sender, which for a trustworthy header is just
+    # their personal name -- e.g. "Vijendra") and vendor_company (their
+    # agency's name, e.g. "Quantum World Technologies Inc.", now always
+    # available regardless of header trust -- see comment above) since a
+    # bogus client can echo either one.
+    if client and not _CLIENT_LABEL_PRESENT_RE.search(full_text):
         _client_lower = client.strip().lower()
-        _vendor_lower = vendor_name.strip().lower()
-        if _client_lower and _vendor_lower and (
-            _client_lower == _vendor_lower
-            or _client_lower in _vendor_lower
-            or _vendor_lower in _client_lower
-        ):
-            client = None
+        for _vendor_candidate in (vendor_name, vendor_company):
+            if not _vendor_candidate:
+                continue
+            _vendor_lower = _vendor_candidate.strip().lower()
+            if _client_lower and _vendor_lower and (
+                _client_lower == _vendor_lower
+                or _client_lower in _vendor_lower
+                or _vendor_lower in _client_lower
+            ):
+                client = None
+                break
+
 
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email
