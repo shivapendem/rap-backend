@@ -1155,21 +1155,13 @@ async def update_own_profile(
     async def _rematch_in_background(cid: int):
         from database import AsyncSessionLocal
         from phase4 import match_consultant
-        from matching_router import run_matching_for_consultant
         try:
             while True:
                 _rematch_dirty.discard(cid)
                 async with AsyncSessionLocal() as bg_session:
+                    # Single engine — refreshes RequirementConsultantMatch
+                    # directly; no second table/pipeline to catch up.
                     await match_consultant(bg_session, cid)
-                    # COVERAGE GAP FIX (not a matching-condition change):
-                    # this only ever refreshed Pipeline A (the admin
-                    # Requirements page's match count). Pending
-                    # Applications (Pipeline B, the JobMatch table) never
-                    # got refreshed when a consultant updated their
-                    # profile — even when the update was specifically to
-                    # fix a gap keeping them from matching something.
-                    # Same session, same trigger, second pipeline.
-                    await run_matching_for_consultant(bg_session, cid)
                 # If another save landed while this pass was running, do
                 # exactly one more pass to pick up its latest data — this
                 # pass started with whatever was saved BEFORE it began,

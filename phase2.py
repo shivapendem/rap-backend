@@ -436,11 +436,9 @@ async def get_raw_email(
     # BUG FIX: this endpoint used to block CONSULTANT entirely, so the
     # "View Raw" button on the consultant's own Requirements page always
     # 403'd. Consultants can view raw email content, but ONLY for a
-    # requirement they're actually matched to (checking both match
-    # tables, same dual-check used for the Apply eligibility fix) — not
-    # arbitrary emails by ID.
+    # requirement they're actually matched to — not arbitrary emails by ID.
     if current_user.role == "CONSULTANT":
-        from models import Consultant, RequirementConsultantMatch, JobMatch
+        from models import Consultant, RequirementConsultantMatch
         cons_result = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
         consultant = cons_result.scalars().first()
         if not consultant:
@@ -451,13 +449,7 @@ async def get_raw_email(
             .where(Requirement.raw_email_id == email_id_int, RequirementConsultantMatch.consultant_id == consultant.id)
         )
         if not owns_req.scalars().first():
-            owns_req_job = await db.execute(
-                select(Requirement.id)
-                .join(JobMatch, JobMatch.requirement_id == Requirement.id)
-                .where(Requirement.raw_email_id == email_id_int, JobMatch.consultant_id == consultant.id)
-            )
-            if not owns_req_job.scalars().first():
-                raise HTTPException(status_code=403, detail="This email isn't linked to a requirement matched to you.")
+            raise HTTPException(status_code=403, detail="This email isn't linked to a requirement matched to you.")
 
     result = await db.execute(
         text("""
@@ -734,49 +726,10 @@ async def reparse_email(
     # always leaves the requirement with a real match count.
     if requirement_id is not None:
         try:
+            # Single engine — one call refreshes RequirementConsultantMatch
+            # directly; there's no second table left to catch up separately.
             from phase4 import match_requirement
             await match_requirement(db, requirement_id)
-
-            # COVERAGE GAP FIX (not a matching-condition change): this only
-            # ever ran Pipeline A above. Pipeline B — the JobMatch table
-            # that actually drives Pending Applications — never got
-            # refreshed after a manual reparse, so a role/skills/employment
-            # type correction made here was invisible on that screen until
-            # an admin separately clicked "Run Engine". Same call
-            # requirements_sync.py already makes for a brand-new
-            # requirement — applying it here too for a re-parsed one.
-            from models import Requirement, Consultant, JobMatch, User
-            from matching_router import run_matching_for_requirement
-            req_res = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
-            req_obj = req_res.scalars().first()
-            if req_obj:
-                # BUG FIX ("Reparse"-triggered matches scored against
-                # deactivated/non-consultant users): same fix already
-                # applied to requirements_sync.py's own copy of this exact
-                # query — this used Consultant.status == "ACTIVE" alone,
-                # with no User join at all, unlike the bulk "Run Engine"
-                # background run (matching_router.py's
-                # _run_matching_engine_background), which also requires
-                # User.role == "CONSULTANT" and User.is_authorized ==
-                # True. All three call sites feed the same
-                # run_matching_for_requirement(), so this one was still
-                # scoring a re-parsed requirement against a broader,
-                # inconsistent roster than the manual "Run Engine" button
-                # uses. Matches that filter exactly.
-                cons_res = await db.execute(
-                    select(Consultant)
-                    .join(User, Consultant.user_id == User.id)
-                    .where(
-                        Consultant.status == "ACTIVE",
-                        User.role == "CONSULTANT",
-                        User.is_authorized == True,
-                    )
-                )
-                consultants = cons_res.scalars().all()
-                existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
-                existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
-                await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
-                await db.commit()
         except Exception as match_err:
             print(f"[reparse_email] auto-match FAILED for requirement_id={requirement_id}: {match_err}")
             from error_logger import log_db_error

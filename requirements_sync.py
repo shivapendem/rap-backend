@@ -283,63 +283,10 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 2000) -> dict:
                     # an ongoing basis. Local import avoids a top-level
                     # circular import between this module and phase4.
                     try:
+                        # Single engine — writes RequirementConsultantMatch
+                        # directly, one pass, no second table to keep in sync.
                         from phase4 import match_requirement
                         await match_requirement(db, save_result["id"])
-
-                        # Also run the JobMatch engine to populate Pending Applications
-                        from models import Requirement, Consultant, JobMatch
-                        from sqlalchemy.future import select
-                        from matching_router import run_matching_for_requirement
-                        req_res = await db.execute(select(Requirement).where(Requirement.id == save_result["id"]))
-                        req_obj = req_res.scalars().first()
-                        if req_obj:
-                            # BUG FIX: run_matching_for_requirement now takes the
-                            # active consultant roster and existing-match pairs
-                            # as arguments instead of re-querying them itself
-                            # (that redundant per-call query was fine for this
-                            # single-requirement call site, but was the source
-                            # of a real N+1 timeout on the bulk /matching/run
-                            # endpoint, which loops this over every open
-                            # requirement in one request — fixed there by
-                            # fetching both once per run instead of once per
-                            # requirement). One email can now yield several
-                            # requirements via the multi-requirement split
-                            # above, so this still runs once per SAVED
-                            # requirement, same as before per-item.
-                            # BUG FIX ("auto-synced requirements matched
-                            # against deactivated/non-consultant users"):
-                            # this used to query Consultant.status ==
-                            # "ACTIVE" alone, with no User join at all —
-                            # unlike the bulk "Run Engine" background run
-                            # (matching_router.py's
-                            # _run_matching_engine_background), which also
-                            # requires User.role == "CONSULTANT" and
-                            # User.is_authorized == True. Both call the
-                            # same run_matching_for_requirement(), so every
-                            # real-time auto-sync match was scored against
-                            # a broader, inconsistent roster than the
-                            # manual run uses — including consultants whose
-                            # account is deactivated. get_pending_matches
-                            # happens to filter is_authorized at read time
-                            # today, which is why this wasn't user-visible,
-                            # but it still created and scored stray
-                            # JobMatch rows for ineligible people on every
-                            # sync. Matches the bulk run's filter exactly.
-                            from models import User as _User
-                            cons_res = await db.execute(
-                                select(Consultant)
-                                .join(_User, Consultant.user_id == _User.id)
-                                .where(
-                                    Consultant.status == "ACTIVE",
-                                    _User.role == "CONSULTANT",
-                                    _User.is_authorized == True,
-                                )
-                            )
-                            consultants = cons_res.scalars().all()
-                            existing_res = await db.execute(select(JobMatch.requirement_id, JobMatch.consultant_id))
-                            existing_pairs = {(row[0], row[1]) for row in existing_res.all()}
-                            await run_matching_for_requirement(db, req_obj, consultants, existing_pairs)
-                            await db.commit()
 
                     except Exception as match_err:
                         # Don't let a matching failure undo the successful
