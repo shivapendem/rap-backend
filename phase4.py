@@ -72,8 +72,8 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # which is exactly what pushed past the request timeout.
 #
 # MATCHING_LOGIC_VERSION tags every row with the code version it was last
-# validated under (stored in the existing JSONB score_breakdown /
-# matching_info fields — no schema migration needed). A row already
+# validated under (stored in the existing JSONB score_breakdown field —
+# no schema migration needed). A row already
 # tagged with the CURRENT version gets skipped fast, restoring the old
 # performance for the common case (nothing changed since the last run).
 # A row from before a logic change (untagged, or tagged with an older
@@ -702,6 +702,19 @@ def score_role(
 
     req_tokens = _tokenize_role(_clear_role_text(requirement_role))
     req_domain = req_tokens - GENERIC_ROLE_WORDS
+    # BUG FIX ("SRE" vs "Site Reliability Engineer" scored 71.7, "PM" vs
+    # "Project Manager" scored 57.5 — below the PASS threshold, for what
+    # should be as exact a match as SYNONYMS can represent): when an
+    # acronym like "sre"/"pm" expands into its spelled-out words, the
+    # BARE ACRONYM TOKEN ITSELF stays in req_domain as one of the words
+    # that must overlap — but it can never literally appear in a
+    # consultant's title who wrote the term out in full, so it silently
+    # drags the domain ratio's denominator down every time the other side
+    # didn't happen to use the same abbreviation. The spelled-out
+    # expansion words are the real, comparable domain signal; the bare
+    # acronym is redundant once expanded (an acronym-vs-acronym match
+    # still scores fully via those same expansion words on both sides).
+    req_domain -= {t for t in req_domain if t in SYNONYMS and SYNONYMS[t] <= req_tokens}
     req_generic = req_tokens & GENERIC_ROLE_WORDS
 
     # (e) Requirement title is bare-generic (no domain word at all, e.g.
@@ -737,11 +750,30 @@ def score_role(
             # not a flat 0 and not a full match either.
             return _title_skill_topup(0.0, cap=NO_ROLE_SIGNAL_CAP)
         else:
+            # BUG FIX ("Data Engineer" / "Power BI Developer" / "SDET"
+            # scored a flat neutral 50 against a Salesforce-only or
+            # Java-only consultant): a multi-word title can reduce to an
+            # EMPTY domain purely as a side effect of GENERIC_ROLE_WORDS
+            # stripping every one of its words (e.g. "data"+"engineer"
+            # are both generic) — that's not the same as the title
+            # genuinely having no stated specialization. Before falling
+            # back to "unknown, be neutral", check for ANY overlap using
+            # the full (pre-strip) word set — even shared generic words
+            # are real evidence of the same job function.
+            if req_tokens and (req_tokens & pref_tokens):
+                overlap_ratio = len(req_tokens & pref_tokens) / len(req_tokens)
+                return _title_skill_topup(round(overlap_ratio * BARE_GENERIC_CAP, 2), cap=BARE_GENERIC_CAP)
+            if req_tokens and len(req_tokens) > 1:
+                # A real multi-word title that shares NOTHING at all with
+                # the consultant's role history — treat like any other
+                # stated-but-non-overlapping specialization, not as "no
+                # signal". Role is mandatory.
+                return _title_skill_topup(0.0, cap=NO_ROLE_SIGNAL_CAP)
             # No domain word stated at all (e.g. plain "Full Stack
-            # Developer" once its skill clause is stripped) — genuinely
-            # unknown, not a conflict. Skills can nudge the neutral
-            # baseline up toward a soft maybe, capped below a confident
-            # match.
+            # Developer" once its skill clause is stripped, or a single
+            # bare generic word) — genuinely unknown, not a conflict.
+            # Skills can nudge the neutral baseline up toward a soft
+            # maybe, capped below a confident match.
             return _title_skill_topup(50.0, cap=BARE_GENERIC_CAP)
 
     domain_overlap = req_domain & pref_tokens
@@ -889,6 +921,23 @@ def score_employment_type(requirement_types: Optional[List[str]], consultant_typ
     return 100.0 if overlap else 0.0
 
 
+STATE_ABBREVIATIONS: dict[str, str] = {
+    "al": "alabama", "ak": "alaska", "az": "arizona", "ar": "arkansas",
+    "ca": "california", "co": "colorado", "ct": "connecticut", "de": "delaware",
+    "fl": "florida", "ga": "georgia", "hi": "hawaii", "id": "idaho",
+    "il": "illinois", "in": "indiana", "ia": "iowa", "ks": "kansas",
+    "ky": "kentucky", "la": "louisiana", "me": "maine", "md": "maryland",
+    "ma": "massachusetts", "mi": "michigan", "mn": "minnesota", "ms": "mississippi",
+    "mo": "missouri", "mt": "montana", "ne": "nebraska", "nv": "nevada",
+    "nh": "new hampshire", "nj": "new jersey", "nm": "new mexico", "ny": "new york",
+    "nc": "north carolina", "nd": "north dakota", "oh": "ohio", "ok": "oklahoma",
+    "or": "oregon", "pa": "pennsylvania", "ri": "rhode island", "sc": "south carolina",
+    "sd": "south dakota", "tn": "tennessee", "tx": "texas", "ut": "utah",
+    "vt": "vermont", "va": "virginia", "wa": "washington", "wv": "west virginia",
+    "wi": "wisconsin", "wy": "wyoming", "dc": "district of columbia",
+}
+
+
 def score_location(requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]) -> float:
     """
     Location/work mode compatibility.
@@ -925,9 +974,40 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
         if not consultant.preferred_locations:
             score += 60.0
         else:
-            req_loc = requirement.location.lower()
+            req_loc = requirement.location.lower().strip()
             pref_locs = consultant.preferred_locations.lower()
-            if req_loc in pref_locs:
+            # BUG FIX (state-code false positives): a raw substring check
+            # ("ca" in pref_locs) collides constantly with ordinary
+            # English — "CA" (California) matched any consultant who
+            # listed "North Carolina"; "OR" (Oregon) matched "Florida";
+            # "IN" (Indiana) matched "Austin". Word-boundary matching on
+            # each individual location phrase (split on the usual list
+            # delimiters) keeps the intended behavior — a full city/
+            # region name still matches inside a longer "City, ST" value
+            # — while requiring a short code like a state abbreviation to
+            # appear as its own token. A small explicit abbreviation<->
+            # full-name table (STATE_ABBREVIATIONS, see matching_engine.py)
+            # handles "CA" vs "California" properly instead of relying on
+            # substring luck that only worked for a few states by
+            # coincidence and silently failed for most others (TX/Texas,
+            # NY/New York).
+            pref_phrases = [p.strip() for p in re.split(r'[,;/]', pref_locs) if p.strip()]
+
+            def _phrase_matches(phrase: str) -> bool:
+                if (
+                    re.search(r'\b' + re.escape(phrase) + r'\b', req_loc) is not None
+                    or re.search(r'\b' + re.escape(req_loc) + r'\b', phrase) is not None
+                ):
+                    return True
+                req_full = STATE_ABBREVIATIONS.get(req_loc)
+                phrase_full = STATE_ABBREVIATIONS.get(phrase)
+                if req_full and re.search(r'\b' + re.escape(req_full) + r'\b', phrase):
+                    return True
+                if phrase_full and re.search(r'\b' + re.escape(phrase_full) + r'\b', req_loc):
+                    return True
+                return False
+
+            if any(_phrase_matches(p) for p in pref_phrases):
                 score += 60.0
 
     # Work mode match — compare against most recent experience entry's work_mode

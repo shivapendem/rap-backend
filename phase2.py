@@ -45,14 +45,8 @@ from models import User, Requirement, Email
 from auth import get_current_user
 from pipeline import process_email
 from parser import parse_requirement
-from cleaner import clean_requirement_text, html_to_text, is_junk_plain_text, strip_css_junk
+from cleaner import clean_requirement_text, html_to_text
 from dedup import create_jd_hash, build_dedup_key, save_requirement
-# Same HTML-vs-plain-text detection the parsing pipeline already uses
-# (pipeline.py, requirements_sync.py) — imported rather than reimplemented,
-# so the Raw Email Viewer converts a given email exactly the same way the
-# parser did, instead of drifting out of sync with a second, separate
-# HTML-detection rule of its own.
-from requirements_sync import _looks_like_html
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +200,18 @@ async def get_requirement_detail(
     # of parsed_fields instead.
     parsed_fields = requirement.parsed_fields or {}
 
+    # Live count — not the cached ats_match_count column, which only ever
+    # refreshed when this specific requirement was rematched. Matches the
+    # exact same query the requirements list and Pending Applications use.
+    from models import RequirementConsultantMatch as _RCM
+    match_count_result = await db.execute(
+        select(func.count()).select_from(_RCM).where(
+            _RCM.requirement_id == requirement_id,
+            _RCM.status == "MATCHING",
+        )
+    )
+    live_match_count = match_count_result.scalar_one()
+
     return RequirementDetailResponse(
         id=str(requirement.id),
         role=requirement.role,
@@ -223,7 +229,7 @@ async def get_requirement_detail(
         job_description=requirement.job_description,
         parsed_fields=requirement.parsed_fields,
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
-        ats_match_count=requirement.ats_match_count,
+        ats_match_count=live_match_count,
         status=requirement.status,
         received_date=requirement.received_date.isoformat() if requirement.received_date else None,
     )
@@ -326,53 +332,6 @@ async def parse_text_endpoint(
 # All columns included as per table structure
 # ---------------------------------------------------------------------------
 
-def _build_display_body(body_text: Optional[str], body_html: Optional[str]) -> str:
-    """
-    BUG FIX ("raw mail" showing full HTML source — tags, <style> blocks,
-    the whole document — instead of readable text): the Raw Email Viewer
-    (RawEmailModal.tsx) put whichever of body_text/body_html it got
-    straight into a <pre>, verbatim. Many recruiter/ATS senders (e.g.
-    Quantum World Technologies' templated postings) send HTML-only email
-    with no text/plain MIME part at all — decode_gmail_body /
-    gmail_reader.py leave body_text as "" for these, which is a fact
-    about the source email, not a bug — so the viewer's own fallback
-    chain (frontend's fetchRawEmail: body_text || body_html) landed on
-    raw body_html and displayed it as literal text.
-
-    This does NOT touch how body_text/body_html are stored or how the
-    parsing pipeline reads them — requirements_sync.py's own
-    _looks_like_html/is_junk_plain_text checks still see the original,
-    unmodified columns, exactly as before. It only computes a
-    human-readable rendering for on-screen viewing, reusing the exact
-    same detection/conversion the parser already trusts (identical to
-    the inline selection logic in pipeline.py's manual-reparse path) so
-    what the person sees here matches what the parser actually saw.
-    """
-    body_text = body_text or ""
-    body_html = body_html or ""
-
-    if _looks_like_html(body_text):
-        candidate = html_to_text(body_text)
-    elif body_text and not is_junk_plain_text(body_text):
-        candidate = body_text
-    elif body_html:
-        candidate = html_to_text(body_html)
-    elif body_text:
-        candidate = strip_css_junk(body_text)
-    else:
-        candidate = ""
-
-    # BUG FIX (regression guard): the frontend's fetchRawEmail does
-    # `raw.body || raw.body_text || raw.body_html || "(empty)"`. An empty
-    # string here is falsy, so if a real HTML email happens to yield no
-    # visible text (e.g. a purely image/table layout with no text nodes)
-    # the chain would fall through PAST this field to raw.body_html --
-    # silently reintroducing the exact raw-markup display this function
-    # exists to prevent. Returning a non-empty, explicit message instead
-    # of "" guarantees this field always wins that fallback chain.
-    return candidate.strip() or "(no readable text content in this email)"
-
-
 @router.get(
     "/api/admin/raw-emails/{email_id}",
     summary="Get raw email — checks gmail_emails first, falls back to emails table",
@@ -466,14 +425,7 @@ async def get_raw_email(
     )
     row = result.mappings().first()
     if row:
-        return {
-            "source": "gmail_emails",
-            # Readable rendering for the viewer, alongside the untouched
-            # raw body_text/body_html columns (still included via the
-            # spread below) — see _build_display_body's docstring.
-            "body": _build_display_body(row["body_text"], row["body_html"]),
-            **dict(row),
-        }
+        return {"source": "gmail_emails", **dict(row)}
 
     # Fall back to the emails table — this is the correct source for any
     # requirement created after the raw_email_id FK fix.
@@ -495,10 +447,6 @@ async def get_raw_email(
         "cc_addresses": email.cc_addresses,
         "bcc_addresses": email.bcc_addresses,
         "reply_to": email.reply_to_address,
-        # Readable rendering for the viewer — see _build_display_body's
-        # docstring; body_text/body_html below stay the untouched raw
-        # columns, exactly as before.
-        "body": _build_display_body(email.body_text, email.body_html),
         "body_text": email.body_text,
         "body_html": email.body_html,
         "date": email.received_at,
