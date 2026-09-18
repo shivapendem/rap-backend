@@ -3980,11 +3980,19 @@ def normalize_employment_types(employment_types: Optional[List[str]]) -> List[st
     'C2C' and 'CONTRACT' mean the same engagement when both are present
     for one requirement; only 'C2C' is kept. Also de-dupes any other
     repeated entries while preserving original order.
+
+    BUG FIX ("Contract-to-Hire (C2H) also comes back tagged CONTRACT"):
+    CONTRACT's own bare 'contract' keyword unavoidably word-boundary-
+    matches inside "contract to hire"/"contract-to-hire" text too, so any
+    C2H posting was tagged with BOTH 'C2H' and 'CONTRACT'. Same fix, same
+    precedence: keep the more specific 'C2H', drop 'CONTRACT'.
     """
     if not employment_types:
         return employment_types
     deduped = list(dict.fromkeys(employment_types))  # de-dupe, keep order
     if "C2C" in deduped and "CONTRACT" in deduped:
+        deduped = [t for t in deduped if t != "CONTRACT"]
+    if "C2H" in deduped and "CONTRACT" in deduped:
         deduped = [t for t in deduped if t != "CONTRACT"]
     return deduped
 
@@ -6010,6 +6018,19 @@ def parse_requirement(
             vendor_name = body_name
         if body_company and body_company.strip().lower() != (body_name or '').strip().lower():
             vendor_name = f"{vendor_name} ({body_company})" if vendor_name else body_company
+
+    # BUG FIX ("client incorrectly set to vendor/recruiting company when
+    # no real client is named" -- confirmed real case): only overrides
+    # when no genuine "Client:" label grounds the value.
+    if client and vendor_name and not _CLIENT_LABEL_PRESENT_RE.search(full_text):
+        _client_lower = client.strip().lower()
+        _vendor_lower = vendor_name.strip().lower()
+        if _client_lower and _vendor_lower and (
+            _client_lower == _vendor_lower
+            or _client_lower in _vendor_lower
+            or _vendor_lower in _client_lower
+        ):
+            client = None
 
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email
