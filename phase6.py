@@ -1345,15 +1345,19 @@ async def _run_generation_pipeline(
     )
     db.add(generated)
 
-    # ── Step 11: Update match status ─────────────────────────────────────
-    match.status = "READY_TO_APPLY" if final_status == "READY" else "RESUME_GENERATED"
+    # ── Step 11: Update resume status ────────────────────────────────────
+    # resume_status is independent of `status` now — this only ever tracks
+    # resume-generation progress. It never overwrites `status`, so the
+    # matching engine's MATCHING/APPLIED/REJECTED/NOT_ELIGIBLE state can't
+    # be clobbered by a resume being generated, and vice versa.
+    match.resume_status = "READY_TO_APPLY" if final_status == "READY" else "RESUME_GENERATED"
 
     await db.commit()
     await db.refresh(generated)
 
     logger.info(
-        "Generation complete: id=%s ats=%s status=%s match_status=%s",
-        generated.id, ats_total, final_status, match.status,
+        "Generation complete: id=%s ats=%s status=%s match_status=%s resume_status=%s",
+        generated.id, ats_total, final_status, match.status, match.resume_status,
     )
     return generated
 
