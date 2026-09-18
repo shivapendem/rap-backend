@@ -3587,31 +3587,15 @@ _NEGATIVE_FRAMING_SIGNAL_PATTERN = re.compile(
     r'\bnow\s+exploring\b|'
     r'\bemployment\s+type\s*:?\s*(?:\w+[\s\-]*)?\(?\s*(?:internal|n/?a)\)?\b'
 )
-# BUG FIX ("The previous Java Developer position in Dallas has been
-# closed and filled. However, we have a new similar opening available:
-# Role: Java Developer Location: Austin, TX..." -- confirmed real
-# scenario; ported from the identical fix in the cron copy of this
-# file): a stale/closed mention describing a DIFFERENT, PAST position
-# shouldn't block a genuinely new opening that follows.
-_NEW_OPENING_AFTER_CLOSED_PATTERN = re.compile(
-    r'(?i)(?:\b(?:however|but)\b|[\-:])\s*.{0,60}\b(?:new|another|similar|different)\s+'
-    r'(?:opening|position|role|requirement)\s+(?:is\s+)?available\b'
-)
 
 
 def _has_negative_framing_signal(full_text: str) -> bool:
     """True when `full_text` contains a stale/closed/candidate-framing
     signal that should block the structured-signal bypass even when 3+
-    fields are found -- checks every match, not just the first.
-    """
+    fields are found."""
     if not full_text:
         return False
-    for m in _NEGATIVE_FRAMING_SIGNAL_PATTERN.finditer(full_text):
-        following = full_text[m.end():m.end() + 150]
-        if _NEW_OPENING_AFTER_CLOSED_PATTERN.search(following):
-            continue
-        return True
-    return False
+    return bool(_NEGATIVE_FRAMING_SIGNAL_PATTERN.search(full_text))
 
 
 def _crop_before_signature_block(text: str) -> str:
@@ -4031,6 +4015,54 @@ def normalize_employment_types(employment_types: Optional[List[str]]) -> List[st
     if "C2H" in deduped and "CONTRACT" in deduped:
         deduped = [t for t in deduped if t != "CONTRACT"]
     return deduped
+
+
+def _validate_employment_types_against_negation(types: Optional[List[str]], full_text: str) -> Optional[List[str]]:
+    """
+    Deterministic backstop for employment_types, regardless of whether
+    the list came from the AI stage or the regex fallback.
+
+    BUG FIX (raised as a real gap: a prompt instruction telling the AI
+    to watch for negation -- "No C2C", "W2 only" -- is not a guarantee.
+    extract_employment_types() already has proven negation-awareness
+    (_NEGATION_BEFORE), but it was only ever reached via
+    `ai_employment_types or extract_employment_types(...)` -- an `or`,
+    not a merge -- so the moment the AI stage returned ANY non-empty
+    list, this deterministic check never ran on it at all. A cheap
+    model getting negation wrong (e.g. returning ['C2C'] for an email
+    that says "No C2C. W2 only.") had zero code-level safety net.
+
+    Reuses the exact same keyword/negation-window logic already proven
+    in extract_employment_types() rather than inventing a second,
+    possibly-diverging negation rule. A type is kept if the text
+    contains at least one NON-negated mention of one of its keywords,
+    or no mention of it at all (nothing here contradicts the AI's
+    claim, e.g. an oral-only agreement never written in the email). It
+    is dropped only when every mention actually found is negated.
+    """
+    if not types or not full_text:
+        return types
+    text_lower = normalize_text(full_text).lower()
+    kept = []
+    for t in types:
+        if t == "UNKNOWN" or t not in EMPLOYMENT_KEYWORDS:
+            kept.append(t)
+            continue
+        any_occurrence = False
+        any_unnegated = False
+        for keyword in EMPLOYMENT_KEYWORDS[t]:
+            for m in re.finditer(rf'\b{re.escape(keyword)}\b', text_lower):
+                any_occurrence = True
+                window = text_lower[max(0, m.start() - 20):m.start()]
+                if not _NEGATION_BEFORE.search(window):
+                    any_unnegated = True
+                    break
+            if any_unnegated:
+                break
+        if any_unnegated or not any_occurrence:
+            kept.append(t)
+        # else: every mention of this type in the email was negated — drop it.
+    return kept if kept else ["UNKNOWN"]
 
 
 # BUG FIX: "Candidate should NOT be more than 15 years of experience" (a
@@ -5962,6 +5994,11 @@ def parse_requirement(
 
     ai_employment_types = _ai_field('employment_types', unknown_value=['UNKNOWN'])
     employment_types = ai_employment_types or extract_employment_types(full_text)
+    # Deterministic negation backstop — see
+    # _validate_employment_types_against_negation()'s docstring. Applies
+    # regardless of source, so an AI-returned type the email explicitly
+    # negates doesn't survive purely because the AI happened to succeed.
+    employment_types = _validate_employment_types_against_negation(employment_types, full_text)
     # De-dupe semantically-identical tags (e.g. "C2C" + "CONTRACT" both
     # present for the same posting) — see normalize_employment_types().
     employment_types = normalize_employment_types(employment_types)

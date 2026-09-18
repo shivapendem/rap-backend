@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Optional
@@ -706,10 +707,33 @@ async def reparse_email(
             requirement_id = result["id"]
 
         # ---- Step 5: mark processed/parsed on whichever raw source we used ----
+        # BUG FIX ("Reparse a 'Parsed - Dup' email -> briefly shows Parsed,
+        # then corrects itself back to Parsed - Dup a little later" --
+        # confirmed real case, and worse than a display glitch): this
+        # unconditionally hardcoded status_desc = 'Pending', regardless of
+        # what requirement_status (available right above, from Step 4) had
+        # just determined. 'Pending' isn't a display bug in isolation --
+        # it's requirements_sync.py's own SELECT criteria for "still needs
+        # processing" (`status_desc IS NULL OR = 'Pending' OR = 'Failed'`,
+        # combined with `NOT EXISTS (... WHERE raw_email_id = ge.id)`,
+        # which a correctly-identified duplicate always satisfies since it
+        # has no Requirement of its own). So every reparse -- duplicate or
+        # not -- silently made this email eligible to be picked up and
+        # reprocessed AGAIN by the next background sync cycle: a second,
+        # completely invisible, wasted AI call for every single reparse.
+        # For a duplicate, THAT second pass is what actually set the
+        # correct 'Parsed - Dup' -- the "self-correction" the person saw
+        # was this hidden extra reprocessing quietly doing the job Step 5
+        # should have done immediately. Mapping requirement_status directly
+        # to the same status_desc convention requirements_sync.py's own
+        # final_status logic already uses ("duplicate" -> "Parsed - Dup",
+        # everything else -> "Parsed") sets the right value the first time
+        # and removes it from the background loop's pending queue for good.
+        status_desc = "Parsed - Dup" if requirement_status == "duplicate" else "Parsed"
         if source_gmail_emails_id is not None:
             await db.execute(
-                text("UPDATE gmail_emails SET processed = true, status_desc = 'Pending' WHERE id = :id"),
-                {"id": source_gmail_emails_id}
+                text("UPDATE gmail_emails SET processed = true, status_desc = :status_desc WHERE id = :id"),
+                {"id": source_gmail_emails_id, "status_desc": status_desc}
             )
         email.parse_status = "PARSED"
         await db.commit()
@@ -745,7 +769,22 @@ async def reparse_email(
             # an admin separately clicked "Run Engine". Same call
             # requirements_sync.py already makes for a brand-new
             # requirement — applying it here too for a re-parsed one.
-            from models import Requirement, Consultant, JobMatch, User
+            # BUG FIX ("Reparse failed (500): local variable 'Requirement'
+            # referenced before assignment"): this local `from models
+            # import` re-imported Requirement (and User) even though both
+            # are already imported at module level (see the top of this
+            # file). Python treats any name assigned anywhere in a
+            # function -- including via a later local import -- as local
+            # to that function for its ENTIRE scope, from the very first
+            # line. That silently turned every earlier use of
+            # `Requirement` in this function (e.g. the existing-requirement
+            # lookup in Step 4, well before this line even runs) into a
+            # reference to a not-yet-assigned local variable instead of
+            # the module-level import, crashing every single reparse
+            # attempt. Consultant and JobMatch aren't imported at module
+            # level, so they still need to be imported here -- only the
+            # two redundant, bug-causing names are removed.
+            from models import Consultant, JobMatch
             from matching_router import run_matching_for_requirement
             req_res = await db.execute(select(Requirement).where(Requirement.id == requirement_id))
             req_obj = req_res.scalars().first()
@@ -817,6 +856,15 @@ async def reparse_email(
 # nearly the entire day. Uses a real IANA zone (America/Chicago) rather
 # than a fixed offset so the CST (UTC-6) / CDT (UTC-5) daylight-saving
 # switch is handled automatically.
+#
+# NOTE: this is intentionally CST, not IST — confirmed as the correct
+# convention for this endpoint (matches phase8.py's separate, established
+# _CST_ZONE for this admin area's other date filters). The caller
+# (admin.api.ts's countEmailsIngestedToday()) must send a CST-based date
+# key, not an IST one — see that file's own fix for the matching half of
+# this. Sending an IST date key here, against this CST interpretation,
+# reintroduces a ~10.5 hour window mismatch and undercounts "today" for
+# roughly the first third of the IST calendar day.
 _CST_ZONE = ZoneInfo("America/Chicago")
 
 
@@ -864,8 +912,49 @@ async def get_gmail_emails(
         where_clauses.append("processed = :processed")
         params["processed"] = processed
     if search:
-        where_clauses.append("(subject ILIKE :search OR from_address ILIKE :search OR from_name ILIKE :search)")
-        params["search"] = f"%{search}%"
+        # BUG FIX ("search shows 'no results' for a requirement that
+        # genuinely exists" -- confirmed real case): only subject,
+        # from_address, and from_name were ever searched -- never the
+        # actual email body. That works whenever the search term happens
+        # to be repeated in the subject line (common for role names,
+        # since many recruiters put the title there), and silently fails
+        # for anything only present in the body -- a skill, a client
+        # name, a role phrased differently in the body than the subject,
+        # or a subject that's just a generic "Urgent Requirement" with no
+        # identifying text at all. Adding body_text/body_html so a real
+        # match anywhere in the email is actually found.
+        #
+        # BUG FIX ("no results for SOME requirements, even when the
+        # subject text is clearly right there" -- confirmed real case):
+        # a subject/body originating from an HTML email frequently
+        # contains &nbsp; entities, which decode to U+00A0 (a NON-
+        # BREAKING space), not a regular space (U+0020). It renders
+        # visually identical to a normal space in any UI, so a person
+        # typing a search term with an ordinary keyboard space at that
+        # word boundary produces a search string that is byte-for-byte
+        # different from the stored text at exactly that point --
+        # ILIKE's substring match is exact about whitespace, so it
+        # silently fails right there even though the text "obviously"
+        # matches to the eye. The same HTML-to-text flattening can also
+        # leave runs of multiple consecutive spaces where a person would
+        # only type one. Normalizing BOTH sides -- the stored columns
+        # (regexp_replace, converting nbsp to a plain space and
+        # collapsing whitespace runs) and the incoming search term
+        # (same normalization in Python, right below) -- means a person
+        # can search with ordinary single spaces and match regardless of
+        # what invisible whitespace variant the source HTML happened to
+        # decode into.
+        _ws_normalize_sql = (
+            "regexp_replace(REPLACE({col}, chr(160), ' '), '\\s+', ' ', 'g')"
+        )
+        where_clauses.append(
+            "(" + " OR ".join(
+                f"{_ws_normalize_sql.format(col=col)} ILIKE :search"
+                for col in ("subject", "from_address", "from_name", "body_text", "body_html")
+            ) + ")"
+        )
+        _normalized_search = re.sub(r"\s+", " ", search.replace("\xa0", " ")).strip()
+        params["search"] = f"%{_normalized_search}%"
     if date_from:
         where_clauses.append("date >= :date_from")
         try:
