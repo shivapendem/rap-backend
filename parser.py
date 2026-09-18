@@ -3567,15 +3567,31 @@ _NEGATIVE_FRAMING_SIGNAL_PATTERN = re.compile(
     r'\bnow\s+exploring\b|'
     r'\bemployment\s+type\s*:?\s*(?:\w+[\s\-]*)?\(?\s*(?:internal|n/?a)\)?\b'
 )
+# BUG FIX ("The previous Java Developer position in Dallas has been
+# closed and filled. However, we have a new similar opening available:
+# Role: Java Developer Location: Austin, TX..." -- confirmed real
+# scenario; ported from the identical fix in the cron copy of this
+# file): a stale/closed mention describing a DIFFERENT, PAST position
+# shouldn't block a genuinely new opening that follows.
+_NEW_OPENING_AFTER_CLOSED_PATTERN = re.compile(
+    r'(?i)(?:\b(?:however|but)\b|[\-:])\s*.{0,60}\b(?:new|another|similar|different)\s+'
+    r'(?:opening|position|role|requirement)\s+(?:is\s+)?available\b'
+)
 
 
 def _has_negative_framing_signal(full_text: str) -> bool:
     """True when `full_text` contains a stale/closed/candidate-framing
     signal that should block the structured-signal bypass even when 3+
-    fields are found."""
+    fields are found -- checks every match, not just the first.
+    """
     if not full_text:
         return False
-    return bool(_NEGATIVE_FRAMING_SIGNAL_PATTERN.search(full_text))
+    for m in _NEGATIVE_FRAMING_SIGNAL_PATTERN.finditer(full_text):
+        following = full_text[m.end():m.end() + 150]
+        if _NEW_OPENING_AFTER_CLOSED_PATTERN.search(following):
+            continue
+        return True
+    return False
 
 
 def _crop_before_signature_block(text: str) -> str:
