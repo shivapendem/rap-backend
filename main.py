@@ -906,7 +906,20 @@ async def get_requirements(
         # array membership. Falls back to a no-op filter on the SQLite dev
         # path where this column is stored as JSON text instead.
         if DATABASE_URL.startswith("postgresql"):
-            query = query.where(Requirement.employment_types.any(employment_type))
+            EMPLOYMENT_TYPE_BUCKET_EXPANSION = {
+                "C2C": ["C2C", "CONTRACT", "C2H"],
+                "W2": ["W2"],
+                "1099": ["1099"],
+                "FULLTIME": ["FULLTIME"],
+                "FULL_TIME": ["FULLTIME"],
+            }
+            raw_types = EMPLOYMENT_TYPE_BUCKET_EXPANSION.get(
+                employment_type.upper(), [employment_type]
+            )
+            if len(raw_types) == 1:
+                query = query.where(Requirement.employment_types.any(raw_types[0]))
+            else:
+                query = query.where(Requirement.employment_types.overlap(raw_types))
 
     if search:
         # BUG FIX: only matched role/vendor_email — searching by client,
