@@ -89,7 +89,6 @@ class RequirementDetailResponse(BaseModel):
     job_description: Optional[str] = None
     parsed_fields: Optional[dict] = None
     parse_confidence: Optional[float] = None
-    ats_match_count: Optional[int] = None
     status: str
     received_date: Optional[str] = None
 
@@ -201,18 +200,6 @@ async def get_requirement_detail(
     # of parsed_fields instead.
     parsed_fields = requirement.parsed_fields or {}
 
-    # Live count — not the cached ats_match_count column, which only ever
-    # refreshed when this specific requirement was rematched. Matches the
-    # exact same query the requirements list and Pending Applications use.
-    from models import RequirementConsultantMatch as _RCM
-    match_count_result = await db.execute(
-        select(func.count()).select_from(_RCM).where(
-            _RCM.requirement_id == requirement_id,
-            _RCM.status == "MATCHING",
-        )
-    )
-    live_match_count = match_count_result.scalar_one()
-
     return RequirementDetailResponse(
         id=str(requirement.id),
         role=requirement.role,
@@ -230,7 +217,6 @@ async def get_requirement_detail(
         job_description=requirement.job_description,
         parsed_fields=requirement.parsed_fields,
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
-        ats_match_count=live_match_count,
         status=requirement.status,
         received_date=requirement.received_date.isoformat() if requirement.received_date else None,
     )
@@ -692,7 +678,7 @@ async def reparse_email(
         raise HTTPException(status_code=500, detail=f"Reparse failed: {e}")
 
     # BUG FIX: nothing here ever ran matching, so a manually reparsed
-    # requirement's ats_match_count stayed at 0 the same way auto-synced
+    # requirement's match count stayed at 0 the same way auto-synced
     # ones did (see requirements_sync.py) until an admin separately
     # clicked "Rematch"/"Match All". Trigger it here too so reparse
     # always leaves the requirement with a real match count.

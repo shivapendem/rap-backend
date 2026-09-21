@@ -13,6 +13,9 @@
 # ---------------------------------------------------------------------------
 
 from typing import Optional, List, Any
+
+# Preferred Location is a fixed single-select on the frontend.
+PREFERRED_LOCATION_OPTIONS = ("All", "Onsite", "Hybrid", "Remote")
 import re
 from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
@@ -231,7 +234,6 @@ class ConsultantAdminRowDTO(BaseModel):
     preferred_locations: Optional[str] = None
     availability_status: Optional[str] = None
     total_experience_years: Optional[float] = None
-    secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     ats_score: Optional[float] = None
     linkedin_url: Optional[str] = None
@@ -284,7 +286,6 @@ class UpdateConsultantRequestDTO(BaseModel):
     current_location: Optional[str] = None
     preferred_locations: Optional[str] = None
     total_experience_years: Optional[float] = None
-    secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     linkedin_url: Optional[str] = None
     education: Optional[List[EducationEntryDTO]] = None
@@ -312,13 +313,20 @@ class UpdateConsultantRequestDTO(BaseModel):
     # sent as empty" (someone tried to clear a required value) is
     # rejected. No model_fields_set bookkeeping needed for that reason.
     @field_validator(
-        "primary_skills", "secondary_skills", "current_location",
+        "primary_skills", "current_location",
         "preferred_locations", "preferred_roles",
     )
     @classmethod
     def validate_required_text_fields(cls, v: Optional[str], info) -> Optional[str]:
         if v is not None and not v.strip():
             raise ValueError(f"{info.field_name} is required and cannot be cleared")
+        return v
+
+    @field_validator("preferred_locations")
+    @classmethod
+    def validate_preferred_locations_value(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v.strip() and v.strip() not in PREFERRED_LOCATION_OPTIONS:
+            raise ValueError(f"preferred_locations must be one of {PREFERRED_LOCATION_OPTIONS}")
         return v
 
     @field_validator("phone")

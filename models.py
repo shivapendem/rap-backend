@@ -96,12 +96,16 @@ class Consultant(Base):
     phone = Column(Text, nullable=True)
     sales_recruiter_user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     current_location = Column(Text, nullable=True)
+    # Now a fixed single-select on the frontend: "All" | "Onsite" | "Hybrid" | "Remote".
+    # Column stays Text (SQLite/Postgres portability) — validated at the
+    # Pydantic layer (see phase_users_schema.py PREFERRED_LOCATION_OPTIONS).
     preferred_locations = Column(Text, nullable=True)
     work_authorization = Column(Text, nullable=True)
     availability_status = Column(Text, nullable=True)
     total_experience_years = Column(Numeric, nullable=True)
     primary_skills = Column(Text, nullable=True)
-    secondary_skills = Column(Text, nullable=True)
+    # MIGRATION REQUIRED — secondary_skills column removed:
+    #     ALTER TABLE consultants DROP COLUMN secondary_skills;
     preferred_roles = Column(Text, nullable=True)
     # MIGRATION REQUIRED — same as User.mobile_number/extension/linkedin_url
     # above: ALTER TABLE consultants ADD COLUMN linkedin_url TEXT;
@@ -306,7 +310,10 @@ class Requirement(Base):
     dedup_key = Column(Text, nullable=True, unique=True, index=True)  # Phase 2: vendor_email|role|jd_hash
     parsed_fields = JSONBColumn(nullable=True)
     parse_confidence = Column(Numeric(5, 2), default=0)
-    ats_match_count = Column(Integer, default=0)
+    # ats_match_count column removed — matched-consultant count is now
+    # always computed live (see main.py get_requirements / phase2.py
+    # get_requirement_detail), so a cached column could only ever go
+    # stale. Nothing writes or reads this column anymore.
     status = Column(Text, nullable=False, default="NEW", index=True)
     received_date = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())

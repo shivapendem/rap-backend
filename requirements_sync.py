@@ -276,12 +276,12 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 2000) -> dict:
                     saved += 1
                     # BUG FIX: nothing ever called match_requirement() for
                     # requirements created here — only the manual admin
-                    # "Rematch"/"Match All" buttons did. That left
-                    # ats_match_count stuck at its column default of 0 for
-                    # every auto-synced requirement forever, since this loop
-                    # is the only path that creates new Requirement rows on
-                    # an ongoing basis. Local import avoids a top-level
-                    # circular import between this module and phase4.
+                    # "Rematch"/"Match All" buttons did. That left every
+                    # auto-synced requirement with zero real matches
+                    # recorded forever, since this loop is the only path
+                    # that creates new Requirement rows on an ongoing
+                    # basis. Local import avoids a top-level circular
+                    # import between this module and phase4.
                     try:
                         # Single engine — writes RequirementConsultantMatch
                         # directly, one pass, no second table to keep in sync.

@@ -240,7 +240,6 @@ async def update_consultant(
         current_location=body.current_location,
         preferred_locations=body.preferred_locations,
         total_experience_years=body.total_experience_years,
-        secondary_skills=body.secondary_skills,
         preferred_roles=body.preferred_roles,
         linkedin_url=body.linkedin_url,
         education=[e.model_dump() for e in body.education] if body.education is not None else None,

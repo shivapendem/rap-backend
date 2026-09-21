@@ -62,8 +62,11 @@ from auth import (
 # requirements" error with no indication of which column caused it.
 ALLOWED_SORT_COLUMNS = {
     "received_date", "received_at", "role", "vendor", "client", "status",
-    "created_at", "ats_match_count", "vendor_email", "work_mode", "location",
+    "created_at", "vendor_email", "work_mode", "location",
     "parse_confidence",
+    # matched_count removed — it's computed live in Python after the DB
+    # query runs (see get_requirements below), not a real column, so the
+    # database has nothing to sort by for it.
 }
 
 # ---------------------------------------------------------------------------
@@ -131,7 +134,6 @@ class RequirementResponse(BaseModel):
     rate: Optional[str] = None
     experience: Optional[str] = None
     skills: Optional[str] = None
-    ats_match_count: Optional[int] = None
     parse_confidence: Optional[float] = None
     raw_email_id: Optional[int] = None
     # Names of consultants matched to this requirement — scoped to the
@@ -1049,12 +1051,11 @@ async def get_requirements(
             matches_by_req.setdefault(req_id, []).append(name)
 
         for r in reqs:
-            # Live count, not the cached ats_match_count column — this is
-            # what removes the discrepancy with Pending Applications for
-            # good: both now come from the exact same query (status ==
-            # "MATCHING"), computed at request time, every time.
+            # matched_consultants is what's actually shown (the "Matched
+            # Consultants" column) — matched_count was a separate numeric
+            # column that got removed as redundant; nothing reads it
+            # anymore.
             r.matched_consultants = matches_by_req.get(r.id, [])
-            r.ats_match_count = len(r.matched_consultants)
 
         # Which of those matched consultants already have a real SENT
         # application for this requirement — powers the "highlight

@@ -460,7 +460,6 @@ class RecruiterDashboardRow(BaseModel):
     rate: Optional[str] = None
     status: str
     received_date: Optional[str] = None
-    ats_match_count: int = 0
     # Only present when consultant_id filter is active
     match_score: Optional[float] = None
     match_status: Optional[str] = None

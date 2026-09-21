@@ -164,7 +164,6 @@ async def seed_db():
                         },
                         vendor_contact=random.choice(VENDOR_CONTACTS),
                         rate="$100/hr",
-                        ats_match_count=random.randint(1, 20),
                         parse_confidence=round(random.uniform(0.70, 0.99), 2),
                     )
                 )

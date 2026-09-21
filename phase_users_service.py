@@ -59,7 +59,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
     experience_count = exp_count_result.scalar_one()
 
     completeness = 0
-    if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
+    if (c.primary_skills or "").strip():
         completeness += 30  # Skills
     if experience_count > 0:
         completeness += 25  # Experience
@@ -140,7 +140,6 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         preferred_locations=c.preferred_locations,
         availability_status=c.availability_status,
         total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
-        secondary_skills=c.secondary_skills,
         preferred_roles=c.preferred_roles,
         ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
         # BUG FIX ("admin shows no education / different LinkedIn than the
@@ -275,7 +274,7 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
         latest_ats_score = latest_ats.get(c.user_id) if c.user_id else None
 
         completeness = 0
-        if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
+        if (c.primary_skills or "").strip():
             completeness += 30
         if experience_count > 0:
             completeness += 25
@@ -306,8 +305,7 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
             preferred_locations=c.preferred_locations,
             availability_status=c.availability_status,
             total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
-            secondary_skills=c.secondary_skills,
-            preferred_roles=c.preferred_roles,
+                preferred_roles=c.preferred_roles,
             ats_score=float(latest_ats_score) if latest_ats_score is not None else None,
             linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
             education=c.education or (resume_info or {}).get("education") or [],
@@ -631,7 +629,6 @@ class ConsultantAssignmentService:
         current_location: Optional[str] = None,
         preferred_locations: Optional[str] = None,
         total_experience_years: Optional[float] = None,
-        secondary_skills: Optional[str] = None,
         preferred_roles: Optional[str] = None,
         linkedin_url: Optional[str] = None,
         education: Optional[list] = None,
@@ -660,8 +657,6 @@ class ConsultantAssignmentService:
             consultant.preferred_locations = preferred_locations
         if total_experience_years is not None:
             consultant.total_experience_years = total_experience_years
-        if secondary_skills is not None:
-            consultant.secondary_skills = secondary_skills
         if preferred_roles is not None:
             consultant.preferred_roles = preferred_roles
         if linkedin_url is not None:
@@ -702,7 +697,7 @@ class ConsultantAssignmentService:
         # (summary, experience, etc.) untouched — same one-field-at-a-time
         # merge shape skills already used, just no longer skills-only.
         elif consultant.user_id and (
-            primary_skills is not None or secondary_skills is not None or education is not None
+            primary_skills is not None or education is not None
             or phone is not None or current_location is not None or linkedin_url is not None
             or total_experience_years is not None or preferred_roles is not None
         ):
@@ -710,9 +705,8 @@ class ConsultantAssignmentService:
             linked_user = user_result.scalars().first()
             if linked_user:
                 existing_info = dict(linked_user.resume_info or {})
-                if primary_skills is not None or secondary_skills is not None:
-                    combined = ", ".join(filter(None, [consultant.primary_skills, consultant.secondary_skills]))
-                    existing_info["skills"] = _skills_to_list(combined)
+                if primary_skills is not None:
+                    existing_info["skills"] = _skills_to_list(consultant.primary_skills or "")
                 if education is not None:
                     existing_info["education"] = education
                 if phone is not None:

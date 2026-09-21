@@ -261,17 +261,16 @@ def _build_profile_resume_info(
         )
 
     primary = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()]
-    secondary = [s.strip() for s in (consultant.secondary_skills or "").split(",") if s.strip()]
 
     profile_json = consultant.resume_info or {}
     tech_stack_json = profile_json.get("tech_stack") or {}
 
-    if not primary and not secondary:
-        primary = tech_stack_json.get("expert") or profile_json.get("skills") or []
-        secondary = (
-            (tech_stack_json.get("exposure") or [])
+    if not primary:
+        primary = (
+            (tech_stack_json.get("expert") or [])
+            + (tech_stack_json.get("exposure") or [])
             + (tech_stack_json.get("familiar") or [])
-        )
+        ) or profile_json.get("skills") or []
 
     if not experience_payload:
         experience_payload = [
@@ -306,8 +305,8 @@ def _build_profile_resume_info(
         # genuinely was on file — just not in this JSON blob.
         "linkedin": consultant.linkedin_url or profile_json.get("linkedin", ""),
         "github": profile_json.get("github", ""),
-        "tech_stack": {"expert": primary, "familiar": secondary},
-        "skills": primary + secondary,
+        "tech_stack": {"expert": primary, "familiar": []},
+        "skills": primary,
         "base_resume_text": consultant.base_resume_text or "",
         "experience": experience_payload,
         "education": profile_json.get("education") or profile_json.get("educational_background") or [],
@@ -416,7 +415,7 @@ def _validate_resume_output(resume_data: dict, consultant: Consultant) -> tuple[
     notes = resume_data.get("generation_notes", "")
     profile_skills_lower = set(
         s.strip().lower()
-        for s in (consultant.primary_skills or "").split(",") + (consultant.secondary_skills or "").split(",")
+        for s in (consultant.primary_skills or "").split(",")
         if s.strip()
     )
 

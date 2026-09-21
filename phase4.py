@@ -80,7 +80,7 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-09-05-role-mandatory-no-ai-skill-topup"
+MATCHING_LOGIC_VERSION = "2026-09-21-role-mandatory-acronym-location-fix"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
@@ -208,9 +208,8 @@ def extract_skills(text: Optional[str]) -> List[str]:
 
 
 def _consultant_skills(consultant: Consultant) -> List[str]:
-    """Combine primary + secondary skills text into a single skill list."""
-    combined = ", ".join(filter(None, [consultant.primary_skills, consultant.secondary_skills]))
-    return extract_skills(combined)
+    """Extract the consultant's skill list."""
+    return extract_skills(consultant.primary_skills or "")
 
 
 def _requirement_skills(requirement: Requirement) -> List[str]:
@@ -942,25 +941,15 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
     """
     Location/work mode compatibility.
     REMOTE requirement matches any consultant fully (location-agnostic).
-    Otherwise compare requirement.location against consultant.preferred_locations
-    and work_mode against the consultant's most recent experience entry.
 
-    BUG FIX (soft score disagreed with the hard gate on the exact same
-    consultant): location_passes() — the actual eligibility GATE this
-    score feeds a ranking for — already treats a consultant with no
-    preferred_locations stated as N/A and passes them, same "unspecified
-    = don't penalize" wildcard rule documented on every other Stage 0-4
-    filter and on score_employment_type()'s own matching fix above. This
-    function never got that same treatment: it only ever awarded the 60
-    location points when BOTH requirement.location AND
-    consultant.preferred_locations were present, so a consultant who
-    correctly passed the gate specifically BECAUSE they have no location
-    constraint still lost up to 10 weighted points (location is 10% of
-    the total in score_match()) on their ranking score for having
-    "failed" a location match that was never actually evaluated against
-    them. Now mirrors location_passes(): no stated consultant preference
-    counts as an open match, same as the requirement-side REMOTE case
-    above already does.
+    UPDATED: consultant.preferred_locations is now a fixed single-select
+    (PREFERRED_LOCATION_OPTIONS in phase_users_schema.py: "All" | "Onsite"
+    | "Hybrid" | "Remote") instead of a free-text city/state list — it is
+    compared directly against requirement.work_mode instead of
+    requirement.location text. "All" (or unset, for legacy rows saved
+    before this change) is treated as an open match, same "unspecified =
+    don't penalize" wildcard rule documented on every other Stage 0-4
+    filter and mirrored by location_passes() below.
     """
     req_work_mode = (requirement.work_mode or "").upper()
 
@@ -969,46 +958,12 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
 
     score = 0.0
 
-    # Location match
-    if requirement.location:
-        if not consultant.preferred_locations:
-            score += 60.0
-        else:
-            req_loc = requirement.location.lower().strip()
-            pref_locs = consultant.preferred_locations.lower()
-            # BUG FIX (state-code false positives): a raw substring check
-            # ("ca" in pref_locs) collides constantly with ordinary
-            # English — "CA" (California) matched any consultant who
-            # listed "North Carolina"; "OR" (Oregon) matched "Florida";
-            # "IN" (Indiana) matched "Austin". Word-boundary matching on
-            # each individual location phrase (split on the usual list
-            # delimiters) keeps the intended behavior — a full city/
-            # region name still matches inside a longer "City, ST" value
-            # — while requiring a short code like a state abbreviation to
-            # appear as its own token. A small explicit abbreviation<->
-            # full-name table (STATE_ABBREVIATIONS, see matching_engine.py)
-            # handles "CA" vs "California" properly instead of relying on
-            # substring luck that only worked for a few states by
-            # coincidence and silently failed for most others (TX/Texas,
-            # NY/New York).
-            pref_phrases = [p.strip() for p in re.split(r'[,;/]', pref_locs) if p.strip()]
-
-            def _phrase_matches(phrase: str) -> bool:
-                if (
-                    re.search(r'\b' + re.escape(phrase) + r'\b', req_loc) is not None
-                    or re.search(r'\b' + re.escape(req_loc) + r'\b', phrase) is not None
-                ):
-                    return True
-                req_full = STATE_ABBREVIATIONS.get(req_loc)
-                phrase_full = STATE_ABBREVIATIONS.get(phrase)
-                if req_full and re.search(r'\b' + re.escape(req_full) + r'\b', phrase):
-                    return True
-                if phrase_full and re.search(r'\b' + re.escape(phrase_full) + r'\b', req_loc):
-                    return True
-                return False
-
-            if any(_phrase_matches(p) for p in pref_phrases):
-                score += 60.0
+    # Preferred-location (work-mode) match
+    pref = (consultant.preferred_locations or "").strip().upper()
+    if not pref or pref == "ALL":
+        score += 60.0
+    elif req_work_mode and pref == req_work_mode:
+        score += 60.0
 
     # Work mode match — compare against most recent experience entry's work_mode
     if req_work_mode and experiences:
@@ -1213,10 +1168,15 @@ def location_passes(
     wildcard rule as every other Stage 1-4 filter. Otherwise reuses
     score_location()'s existing remote/onsite/hybrid compatibility rules
     unchanged, converted from a weighted score into a boolean pass/fail.
+
+    UPDATED: consultant.preferred_locations is now a fixed single-select
+    ("All" | "Onsite" | "Hybrid" | "Remote") — "All" (or unset, for legacy
+    rows) is the wildcard equivalent of the old "not stated" case.
     """
     if not requirement.location or requirement.location.strip().upper() == "N/A":
         return True, "requirement location is N/A — passes all"
-    if not consultant.preferred_locations or consultant.preferred_locations.strip().upper() == "N/A":
+    pref = (consultant.preferred_locations or "").strip().upper()
+    if not pref or pref == "ALL":
         return True, "consultant location constraint is N/A — matches requirement"
     score = score_location(requirement, consultant, experiences)
     return score > 0, f"location score={score}"
@@ -1574,7 +1534,6 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
             existing.match_reason = "consultant no longer active/authorized"
 
     match_count = sum(1 for m in existing_by_consultant.values() if m.status == "MATCHING")
-    requirement.ats_match_count = match_count
 
     await db.commit()
     logger.info(

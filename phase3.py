@@ -176,7 +176,7 @@ class ProfileUpdateRequest(BaseModel):
     # `if (updated.length === 0) return;` before ever calling mutate),
     # SkillTagInput.tsx's removeSkill had no equivalent guard, and every
     # OTHER component's auto-save (ProfileForm, WorkAuthSelect,
-    # EmploymentTypeCheckboxGroup) passes primarySkills/secondarySkills/
+    # EmploymentTypeCheckboxGroup) passes primarySkills/
     # workAuth straight through from the current profile prop unchanged
     # — so a brand-new consultant who never touches Skills or Work
     # Authorisation at all could still "successfully" save every other
@@ -184,7 +184,6 @@ class ProfileUpdateRequest(BaseModel):
     # skills / a null work auth, with the UI's required asterisks never
     # actually being enforced by anything.
     primarySkills: List[str] = Field(..., min_length=1)
-    secondarySkills: List[str] = Field(..., min_length=1)
     workAuth: str = Field(...)
     # BUG FIX: default=["C2C"] was itself an now-invalid legacy value once
     # the allowed set below was narrowed to FULL_TIME/CONTRACT — required
@@ -192,7 +191,7 @@ class ProfileUpdateRequest(BaseModel):
     # fields that were made required earlier (title, education, etc.).
     employmentTypes: List[str] = Field(..., min_length=1)
     preferredRoles: str = Field(..., min_length=1, max_length=200)
-    preferredLocations: str = Field(..., min_length=1, max_length=200)
+    preferredLocations: str = Field(..., min_length=1, max_length=20)
     totalExperienceYears: float = Field(..., ge=0, le=60)
     # BUG FIX: these three were never collectable anywhere — the
     # "Profile incomplete" check (resume_validation.py) has always
@@ -285,6 +284,14 @@ class ProfileUpdateRequest(BaseModel):
         allowed = {"FULL_TIME", "CONTRACT"}
         return list(dict.fromkeys(t for t in v if t in allowed))
 
+    @field_validator("preferredLocations")
+    @classmethod
+    def validate_preferred_locations(cls, v):
+        allowed = {"All", "Onsite", "Hybrid", "Remote"}
+        if v not in allowed:
+            raise ValueError(f"preferredLocations must be one of {allowed}")
+        return v
+
 
 # BUG FIX (app crashed on startup): update_consultant_by_id below declares
 # its request body as AdminConsultantUpdateRequest, but that class didn't
@@ -309,11 +316,10 @@ class AdminConsultantUpdateRequest(BaseModel):
     phone: str = Field(..., pattern=r"^\+?[\d\s\-().]{7,20}$")
     linkedInUrl: str = Field(..., min_length=1)
     primarySkills: List[str] = Field(..., min_length=1)
-    secondarySkills: List[str] = Field(..., min_length=1)
     workAuth: str = Field(...)
     employmentTypes: List[str] = Field(..., min_length=1)
     preferredRoles: str = Field(..., min_length=1, max_length=200)
-    preferredLocations: str = Field(..., min_length=1, max_length=200)
+    preferredLocations: str = Field(..., min_length=1, max_length=20)
     totalExperienceYears: float = Field(..., ge=0, le=60)
     education: List[EducationEntryRequest] = Field(..., min_length=1)
     resumeRichText: Optional[str] = None
@@ -341,6 +347,14 @@ class AdminConsultantUpdateRequest(BaseModel):
         allowed = {"FULL_TIME", "CONTRACT"}
         return list(dict.fromkeys(t for t in v if t in allowed))
 
+    @field_validator("preferredLocations")
+    @classmethod
+    def validate_preferred_locations(cls, v):
+        allowed = {"All", "Onsite", "Hybrid", "Remote"}
+        if v not in allowed:
+            raise ValueError(f"preferredLocations must be one of {allowed}")
+        return v
+
 
 class ProfileResponse(BaseModel):
     model_config = {"from_attributes": True}
@@ -351,7 +365,6 @@ class ProfileResponse(BaseModel):
     phone: Optional[str] = None
     linkedInUrl: Optional[str] = None
     primarySkills: List[str] = []
-    secondarySkills: List[str] = []
     workAuth: Optional[str] = None
     employmentTypes: List[str] = []
     resume: Optional[dict] = None
@@ -409,7 +422,6 @@ class AdminConsultantCreateRequest(BaseModel):
     preferred_locations: Optional[str] = None
     availability_status: Optional[str] = None
     total_experience_years: Optional[float] = Field(None, ge=0, le=60)
-    secondary_skills: Optional[str] = None
     preferred_roles: Optional[str] = None
     resume_info: Optional[dict] = None
     resume_rich_text: Optional[str] = None
@@ -654,7 +666,6 @@ async def _consultant_to_profile_response(
         resume_info = user_result.scalar_one_or_none() or {}
     """Map ORM Consultant → ProfileResponse matching frontend ConsultantProfileDTO."""
     primary = [s.strip() for s in (c.primary_skills or "").split(",") if s.strip()]
-    secondary = [s.strip() for s in (c.secondary_skills or "").split(",") if s.strip()]
     emp_types = c.preferred_employment_types or []
 
     # PERF FIX ("taking long time to save"): base_resume_file_path is set
@@ -714,7 +725,7 @@ async def _consultant_to_profile_response(
     # for total_applications_sent).
      
     completeness = 0
-    if (c.primary_skills or "").strip() or (c.secondary_skills or "").strip():
+    if (c.primary_skills or "").strip():
         completeness += 30  # Skills
     if experience_count > 0:
         completeness += 25  # Experience
@@ -751,7 +762,6 @@ async def _consultant_to_profile_response(
         # this column existed.
         linkedInUrl=c.linkedin_url if c.linkedin_url is not None else resume_info.get("linkedin"),
         primarySkills=primary,
-        secondarySkills=secondary,
         workAuth=c.work_authorization,
         employmentTypes=emp_types,
         resume=resume,
@@ -1062,7 +1072,6 @@ async def update_own_profile(
     consultant.phone = payload.phone
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
-    consultant.secondary_skills = ", ".join(payload.secondarySkills)
     # BUG FIX: this used to only stash linkedInUrl inside User.resume_info
     # (see below) — the admin screens (phase_users_service.py, phase3.py's
     # admin update_consultant) read/write the real Consultant.linkedin_url
@@ -1100,7 +1109,7 @@ async def update_own_profile(
         "title": payload.title,
         "summary": payload.summary,
         "years_experience": payload.totalExperienceYears,
-        "skills": payload.primarySkills + payload.secondarySkills,
+        "skills": payload.primarySkills,
         "education": [e.model_dump() for e in payload.education],
     })
     current_user.resume_info = existing_info
@@ -1334,7 +1343,6 @@ async def update_consultant_by_id(
     consultant.phone = payload.phone
     consultant.work_authorization = payload.workAuth
     consultant.primary_skills = ", ".join(payload.primarySkills)
-    consultant.secondary_skills = ", ".join(payload.secondarySkills)
     consultant.linkedin_url = payload.linkedInUrl
     consultant.preferred_employment_types = _resolve_employment_types(
         consultant.preferred_employment_types, payload.employmentTypes
@@ -1425,7 +1433,6 @@ async def admin_create_consultant(
         work_authorization=payload.work_auth,
         preferred_employment_types=payload.employment_prefs,
         primary_skills=payload.primary_skills or "",
-        secondary_skills=payload.secondary_skills or "",
         status="ACTIVE",
         preferred_roles=payload.preferred_roles,
         preferred_locations=payload.preferred_locations,

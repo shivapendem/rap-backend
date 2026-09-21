@@ -408,7 +408,6 @@ async def generate_resume_from_template(
     parsed_html = parsed_html.replace("{email}", target_user.email or consultant.email or "")
     parsed_html = parsed_html.replace("{linkedin}", target_user.linkedin_url or consultant.linkedin_url or "")
     parsed_html = parsed_html.replace("{location}", consultant.current_location or "")
-    parsed_html = parsed_html.replace("{secondary_skills}", consultant.secondary_skills or "")
     
     education = resume_info.get("education", []) or []
     ed_str = ", ".join([f"{e.get('degree','')} from {e.get('institution','')}" for e in education if e.get('degree') or e.get('institution')])
@@ -1691,10 +1690,9 @@ async def build_base_resume_content(
     # generate_tailored_resume's table) with primary skills bolded within
     # each row, matching the categorized format used there.
     primary_list = [s.strip().replace("**", "") for s in (consultant.primary_skills or "").split(",") if s.strip()]
-    secondary_list = [s.strip().replace("**", "") for s in (consultant.secondary_skills or "").split(",") if s.strip()]
     technical_proficiencies = (
-        categorize_skills_with_tier(primary_list, secondary_list)
-        if (primary_list or secondary_list) else []
+        categorize_skills_with_tier(primary_list, [])
+        if primary_list else []
     )
 
     exp_rows_result = await db.execute(
@@ -2075,29 +2073,17 @@ async def update_base_resume_content(
             info["summary"] = summary_val
             user_row.resume_info = info
 
-    # BUG FIX (primary/secondary tier silently wiped on every resume
-    # save): this used to decide a whole ROW's tier by checking whether
-    # the word "primary" appeared in its CATEGORY text — but real
-    # categories are technology-type labels ("Programming Languages",
-    # "Cloud Platforms", etc.), never "Primary Skills", so every row
-    # fell into the `else` branch and consultant.secondary_skills got
-    # overwritten with the ENTIRE skill set on every save while
-    # primary_skills went stale. Tier now lives per-skill (see
-    # categorize_skills_with_tier in claude_service.py) as an
-    # {"name", "isPrimary"} object, so it's read directly instead of
-    # guessed from category wording. Legacy rows saved before this
-    # change may still have plain string skills with no tier — those
-    # fall back to the old category-text heuristic so older data
-    # doesn't just disappear, but any row using the new per-skill shape
-    # is now correct regardless of how its category is named.
+    # UPDATED (secondary_skills column removed): every skill saved here —
+    # whether starred (isPrimary) or not — now goes into the single
+    # primary_skills column. The isPrimary tag/legacy category bucket is
+    # no longer used to split skills into two stored columns; it only
+    # still drives the star icon shown in Technical Proficiencies.
     tech_rows = resume_data.get("technical_proficiencies") or []
-    primary_bits, secondary_bits = [], []
+    all_bits = []
     for row in tech_rows:
         if not isinstance(row, dict):
             continue
         skills_val = row.get("skills")
-        category = (row.get("category") or "").strip().lower()
-        legacy_bucket = "primary" if "primary" in category else "secondary"
 
         items = skills_val if isinstance(skills_val, list) else (
             [s.strip() for s in (skills_val or "").split(",") if s.strip()]
@@ -2107,22 +2093,22 @@ async def update_base_resume_content(
                 name = (item.get("name") or "").strip()
                 if not name:
                     continue
-                if item.get("isPrimary"):
-                    primary_bits.append(name)
-                else:
-                    secondary_bits.append(name)
+                all_bits.append(name)
             else:
                 name = (item or "").strip()
                 if not name:
                     continue
-                if legacy_bucket == "primary":
-                    primary_bits.append(name)
-                else:
-                    secondary_bits.append(name)
-    if primary_bits:
-        consultant.primary_skills = ", ".join(primary_bits)
-    if secondary_bits:
-        consultant.secondary_skills = ", ".join(secondary_bits)
+                all_bits.append(name)
+    if all_bits:
+        # Dedupe while preserving order — a skill could appear in more
+        # than one row.
+        seen = set()
+        deduped = []
+        for b in all_bits:
+            if b.lower() not in seen:
+                seen.add(b.lower())
+                deduped.append(b)
+        consultant.primary_skills = ", ".join(deduped)
 
     incoming_experience = resume_data.get("experience") or []
     existing_rows_result = await db.execute(
@@ -2566,15 +2552,12 @@ async def get_consultants_for_resumes(
         # therefore showed up with an empty skills list here, which fed
         # straight into ApplyToRequirementPage's {skills} template fill
         # and silently fell back to "relevant technologies" even when the
-        # consultant had skills on file. Prefer primary_skills (+
-        # secondary_skills) split into a list; keep u.skills as a
-        # last-resort fallback for any user row that predates Consultant.
+        # consultant had skills on file. Prefer primary_skills split
+        # into a list; keep u.skills as a last-resort fallback for any
+        # user row that predates Consultant.
         consultant_skills = [
             s.strip()
-            for s in ", ".join(filter(None, [
-                c.primary_skills if c else None,
-                c.secondary_skills if c else None,
-            ])).split(",")
+            for s in (c.primary_skills or "").split(",")
             if s.strip()
         ] if c else []
         return {
