@@ -1044,6 +1044,20 @@ async def get_requirements(
                 # active match, and showing it in this column (or in the
                 # count) is exactly the stale-count bug this replaces.
                 RequirementConsultantMatch.status == "MATCHING",
+                # BUG FIX ("CLM/CPQ Business Systems Analyst" showed
+                # MATCHED here with a name listed, but the same
+                # requirement had zero results on Pending Applications'
+                # "Matching (To Apply)" tab): status=="MATCHING" alone is
+                # too broad — a consultant gets status=MATCHING the
+                # moment they clear basic eligibility, regardless of
+                # whether the role itself is a real match (tier=STRONG)
+                # or just a soft/irrelevant overlap (tier=NEAR_MISS).
+                # Pending Applications' MATCHING tab already restricts to
+                # tier=="STRONG" (see matching_router.py); this is the
+                # other query that determines "matched" on this page —
+                # the consultant-filter subquery above already had this
+                # fix, this general per-row query didn't.
+                RequirementConsultantMatch.tier == "STRONG",
             )
         )
         if current_user.role == "RECRUITER":

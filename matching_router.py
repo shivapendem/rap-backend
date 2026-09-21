@@ -42,18 +42,25 @@ _matching_run_state: dict = {
 
 async def _run_matching_engine_background():
     """
-    Loops every open (non-terminal) requirement and calls
-    match_requirement() for each — the same single engine used by
-    auto-sync, reparse, and the per-requirement admin "Rematch" button.
+    Loops open (non-terminal) requirements received in the last 24 hours
+    and calls match_requirement() for each — the same single engine used
+    by auto-sync, reparse, and the per-requirement admin "Rematch"
+    button. New requirements are already auto-matched the moment they're
+    synced; this exists to catch anything auto-sync missed, not to redo
+    the whole backlog. Keeping it scoped to 24h means it always finishes
+    in one run and can't be caught mid-pass by a redeploy/restart.
+
     Per-requirement isolation: one bad requirement is logged and skipped
     rather than aborting the whole run.
     """
     global _matching_run_state
     try:
         async with AsyncSessionLocal() as db:
+            since = datetime.now(timezone.utc) - timedelta(hours=24)
             reqs_res = await db.execute(
                 select(Requirement.id).where(
-                    Requirement.status.notin_(Requirement.TERMINAL_STATUSES)
+                    Requirement.status.notin_(Requirement.TERMINAL_STATUSES),
+                    Requirement.received_date >= since,
                 )
             )
             requirement_ids = [row[0] for row in reqs_res.all()]
@@ -107,6 +114,9 @@ async def trigger_matching_run(
     """
     Triggers the matching engine and returns immediately — the actual
     work happens in the background. Poll GET /run/status for progress.
+    Scoped to requirements received in the last 24 hours — new
+    requirements are already auto-matched on sync, so this just catches
+    anything that slipped through.
     """
     if current_user.role not in ["ADMIN", "RECRUITER"]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -299,11 +309,18 @@ async def mark_match_applied(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Mark a match as applied. Scoped to the caller's own/assigned consultants."""
+    """
+    Mark a match as applied. Scoped to the caller's own/assigned consultants.
+
+    Also allowed from NOT_ELIGIBLE — the engine's disqualification is a
+    signal, not a hard block; a recruiter can still choose to push an
+    application through for a match the engine flagged as no longer
+    meeting the automatic criteria.
+    """
     match = await _load_match_for_action(db, match_id, current_user)
 
-    if match.status != "MATCHING":
-        raise HTTPException(status_code=400, detail="Only currently-matching rows can be applied")
+    if match.status not in ("MATCHING", "NOT_ELIGIBLE"):
+        raise HTTPException(status_code=400, detail="Only matching or no-longer-eligible rows can be applied")
 
     match.status = "APPLIED"
     await db.commit()
