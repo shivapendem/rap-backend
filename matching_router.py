@@ -179,6 +179,24 @@ async def get_pending_matches(
                 User.is_authorized == True,
             )
         )
+        # BUG FIX ("Requirements page consultant filter doesn't match
+        # Pending Applications"): the MATCHING tab included every
+        # eligible-but-irrelevant row (tier=NEAR_MISS), not just real role
+        # matches (tier=STRONG) — see phase4.py's match_requirement(),
+        # which assigns status=MATCHING the moment a consultant clears
+        # basic eligibility, regardless of role-match tier. This was
+        # invisible here because results are sorted by match_score DESC
+        # (the STRONG matches already float to the top), but the
+        # Requirements page's consultant filter (main.py get_requirements)
+        # has no such sort and was showing the NEAR_MISS rows plainly.
+        # Restricting the MATCHING tab itself to tier=="STRONG" makes
+        # "matching" mean the same thing on both pages — it removes only
+        # rows that were already buried below every real match here, so
+        # nothing currently visible/actionable changes. Other tabs
+        # (Applied/Rejected/Not Eligible — lifecycle history, not "is this
+        # a real match") are untouched.
+        if target_status == "MATCHING":
+            stmt = stmt.where(RequirementConsultantMatch.tier == "STRONG")
         if consultant_id:
             c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
             if c_ids:

@@ -914,20 +914,40 @@ async def get_requirements(
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid consultant_id format")
         if filter_consultant_ids:
-            matched_consultant_subq = select(RequirementConsultantMatch.requirement_id).where(
-                RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids),
-                # BUG FIX (Requirements page showed hundreds of unrelated
-                # requirements — "IT Help Desk Analyst", "Java Developer",
-                # etc. — for a consultant whose real matches, per Pending
-                # Applications, were all "AI Engineer"-type roles): this
-                # subquery had no status filter at all, so filtering by a
-                # consultant surfaced every requirement they'd EVER had a
-                # RequirementConsultantMatch row for — including old rows
-                # the engine has since marked NOT_ELIGIBLE, REJECTED, or
-                # already APPLIED — not just their current real matches.
-                # Same status the Requirements page's own match count and
-                # Pending Applications both already filter to.
-                RequirementConsultantMatch.status == "MATCHING",
+            # BUG FIX: this subquery only checked RequirementConsultantMatch
+            # itself — Pending Applications' equivalent query (matching_router.py
+            # _base_stmt) also requires Consultant.status=="ACTIVE" and
+            # User.is_authorized==True, so a match tied to an inactive or
+            # deauthorized consultant could show up here but never on Pending
+            # Applications. Joining the same two tables with the same gates
+            # so both pages define "a real, current match" identically.
+            matched_consultant_subq = (
+                select(RequirementConsultantMatch.requirement_id)
+                .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
+                .join(User, User.id == Consultant.user_id)
+                .where(
+                    RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids),
+                # BUG FIX (Requirements page still showed hundreds of
+                # unrelated requirements after the status=="MATCHING" fix
+                # below — e.g. "Pega Lead Business Architect", "Full stack
+                # developer (C++ & Angular)", "Power BI Developer" for a
+                # Salesforce consultant): status=="MATCHING" was too broad.
+                # Per phase4.py's match_requirement(), a consultant gets
+                # status=MATCHING the moment they clear basic eligibility
+                # (work auth, employment type, etc.) REGARDLESS of whether
+                # the role itself matches — a soft/irrelevant role overlap
+                # still gets status=MATCHING, just tier=NEAR_MISS instead
+                # of tier=STRONG. Pending Applications hits this same
+                # status=="MATCHING" universe but sorts by match_score
+                # DESC, so the real (STRONG) matches float to the top and
+                # the NEAR_MISS noise is just scrolled past, never
+                # filtered out. Restrict this page's consultant filter to
+                # tier=="STRONG" so "filter by consultant" here means the
+                # same thing it visually appears to mean on Pending
+                # Applications: a real role match, not just eligibility.
+                    RequirementConsultantMatch.status == "MATCHING",
+                    RequirementConsultantMatch.tier == "STRONG",
+                )
             )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
 
