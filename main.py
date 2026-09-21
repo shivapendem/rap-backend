@@ -760,6 +760,32 @@ def _clean_employment_types(values: Optional[List[str]]) -> Optional[List[str]]:
     return cleaned or None
 
 
+_EMPLOYMENT_TYPE_FILTER_BUCKETS: list[list[str]] = [
+    ["C2C", "CONTRACT", "C2H"],
+    ["W2"],
+    ["1099"],
+    ["FULLTIME"],
+]
+
+
+def _normalize_employment_type_filter_key(raw: str) -> str:
+    if not raw:
+        return ""
+    return "".join(ch for ch in raw.upper() if ch not in (" ", "_", "-"))
+
+
+_EMPLOYMENT_TYPE_FILTER_INDEX: dict[str, list[str]] = {
+    _normalize_employment_type_filter_key(member): bucket
+    for bucket in _EMPLOYMENT_TYPE_FILTER_BUCKETS
+    for member in bucket
+}
+
+
+def _normalize_employment_type_filter(employment_type: str) -> list[str]:
+    key = _normalize_employment_type_filter_key(employment_type)
+    return _EMPLOYMENT_TYPE_FILTER_INDEX.get(key, [employment_type])
+
+
 def _coerce_skills_list(value) -> List[str]:
     """parsed_fields['skills'] is normally a List[str] (see parser.py's
     extract_skills), but older rows — or any future bad data — may have
@@ -913,12 +939,12 @@ async def get_requirements(
         query = query.where(Requirement.parse_confidence < 0.5)
 
     if employment_type:
-        # employment_types is a real Postgres ARRAY(Text) column in
-        # production (see models.py ArrayTextColumn) — .any() checks
-        # array membership. Falls back to a no-op filter on the SQLite dev
-        # path where this column is stored as JSON text instead.
+        raw_types = _normalize_employment_type_filter(employment_type)
         if DATABASE_URL.startswith("postgresql"):
-            query = query.where(Requirement.employment_types.any(employment_type))
+            if len(raw_types) == 1:
+                query = query.where(Requirement.employment_types.any(raw_types[0]))
+            else:
+                query = query.where(Requirement.employment_types.overlap(raw_types))
 
     if search:
         # BUG FIX: only matched role/vendor_email — searching by client,
