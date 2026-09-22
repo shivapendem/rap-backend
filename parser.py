@@ -22,6 +22,7 @@ from typing import Optional, List, Dict, Any, Tuple, Union
 PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email containing a job requirement.
 Extract its content using the extract_requirement tool.
 If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess.
+IMPORTANT: Senders often mix up fields (e.g. putting the company name like 'IBM' in the TITLE field, and the job title like 'Software Engineer' in the CLIENT field). You must intelligently evaluate the content of these fields and swap them to their logical correct placements if an obvious mistake was made.
 """
 
 # P0 fix: previously this asked the model to "return only JSON" and then
