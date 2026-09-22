@@ -2574,14 +2574,19 @@ async def get_consultants_for_resumes(
     if requirement_id:
         from models import RequirementConsultantMatch
 
-        # RequirementConsultantMatch is the single source of truth for
-        # "is this consultant matched to this requirement" now — no more
-        # union with a second table. Excludes REJECTED the same way the
-        # old JobMatch-side filter did.
+        # BUG FIX ("Select Candidate" in Compose Mail could show a
+        # consultant the matching engine explicitly disqualified):
+        # status != "REJECTED" let NOT_ELIGIBLE and APPLIED rows through
+        # too, not just real current matches — a different, looser rule
+        # than every other screen in the app (Requirements, Pending
+        # Applications, the consultant's own view all use
+        # status == "MATCHING"). Aligned to the same single rule so a
+        # candidate who's a valid match on the Requirements page is
+        # exactly who's selectable here, no more and no less.
         rcm_result = await db.execute(
             select(RequirementConsultantMatch.consultant_id).where(
                 RequirementConsultantMatch.requirement_id == requirement_id,
-                RequirementConsultantMatch.status != "REJECTED",
+                RequirementConsultantMatch.status == "MATCHING",
             )
         )
         matched_consultant_ids = list({row[0] for row in rcm_result.all()})

@@ -787,6 +787,30 @@ async def get_consultant_requirements(
         ))
     if work_mode_filter:
         filters.append(Requirement.work_mode == work_mode_filter)
+    # BUG FIX ("consultant clicks 'Matched' filter, gets wrong/incomplete
+    # results"): the status filter used to run in a Python loop AFTER
+    # pagination — filtering rows already limited to one page, using a
+    # `total` count that was computed with no status filter at all. A
+    # consultant with matches scattered across several pages would see
+    # a different, incomplete "Matched" subset depending on which page
+    # they happened to be on, against a total/page-count that didn't
+    # match what was actually shown. Moved into the SQL WHERE clause,
+    # same as the count and pagination, so filtering happens on the
+    # full result set before either is computed — reversing
+    # _match_status_to_consultant_requirement_status()'s own mapping.
+    if status_filter == "MATCHED":
+        filters.append(RequirementConsultantMatch.status == "MATCHING")
+        filters.append(or_(
+            RequirementConsultantMatch.resume_status.is_(None),
+            RequirementConsultantMatch.resume_status.notin_(["RESUME_GENERATED", "READY_TO_APPLY"]),
+        ))
+    elif status_filter == "RESUME_READY":
+        filters.append(RequirementConsultantMatch.status == "MATCHING")
+        filters.append(RequirementConsultantMatch.resume_status.in_(["RESUME_GENERATED", "READY_TO_APPLY"]))
+    elif status_filter == "APPLIED":
+        filters.append(RequirementConsultantMatch.status == "APPLIED")
+    elif status_filter == "NEEDS_REVIEW":
+        filters.append(RequirementConsultantMatch.status == "REJECTED")
 
     base_q = base_q.where(and_(*filters))
 
@@ -853,8 +877,8 @@ async def get_consultant_requirements(
     rows: List[ConsultantRequirementResponse] = []
     for match, req, resume in results:
         frontend_status = _match_status_to_consultant_requirement_status(match.status, match.resume_status)
-        if status_filter and frontend_status != status_filter:
-            continue
+        # status filtering now happens in SQL, above — every row that
+        # reaches this loop already passed the filter.
 
         already_applied = req.id in sent_application_req_ids
         resume_generated = bool(resume and resume.generation_status == "COMPLETED")
@@ -1179,6 +1203,25 @@ async def get_consultant_requirements_for_recruiter(
         filters.append(cast(Requirement.parsed_fields, Text).ilike(f"%{skillsSearch}%"))
     if work_mode_filter:
         filters.append(Requirement.work_mode == work_mode_filter)
+    # BUG FIX: this endpoint accepted a `status` query param but never
+    # actually used it anywhere — a recruiter filtering this consultant's
+    # requirements by status got every status back regardless, silently.
+    # Same SQL-level approach as the consultant's own endpoint, reversing
+    # _match_status_to_recruiter_requirement_status()'s mapping (New |
+    # Matched | Resume Ready | Applied | Rejected).
+    if status == "Matched":
+        filters.append(RequirementConsultantMatch.status == "MATCHING")
+        filters.append(or_(
+            RequirementConsultantMatch.resume_status.is_(None),
+            RequirementConsultantMatch.resume_status.notin_(["RESUME_GENERATED", "READY_TO_APPLY"]),
+        ))
+    elif status == "Resume Ready":
+        filters.append(RequirementConsultantMatch.status == "MATCHING")
+        filters.append(RequirementConsultantMatch.resume_status.in_(["RESUME_GENERATED", "READY_TO_APPLY"]))
+    elif status == "Applied":
+        filters.append(RequirementConsultantMatch.status == "APPLIED")
+    elif status == "Rejected":
+        filters.append(RequirementConsultantMatch.status == "REJECTED")
 
     base_q = base_q.where(and_(*filters))
 

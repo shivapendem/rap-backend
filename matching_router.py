@@ -161,7 +161,9 @@ async def get_pending_matches(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     status: Optional[str] = Query(None),
-    consultant_id: Optional[str] = Query(None)
+    consultant_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(100, ge=1, le=200),
 ):
     """
     Matches for the current user's view, with optional status filter.
@@ -173,6 +175,14 @@ async def get_pending_matches(
     Near Miss no longer exists anywhere — a soft/borderline role match is
     rejected at validate_match()'s gate itself, so every MATCHING row is
     a confident match by construction.
+
+    BUG FIX ("Pending Applications not showing all pending applications"):
+    this used to hard-code .limit(200) with no offset/page parameter at
+    all — `total` was always reported accurately, but the actual rows
+    were silently capped at 200 regardless of how many real matches
+    existed, with no way to ever see the rest. Real pagination now:
+    100 per page by default (matches the Requirements page's own
+    pagination), page/pageSize both controllable by the caller.
     """
     valid_statuses = {"MATCHING", "APPLIED", "REJECTED", "NOT_ELIGIBLE"}
     target_status = status.upper().strip() if status and status.upper().strip() in valid_statuses else "MATCHING"
@@ -204,6 +214,9 @@ async def get_pending_matches(
             stmt = stmt.where(RequirementConsultantMatch.consultant_id.in_(assigned_subq))
         return stmt
 
+    count_stmt = _base_stmt(select(func.count()).select_from(RequirementConsultantMatch))
+    total_count = (await db.execute(count_stmt)).scalar_one()
+
     stmt = _base_stmt(select(
         RequirementConsultantMatch.id,
         RequirementConsultantMatch.requirement_id,
@@ -223,13 +236,14 @@ async def get_pending_matches(
     # Same reasoning as before: order by match quality first, not by when
     # it happened to be scored, so a stronger match always sorts above a
     # weaker one; created_at as a stable tiebreaker for equal scores.
-    stmt = stmt.order_by(RequirementConsultantMatch.match_score.desc(), RequirementConsultantMatch.created_at.desc()).limit(200)
+    stmt = (
+        stmt.order_by(RequirementConsultantMatch.match_score.desc(), RequirementConsultantMatch.created_at.desc())
+        .offset((page - 1) * pageSize)
+        .limit(pageSize)
+    )
 
     result = await db.execute(stmt)
     rows = result.mappings().all()
-
-    count_stmt = _base_stmt(select(func.count()).select_from(RequirementConsultantMatch))
-    total_count = (await db.execute(count_stmt)).scalar_one()
 
     output = [
         {
@@ -251,7 +265,13 @@ async def get_pending_matches(
         for row in rows
     ]
 
-    return {"matches": output, "total": total_count}
+    return {
+        "matches": output,
+        "total": total_count,
+        "page": page,
+        "pageSize": pageSize,
+        "totalPages": (total_count + pageSize - 1) // pageSize if total_count else 1,
+    }
 
 
 async def _load_match_for_action(db: AsyncSession, match_id: int, current_user: User) -> RequirementConsultantMatch:

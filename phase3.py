@@ -85,10 +85,84 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Per-consultant background-rematch coalescing guard — see
-# _rematch_in_background in update_own_profile below. Per-process only;
-# would need a DB/Redis-backed lock for a multi-worker deployment.
+# _trigger_consultant_rematch below. Per-process only; would need a
+# DB/Redis-backed lock for a multi-worker deployment.
 _rematch_in_progress: set[int] = set()
 _rematch_dirty: set[int] = set()
+
+
+def _trigger_consultant_rematch(consultant_id: int) -> None:
+    """
+    Kicks off a background re-score of this consultant against every
+    open requirement — the same single engine (match_consultant()) used
+    everywhere else. Fire-and-forget: the caller's own request/response
+    never waits on it, so it never blocks or fails a profile save.
+
+    BUG FIX ("saving one field on My Profile takes 8+ seconds, and a
+    second save right after sits stuck pending"): with 44,000+ open
+    requirements in the system, one rematch pass loops over all of them
+    for this consultant — genuinely takes several seconds. Every
+    field-level auto-save (Work Auth, Skills, Employment Type, etc.)
+    used to independently fire its OWN full rematch via
+    asyncio.create_task. Editing more than one field within a few
+    seconds — completely normal usage — spawned multiple overlapping
+    background tasks for the SAME consultant, all trying to upsert into
+    the same RequirementConsultantMatch rows at once, so they
+    serialized against each other via Postgres row locks instead of
+    Python ever noticing they overlapped. Track whether a rematch is
+    already running for this consultant; if a new save lands mid-run,
+    don't start a second one — just flag that one more pass is needed
+    once the current one finishes, so N rapid saves cost at most 2
+    rematch passes instead of N concurrent ones.
+
+    BUG FIX (this trigger existed only in update_own_profile — the
+    consultant's own self-service edit — so an admin correcting a
+    consultant's profile from User Management never refreshed their
+    matches at all, the only way to force it was the consultant editing
+    their own profile, or a full backlog rematch): now called from both
+    the self-service and the admin-facing update endpoints.
+
+    NOTE: this in-memory guard is per-process — fine for a single
+    uvicorn worker, but would need a DB- or Redis-backed lock instead if
+    this ever runs multi-worker.
+    """
+    async def _rematch_in_background(cid: int):
+        from database import AsyncSessionLocal
+        from phase4 import match_consultant
+        try:
+            while True:
+                _rematch_dirty.discard(cid)
+                async with AsyncSessionLocal() as bg_session:
+                    # Single engine — refreshes RequirementConsultantMatch
+                    # directly; no second table/pipeline to catch up.
+                    await match_consultant(bg_session, cid)
+                # If another save landed while this pass was running, do
+                # exactly one more pass to pick up its latest data — this
+                # pass started with whatever was saved BEFORE it began,
+                # so it can't have already covered that save.
+                if cid not in _rematch_dirty:
+                    break
+        except Exception as e:
+            logger.error("Background auto-match failed for consultant_id=%s: %s", cid, e)
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="background_auto_match",
+                error=e,
+                source_type="consultant",
+                source_id=str(cid),
+            )
+        finally:
+            _rematch_in_progress.discard(cid)
+
+    if consultant_id in _rematch_in_progress:
+        # A rematch is already running for this consultant — just mark
+        # that it needs one more pass when it's done, instead of
+        # spawning a second task that would fight the first one over
+        # the same rows.
+        _rematch_dirty.add(consultant_id)
+    else:
+        _rematch_in_progress.add(consultant_id)
+        asyncio.create_task(_rematch_in_background(consultant_id))
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1135,69 +1209,10 @@ async def update_own_profile(
     await db.commit()
     await db.refresh(consultant)
 
-    # Re-run matching for this consultant so their requirement matches reflect
-    # the just-saved profile. Runs in the background with its own DB session so
-    # it never blocks or fails the profile save.
-    #
-    # BUG FIX ("saving one field on My Profile takes 8+ seconds, and a
-    # second save right after sits stuck pending"): with 44,000+ open
-    # requirements in the system, one rematch pass loops over all of
-    # them for this consultant — genuinely takes several seconds. Every
-    # field-level auto-save (Work Auth, Skills, Employment Type, etc.)
-    # used to independently fire its OWN full rematch via
-    # asyncio.create_task. Editing more than one field within a few
-    # seconds — completely normal usage — spawned multiple overlapping
-    # background tasks for the SAME consultant, all trying to upsert
-    # into the same RequirementConsultantMatch rows at once, so they
-    # serialized against each other via Postgres row locks instead of
-    # Python ever noticing they overlapped. Same coalescing shape as the
-    # existing base-resume-sync fix and the Gmail sync mutex fix: track
-    # whether a rematch is already running for this consultant; if a new
-    # save lands mid-run, don't start a second one — just flag that one
-    # more pass is needed once the current one finishes, so N rapid
-    # saves cost at most 2 rematch passes instead of N concurrent ones.
-    # NOTE: this in-memory guard is per-process — fine for a single
-    # uvicorn worker, but would need a DB- or Redis-backed lock instead
-    # if this ever runs multi-worker.
-    consultant_id = consultant.id
-
-    async def _rematch_in_background(cid: int):
-        from database import AsyncSessionLocal
-        from phase4 import match_consultant
-        try:
-            while True:
-                _rematch_dirty.discard(cid)
-                async with AsyncSessionLocal() as bg_session:
-                    # Single engine — refreshes RequirementConsultantMatch
-                    # directly; no second table/pipeline to catch up.
-                    await match_consultant(bg_session, cid)
-                # If another save landed while this pass was running, do
-                # exactly one more pass to pick up its latest data — this
-                # pass started with whatever was saved BEFORE it began,
-                # so it can't have already covered that save.
-                if cid not in _rematch_dirty:
-                    break
-        except Exception as e:
-            logger.error("Background auto-match failed for consultant_id=%s: %s", cid, e)
-            from error_logger import log_db_error
-            await log_db_error(
-                stage="background_auto_match",
-                error=e,
-                source_type="consultant",
-                source_id=str(cid),
-            )
-        finally:
-            _rematch_in_progress.discard(cid)
-
-    if consultant_id in _rematch_in_progress:
-        # A rematch is already running for this consultant — just mark
-        # that it needs one more pass when it's done, instead of
-        # spawning a second task that would fight the first one over
-        # the same rows.
-        _rematch_dirty.add(consultant_id)
-    else:
-        _rematch_in_progress.add(consultant_id)
-        asyncio.create_task(_rematch_in_background(consultant_id))
+    # Re-run matching for this consultant so their requirement matches
+    # reflect the just-saved profile. Runs in the background — see
+    # _trigger_consultant_rematch for the full reasoning.
+    _trigger_consultant_rematch(consultant.id)
 
     count_result = await db.execute(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
@@ -1359,6 +1374,16 @@ async def update_consultant_by_id(
 
     await db.commit()
     await db.refresh(consultant)
+
+    # BUG FIX: this admin-facing update never re-triggered matching at
+    # all — only the consultant's own self-service profile save
+    # (update_own_profile) did. So an admin correcting a consultant's
+    # profile here (e.g. fixing their preferred roles to clear a
+    # backlog of stale/wrong matches) had no effect on their existing
+    # RequirementConsultantMatch rows; only that consultant logging in
+    # and re-saving their own profile did anything. Same trigger, same
+    # coalescing guard, now available from both paths.
+    _trigger_consultant_rematch(consultant.id)
 
     count_result = await db.execute(
         select(func.count()).where(ConsultantExperience.consultant_id == consultant_id)
