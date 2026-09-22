@@ -80,7 +80,7 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-09-21-role-mandatory-acronym-location-fix"
+MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
