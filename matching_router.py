@@ -2,9 +2,10 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 import logging
 import math
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -156,12 +157,42 @@ def _safe_float(val):
         return None
 
 
+# Same invisible/lookalike-space character set as phase2.py's Gmail
+# search fix (get_gmail_emails) — kept identical rather than re-derived so
+# the two never drift apart. See that file for the full rationale: these
+# are Unicode characters (narrow no-break space, zero-width space, word
+# joiner, etc.) that render as an ordinary space, or nothing at all, but
+# aren't matched by a plain ILIKE substring comparison or by Postgres's
+# (ASCII-only) \s.
+_INVISIBLE_SPACE_CHARS = (
+    "\u00A0\u1680\u180E\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200A\u200B\u200C\u200D\u202F\u205F\u3000"
+    "\u2060\uFEFF"
+)
+_INVISIBLE_SPACE_SQL_CLASS = (
+    "[\\u00A0\\u1680\\u180E\\u2000-\\u200D\\u202F\\u205F\\u3000\\u2060\\uFEFF]"
+)
+
+
+def _normalize_ws_col(col):
+    """Same normalization as phase2.py's Gmail search, applied to a
+    SQLAlchemy column expression instead of a raw SQL fragment: fold every
+    invisible/lookalike space character to a plain space, then collapse
+    whitespace runs, so a stored value can be substring-matched regardless
+    of which whitespace variant it actually contains."""
+    return func.regexp_replace(
+        func.regexp_replace(col, _INVISIBLE_SPACE_SQL_CLASS, " ", "g"),
+        r"\s+", " ", "g",
+    )
+
+
 @router.get("/pending")
 async def get_pending_matches(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     status: Optional[str] = Query(None),
-    consultant_id: Optional[str] = Query(None)
+    consultant_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
 ):
     """
     Matches for the current user's view, with optional status filter.
@@ -173,9 +204,34 @@ async def get_pending_matches(
     NEAR_MISS is no longer a status — a soft role match is a MATCHING row
     with tier="NEAR_MISS", filterable via the `tier` field in the response
     instead of a separate status/tab.
+
+    BUG FIX ("search for the requirement shows no results, even though
+    it's visibly in the list" -- confirmed real case): this endpoint
+    already truncates to the 200 highest-scoring rows (see .limit(200)
+    below) so the "Pending Applications" screen doesn't have to paginate.
+    The frontend used to apply the search box's text entirely
+    client-side, AFTER that cap -- filtering whatever 200 rows happened
+    to be fetched, not the real underlying set. Any match that scored
+    outside the top 200 was silently never fetched at all, so no amount
+    of correct search text could ever find it; it only reappeared once a
+    real server-side filter (the candidate dropdown) shrank the
+    underlying result set enough for that row to fit inside the cap. The
+    `search` param now applies here, in the SQL, alongside the other
+    filters and BEFORE the LIMIT -- so a real match is found regardless
+    of its score rank, exactly like the other server-side filters
+    already are. Matches the same fields the old client-side filter did
+    (requirement title/company, candidate name/email), with the same
+    invisible-whitespace normalization as the Gmail search fix so a
+    copy-pasted/ATS-templated title with a look-alike space character
+    doesn't reintroduce that exact bug here too.
     """
     valid_statuses = {"MATCHING", "APPLIED", "REJECTED", "NOT_ELIGIBLE"}
     target_status = status.upper().strip() if status and status.upper().strip() in valid_statuses else "MATCHING"
+
+    normalized_search = None
+    if search:
+        _search_table = str.maketrans({c: " " for c in _INVISIBLE_SPACE_CHARS})
+        normalized_search = re.sub(r"\s+", " ", search.translate(_search_table)).strip()
 
     def _base_stmt(select_clause):
         stmt = (
@@ -211,6 +267,14 @@ async def get_pending_matches(
             c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
             if c_ids:
                 stmt = stmt.where(RequirementConsultantMatch.consultant_id.in_(c_ids))
+        if normalized_search:
+            pattern = f"%{normalized_search}%"
+            stmt = stmt.where(or_(
+                _normalize_ws_col(Requirement.role).ilike(pattern),
+                _normalize_ws_col(func.coalesce(Requirement.client, Requirement.vendor)).ilike(pattern),
+                _normalize_ws_col(Consultant.full_name).ilike(pattern),
+                _normalize_ws_col(Consultant.email).ilike(pattern),
+            ))
         if current_user.role == "CONSULTANT":
             cons_subq = select(Consultant.id).where(Consultant.user_id == current_user.id).scalar_subquery()
             stmt = stmt.where(RequirementConsultantMatch.consultant_id == cons_subq)
