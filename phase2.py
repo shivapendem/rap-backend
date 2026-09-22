@@ -319,6 +319,56 @@ async def parse_text_endpoint(
 # All columns included as per table structure
 # ---------------------------------------------------------------------------
 
+# BUG FIX ("Raw Email Viewer shows literal HTML tags/markup" -- confirmed
+# real case: a full <!DOCTYPE html>...<style>...</style>...<p>... document
+# rendered verbatim in the read-only viewer instead of readable text): this
+# endpoint has always returned body_text/body_html completely raw -- no
+# caller-side conversion at all. That's invisible for a plain-text email
+# (body_text alone is already readable), but for an HTML-templated email
+# (the overwhelmingly common case for recruiter broadcasts) with no real
+# body_text, callers were left to guess how to render body_html themselves.
+# GmailPage.tsx's own email-detail modal already has a crude client-side
+# fallback for this (a bare `.replace(/<[^>]+>/g, " ")` regex, which strips
+# tags but leaves <style> block CSS sitting in the output as visible text --
+# see that function's own BUG FIX history), but RawEmailModal.tsx (the
+# Requirements page's "Raw Email Viewer", i.e. THIS exact symptom) has no
+# fallback at all -- it renders whatever this endpoint sends completely
+# verbatim inside a <pre> block. Meanwhile the Apply screen shows clean
+# text because it reads the Requirement's own already-cleaned
+# job_description (cleaned once, at ingestion, via
+# cleaner.clean_requirement_text -- see dedup.py's save_requirement), not
+# this endpoint at all -- so the two screens were never guaranteed to
+# agree. Computing one correctly-converted "body" HERE, backend-side, using
+# the SAME html_to_text() this file already imports (and dedup.py already
+# uses for the ingestion-time cleaning that makes the Apply screen work),
+# fixes it at the one source both screens should share, instead of leaving
+# every caller to reinvent (or skip) its own HTML-to-text conversion.
+# Purely additive to the response shape -- every existing key is
+# unchanged, this only adds a new "body" key -- so it can't break any
+# caller that doesn't already read it. GmailPage.tsx's own emailBody()
+# already prefers e.body first when present, so it picks this up
+# automatically too, upgrading its own cruder fallback for free rather
+# than leaving two different, inconsistent conversions in the codebase.
+#
+# Defined as its own top-level function, BEFORE get_raw_email, and used
+# nowhere else in its own body except its own two parameters -- kept
+# fully self-contained on purpose so it can't accidentally end up nested
+# inside (or swallowing) the endpoint function below it.
+def _build_display_body(body_text: Optional[str], body_html: Optional[str]) -> Optional[str]:
+    # A real plain-text body needs no conversion. Same "does this actually
+    # look like plain text or is it HTML sitting in the wrong column"
+    # check clean_requirement_text() itself uses, so a body_text that's
+    # actually raw HTML markup (some ingestion paths do this) still gets
+    # converted instead of dumped verbatim.
+    if body_text and "<html" not in body_text.lower() and "<body" not in body_text.lower():
+        return body_text
+    if body_text:
+        return html_to_text(body_text)
+    if body_html:
+        return html_to_text(body_html)
+    return None
+
+
 @router.get(
     "/api/admin/raw-emails/{email_id}",
     summary="Get raw email — checks gmail_emails first, falls back to emails table",
@@ -412,7 +462,11 @@ async def get_raw_email(
     )
     row = result.mappings().first()
     if row:
-        return {"source": "gmail_emails", **dict(row)}
+        return {
+            "source": "gmail_emails",
+            **dict(row),
+            "body": _build_display_body(row["body_text"], row["body_html"]),
+        }
 
     # Fall back to the emails table — this is the correct source for any
     # requirement created after the raw_email_id FK fix.
@@ -436,6 +490,7 @@ async def get_raw_email(
         "reply_to": email.reply_to_address,
         "body_text": email.body_text,
         "body_html": email.body_html,
+        "body": _build_display_body(email.body_text, email.body_html),
         "date": email.received_at,
         "is_read": email.is_read,
         "is_starred": email.is_starred,
@@ -816,8 +871,40 @@ async def get_gmail_emails(
         # can search with ordinary single spaces and match regardless of
         # what invisible whitespace variant the source HTML happened to
         # decode into.
+        #
+        # BUG FIX ("Mainframe Automation Engineer" -- an exact, plain-
+        # looking SUBJECT, already parsed and visibly sitting in the
+        # list -- returned "No matching emails found"): confirmed via a
+        # live query test that chr(160) (plain NBSP) was only ONE of
+        # several Unicode characters that render as an ordinary-looking
+        # (or entirely invisible) space but are byte-for-byte different
+        # from U+0020. Subjects that pass through Word/Outlook
+        # autocorrect, ATS templates, or copy-pasted job titles commonly
+        # carry narrow no-break spaces (U+202F), thin/figure/punctuation
+        # spaces (U+2000-U+200A), ideographic space (U+3000), Ogham space
+        # mark (U+1680), or genuinely invisible characters like zero-
+        # width space (U+200B), zero-width joiner/non-joiner (U+200C/D),
+        # word joiner (U+2060), and the zero-width no-break
+        # space/BOM (U+FEFF). None of these are matched by Postgres's
+        # regex \s (ASCII-only, unlike Python's), so each one slipped
+        # straight through the old chr(160)-only fix and broke the
+        # search at exactly that word boundary -- same failure mode as
+        # the original nbsp bug, just a different character. Folding
+        # this whole set to a plain space (not stripping them outright --
+        # removing a zero-width character between two words would glue
+        # them into one word and reintroduce the same false-negative)
+        # before collapsing whitespace runs closes the entire class of
+        # "looks like a space, isn't a space" bug at once, on both the
+        # column side (SQL) and the search term side (Python, below).
+        _INVISIBLE_SPACE_CHARS = (
+            "\u00A0\u1680\u180E\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+            "\u2007\u2008\u2009\u200A\u200B\u200C\u200D\u202F\u205F\u3000"
+            "\u2060\uFEFF"
+        )
         _ws_normalize_sql = (
-            "regexp_replace(REPLACE({col}, chr(160), ' '), '\\s+', ' ', 'g')"
+            "regexp_replace(regexp_replace({col}, "
+            "'[\\u00A0\\u1680\\u180E\\u2000-\\u200D\\u202F\\u205F\\u3000\\u2060\\uFEFF]', "
+            "' ', 'g'), '\\s+', ' ', 'g')"
         )
         where_clauses.append(
             "(" + " OR ".join(
@@ -825,7 +912,8 @@ async def get_gmail_emails(
                 for col in ("subject", "from_address", "from_name", "body_text", "body_html")
             ) + ")"
         )
-        _normalized_search = re.sub(r"\s+", " ", search.replace("\xa0", " ")).strip()
+        _search_table = str.maketrans({c: " " for c in _INVISIBLE_SPACE_CHARS})
+        _normalized_search = re.sub(r"\s+", " ", search.translate(_search_table)).strip()
         params["search"] = f"%{_normalized_search}%"
     if date_from:
         where_clauses.append("date >= :date_from")
