@@ -927,26 +927,7 @@ async def get_requirements(
                 .join(User, User.id == Consultant.user_id)
                 .where(
                     RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids),
-                # BUG FIX (Requirements page still showed hundreds of
-                # unrelated requirements after the status=="MATCHING" fix
-                # below — e.g. "Pega Lead Business Architect", "Full stack
-                # developer (C++ & Angular)", "Power BI Developer" for a
-                # Salesforce consultant): status=="MATCHING" was too broad.
-                # Per phase4.py's match_requirement(), a consultant gets
-                # status=MATCHING the moment they clear basic eligibility
-                # (work auth, employment type, etc.) REGARDLESS of whether
-                # the role itself matches — a soft/irrelevant role overlap
-                # still gets status=MATCHING, just tier=NEAR_MISS instead
-                # of tier=STRONG. Pending Applications hits this same
-                # status=="MATCHING" universe but sorts by match_score
-                # DESC, so the real (STRONG) matches float to the top and
-                # the NEAR_MISS noise is just scrolled past, never
-                # filtered out. Restrict this page's consultant filter to
-                # tier=="STRONG" so "filter by consultant" here means the
-                # same thing it visually appears to mean on Pending
-                # Applications: a real role match, not just eligibility.
                     RequirementConsultantMatch.status == "MATCHING",
-                    RequirementConsultantMatch.tier == "STRONG",
                 )
             )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
@@ -1044,20 +1025,6 @@ async def get_requirements(
                 # active match, and showing it in this column (or in the
                 # count) is exactly the stale-count bug this replaces.
                 RequirementConsultantMatch.status == "MATCHING",
-                # BUG FIX ("CLM/CPQ Business Systems Analyst" showed
-                # MATCHED here with a name listed, but the same
-                # requirement had zero results on Pending Applications'
-                # "Matching (To Apply)" tab): status=="MATCHING" alone is
-                # too broad — a consultant gets status=MATCHING the
-                # moment they clear basic eligibility, regardless of
-                # whether the role itself is a real match (tier=STRONG)
-                # or just a soft/irrelevant overlap (tier=NEAR_MISS).
-                # Pending Applications' MATCHING tab already restricts to
-                # tier=="STRONG" (see matching_router.py); this is the
-                # other query that determines "matched" on this page —
-                # the consultant-filter subquery above already had this
-                # fix, this general per-row query didn't.
-                RequirementConsultantMatch.tier == "STRONG",
             )
         )
         if current_user.role == "RECRUITER":

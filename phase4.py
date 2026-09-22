@@ -36,12 +36,12 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import get_db, AsyncSessionLocal
 from models import (
     User,
     Consultant,
@@ -80,7 +80,7 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-09-21-role-mandatory-acronym-location-fix"
+MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
@@ -1214,8 +1214,7 @@ def validate_match(
 
     Returns:
       {
-        "eligible": bool,            # False only for a REJECTED tier
-        "tier": "REJECTED" | "NEAR_MISS_CANDIDATE" | "PASS",
+        "eligible": bool,
         "stage_failed": str | None,  # "role" / "employment_type" /
                                       # "work_authorization" / "experience" /
                                       # "location", or None if eligible
@@ -1223,11 +1222,13 @@ def validate_match(
         "reason": str,               # human-readable, for the audit log
       }
 
-    "NEAR_MISS_CANDIDATE" means Stage 0 was a soft (10-70%) role match, not
-    a hard reject and not a confident pass either — callers should still
-    run score_match() and only actually tag the result NEAR_MISS if the
-    FINAL blended score also lands below MATCH_THRESHOLD; if other factors
-    compensate for the imperfect role match, it's a genuine PASS instead.
+    Near Miss removed entirely, at the source: a soft (10-70%) role match
+    used to still pass this gate as "NEAR_MISS_CANDIDATE" and become a
+    MATCHING row tagged tier="NEAR_MISS", relying on every downstream
+    query to remember to filter tier=="STRONG" back out — exactly the
+    class of bug that kept resurfacing. Requiring a confident role match
+    right here means there is no weaker tier left to filter anywhere
+    downstream; every MATCHING row is a strong match by construction.
     """
     if requirement_skills is None:
         requirement_skills = _requirement_skills(requirement)
@@ -1237,36 +1238,38 @@ def validate_match(
         requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills
     )
 
-    if role_raw < 10.0:
+    # Confident-match bar: role_raw >= 70 (a real, strong role fit).
+    # Anything below this is no longer eligible — there is no separate
+    # "soft match, let it through anyway" tier.
+    if role_raw < 70.0:
         return {
-            "eligible": False, "tier": "REJECTED", "stage_failed": "role",
-            "role_raw": role_raw, "reason": f"role score {role_raw} < 10 (hard floor)",
+            "eligible": False, "stage_failed": "role",
+            "role_raw": role_raw,
+            "reason": f"role score {role_raw} below the confident-match bar (70) — a soft/borderline role match is not eligible",
         }
-
-    tier = "PASS" if role_raw >= 70.0 else "NEAR_MISS_CANDIDATE"
 
     # Stage 1 — Employment Type
     passed, reason = employment_type_passes(requirement.employment_types, consultant.preferred_employment_types)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "employment_type", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "employment_type", "role_raw": role_raw, "reason": reason}
 
     # Stage 2 — Work Authorization (batched push rule)
     req_work_auth = _requirement_work_auth_text(requirement)
     passed, reason = work_auth_passes(req_work_auth, consultant.work_authorization)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "work_authorization", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "work_authorization", "role_raw": role_raw, "reason": reason}
 
     # Stage 3 — Experience (-2 years floor)
     passed, reason = experience_passes(requirement, consultant, experiences)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "experience", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "experience", "role_raw": role_raw, "reason": reason}
 
     # Stage 4 — Location
     passed, reason = location_passes(requirement, consultant, experiences)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "location", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "location", "role_raw": role_raw, "reason": reason}
 
-    return {"eligible": True, "tier": tier, "stage_failed": None, "role_raw": role_raw, "reason": "passed all stages"}
+    return {"eligible": True, "stage_failed": None, "role_raw": role_raw, "reason": "passed all stages"}
 
 
 def score_match(
@@ -1382,9 +1385,10 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
 
     Every consultant runs through validate_match()'s Stage 0-4 gate.
     Ineligible consultants get status=NOT_ELIGIBLE (row kept for audit,
-    never deleted). Eligible consultants get status=MATCHING regardless
-    of role-match tier — NEAR_MISS is no longer a status, just an
-    informational `tier` field on the row.
+    never deleted). Eligible consultants get status=MATCHING — Near Miss
+    no longer exists anywhere, as a status or otherwise; a soft/
+    borderline role match is rejected at the gate itself, so every
+    MATCHING row is a confident match by construction.
 
     Returns the current count of MATCHING rows for this requirement.
     """
@@ -1463,13 +1467,11 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
             requirement_skills=requirement_skills,
         )
         result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
-        tier_value = "NEAR_MISS" if validation["tier"] == "NEAR_MISS_CANDIDATE" else "STRONG"
 
         try:
             async with db.begin_nested():
                 if existing is not None:
                     existing.status = "MATCHING"
-                    existing.tier = tier_value
                     existing.match_score = result["total"]
                     existing.skill_score = result["skill_score"]
                     existing.role_score = result["role_score"]
@@ -1486,7 +1488,6 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                         requirement_id=requirement_id,
                         consultant_id=consultant.id,
                         status="MATCHING",
-                        tier=tier_value,
                         match_score=result["total"],
                         skill_score=result["skill_score"],
                         role_score=result["role_score"],
@@ -1511,7 +1512,6 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
             row = res.scalars().first()
             if row:
                 row.status = "MATCHING"
-                row.tier = tier_value
                 row.match_score = result["total"]
                 row.skill_score = result["skill_score"]
                 row.role_score = result["role_score"]
@@ -1666,13 +1666,11 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
             requirement_skills=requirement_skills,
         )
         result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
-        tier_value = "NEAR_MISS" if validation["tier"] == "NEAR_MISS_CANDIDATE" else "STRONG"
 
         try:
             async with db.begin_nested():
                 if existing:
                     existing.status = "MATCHING"
-                    existing.tier = tier_value
                     existing.match_score = result["total"]
                     existing.skill_score = result["skill_score"]
                     existing.role_score = result["role_score"]
@@ -1689,7 +1687,6 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                         requirement_id=requirement.id,
                         consultant_id=consultant_id,
                         status="MATCHING",
-                        tier=tier_value,
                         match_score=result["total"],
                         skill_score=result["skill_score"],
                         role_score=result["role_score"],
@@ -1712,7 +1709,6 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
             row = res.scalars().first()
             if row:
                 row.status = "MATCHING"
-                row.tier = tier_value
                 row.match_score = result["total"]
                 row.skill_score = result["skill_score"]
                 row.role_score = result["role_score"]
@@ -1856,75 +1852,112 @@ async def rematch_requirement(
     return RematchResponse(requirement_id=str(requirement_id), assignments_created_or_updated=count)
 
 
+_match_all_state: dict = {
+    "status": "idle",  # idle | running | completed | failed
+    "started_at": None,
+    "finished_at": None,
+    "total_requirements": 0,
+    "processed_requirements": 0,
+    "total_assignments": 0,
+    "error": None,
+}
+
+
+async def _run_match_all_background():
+    global _match_all_state
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Requirement).where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
+            )
+            requirements = result.scalars().all()
+            _match_all_state["total_requirements"] = len(requirements)
+
+            total_assignments = 0
+            processed = 0
+            for requirement in requirements:
+                try:
+                    count = await match_requirement(db, requirement.id)
+                    total_assignments += count
+                except Exception as e:
+                    await db.rollback()
+                    print(f"[match_all_requirements] FAILED requirement_id={requirement.id}: {e}")
+                    from error_logger import log_db_error
+                    await log_db_error(
+                        stage="match_all_requirements",
+                        error=e,
+                        source_type="requirement",
+                        source_id=requirement.id,
+                    )
+                finally:
+                    processed += 1
+                    _match_all_state["processed_requirements"] = processed
+                    _match_all_state["total_assignments"] = total_assignments
+
+            _match_all_state.update({
+                "status": "completed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+    except Exception as e:
+        _match_all_state.update({
+            "status": "failed",
+            "error": str(e),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+
 @router.post(
     "/api/admin/requirements/match-all",
-    response_model=MatchAllResponse,
     summary="Run matching for all requirements (admin only)",
 )
 async def match_all_requirements(
-    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
     """
-    Admin-triggered bulk matching run across every requirement in the table.
-    Substitutes for a background worker until Phase 2's Celery/scheduler exists.
+    Admin-triggered bulk matching run across every open requirement.
+
+    BUG FIX (timeout): this used to run the entire loop synchronously
+    inside the HTTP request/response cycle — at real-world scale (tens
+    of thousands of open requirements) this reliably exceeds any
+    reasonable request timeout before finishing, and a killed request
+    gives no indication of how far it actually got. Now backgrounded,
+    same pattern as matching_router.py's /run: this call returns
+    immediately, and GET /api/admin/requirements/match-all/status polls
+    progress. Needed specifically to clear a stale backlog after a
+    scoring-logic change (a MATCHING_LOGIC_VERSION bump only takes
+    effect the next time a row is actually rescored — this is what
+    forces that for the entire open backlog in one pass, not just
+    requirements from the last 24 hours).
+
+    Per-requirement isolation preserved: one bad requirement is logged
+    and skipped rather than aborting the whole run.
     """
     _require_role(current_user, "ADMIN")
 
-    # BUG FIX: this had no status filter at all — unlike Pipeline B's own
-    # bulk background run (matching_router.py's
-    # _run_matching_engine_background, which filters
-    # Requirement.status.notin_(["CLOSED", "REJECTED"])), every requirement
-    # ever created — including long-closed and rejected ones — got fully
-    # scored against every active consultant on each "Match All" click.
-    # match_requirement() itself only filters Consultant.status ==
-    # "ACTIVE"; nothing anywhere in this call chain excluded the
-    # requirement's own status. That's pure wasted compute at the scale
-    # this file's own comments describe (37,000+ requirements caused a
-    # real timeout before), and could create brand new ASSIGNED/NEAR_MISS
-    # rows for a posting that's no longer actually open. Matches Pipeline
-    # B's exact filter so both "run everything" entry points agree on
-    # what "everything" means.
-    #
-    # Now reads Requirement.TERMINAL_STATUSES (a single shared constant on
-    # the model — see models.py) instead of its own hardcoded copy of the
-    # same two strings — matching_router.py's two occurrences of this same
-    # filter still use their own literal list; this is the first of the
-    # three to move to the shared constant, opportunistically, not a
-    # requirement for this fix to work correctly on its own.
-    result = await db.execute(
-        select(Requirement).where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
-    )
-    requirements = result.scalars().all()
+    if _match_all_state["status"] == "running":
+        return {"success": True, "already_running": True, **_match_all_state}
 
-    total_assignments = 0
-    for requirement in requirements:
-        # BUG FIX: previously had no per-requirement error isolation — a DB
-        # failure on any single requirement (bad data, constraint violation,
-        # etc.) crashed the entire bulk run with an unhandled 500, silently
-        # dropping every requirement after it, and left the shared session
-        # in an aborted-transaction state for anything that followed.
-        # Isolate + log + continue, matching the pattern already used by
-        # sync_pending_emails() and the email queue worker loop.
-        try:
-            count = await match_requirement(db, requirement.id)
-            total_assignments += count
-        except Exception as e:
-            await db.rollback()
-            print(f"[match_all_requirements] FAILED requirement_id={requirement.id}: {e}")
-            from error_logger import log_db_error
-            await log_db_error(
-                stage="match_all_requirements",
-                error=e,
-                source_type="requirement",
-                source_id=requirement.id,
-            )
-            continue
+    _match_all_state.update({
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "total_requirements": 0,
+        "processed_requirements": 0,
+        "total_assignments": 0,
+        "error": None,
+    })
+    background_tasks.add_task(_run_match_all_background)
+    return {"success": True, "started": True, **_match_all_state}
 
-    return MatchAllResponse(
-        requirements_processed=len(requirements),
-        total_assignments=total_assignments,
-    )
+
+@router.get(
+    "/api/admin/requirements/match-all/status",
+    summary="Poll progress of the bulk match-all run (admin only)",
+)
+async def get_match_all_status(current_user: User = Depends(get_current_user)):
+    _require_role(current_user, "ADMIN")
+    return _match_all_state
 
 
 @router.get(

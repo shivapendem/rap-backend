@@ -435,10 +435,11 @@ class RequirementConsultantMatch(Base):
     # bug that made Requirements/Pending Applications disagree). phase6.py
     # writes this; the matching engine never touches it.
     resume_status = Column(Text, nullable=True)  # None | RESUME_GENERATED | READY_TO_APPLY
-    # Informational only — does not branch status. Replaces the old
-    # NEAR_MISS status/tab: a borderline role match still shows here,
-    # but it's just a MATCHING row with tier="NEAR_MISS".
-    tier = Column(Text, nullable=True)  # STRONG | NEAR_MISS
+    # tier column removed — Near Miss no longer exists anywhere, as a
+    # status, a tier, or otherwise. A soft/borderline role match is now
+    # rejected at validate_match()'s gate itself (see matching_engine.py),
+    # so every MATCHING row is a confident match by construction; there
+    # is no weaker tier left to record or filter.
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 

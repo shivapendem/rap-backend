@@ -201,9 +201,9 @@ async def get_pending_matches(
     Requirements page's per-requirement count again.
 
     status values: MATCHING (default) | APPLIED | REJECTED | NOT_ELIGIBLE.
-    NEAR_MISS is no longer a status — a soft role match is a MATCHING row
-    with tier="NEAR_MISS", filterable via the `tier` field in the response
-    instead of a separate status/tab.
+    Near Miss no longer exists anywhere — a soft/borderline role match is
+    rejected at validate_match()'s gate itself, so every MATCHING row is
+    a confident match by construction.
 
     BUG FIX ("search for the requirement shows no results, even though
     it's visibly in the list" -- confirmed real case): this endpoint
@@ -245,24 +245,6 @@ async def get_pending_matches(
                 User.is_authorized == True,
             )
         )
-        # BUG FIX ("Requirements page consultant filter doesn't match
-        # Pending Applications"): the MATCHING tab included every
-        # eligible-but-irrelevant row (tier=NEAR_MISS), not just real role
-        # matches (tier=STRONG) — see phase4.py's match_requirement(),
-        # which assigns status=MATCHING the moment a consultant clears
-        # basic eligibility, regardless of role-match tier. This was
-        # invisible here because results are sorted by match_score DESC
-        # (the STRONG matches already float to the top), but the
-        # Requirements page's consultant filter (main.py get_requirements)
-        # has no such sort and was showing the NEAR_MISS rows plainly.
-        # Restricting the MATCHING tab itself to tier=="STRONG" makes
-        # "matching" mean the same thing on both pages — it removes only
-        # rows that were already buried below every real match here, so
-        # nothing currently visible/actionable changes. Other tabs
-        # (Applied/Rejected/Not Eligible — lifecycle history, not "is this
-        # a real match") are untouched.
-        if target_status == "MATCHING":
-            stmt = stmt.where(RequirementConsultantMatch.tier == "STRONG")
         if consultant_id:
             c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
             if c_ids:
@@ -299,7 +281,6 @@ async def get_pending_matches(
         RequirementConsultantMatch.score_breakdown,
         RequirementConsultantMatch.match_reason,
         RequirementConsultantMatch.status,
-        RequirementConsultantMatch.tier,
         RequirementConsultantMatch.resume_status,
         RequirementConsultantMatch.created_at,
     ))
@@ -328,7 +309,6 @@ async def get_pending_matches(
             "score_breakdown": row["score_breakdown"] or {},
             "match_reason": row["match_reason"],
             "status": row["status"],
-            "tier": row["tier"],
             "resume_status": row["resume_status"],
             "created_at": row["created_at"],
         }
