@@ -14,8 +14,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_PARSER_MODEL", "gpt-4o-mini")
 
 PARSE_REQUIREMENT_SYSTEM_PROMPT = """You are a job requirement parsing engine. You will be given the raw subject and body of an email, sent by a recruiter or staffing vendor, describing a job opening.
-Extract its content using the extract_requirement JSON schema.
+Your task is to extract its content into structured JSON.
 If a field is not present or cannot be confidently determined, leave it as null (or an empty list for list fields) — do not guess, and never copy text meant for one field into a different one.
+IMPORTANT: Senders often mix up fields (e.g. putting the company name like 'IBM' in the TITLE field, and the job title like 'Software Engineer' in the CLIENT field). You must intelligently evaluate the content of these fields and swap them to their logical correct placements if an obvious mistake was made.
 
 ROLE
 - Extract the specific job title being staffed (e.g. "Senior Java Developer", "Scrum Master"). This is very often stated with an explicit label ("Role:", "Title:", "Job Title:", "Position:") — use that when it's there. It is just as often stated only in plain prose with NO label at all (e.g. "We are looking for a Senior React Developer to join the team", "Seeking a DevOps Engineer for a 6-month contract") — extract the title from context in that case with the same confidence as a labeled one. Don't leave role null just because there's no colon-separated label; most real postings don't have one.
