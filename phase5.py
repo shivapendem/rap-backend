@@ -229,8 +229,9 @@ def _employment_types_for_recruiter(values: Optional[List[str]]) -> List[str]:
 def _match_status_to_consultant_requirement_status(match_status: Optional[str], resume_status: Optional[str] = None) -> str:
     """
     consultant.ts RequirementStatus: MATCHED | RESUME_READY | APPLIED | NEEDS_REVIEW.
-    (NEAR_MISS removed — a soft role match is now just a MATCHING row with
-    tier="NEAR_MISS" on the backend; it's no longer a distinct status/tab.)
+    (Near Miss removed entirely — a soft/borderline role match is now
+    rejected at validate_match()'s gate itself, so it never becomes a
+    MATCHING row at all.)
 
     `status` (MATCHING/APPLIED/REJECTED/NOT_ELIGIBLE) and `resume_status`
     (None/RESUME_GENERATED/READY_TO_APPLY) are independent columns now —
@@ -763,7 +764,19 @@ async def get_consultant_requirements(
             & (GeneratedResume.is_final == True),
         )
     )
-    filters = [RequirementConsultantMatch.consultant_id == consultant.id]
+    filters = [
+        RequirementConsultantMatch.consultant_id == consultant.id,
+        # BUG FIX (consultant's own Requirements screen disagreed with
+        # both Pending Applications and the admin Requirements screen for
+        # the exact same consultant): this query had no status filter at
+        # all — every RequirementConsultantMatch row ever created for
+        # this consultant was included, and
+        # _match_status_to_consultant_requirement_status() below has no
+        # case for NOT_ELIGIBLE, so a requirement the engine explicitly
+        # disqualified them from silently fell through to its default and
+        # displayed as "MATCHED" anyway. Excluding NOT_ELIGIBLE here.
+        RequirementConsultantMatch.status.in_(["MATCHING", "APPLIED", "REJECTED"]),
+    ]
     if roleKeyword:
         filters.append(Requirement.role.ilike(f"%{roleKeyword}%"))
     if search:
@@ -1033,6 +1046,12 @@ async def get_all_requirements_for_recruiter(
                 RequirementConsultantMatch.requirement_id.in_(req_ids),
                 Consultant.status == "ACTIVE",
                 User.is_authorized == True,
+                # BUG FIX — same gap as the other requirement-list queries
+                # in this file: no status filter meant this "matched
+                # consultants" list included NOT_ELIGIBLE rows too,
+                # disagreeing with Pending Applications and the admin
+                # Requirements screen for the same requirement.
+                RequirementConsultantMatch.status == "MATCHING",
             )
         )
         if current_user.role == "RECRUITER":
@@ -1138,7 +1157,14 @@ async def get_consultant_requirements_for_recruiter(
             & (GeneratedResume.is_final == True),
         )
     )
-    filters = [RequirementConsultantMatch.consultant_id == consultant_id]
+    filters = [
+        RequirementConsultantMatch.consultant_id == consultant_id,
+        # BUG FIX — same as the consultant's own /api/consultant/requirements
+        # endpoint: no status filter meant NOT_ELIGIBLE rows showed as
+        # "Matched" here too, disagreeing with both the consultant's own
+        # screen and Pending Applications for the same consultant.
+        RequirementConsultantMatch.status.in_(["MATCHING", "APPLIED", "REJECTED"]),
+    ]
     if roleSearch:
         filters.append(Requirement.role.ilike(f"%{roleSearch}%"))
     if search:
@@ -1854,7 +1880,15 @@ async def dashboard_stats(
 
         assigned_sq = (
             select(func.count(RequirementConsultantMatch.id))
-            .where(RequirementConsultantMatch.consultant_id == consultant.id)
+            .where(
+                RequirementConsultantMatch.consultant_id == consultant.id,
+                # BUG FIX — same gap as the requirements-list queries in
+                # this file: no status filter meant this dashboard count
+                # included NOT_ELIGIBLE rows too, disagreeing with the
+                # consultant's own Requirements list right below it on
+                # the same dashboard.
+                RequirementConsultantMatch.status.in_(["MATCHING", "APPLIED", "REJECTED"]),
+            )
             .scalar_subquery()
         )
         applied_sq = (

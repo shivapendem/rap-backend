@@ -1214,8 +1214,7 @@ def validate_match(
 
     Returns:
       {
-        "eligible": bool,            # False only for a REJECTED tier
-        "tier": "REJECTED" | "NEAR_MISS_CANDIDATE" | "PASS",
+        "eligible": bool,
         "stage_failed": str | None,  # "role" / "employment_type" /
                                       # "work_authorization" / "experience" /
                                       # "location", or None if eligible
@@ -1223,11 +1222,13 @@ def validate_match(
         "reason": str,               # human-readable, for the audit log
       }
 
-    "NEAR_MISS_CANDIDATE" means Stage 0 was a soft (10-70%) role match, not
-    a hard reject and not a confident pass either — callers should still
-    run score_match() and only actually tag the result NEAR_MISS if the
-    FINAL blended score also lands below MATCH_THRESHOLD; if other factors
-    compensate for the imperfect role match, it's a genuine PASS instead.
+    Near Miss removed entirely, at the source: a soft (10-70%) role match
+    used to still pass this gate as "NEAR_MISS_CANDIDATE" and become a
+    MATCHING row tagged tier="NEAR_MISS", relying on every downstream
+    query to remember to filter tier=="STRONG" back out — exactly the
+    class of bug that kept resurfacing. Requiring a confident role match
+    right here means there is no weaker tier left to filter anywhere
+    downstream; every MATCHING row is a strong match by construction.
     """
     if requirement_skills is None:
         requirement_skills = _requirement_skills(requirement)
@@ -1237,36 +1238,38 @@ def validate_match(
         requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills
     )
 
-    if role_raw < 10.0:
+    # Confident-match bar: role_raw >= 70 (a real, strong role fit).
+    # Anything below this is no longer eligible — there is no separate
+    # "soft match, let it through anyway" tier.
+    if role_raw < 70.0:
         return {
-            "eligible": False, "tier": "REJECTED", "stage_failed": "role",
-            "role_raw": role_raw, "reason": f"role score {role_raw} < 10 (hard floor)",
+            "eligible": False, "stage_failed": "role",
+            "role_raw": role_raw,
+            "reason": f"role score {role_raw} below the confident-match bar (70) — a soft/borderline role match is not eligible",
         }
-
-    tier = "PASS" if role_raw >= 70.0 else "NEAR_MISS_CANDIDATE"
 
     # Stage 1 — Employment Type
     passed, reason = employment_type_passes(requirement.employment_types, consultant.preferred_employment_types)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "employment_type", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "employment_type", "role_raw": role_raw, "reason": reason}
 
     # Stage 2 — Work Authorization (batched push rule)
     req_work_auth = _requirement_work_auth_text(requirement)
     passed, reason = work_auth_passes(req_work_auth, consultant.work_authorization)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "work_authorization", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "work_authorization", "role_raw": role_raw, "reason": reason}
 
     # Stage 3 — Experience (-2 years floor)
     passed, reason = experience_passes(requirement, consultant, experiences)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "experience", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "experience", "role_raw": role_raw, "reason": reason}
 
     # Stage 4 — Location
     passed, reason = location_passes(requirement, consultant, experiences)
     if not passed:
-        return {"eligible": False, "tier": "REJECTED", "stage_failed": "location", "role_raw": role_raw, "reason": reason}
+        return {"eligible": False, "stage_failed": "location", "role_raw": role_raw, "reason": reason}
 
-    return {"eligible": True, "tier": tier, "stage_failed": None, "role_raw": role_raw, "reason": "passed all stages"}
+    return {"eligible": True, "stage_failed": None, "role_raw": role_raw, "reason": "passed all stages"}
 
 
 def score_match(
@@ -1382,9 +1385,10 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
 
     Every consultant runs through validate_match()'s Stage 0-4 gate.
     Ineligible consultants get status=NOT_ELIGIBLE (row kept for audit,
-    never deleted). Eligible consultants get status=MATCHING regardless
-    of role-match tier — NEAR_MISS is no longer a status, just an
-    informational `tier` field on the row.
+    never deleted). Eligible consultants get status=MATCHING — Near Miss
+    no longer exists anywhere, as a status or otherwise; a soft/
+    borderline role match is rejected at the gate itself, so every
+    MATCHING row is a confident match by construction.
 
     Returns the current count of MATCHING rows for this requirement.
     """
@@ -1463,13 +1467,11 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
             requirement_skills=requirement_skills,
         )
         result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
-        tier_value = "NEAR_MISS" if validation["tier"] == "NEAR_MISS_CANDIDATE" else "STRONG"
 
         try:
             async with db.begin_nested():
                 if existing is not None:
                     existing.status = "MATCHING"
-                    existing.tier = tier_value
                     existing.match_score = result["total"]
                     existing.skill_score = result["skill_score"]
                     existing.role_score = result["role_score"]
@@ -1486,7 +1488,6 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
                         requirement_id=requirement_id,
                         consultant_id=consultant.id,
                         status="MATCHING",
-                        tier=tier_value,
                         match_score=result["total"],
                         skill_score=result["skill_score"],
                         role_score=result["role_score"],
@@ -1511,7 +1512,6 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
             row = res.scalars().first()
             if row:
                 row.status = "MATCHING"
-                row.tier = tier_value
                 row.match_score = result["total"]
                 row.skill_score = result["skill_score"]
                 row.role_score = result["role_score"]
@@ -1666,13 +1666,11 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
             requirement_skills=requirement_skills,
         )
         result["score_breakdown"]["_version"] = MATCHING_LOGIC_VERSION
-        tier_value = "NEAR_MISS" if validation["tier"] == "NEAR_MISS_CANDIDATE" else "STRONG"
 
         try:
             async with db.begin_nested():
                 if existing:
                     existing.status = "MATCHING"
-                    existing.tier = tier_value
                     existing.match_score = result["total"]
                     existing.skill_score = result["skill_score"]
                     existing.role_score = result["role_score"]
@@ -1689,7 +1687,6 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
                         requirement_id=requirement.id,
                         consultant_id=consultant_id,
                         status="MATCHING",
-                        tier=tier_value,
                         match_score=result["total"],
                         skill_score=result["skill_score"],
                         role_score=result["role_score"],
@@ -1712,7 +1709,6 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
             row = res.scalars().first()
             if row:
                 row.status = "MATCHING"
-                row.tier = tier_value
                 row.match_score = result["total"]
                 row.skill_score = result["skill_score"]
                 row.role_score = result["role_score"]
@@ -1881,7 +1877,7 @@ async def match_all_requirements(
     # "ACTIVE"; nothing anywhere in this call chain excluded the
     # requirement's own status. That's pure wasted compute at the scale
     # this file's own comments describe (37,000+ requirements caused a
-    # real timeout before), and could create brand new ASSIGNED/NEAR_MISS
+    # real timeout before), and could create brand new MATCHING
     # rows for a posting that's no longer actually open. Matches Pipeline
     # B's exact filter so both "run everything" entry points agree on
     # what "everything" means.
