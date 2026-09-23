@@ -1423,7 +1423,7 @@ async def apply_to_requirement(
     # resolution, real filename), instead of maintaining a second,
     # diverging "apply" implementation that only pretends to send.
     from models import EmailQueue
-    from email_queue import process_single_email_queue_item, UPLOAD_DIR
+    from email_queue import process_single_email_queue_item, EMAIL_ATTACHMENT_S3_PREFIX
     from email_template import build_application_email, resolve_sender_fields
     from pathlib import Path
     import uuid as _uuid
@@ -1490,9 +1490,13 @@ async def apply_to_requirement(
                 if c.isalnum() or c in " -_."
             ).strip() or "Resume.pdf"
             unique_name = f"{_uuid.uuid4()}__{safe_name}"
-            with open(Path(UPLOAD_DIR) / unique_name, "wb") as f:
-                f.write(body_bytes)
-            attachment_refs = [unique_name]
+            # S3-ONLY FIX: store the attachment in Spaces, not /tmp.
+            import io as _io
+            from s3_service import upload_file_to_s3
+            s3_ref = f"{EMAIL_ATTACHMENT_S3_PREFIX}{unique_name}"
+            if not await asyncio.to_thread(upload_file_to_s3, _io.BytesIO(body_bytes), s3_ref, "application/octet-stream"):
+                raise HTTPException(status_code=502, detail="Could not store the resume attachment. Please try again.")
+            attachment_refs = [s3_ref]
         else:
             # Resume exists but its bytes can't be found anywhere —
             # fail loudly instead of silently sending without it.
