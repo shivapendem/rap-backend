@@ -34,6 +34,20 @@ CLIENT
 - A section heading that describes what the end client wants in a candidate — e.g. "What the Client is Looking For," "Client Requirements," "Client Expectations" — is NOT a statement naming who the client is. It introduces a description of desired skills/experience, not a company name. Extract a real client only if one is separately, explicitly named elsewhere; do not extract any part of the heading itself (e.g. never "Looking For").
 - A bare country or region name (USA, India, Canada, etc.) is NEVER a client — even when it sits right next to a dash near other job details (e.g. "Remote – USA," or a signature listing office locations like "USA - INDIA"). These are locations or the vendor's own office locations, never a company name.
 - If nothing in the email actually names a client, do not manufacture one by pulling in a nearby unrelated sentence, a responsibility bullet, or any other stray text just because the client field expects a value — leave it null. A wrong guess is far worse than an honest null.
+- The client value must be a real ORGANIZATION NAME: a proper-noun company, bank, agency or institution (e.g. "Cigna", "Wells Fargo", "Bank of America", "State of Texas"). It is never a sentence fragment, a job title, a department, a skill, or a technical term. If what you would return is not the name of an organization, return null.
+- These are NEVER the client, return null for them:
+  - The sender's signature block: their name, title or department ("Team Lead - Recruitment", "Sr. Technical Recruiter", "Talent Acquisition"), their agency, phone, LinkedIn text, or certifications ("WBENC-Certified WBE").
+  - Bullet or list items describing the job (skills, duties, technical terms), even when a bullet starts with a dash and a capitalized word ("- PTR records", "- SOA and NS records", "- Forward and reverse lookup zones"). Exception: a bullet that is itself a client label ("- Client: Wells Fargo", "• End Client: Cigna") still counts; extract that name.
+  - The words "client" or "customer" used as ordinary nouns or inside compound words: "customer-first mindset", "customer needs", "what the customer wants", "client-facing", "client-side", "customer satisfaction". A hyphen glued to the word ("customer-first") is NOT a label; only "Client:", "End Client:", "Customer:" or a spaced "Client - Name" is.
+  - Product or module names that contain the word customer/client ("Customer Central", "Client Portal") unless the email explicitly says that is the client.
+  - Mailing-list or Google Group names ("Ajeet_C2CPositions", "Daily Requirement") and unsubscribe/footer text.
+- Many emails simply do not name a client. Returning null is the correct answer then, and is always better than returning any other text from the email.
+- Real examples from past emails (email text -> correct client):
+  - Only a signature "Satnam Singh Sohal / Team Lead - Recruitment / Thunderhawk Technology Partners", no client named -> null (not "Recruitment", not the agency)
+  - A DNS bullet list "- Forward and reverse lookup zones / - PTR records / - SOA and NS records", no client named -> null (not "PTR records")
+  - "You need to have a customer-first mindset to determine what the customer wants" -> null (not "first mindset to determine what the customer")
+  - "Client: Wells Fargo" -> "Wells Fargo"; "End Client - Cigna" -> "Cigna"; "This position is with Northern Trust" -> "Northern Trust"
+
 
 EMPLOYMENT TYPE
 - Watch for negation: "No C2C", "not open to C2C", "no H1B" means that value should NOT be included as an accepted type.
@@ -85,7 +99,7 @@ PARSE_REQUIREMENT_SCHEMA = {
             },
             "client": {
                 "type": ["string", "null"],
-                "description": "The END client company where the consultant will work — from a label ('Client:') OR named in plain prose ('this role is with Northern Trust'). NEVER the recruiter/vendor/staffing agency sending this email, even if that company's name appears in the signature. NEVER a country/region name (USA, India). NEVER extracted from 'client-facing' (a skill phrase, not a label) or a heading like 'What the Client is Looking For'. Leave null for a vague reference ('one of our clients'), no mention at all, or when nothing genuinely names a client — do not manufacture a value from unrelated nearby text."
+                "description": "The END client company where the consultant will work — from a label ('Client:') OR named in plain prose ('this role is with Northern Trust'). NEVER the recruiter/vendor/staffing agency sending this email, even if that company's name appears in the signature. NEVER a country/region name (USA, India). NEVER extracted from 'client-facing' (a skill phrase, not a label) or a heading like 'What the Client is Looking For'. Leave null for a vague reference ('one of our clients'), no mention at all, or when nothing genuinely names a client — do not manufacture a value from unrelated nearby text. Must be an organization name only -- never a sentence fragment, job title/department from the signature (e.g. 'Team Lead - Recruitment'), a JD bullet item (e.g. 'PTR records'), or text after a glued hyphen like 'customer-first'. Null is the correct answer when no organization is named as the client."
             },
             "location": {"type": ["string", "null"], "description": "City, state, or Remote/Hybrid/Onsite."},
             "rate": {"type": ["string", "null"], "description": "The pay/bill rate or compensation."},

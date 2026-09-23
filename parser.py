@@ -744,6 +744,14 @@ def _role_echoes_non_role_label(role_value: Optional[str], text: str) -> bool:
     return False
 
 CLIENT_PATTERNS = [
+    # BUG FIX ("client: 'first mindset to determine what the customer'"
+    # from "...a customer-first mindset to determine what the customer
+    # wants" -- confirmed real case): the separator was [:\-], so the hyphen
+    # INSIDE an ordinary compound word ("customer-first", "client-facing",
+    # "client-side", "end-client-ready") counted as a "Customer -" label and
+    # everything after it was captured as the client. A real label is
+    # "Client:" or a SPACED dash ("Client - Cigna"); a glued hyphen never is.
+    # Every label pattern below now accepts only those two separators.
     # BUG FIX ("client: ':Software Quality Assurance Engineer III :::Lake
     # Forest, IL...'" — the label matched on the FIRST colon of a "::"
     # subject-segment delimiter (e.g. "Direct Client ::Software Quality
@@ -753,7 +761,7 @@ CLIENT_PATTERNS = [
     # separator NOT be immediately followed by another colon. A genuine
     # "Client:" label is never itself followed by a second colon; a "::"
     # segment delimiter always is.
-    r'(?i)\bend\s*client\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bend\s*client(?:\s*:(?!:)|[ \t]+[\-\u2013](?=[ \t]))[ \t]*\n?[ \t]*(.+)',
     # BUG FIX ("client: None" -- fell through entirely, letting a worse
     # fallback further down in the extraction chain win instead --
     # confirmed on a real requirement row, "Client Name: Virtusa/
@@ -761,10 +769,10 @@ CLIENT_PATTERNS = [
     # from the bare "Client:" pattern below (which requires "client"
     # immediately followed by the colon -- "Name" sitting in between
     # doesn't match \s*).
-    r'(?i)\bclient\s*name\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
-    r'(?i)\bclient\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
-    r'(?i)\bcustomer\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
-    r'(?i)\bimplementation\s*(?:partner)?\s*[:\-](?!:)[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bclient\s*name(?:\s*:(?!:)|[ \t]+[\-\u2013](?=[ \t]))[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bclient(?:\s*:(?!:)|[ \t]+[\-\u2013](?=[ \t]))[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bcustomer(?:\s*:(?!:)|[ \t]+[\-\u2013](?=[ \t]))[ \t]*\n?[ \t]*(.+)',
+    r'(?i)\bimplementation\s*(?:partner)?(?:\s*:(?!:)|[ \t]+[\-\u2013](?=[ \t]))[ \t]*\n?[ \t]*(.+)',
     # "Client is Zensar" -- no colon at all, just prose. Tightly bounded to
     # 1-4 capitalized words (typical company-name shape) so it stops
     # naturally at the client name instead of running into the rest of the
@@ -5974,6 +5982,23 @@ def parse_requirement(
                     r'(?=[ \t]*(?:Location|Client|Rate|\n|$))',
                     norm_body
                 )
+                # BUG FIX ("client: 'Recruitment'" from the signature line
+                # "Team Lead - Recruitment", and "client: 'PTR records'" from
+                # an indented DNS bullet "      - PTR records" -- both
+                # confirmed real cases): this unanchored fallback accepted ANY
+                # "<text> - <Capitalized>" line. Its left side [A-Za-z ]{4,}
+                # even matches pure indentation, so every nested bullet
+                # qualified, and a signature title/department line looks
+                # identical to "Role - Client". The fallback exists only for
+                # the "<Role Title> - <Client>" convention, so the text before
+                # the dash must now actually BE the role already extracted.
+                # No known role -> no guess.
+                if dash_m:
+                    _dash_left = re.split(r'[ \t]+[\-\u2013][ \t]+', dash_m.group(0), 1)[0].strip().lower()
+                    _dash_role = (role or '').strip().lower()
+                    if (len(_dash_left) < 4 or not _dash_role or _dash_role == 'unknown'
+                            or not (_dash_left in _dash_role or _dash_role in _dash_left)):
+                        dash_m = None
             if dash_m:
                 cand = clean_client(dash_m.group(1))
                 # BUG FIX: this fallback regex has no awareness of what role was
@@ -6020,6 +6045,20 @@ def parse_requirement(
     # table-header text is never a real client name, regardless of
     # whether some other genuine client signal also exists elsewhere in
     # the email.
+    # BUG FIX (sentence fragments stored as client, e.g. "first mindset to
+    # determine what the customer"): a company name is a short proper noun
+    # phrase. Two or more lowercase function words (to/what/the/and/...)
+    # means prose, from whichever source produced it (AI or regex). One is
+    # allowed so real names like "Bank of America" / "Procter and
+    # Gamble" survive. Also reject a multi-word value whose first word is
+    # all-lowercase ("customer needs and ..."); "eBay"/"iCIMS" still pass.
+    if client:
+        _cl_words = re.findall(r"[A-Za-z][A-Za-z'&.\-]*", client)
+        _cl_func = {'to', 'the', 'what', 'and', 'of', 'for', 'with', 'how', 'who',
+                    'that', 'which', 'is', 'are', 'a', 'an', 'in', 'on', 'we', 'you', 'they'}
+        _cl_func_hits = sum(1 for w in _cl_words if w in _cl_func)
+        if _cl_func_hits >= 2 or (len(_cl_words) > 1 and _cl_words[0] == _cl_words[0].lower()):
+            client = None
     if client and _looks_like_generic_client_header(client):
         client = None
 
