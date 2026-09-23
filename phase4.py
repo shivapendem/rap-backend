@@ -80,7 +80,27 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed"
+MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed-backend-fallback"
+# BUG FIX (two engines silently overwriting each other's scores forever):
+# this used to be the exact same string as rap_python_cron/matching_engine.py's
+# MATCHING_LOGIC_VERSION — but the two engines do NOT compute the same
+# score. cron blends semantic (0.40) + role (0.30); this file has no
+# semantic factor at all and weights role at 0.70 alone. Tagging both
+# engines' output identically meant each one treated the other's rows as
+# "already scored under the current logic, skip it" — so a row scored by
+# whichever engine touched it LAST just stuck permanently, with no way
+# for the more accurate semantic-aware cron engine to ever revisit a row
+# this backend engine had already written, and vice versa. This engine
+# now gets its own distinct tag (see the skip-check below for how the
+# two sides use it asymmetrically), and this string must be kept in sync
+# by hand with CRON_MATCHING_LOGIC_VERSION below whenever either engine's
+# scoring changes — there's no shared import between these two separate
+# deployed processes to enforce it automatically.
+#
+# Keep this in sync by hand with rap_python_cron/matching_engine.py's own
+# MATCHING_LOGIC_VERSION whenever cron's scoring logic changes — there's
+# no shared import between these two separate deployed processes.
+CRON_MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
@@ -1440,7 +1460,14 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
         if existing.status in ("APPLIED", "REJECTED"):
             continue  # frozen — human decision, engine never touches it again
         if existing.status == "MATCHING" and existing.score_breakdown and \
-                existing.score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+                existing.score_breakdown.get("_version") in (MATCHING_LOGIC_VERSION, CRON_MATCHING_LOGIC_VERSION):
+            # Already current under this engine's own logic, OR already
+            # scored by cron's more accurate semantic-aware engine — this
+            # engine must never overwrite that with its weaker no-semantic
+            # formula. cron itself has no such deference (see its own
+            # skip-check): it's free to re-score anything not tagged with
+            # its own exact version, so a row this engine wrote does get
+            # picked up and upgraded the next time cron processes it.
             continue  # already current, nothing to do
         needs_scoring.append(consultant)  # stale version, or was NOT_ELIGIBLE
 
@@ -1600,7 +1627,9 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
         if existing_status in ("APPLIED", "REJECTED"):
             continue  # frozen — human decision, engine never touches it again
         if existing_status == "MATCHING" and existing_score_breakdown and \
-                existing_score_breakdown.get("_version") == MATCHING_LOGIC_VERSION:
+                existing_score_breakdown.get("_version") in (MATCHING_LOGIC_VERSION, CRON_MATCHING_LOGIC_VERSION):
+            # Same deference to cron's more accurate scoring as
+            # match_requirement()'s skip-check above.
             match_count += 1
             continue
         ids_needing_scoring.append(req_id)

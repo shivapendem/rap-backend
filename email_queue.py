@@ -1422,6 +1422,31 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 if app:
                     app.status = "FAILED"
                     app.error_message = err_msg
+                # BUG FIX (match marked APPLIED before the send is even
+                # attempted, then stuck that way forever if the send
+                # fails): the "Add to queue" flow deliberately marks the
+                # RequirementConsultantMatch APPLIED the instant something
+                # is queued, not once it actually sends — that's
+                # intentional, it's what stops the same match from being
+                # queued a second time while the first send is still
+                # pending (see the BUG FIX comment where this gets set).
+                # Moving that marking to after a successful send would
+                # reopen exactly that race. The safe fix is the other
+                # direction: when the send turns out to have failed,
+                # revert the match back to MATCHING here so it's a normal,
+                # re-applicable match again instead of being permanently
+                # stuck showing as "Applied" for an application that
+                # never actually went out.
+                from models import RequirementConsultantMatch
+                match_res = await session.execute(
+                    select(RequirementConsultantMatch).where(
+                        RequirementConsultantMatch.consultant_id == item.consultant_id,
+                        RequirementConsultantMatch.requirement_id == item.requirement_id,
+                    )
+                )
+                match = match_res.scalars().first()
+                if match and match.status == "APPLIED":
+                    match.status = "MATCHING"
 
         import re
         if not item.to_email or not re.match(r"[^@]+@[^@]+\.[^@]+", item.to_email):
@@ -1738,6 +1763,13 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 f"Attachment(s) no longer available: {', '.join(missing_attachments)}. "
                 f"Re-attach the resume and resend."
             )
+            # BUG FIX: this branch never called mark_app_failed() at
+            # all — the queue item was marked FAILED, but the
+            # Application row (and, via mark_app_failed, the
+            # RequirementConsultantMatch) were left exactly as they
+            # were: still showing as a pending/applied send that in
+            # reality never went anywhere.
+            await mark_app_failed(item.status_text)
             await session.commit()
             for p in tmp_cleanup_paths:
                 try:
@@ -2064,6 +2096,25 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 if failed_app:
                     failed_app.status = "FAILED"
                     failed_app.error_message = str(e)
+                # BUG FIX: this is the genuine send-failure path (a real
+                # exception raised while actually trying to send via
+                # Gmail) — the most important place for the
+                # match-reverts-to-MATCHING-on-failure fix, since this is
+                # where a real send genuinely didn't go out. This handler
+                # re-fetches everything after a rollback and never reused
+                # the mark_app_failed() closure above (it captures the
+                # pre-rollback `item`/`session` state), so it needs the
+                # same revert applied inline here too.
+                from models import RequirementConsultantMatch
+                match_result = await session.execute(
+                    select(RequirementConsultantMatch).where(
+                        RequirementConsultantMatch.consultant_id == failed_item.consultant_id,
+                        RequirementConsultantMatch.requirement_id == failed_item.requirement_id,
+                    )
+                )
+                failed_match = match_result.scalars().first()
+                if failed_match and failed_match.status == "APPLIED":
+                    failed_match.status = "MATCHING"
             try:
                 await session.commit()
             except Exception as inner_e:
