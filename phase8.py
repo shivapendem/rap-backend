@@ -148,8 +148,8 @@ class ReviewActionRequest(BaseModel):
 
 
 class OpenAIUsageDTO(BaseModel):
-    tokens_limit: int
-    tokens_remaining: int
+    tokens_limit: str
+    tokens_remaining: str
     tokens_used_pct: float
     tokens_reset: str
 
@@ -689,6 +689,15 @@ async def update_ai_budget(
         budget_used_pct=round(used_pct, 2),
     )
 
+def format_large_number(num: int) -> str:
+    if num >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.1f}B".replace(".0B", "B")
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.1f}M".replace(".0M", "M")
+    if num >= 1_000:
+        return f"{num / 1_000:.1f}k".replace(".0k", "k")
+    return str(num)
+
 @router.get("/ai-usage/openai", response_model=OpenAIUsageDTO)
 async def get_openai_usage(
     db: AsyncSession = Depends(get_db),
@@ -705,8 +714,8 @@ async def get_openai_usage(
     if not api_key:
         logging.getLogger(__name__).warning("OPENAI_ADMIN_API_KEY is not set in .env")
         return OpenAIUsageDTO(
-            tokens_limit=0,
-            tokens_remaining=0,
+            tokens_limit="0",
+            tokens_remaining="0",
             tokens_used_pct=0.0,
             tokens_reset="End of Month"
         )
@@ -750,14 +759,14 @@ async def get_openai_usage(
         logging.getLogger(__name__).error(f"Error fetching OpenAI usage: {e}")
 
     # The organization usage API returns actual consumed tokens, not a hard limit.
-    # We mock a realistic organization limit (e.g., 50M tokens) to display a percentage.
-    limit = 50_000_000
+    # We mock a realistic organization limit (e.g., 300M tokens) to display a percentage.
+    limit = 300_000_000
     remaining = max(0, limit - total_tokens)
     used_pct = (total_tokens / limit) * 100.0 if limit > 0 else 0.0
 
     return OpenAIUsageDTO(
-        tokens_limit=limit,
-        tokens_remaining=remaining,
+        tokens_limit=format_large_number(limit),
+        tokens_remaining=format_large_number(remaining),
         tokens_used_pct=round(used_pct, 2),
         tokens_reset="End of Month"
     )
