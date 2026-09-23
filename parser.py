@@ -979,6 +979,20 @@ EXPERIENCE_PATTERNS = [
     r'(?i)(\d+\+?\s*yrs?\.?\s*(?:of\s*)?exp(?:erience)?)',
     r'(?i)minimum\s*(?:of\s*)?(\d+\+?\s*years?)',
     r'(?i)(\d+\s*-\s*\d+\s*years?)',
+    # BUG FIX ("Duration: ContractExp: 12 - 18 Yrs" from a MITS/Prohires
+    # broadcast -- experience came back empty): two gaps at once.
+    # (1) HTML-to-text glued the label onto the previous value
+    # ("ContractExp:"), so every \bexp label pattern failed -- there is no
+    # word boundary between "t" and "E". A lowercase->"E" camel-case join
+    # is now accepted as a boundary too (case-sensitive lookaround, so
+    # ordinary words like "index:" can't match).
+    # (2) No pattern accepted a RANGE written with the "Yrs" unit
+    # ("12 - 18 Yrs") -- the range patterns only knew "years". This one
+    # takes a labeled single value or range with years/yrs/no unit.
+    # Kept ABOVE the bare "Exp: 8+" pattern so the full range wins over
+    # just its lower bound at the same position.
+    r'(?i)(?:\b|(?-i:(?<=[a-z])(?=E)))exp(?:erience)?\s*(?:required|req\.?|level)?\s*[:\-]\s*'
+    r'(\d{1,2}\+?\s*(?:(?:-|\u2013|to)\s*\d{1,2}\+?\s*)?(?:years?|yrs?\.?)?)',
     # Bare "Experience: 8+" / "Exp: 5+" -- no explicit "years" unit at all.
     # Common in condensed templates; the label makes the unit unambiguous,
     # so it's safe to infer "years" even though the text doesn't say it.
@@ -4089,7 +4103,7 @@ def extract_experience(text: str) -> Optional[str]:
             if _EXPERIENCE_CAP_CONTEXT.search(preceding):
                 continue  # this occurrence is a maximum/cap, not a requirement
             exp = match.group(1).strip()
-            year_match = re.search(r'\d+\+?\s*(?:-\s*\d+\s*)?years?', exp, re.IGNORECASE)
+            year_match = re.search(r'\d+\+?\s*(?:(?:-|\u2013|to)\s*\d+\s*)?(?:years?|yrs?\.?)', exp, re.IGNORECASE)
             if year_match:
                 value = year_match.group(0)
                 value = re.sub(r'(?i)\byrs?\.?\b', 'years', value)
