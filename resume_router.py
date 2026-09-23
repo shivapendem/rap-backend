@@ -1174,12 +1174,17 @@ async def update_base_resume_text(
                 consultant.base_resume_file_path = key
         else:
             # No file on record yet (text entered without ever uploading a
-            # file) — create one locally, same layout _save_resume_file uses.
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
+            # file) — generate the DOCX and upload it to DigitalOcean Spaces.
+            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes),
+                key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            if not uploaded:
+                raise RuntimeError(f"Failed to upload generated base resume to DigitalOcean Spaces: {key}")
+            consultant.base_resume_file_path = key
     except Exception as e:
         # Don't fail the save over a DOCX regen hiccup — base_resume_text
         # itself already committed below and still powers AI tailoring.
@@ -1791,11 +1796,16 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
             if uploaded:
                 consultant.base_resume_file_path = key
         else:
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
+            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes),
+                key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            if not uploaded:
+                raise RuntimeError(f"Failed to upload generated base resume to DigitalOcean Spaces: {key}")
+            consultant.base_resume_file_path = key
         await db.commit()
     except Exception as e:
         print(f"Base resume DOCX regeneration (background sync) failed for consultant {consultant.id}: {e}")
@@ -2540,6 +2550,13 @@ async def get_consultants_for_resumes(
     # requirement (RequirementConsultantMatch), same source the
     # Requirements table's own "Matched Consultants" column already uses.
     requirement_id: int = None,
+    # Apply page with no consultant pre-selected: if the requirement has no
+    # MATCHING consultants, return the full roster instead of [] so it can
+    # still be applied to manually.
+    fallback_to_all: bool = False,
+    # Apply page opened for one consultant (Pending Applications / consultant
+    # filter): return only that consultant (still role-scoped below).
+    consultant_id: int = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -2571,7 +2588,9 @@ async def get_consultants_for_resumes(
         }
 
     matched_consultant_ids = None
-    if requirement_id:
+    if consultant_id:
+        matched_consultant_ids = [consultant_id]
+    elif requirement_id:
         from models import RequirementConsultantMatch
 
         # BUG FIX ("Select Candidate" in Compose Mail could show a
@@ -2591,7 +2610,10 @@ async def get_consultants_for_resumes(
         )
         matched_consultant_ids = list({row[0] for row in rcm_result.all()})
         if not matched_consultant_ids:
-            return []
+            if fallback_to_all:
+                matched_consultant_ids = None  # no matches → show every candidate
+            else:
+                return []
 
     if current_user.role == "ADMIN":
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(

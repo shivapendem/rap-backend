@@ -854,10 +854,19 @@ async def get_gmail_emails(
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    # light=true: list view only — skip the heavy body/header/address columns
+    # (the View modal fetches the full email via /api/admin/raw-emails/{id}).
+    light: bool = False,
+    # search_body=true also searches the email body (slow on a large table).
+    # Default: subject / from name / from address only — fast.
+    search_body: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "ADMIN", "RECRUITER")
+
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
 
     # Build WHERE clause
     where_clauses = []
@@ -973,15 +982,27 @@ async def get_gmail_emails(
             re.sub(r"([^0-9A-Za-z])", r"\\\1", w)
             for w in search.translate(_search_table).split()
         ]
-        # Search subject / from_address / from_name only -- the email BODY
-        # is intentionally not searched (reading full bodies on a 253k-row
-        # table exceeded the frontend's 30s timeout).
+        # MERGE RESOLUTION (HEAD vs 1196aa0): kept HEAD's indexed whole-field
+        # regex match for subject / from_address / from_name. 1196aa0's
+        # regexp_replace(...) ILIKE :search clause was dropped: it could not
+        # use the pg_trgm indexes (full-table regex on 253k rows), and ANDed
+        # with this clause it compared a regex pattern via ILIKE, so every
+        # search would have returned nothing. Its search_body opt-in is kept
+        # below: when search_body=true, the body is ALSO searched for the
+        # phrase anywhere in body_text (unanchored -- a body never equals the
+        # search). No index covers the body, so this is slow on a large
+        # table; it only runs when explicitly requested. Default (false) is
+        # fast: subject / sender only.
         if _words:
-            where_clauses.append(
+            _clause = (
                 "(subject ~* :search"
                 " OR from_address ~* :search"
-                " OR from_name ~* :search)"
+                " OR from_name ~* :search"
             )
+            if search_body:
+                _clause += " OR body_text ~* :search_phrase"
+                params["search_phrase"] = _ws_class.join(_words)
+            where_clauses.append(_clause + ")")
             # WHOLE-FIELD MATCH: anchored with ^...$ so the entire subject
             # (or sender address / name) must equal the search -- nothing
             # before or after it. Leading/trailing whitespace (incl. the
@@ -1024,15 +1045,24 @@ async def get_gmail_emails(
     # time — it's reliably monotonic, so ordering by it guarantees the
     # most-recently-ingested mail is always first. Falls back to ge.date
     # only for legacy rows that predate fetched_at being populated.
-    result = await db.execute(
-        text(f"""
-            SELECT ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
+    if light:
+        select_cols = """
+            ge.id, ge.account_email, ge.subject, ge.from_address, ge.from_name,
+                   ge.date, ge.fetched_at, ge.category, ge.processed,
+                   ge.status_desc, ge.reason,"""
+    else:
+        select_cols = """
+            ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
                    ge.subject, ge.from_address, ge.from_name, ge.to_addresses, ge.cc_addresses,
                    ge.bcc_addresses, ge.reply_to, ge.body_text, ge.body_html, ge.date,
                    ge.is_read, ge.is_starred, ge.has_attachments, ge.attachments, ge.labels,
                    ge.thread_id, ge.raw_headers, ge.fetched_at, ge.category, ge.priority,
                    ge.processed, ge.classified_at, ge.classifier_tier, ge.job_posting_id,
-                   ge.status_desc, ge.reason,
+                   ge.status_desc, ge.reason,"""
+
+    result = await db.execute(
+        text(f"""
+            SELECT {select_cols}
                    EXISTS (
                        SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
                    ) AS has_requirement
