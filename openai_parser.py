@@ -44,6 +44,19 @@ SKILLS
 - Extract EVERY concrete skill, technology, tool, or platform explicitly named — don't be selective when several are listed together. If the email lists five testing types ("functional, integration, UI/UX, regression, and UAT testing"), include all five, not just some of them.
 - When a SPECIFIC named product or platform is mentioned (e.g. "Salesforce Marketing Cloud", "Braze", "Prisma Cloud"), extract that specific name — don't reduce it down to only a vague general-category paraphrase (e.g. don't drop "Salesforce Marketing Cloud" and keep only "marketing automation"; include the actual product name that was written, alongside a general category term if the email also uses one).
 
+EXPERIENCE
+- Output ONLY the minimum years of experience required, in exactly one of these forms: "5+ years", "5 years", or "5-7 years". Never a sentence, never words copied from the email.
+- Convert the email's phrasing:
+  - "at least", "minimum", "min", "or more", "or above", "& above", "over" → "+". e.g. "at least three years" → "3+ years", "10 & Above" → "10+ years", "Min 15 Years or above" → "15+ years"
+  - Number words → digits: "Eight or more years" → "8+ years", "minimum five (5) years" → "5+ years"
+  - Ranges: "13 to 17 Years" → "13-17 years", "5 - 10 Overall Years" → "5-10 years", "Mid (5-7 Years)" → "5-7 years"
+- Several requirements that ALL apply ("12+ years IT with 5+ in Databricks", "Eight or more years … including at least five in mobile") → the highest: "12+ years", "8+ years".
+- Return null when there is no number of YEARS of experience:
+  - Seniority or skill-level words only: "Senior", "Expert", "Lead-level", "Mid-level", "Beginner to Intermediate"
+  - The number is missing: "Hands on  years of experience"
+  - The number counts something else: "2 - 4 end to end implementation projects", contract duration ("12+ Months", "9 Months"), a maximum cap ("not more than 15 years"), or the sender's own history ("we have 20+ years of experience").
+- Never output a template or placeholder such as "N+ years".
+
 When in doubt on any field, prefer leaving it null over guessing — a wrong value is worse than a missing one.
 """
 
@@ -82,7 +95,7 @@ PARSE_REQUIREMENT_SCHEMA = {
                 "items": {"type": "string", "enum": ["C2C", "C2H", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
                 "description": "One or more of C2C, C2H, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN. Do not include a type the email explicitly negates (e.g. 'No C2C'). Only from the actual posting content — never inferred from a mailing-list/group name or unsubscribe footer text."
             },
-            "experience": {"type": ["string", "null"], "description": "e.g. '8+ years'."},
+            "experience": {"type": ["string", "null"], "description": "Minimum years of experience required, ONLY as '5+ years', '5 years' or '5-7 years' (convert number words and 'at least'/'minimum'/'or above' phrasing; highest if several all apply). Null for seniority/level words only (Senior, Expert, Beginner to Intermediate), a missing number, counts of projects, contract duration, a maximum cap, or the sender's own history. Never a sentence, copied text, or a placeholder like 'N+ years'."},
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
