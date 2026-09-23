@@ -899,7 +899,15 @@ def _save_resume_file(file_bytes: bytes, consultant_id: int, original_filename: 
     }
     ext = ext_map.get(content_type, ".bin")
     s3_key = f"uploads/resumes/{consultant_id}/{uuid.uuid4().hex}{ext}"
-    upload_file_to_s3(io.BytesIO(file_bytes), s3_key, content_type)
+    uploaded = upload_file_to_s3(
+        io.BytesIO(file_bytes),
+        s3_key,
+        content_type,
+    )
+
+    if not uploaded:
+        raise RuntimeError(f"Failed to upload resume to DigitalOcean Spaces: {s3_key}")
+
     return s3_key
 
 
