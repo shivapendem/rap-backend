@@ -979,6 +979,20 @@ EXPERIENCE_PATTERNS = [
     r'(?i)(\d+\+?\s*yrs?\.?\s*(?:of\s*)?exp(?:erience)?)',
     r'(?i)minimum\s*(?:of\s*)?(\d+\+?\s*years?)',
     r'(?i)(\d+\s*-\s*\d+\s*years?)',
+    # BUG FIX ("Duration: ContractExp: 12 - 18 Yrs" from a MITS/Prohires
+    # broadcast -- experience came back empty): two gaps at once.
+    # (1) HTML-to-text glued the label onto the previous value
+    # ("ContractExp:"), so every \bexp label pattern failed -- there is no
+    # word boundary between "t" and "E". A lowercase->"E" camel-case join
+    # is now accepted as a boundary too (case-sensitive lookaround, so
+    # ordinary words like "index:" can't match).
+    # (2) No pattern accepted a RANGE written with the "Yrs" unit
+    # ("12 - 18 Yrs") -- the range patterns only knew "years". This one
+    # takes a labeled single value or range with years/yrs/no unit.
+    # Kept ABOVE the bare "Exp: 8+" pattern so the full range wins over
+    # just its lower bound at the same position.
+    r'(?i)(?:\b|(?-i:(?<=[a-z])(?=E)))exp(?:erience)?\s*(?:required|req\.?|level)?\s*[:\-]\s*'
+    r'(\d{1,2}\+?\s*(?:(?:-|\u2013|to)\s*\d{1,2}\+?\s*)?(?:years?|yrs?\.?)?)',
     # Bare "Experience: 8+" / "Exp: 5+" -- no explicit "years" unit at all.
     # Common in condensed templates; the label makes the unit unambiguous,
     # so it's safe to infer "years" even though the text doesn't say it.
@@ -4089,7 +4103,7 @@ def extract_experience(text: str) -> Optional[str]:
             if _EXPERIENCE_CAP_CONTEXT.search(preceding):
                 continue  # this occurrence is a maximum/cap, not a requirement
             exp = match.group(1).strip()
-            year_match = re.search(r'\d+\+?\s*(?:-\s*\d+\s*)?years?', exp, re.IGNORECASE)
+            year_match = re.search(r'\d+\+?\s*(?:(?:-|\u2013|to)\s*\d+\s*)?(?:years?|yrs?\.?)', exp, re.IGNORECASE)
             if year_match:
                 value = year_match.group(0)
                 value = re.sub(r'(?i)\byrs?\.?\b', 'years', value)
@@ -5447,6 +5461,198 @@ def strip_boilerplate_footer(text: str) -> str:
 # Main Parser Function
 # ---------------------------------------------------------------------------
 
+# =============================================================
+# Experience normalisation -- enforced in code, not just in the prompt
+# =============================================================
+# BUG FIX ("experience still extracting in different formats" -- confirmed
+# real cases: "Minimum of 15 years related experience with a software
+# company, where in 7 years in OutSystems.", "Minimum 3 years", "Min 2+
+# years", "10+ years overall, 5+ years in broadband CPE/ACS environments"):
+# openai_parser.py's prompt ASKS for exactly "5+ years" / "5 years" /
+# "5-7 years", but `strict: True` only guarantees the response's SHAPE (a
+# string or null) -- never what is inside the string. gpt-4o-mini often
+# copies the email's own phrasing verbatim instead of converting it, and
+# nothing downstream checked: reconcile_experience() (cron copy) and
+# `_ai_field('experience') or extract_experience(...)` (backend copy) both
+# pass any AI value containing a digit through unchanged into
+# parsed_fields. The regex fallback also dropped the "minimum" meaning
+# ("Minimum 3 years of experience" -> "3 years", should be "3+ years").
+#
+# finalize_experience() is applied to the final value in
+# parse_requirement(), so every path -- OpenAI, spaCy, regex, the
+# multi-posting parse_requirements() splitter, and the backend's Reparse --
+# produces ONLY one of:  "N+ years" | "N years" | "N-M years" | None,
+# using the same rules the prompt describes:
+#   - min / minimum / at least / over / more than / or more / or above /
+#     & above / plus / "+"            -> "N+ years"
+#   - number words -> digits ("Eight or more years" -> "8+ years")
+#   - ranges ("13 to 17 Years", "5 - 10 Overall Years") -> "13-17 years"
+#   - several requirements that all apply -> the HIGHEST
+#     ("10+ years overall, 5+ years in X" -> "10+ years")
+#   - None for: no number of years (seniority words, "Hands on years"),
+#     months/projects counts, a maximum cap ("not more than 15 years"),
+#     the sender's own history ("we have 20+ years"), placeholders.
+# IDENTICAL block in rap-backend/parser.py and rap_python_cron/parser.py --
+# keep them in sync.
+
+_EXP_CANONICAL_RE = re.compile(r'^(\d{1,2})(?:\+|-(\d{1,2}))? years$')
+_EXP_UNIT = r'(?:years?|yrs?)'
+_EXP_NUMBER_WORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+    'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10, 'eleven': 11,
+    'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15,
+    'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19,
+    'twenty': 20, 'twenty-five': 25, 'twenty five': 25, 'thirty': 30,
+}
+_EXP_NUMBER_WORDS_RE = re.compile(
+    r'(?i)\b(' + '|'.join(sorted((re.escape(w) for w in _EXP_NUMBER_WORDS), key=len, reverse=True)) + r')\b'
+)
+# "Minimum", "at least", "over" ... immediately BEFORE the number.
+_EXP_MIN_BEFORE = re.compile(
+    r'(?i)(?:\bmin(?:imum)?\.?|\bat\s+least|\bover|\bmore\s+than|\bupwards\s+of|\bno\s+less\s+than)'
+    r'\s*(?:of\s*)?[:\-]?\s*$'
+)
+# "or more", "& above", "plus" ... AFTER the number or unit.
+_EXP_MIN_AFTER = re.compile(
+    r'(?i)^\s*(?:\+|plus\b|or\s+(?:more|above|greater|higher)\b|(?:&|and)\s+(?:above|up)\b)'
+)
+# A maximum / cap, not a requirement.
+_EXP_CAP_BEFORE = re.compile(
+    r'(?i)(?:\bnot\s+(?:be\s+)?more\s+than|\bno\s+more\s+than|\bup\s+to|\bmax(?:imum)?\.?|'
+    r'\bless\s+than|\bunder|\bshould\s+not\s+exceed|\bnot\s+(?:to\s+)?exceed)\s*(?:of\s*)?[:\-]?\s*$'
+)
+# The SENDER's own history ("we have 20+ years of experience").
+_EXP_SELF_BEFORE = re.compile(
+    r'(?i)\b(?:we\s+have|we\s+bring|we\s+are|our\s+(?:company|firm|team|organization|agency)\s+'
+    r'(?:has|have|brings)|in\s+business\s+for|serving\s+(?:clients|customers)\s+for)\b[^\n]{0,30}$'
+)
+# A number that counts something other than years.
+_EXP_NON_YEAR_AFTER = re.compile(
+    r'(?i)^\s*\+?\s*(?:months?|mos?\b|weeks?|days?|hours?|hrs?\b|projects?|implementations?|clients?)'
+)
+_EXP_RANGE_RE = re.compile(
+    r'(?i)(?<![\d.])(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\s*(\+)?\s*((?:[a-z]+\s+){0,2}?)' + _EXP_UNIT + r'\b'
+)
+_EXP_SINGLE_RE = re.compile(
+    r'(?i)(?<![\d.\-])(\d{1,2})\s*(\+)?\s*((?:[a-z&]+\s+){0,2}?)' + _EXP_UNIT + r'\b'
+)
+_EXP_BARE_RE = re.compile(r'(?<![\d.\-])(\d{1,2})\s*(\+)?')
+_EXP_MAX_YEARS = 40
+
+
+def _exp_prepare(value: str) -> str:
+    """Unify dashes/apostrophes and turn number words into digits."""
+    t = str(value)
+    for dash in ('\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2212'):
+        t = t.replace(dash, '-')
+    t = re.sub(r"[\u2018\u2019'`]", '', t)            # "years'" -> "years"
+    t = _EXP_NUMBER_WORDS_RE.sub(lambda m: str(_EXP_NUMBER_WORDS[m.group(1).lower()]), t)
+    t = re.sub(r'\b(\d{1,2})\s*\(\s*\1\s*\)', r'\1', t)  # "5 (5) years" -> "5 years"
+    return t
+
+
+def _exp_is_excluded(t: str, start: int) -> bool:
+    before = t[max(0, start - 40):start]
+    if _EXP_CAP_BEFORE.search(before):
+        return True
+    if _EXP_SELF_BEFORE.search(t[max(0, start - 80):start]):
+        return True
+    return False
+
+
+def _exp_candidates(t: str) -> list:
+    """(min_years, formatted_value, position) for every year requirement in t."""
+    out = []
+    taken = []
+    for m in _EXP_RANGE_RE.finditer(t):
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if _exp_is_excluded(t, m.start()) or lo <= 0 or hi > _EXP_MAX_YEARS:
+            continue
+        taken.append((m.start(), m.end()))
+        if lo >= hi:
+            continue
+        out.append((lo, f"{lo}-{hi} years", m.start()))  # "8-12+ years" -> "8-12 years"
+    for m in _EXP_SINGLE_RE.finditer(t):
+        if any(a <= m.start() < b for a, b in taken):
+            continue  # part of a range already counted
+        n = int(m.group(1))
+        if n <= 0 or n > _EXP_MAX_YEARS or _exp_is_excluded(t, m.start()):
+            continue
+        between = m.group(3) or ''
+        plus = bool(
+            m.group(2)
+            or re.search(r'(?i)\bor\s+(?:more|above|greater)\b|(?:&|and)\s+above\b|\bplus\b', between)
+            or _EXP_MIN_BEFORE.search(t[max(0, m.start() - 30):m.start()])
+            or _EXP_MIN_AFTER.match(t[m.end():])
+        )
+        out.append((n, f"{n}+ years" if plus else f"{n} years", m.start()))
+    return out
+
+
+def normalize_experience(value) -> Optional[str]:
+    """Convert any experience text to "N+ years" / "N years" / "N-M years",
+    or None when it states no minimum number of years."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw or not re.search(r'\d', raw) and not _EXP_NUMBER_WORDS_RE.search(raw):
+        return None
+    canonical = re.sub(r'\s+', ' ', raw.lower())
+    if _EXP_CANONICAL_RE.match(canonical):
+        return canonical
+    t = _exp_prepare(raw)
+    candidates = _exp_candidates(t)
+    if not candidates and len(t.split()) <= 6:
+        # Short value with no "years" unit at all: "8+", "10 & Above", "5".
+        for m in _EXP_BARE_RE.finditer(t):
+            n = int(m.group(1))
+            if n <= 0 or n > _EXP_MAX_YEARS or _EXP_NON_YEAR_AFTER.match(t[m.end():]):
+                continue
+            if _exp_is_excluded(t, m.start()):
+                continue
+            plus = bool(m.group(2) or _EXP_MIN_AFTER.match(t[m.end():])
+                        or _EXP_MIN_BEFORE.search(t[max(0, m.start() - 30):m.start()]))
+            candidates.append((n, f"{n}+ years" if plus else f"{n} years", m.start()))
+    if not candidates:
+        return None
+    # Highest minimum wins (several requirements that all apply); ties go
+    # to the earliest-stated one.
+    best = max(candidates, key=lambda c: (c[0], -c[2]))
+    return best[1]
+
+
+def finalize_experience(value, source_text: Optional[str] = None) -> Optional[str]:
+    """The ONLY value parse_requirement() may store for experience.
+
+    1. Normalise whatever the AI / regex produced.
+    2. If that yields nothing usable but a value WAS produced, fall back to
+       the deterministic regex over the email text, normalised the same way.
+    3. A bare "N years" is upgraded to "N+ years" when the email itself
+       states that figure as a minimum ("Minimum 3 years of experience",
+       "at least 5 years", "8 years or more").
+    """
+    result = normalize_experience(value)
+    if result is None and value is not None and source_text:
+        try:
+            result = normalize_experience(extract_experience(source_text))
+        except Exception:
+            result = None
+    if result and source_text:
+        exact = re.fullmatch(r'(\d{1,2}) years', result)
+        if exact:
+            n = exact.group(1)
+            t = _exp_prepare(source_text)
+            for m in re.finditer(r'(?i)(?<![\d.\-])' + n + r'\s*((?:[a-z&]+\s+){0,2}?)' + _EXP_UNIT + r'\b', t):
+                if _exp_is_excluded(t, m.start()):
+                    continue
+                if (_EXP_MIN_BEFORE.search(t[max(0, m.start() - 30):m.start()])
+                        or _EXP_MIN_AFTER.match(t[m.end():])
+                        or re.search(r'(?i)\bor\s+(?:more|above)\b', m.group(1) or '')):
+                    return f"{n}+ years"
+    return result
+
+
+
 def parse_requirement(
     subject: str,
     body: str,
@@ -6138,6 +6344,10 @@ def parse_requirement(
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email
     )
+
+    # Enforce the experience format in code -- see finalize_experience().
+    # Every path (OpenAI / spaCy / regex / bare label line) ends here.
+    experience = finalize_experience(experience, full_text)
 
     parsed = {
         'role': role,

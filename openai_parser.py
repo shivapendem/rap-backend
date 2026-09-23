@@ -50,12 +50,24 @@ EXPERIENCE
   - "at least", "minimum", "min", "or more", "or above", "& above", "over" → "+". e.g. "at least three years" → "3+ years", "10 & Above" → "10+ years", "Min 15 Years or above" → "15+ years"
   - Number words → digits: "Eight or more years" → "8+ years", "minimum five (5) years" → "5+ years"
   - Ranges: "13 to 17 Years" → "13-17 years", "5 - 10 Overall Years" → "5-10 years", "Mid (5-7 Years)" → "5-7 years"
+  - Abbreviated labels and units count exactly like the full words: "Exp", "Exp.", "Experience", "Exp Required", "Yrs", "Yr", "Yrs." all mean experience / years. "Exp: 12 - 18 Yrs" → "12-18 years", "Exp: 8+" → "8+ years", "10+ Yrs exp" → "10+ years".
+- The body is often HTML flattened into one line, so labels run straight into the previous field's value with no space or newline (e.g. "Duration: ContractExp: 12 - 18 Yrs", "Location: New York, NYExperience: 10+ years"). Split them mentally: "ContractExp: 12 - 18 Yrs" is Duration = "Contract" and Experience = "12-18 years". A number after an "Exp"/"Experience" label with a years/Yrs unit is ALWAYS experience, never duration, even when it sits right next to the Duration label.
+- Search the WHOLE email (subject and body, including a dense run-on paragraph) for an experience value before returning null. If an "Exp"/"Experience" label is followed by a number of years anywhere, it must be returned.
 - Several requirements that ALL apply ("12+ years IT with 5+ in Databricks", "Eight or more years … including at least five in mobile") → the highest: "12+ years", "8+ years".
 - Return null when there is no number of YEARS of experience:
   - Seniority or skill-level words only: "Senior", "Expert", "Lead-level", "Mid-level", "Beginner to Intermediate"
   - The number is missing: "Hands on  years of experience"
   - The number counts something else: "2 - 4 end to end implementation projects", contract duration ("12+ Months", "9 Months"), a maximum cap ("not more than 15 years"), or the sender's own history ("we have 20+ years of experience").
 - Never output a template or placeholder such as "N+ years".
+- Real examples from past emails (email text -> correct output):
+  - "Duration: ContractExp: 12 - 18 Yrs  Required qualifications" -> "12-18 years"
+  - "Exp: 12 - 18 Yrs" -> "12-18 years"
+  - "Minimum 3 years of experience as a functional consultant" -> "3+ years"
+  - "Min 2+ years' experience working with RedHat Enterprise Linux" -> "2+ years"
+  - "Minimum of 15 years related experience with a software company, where in 7 years in OutSystems" -> "15+ years"
+  - "Experience Target : 10+ years overall, 5+ years in broadband CPE/ACS environments" -> "10+ years"
+  - "Years of Experience: 15.00 Years of Experience" -> "15 years"
+- Output ONLY the converted value. Never copy the email's own sentence or wording into this field.
 
 When in doubt on any field, prefer leaving it null over guessing — a wrong value is worse than a missing one.
 """
@@ -95,7 +107,7 @@ PARSE_REQUIREMENT_SCHEMA = {
                 "items": {"type": "string", "enum": ["C2C", "C2H", "W2", "1099", "FULLTIME", "CONTRACT", "UNKNOWN"]},
                 "description": "One or more of C2C, C2H, W2, 1099, FULLTIME, CONTRACT, or UNKNOWN. Do not include a type the email explicitly negates (e.g. 'No C2C'). Only from the actual posting content — never inferred from a mailing-list/group name or unsubscribe footer text."
             },
-            "experience": {"type": ["string", "null"], "description": "Minimum years of experience required, ONLY as '5+ years', '5 years' or '5-7 years' (convert number words and 'at least'/'minimum'/'or above' phrasing; highest if several all apply). Null for seniority/level words only (Senior, Expert, Beginner to Intermediate), a missing number, counts of projects, contract duration, a maximum cap, or the sender's own history. Never a sentence, copied text, or a placeholder like 'N+ years'."},
+            "experience": {"type": ["string", "null"], "description": "Minimum years of experience required, ONLY as '5+ years', '5 years' or '5-7 years' (convert number words, 'at least'/'minimum'/'or above' phrasing, and abbreviations like 'Exp: 12 - 18 Yrs' -> '12-18 years', even when the label is glued to the previous field as in 'ContractExp:'; highest if several all apply). Null for seniority/level words only (Senior, Expert, Beginner to Intermediate), a missing number, counts of projects, contract duration, a maximum cap, or the sender's own history. Never a sentence, copied text, or a placeholder like 'N+ years'."},
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
