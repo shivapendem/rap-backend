@@ -713,6 +713,10 @@ async def generate_resume(
             source_type="resume",
             source_id=str(new_resume.id),
         )
+    finally:
+        # S3-ONLY FIX: never leave the resume copy on the server disk
+        import shutil as _shutil
+        _shutil.rmtree(resume_dir, ignore_errors=True)
 
     await db.commit()
     await db.refresh(new_resume)
@@ -803,6 +807,10 @@ async def finalize_resume(
             source_type="resume",
             source_id=str(resume.id),
         )
+    finally:
+        # S3-ONLY FIX: never leave the resume copy on the server disk
+        import shutil as _shutil
+        _shutil.rmtree(resume_dir, ignore_errors=True)
 
     await db.commit()
     await db.refresh(resume)
@@ -1149,19 +1157,9 @@ async def update_base_resume_text(
             # the extension to .docx and drop the old file rather than
             # writing DOCX bytes under a stale .pdf name, which would
             # mislabel the media_type the download endpoint serves.
-            old_path = Path(stored)
-            new_path = old_path.with_suffix(".docx")
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            # BUG FIX: same lock-window race as _regenerate_base_resume_docx_file
-            # / download_base_resume — write to a temp sibling file, then an
-            # atomic rename, instead of holding a lock on the real path for
-            # the full write duration.
-            tmp_path = new_path.with_name(f".{new_path.stem}.{uuid.uuid4().hex}.tmp")
-            tmp_path.write_bytes(docx_bytes)
-            os.replace(tmp_path, new_path)
-            if new_path != old_path and old_path.exists():
-                old_path.unlink()
-            consultant.base_resume_file_path = str(new_path)
+            # S3-ONLY FIX: no longer rewrites the file on the server disk.
+            # Upload to Spaces; the legacy local copy is deleted only after
+            # the upload succeeds.
             # Re-upload under a .docx key so a pre-migration .pdf key
             # doesn't end up mislabeled the same way as the local case.
             key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
@@ -1172,14 +1170,25 @@ async def update_base_resume_text(
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             ):
                 consultant.base_resume_file_path = key
+                try:
+                    os.remove(stored)
+                except OSError:
+                    pass
+            else:
+                raise RuntimeError(f"Failed to upload base resume to DigitalOcean Spaces: {key}")
         else:
             # No file on record yet (text entered without ever uploading a
-            # file) — create one locally, same layout _save_resume_file uses.
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
+            # file) — generate the DOCX and upload it to DigitalOcean Spaces.
+            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes),
+                key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            if not uploaded:
+                raise RuntimeError(f"Failed to upload generated base resume to DigitalOcean Spaces: {key}")
+            consultant.base_resume_file_path = key
     except Exception as e:
         # Don't fail the save over a DOCX regen hiccup — base_resume_text
         # itself already committed below and still powers AI tailoring.
@@ -1749,23 +1758,21 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
 
         stored = consultant.base_resume_file_path
         if stored and os.path.isfile(stored):
-            old_path = Path(stored)
-            new_path = old_path.with_suffix(".docx")
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            # BUG FIX (race with concurrent "View" reads -- see the matching
-            # BUG FIX comment in download_base_resume): writing bytes
-            # directly to new_path holds a Windows file lock on it for the
-            # entire write. Writing to a sibling temp file first and then
-            # atomically replacing the real path with os.replace() shrinks
-            # that lock window from "however long the write takes" down to
-            # "a near-instant rename", making the race far less likely to
-            # ever be hit in the first place.
-            tmp_path = new_path.with_name(f".{new_path.stem}.{uuid.uuid4().hex}.tmp")
-            tmp_path.write_bytes(docx_bytes)
-            os.replace(tmp_path, new_path)
-            if new_path != old_path and old_path.exists():
-                old_path.unlink()
-            consultant.base_resume_file_path = str(new_path)
+            # S3-ONLY FIX: legacy local file -> upload to Spaces (same key
+            # string), then delete it from the server disk.
+            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            if not uploaded:
+                raise RuntimeError(f"Failed to upload base resume to DigitalOcean Spaces: {key}")
+            consultant.base_resume_file_path = key
+            try:
+                os.remove(stored)
+            except OSError:
+                pass
         elif stored:
             key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
             # PERF FIX ("taking long time to save" / requests timing out at
@@ -1791,11 +1798,16 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
             if uploaded:
                 consultant.base_resume_file_path = key
         else:
-            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
-            new_path.write_bytes(docx_bytes)
-            consultant.base_resume_file_path = str(new_path)
+            key = f"uploads/resumes/{consultant.id}/{uuid.uuid4().hex}.docx"
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes),
+                key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            if not uploaded:
+                raise RuntimeError(f"Failed to upload generated base resume to DigitalOcean Spaces: {key}")
+            consultant.base_resume_file_path = key
         await db.commit()
     except Exception as e:
         print(f"Base resume DOCX regeneration (background sync) failed for consultant {consultant.id}: {e}")
@@ -2807,6 +2819,10 @@ async def update_resume(
                 source_type="resume",
                 source_id=str(resume.id),
             )
+        finally:
+            # S3-ONLY FIX: never leave the resume copy on the server disk
+            import shutil as _shutil
+            _shutil.rmtree(resume_dir, ignore_errors=True)
 
     return resume
 
@@ -2900,6 +2916,10 @@ async def download_resume(
                 source_type="resume",
                 source_id=str(resume.id),
             )
+        finally:
+            # S3-ONLY FIX: never leave the resume copy on the server disk
+            import shutil as _shutil
+            _shutil.rmtree(resume_dir, ignore_errors=True)
 
         if not resume.s3_key:
             # BUG FIX ("View gives a generic 400 with no way to diagnose
@@ -3065,6 +3085,10 @@ async def download_resume_docx(
                     source_type="resume",
                     source_id=str(resume.id),
                 )
+            finally:
+                # S3-ONLY FIX: never leave the resume copy on the server disk
+                import shutil as _shutil
+                _shutil.rmtree(resume_dir, ignore_errors=True)
 
         if body is None:
             raise HTTPException(status_code=400, detail="Resume does not have a generated DOCX.")

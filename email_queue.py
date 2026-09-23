@@ -1090,10 +1090,7 @@ async def upload_attachment(
     """
     safe_original = sanitize_attachment_filename(file.filename)
     unique_name = f"{uuid.uuid4()}__{safe_original}"
-    file_path = os.path.join(UPLOAD_DIR, unique_name)
     contents = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(contents)
 
     from s3_service import upload_file_to_s3
     import io
@@ -1106,10 +1103,11 @@ async def upload_attachment(
     uploaded = await asyncio.to_thread(
         upload_file_to_s3, io.BytesIO(contents), s3_key, file.content_type or "application/octet-stream"
     )
-    stored_reference = s3_key if uploaded else unique_name
+    # S3-ONLY FIX: no local /tmp copy any more — Spaces is the only store.
     if not uploaded:
-        print(f"[email_queue] WARNING: Spaces upload failed for {unique_name} — "
-              f"falling back to /tmp only, which is NOT durable across restarts.")
+        raise HTTPException(status_code=502, detail="Attachment upload to storage failed. Please retry.")
+    stored_reference = s3_key
+    file_path = s3_key
 
     return {
         "success": True,

@@ -1036,6 +1036,28 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     doc.save(str(output_path))
 
 
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+async def _generate_docx_to_s3(resume_data, template, consultant_id, requirement_id, base_stem) -> str:
+    """S3-ONLY FIX: build the DOCX in a throwaway temp dir, upload it to
+    Spaces, and return the S3 KEY (stored in GeneratedResume.docx_path).
+    Nothing is left on the server's disk. download_resume() and phase5's
+    apply flow already fall back to download_file_from_s3() whenever
+    docx_path is not a local file, so they work unchanged with a key."""
+    from s3_service import upload_file_to_s3
+    key = f"generated-resumes/{consultant_id}/{requirement_id}/{uuid.uuid4().hex}/{base_stem}.docx"
+    err: list = []
+    with tempfile.TemporaryDirectory(prefix="gen_resume_") as tmp:
+        local = Path(tmp) / f"{base_stem}.docx"
+        _generate_docx(resume_data, local, template=template)
+        with open(local, "rb") as f:
+            ok = await asyncio.to_thread(upload_file_to_s3, f, key, _DOCX_MIME, err)
+    if not ok:
+        raise RuntimeError(f"Spaces upload failed for {key}: {err[0] if err else 'unknown'}")
+    return key
+
+
 def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
     """
     LibreOffice headless first (production), reportlab fallback (local dev).
@@ -1295,14 +1317,9 @@ async def _run_generation_pipeline(
     # the server for PDF generation") for a file nothing downstream
     # actually needs once DOCX is the only supported format. DOCX is now
     # the only artifact this pipeline produces.
-    resume_dir = RESUME_UPLOAD_DIR / "generated" / str(consultant.id) / str(requirement.id)
-    resume_dir.mkdir(parents=True, exist_ok=True)
-
-    docx_path = resume_dir / f"{base_stem}.docx"
-
     try:
-        _generate_docx(resume_data, docx_path, template=template)
-        logger.info("DOCX generated: %s", docx_path)
+        docx_path = await _generate_docx_to_s3(resume_data, template, consultant.id, requirement.id, base_stem)
+        logger.info("DOCX uploaded to Spaces: %s", docx_path)
     except Exception as exc:
         logger.error("DOCX generation failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to generate DOCX: {exc}")
@@ -1651,12 +1668,10 @@ async def update_resume_content(
     if request.template is not None:
         generated.template = request.template
 
-    resume_dir = RESUME_UPLOAD_DIR / "generated" / str(consultant.id) / str(requirement.id)
-    resume_dir.mkdir(parents=True, exist_ok=True)
-    docx_path = resume_dir / f"{base_stem}.docx"
-
     try:
-        _generate_docx(resume_data, docx_path, template=generated.template or "classic")
+        docx_path = await _generate_docx_to_s3(
+            resume_data, generated.template or "classic", consultant.id, requirement.id, base_stem
+        )
     except Exception as exc:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to regenerate DOCX: {exc}")
