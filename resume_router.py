@@ -2540,6 +2540,13 @@ async def get_consultants_for_resumes(
     # requirement (RequirementConsultantMatch), same source the
     # Requirements table's own "Matched Consultants" column already uses.
     requirement_id: int = None,
+    # Apply page with no consultant pre-selected: if the requirement has no
+    # MATCHING consultants, return the full roster instead of [] so it can
+    # still be applied to manually.
+    fallback_to_all: bool = False,
+    # Apply page opened for one consultant (Pending Applications / consultant
+    # filter): return only that consultant (still role-scoped below).
+    consultant_id: int = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -2571,7 +2578,9 @@ async def get_consultants_for_resumes(
         }
 
     matched_consultant_ids = None
-    if requirement_id:
+    if consultant_id:
+        matched_consultant_ids = [consultant_id]
+    elif requirement_id:
         from models import RequirementConsultantMatch
 
         # BUG FIX ("Select Candidate" in Compose Mail could show a
@@ -2591,7 +2600,10 @@ async def get_consultants_for_resumes(
         )
         matched_consultant_ids = list({row[0] for row in rcm_result.all()})
         if not matched_consultant_ids:
-            return []
+            if fallback_to_all:
+                matched_consultant_ids = None  # no matches → show every candidate
+            else:
+                return []
 
     if current_user.role == "ADMIN":
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(

@@ -820,10 +820,19 @@ async def get_gmail_emails(
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    # light=true: list view only — skip the heavy body/header/address columns
+    # (the View modal fetches the full email via /api/admin/raw-emails/{id}).
+    light: bool = False,
+    # search_body=true also searches the email body (slow on a large table).
+    # Default: subject / from name / from address only — fast.
+    search_body: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "ADMIN", "RECRUITER")
+
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
 
     # Build WHERE clause
     where_clauses = []
@@ -906,12 +915,20 @@ async def get_gmail_emails(
             "'[\\u00A0\\u1680\\u180E\\u2000-\\u200D\\u202F\\u205F\\u3000\\u2060\\uFEFF]', "
             "' ', 'g'), '\\s+', ' ', 'g')"
         )
-        where_clauses.append(
-            "(" + " OR ".join(
-                f"{_ws_normalize_sql.format(col=col)} ILIKE :search"
-                for col in ("subject", "from_address", "from_name", "body_text", "body_html")
-            ) + ")"
-        )
+        # PERF FIX ("search not working"): this ran two regexp_replace()
+        # passes + ILIKE over body_text AND body_html for every row of a
+        # 250k+ row table — twice (COUNT + page query) — which blows past
+        # the frontend's 30s request timeout, so the UI showed nothing.
+        # Now: normalized match on the short header columns only; the body
+        # is searched only when explicitly asked (search_body=true), with a
+        # plain ILIKE on body_text (body_html is the same content + tags).
+        search_clauses = [
+            f"{_ws_normalize_sql.format(col=col)} ILIKE :search"
+            for col in ("subject", "from_address", "from_name")
+        ]
+        if search_body:
+            search_clauses.append("body_text ILIKE :search")
+        where_clauses.append("(" + " OR ".join(search_clauses) + ")")
         _search_table = str.maketrans({c: " " for c in _INVISIBLE_SPACE_CHARS})
         _normalized_search = re.sub(r"\s+", " ", search.translate(_search_table)).strip()
         params["search"] = f"%{_normalized_search}%"
@@ -949,15 +966,24 @@ async def get_gmail_emails(
     # time — it's reliably monotonic, so ordering by it guarantees the
     # most-recently-ingested mail is always first. Falls back to ge.date
     # only for legacy rows that predate fetched_at being populated.
-    result = await db.execute(
-        text(f"""
-            SELECT ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
+    if light:
+        select_cols = """
+            ge.id, ge.account_email, ge.subject, ge.from_address, ge.from_name,
+                   ge.date, ge.fetched_at, ge.category, ge.processed,
+                   ge.status_desc, ge.reason,"""
+    else:
+        select_cols = """
+            ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
                    ge.subject, ge.from_address, ge.from_name, ge.to_addresses, ge.cc_addresses,
                    ge.bcc_addresses, ge.reply_to, ge.body_text, ge.body_html, ge.date,
                    ge.is_read, ge.is_starred, ge.has_attachments, ge.attachments, ge.labels,
                    ge.thread_id, ge.raw_headers, ge.fetched_at, ge.category, ge.priority,
                    ge.processed, ge.classified_at, ge.classifier_tier, ge.job_posting_id,
-                   ge.status_desc, ge.reason,
+                   ge.status_desc, ge.reason,"""
+
+    result = await db.execute(
+        text(f"""
+            SELECT {select_cols}
                    EXISTS (
                        SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id
                    ) AS has_requirement
