@@ -115,7 +115,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 2000) -> dict:
         text("""
             SELECT ge.id, ge.message_id, ge.thread_id, ge.account_email, ge.subject,
                    ge.from_address, ge.from_name, ge.reply_to, ge.body_text,
-                   ge.body_html, ge.date
+                   ge.body_html, ge.date, ge.fetched_at
             FROM gmail_emails ge
             WHERE (ge.category IS NULL OR ge.category = 'job_posting' OR ge.category = 'unclassified')
               -- BUG FIX ("Failed rows never auto-retry"): status_desc='Failed'
@@ -269,6 +269,7 @@ async def sync_pending_emails(db: AsyncSession, batch_size: int = 2000) -> dict:
                     cleaned_jd=cleaned_jd,
                     raw_email_id=row["id"],       # gmail_emails.id -- matches the real FK
                     received_date=row["date"],
+                    fetched_at=row["fetched_at"],
                 )
 
                 if save_result["status"] == "saved":
