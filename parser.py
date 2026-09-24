@@ -4808,6 +4808,74 @@ _PERSONAL_WEBMAIL_DOMAINS = {
 }
 
 
+# ── Client sanity helpers (vendor-domain / generic-word rejection) ──────────
+_CLIENT_DOMAIN_IGNORE = {
+    'gmail', 'googlemail', 'yahoo', 'outlook', 'hotmail', 'live', 'msn', 'aol', 'icloud',
+    'protonmail', 'zoho', 'zohoinsights', 'google', 'googlegroups', 'groups', 'linkedin',
+    'facebook', 'twitter', 'youtube', 'instagram', 'microsoft', 'office', 'teams',
+    'calendly', 'dice', 'indeed', 'monster', 'mailchimp', 'sendgrid', 'constantcontact',
+}
+_CLIENT_NAME_SUFFIXES = {
+    'inc', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company', 'pvt',
+    'private', 'plc', 'gmbh', 'the', 'group',
+}
+_GENERIC_BUSINESS_WORDS = {
+    'service', 'services', 'support', 'success', 'experience', 'care', 'relations',
+    'relationship', 'management', 'satisfaction', 'operations', 'sales', 'marketing',
+    'engagement', 'facing', 'centric', 'focused', 'first', 'journey', 'insights', 'data',
+    'analytics', 'portal', 'onboarding', 'communication', 'communications', 'interaction',
+    'interactions', 'requirements', 'needs', 'feedback', 'retention', 'acquisition',
+    'value', 'focus', 'obsession', 'delight', 'and', '&',
+    # client-ATTRIBUTE labels / answers, never a company name on their own
+    # ("Client Interview : Yes", "Client Round: 2", "Client Details: TBD")
+    'interview', 'interviews', 'round', 'rounds', 'mode', 'yes', 'no', 'na', 'n',
+    'a', 'tbd', 'details', 'detail', 'info', 'information', 'required', 'type',
+    'submission', 'location', 'confirmation',
+}
+
+
+def _domain_labels_in_text(text: str) -> set:
+    """Second-level labels of every email/web domain in `text`
+    ("ravi@scalable-systems.com" -> "scalablesystems")."""
+    labels = set()
+    for m in re.finditer(r'(?i)(?:@|https?://|www\.)((?:[a-z0-9\-]+\.)+[a-z]{2,})', text or ''):
+        parts = m.group(1).lower().split('.')
+        if len(parts) >= 2:
+            label = re.sub(r'[^a-z0-9]', '', parts[-2])
+            if label and label not in _CLIENT_DOMAIN_IGNORE:
+                labels.add(label)
+    return labels
+
+
+def _client_matches_any_email_domain(client: str, text: str) -> bool:
+    """True when `client` is really the name behind a domain in the email:
+      "Scalable Systems"      <-> scalable-systems.com  (exact)
+      "concorditsystems"      <-> concorditsystems.com  (exact)
+      "Concord IT Systems"    <-> concorditsystems.com  (exact, joined)
+      "Prophecy Technologies" <-> prophecytechs.com     (first word + abbreviated rest)
+    Deliberately conservative: "Capital One" does NOT match capitalsolutions.com."""
+    tokens = [t for t in re.findall(r'[a-z0-9]+', (client or '').lower()) if t not in _CLIENT_NAME_SUFFIXES]
+    if not tokens:
+        return False
+    joined = ''.join(tokens)
+    for label in _domain_labels_in_text(text):
+        if joined == label:
+            return True
+        if len(joined) >= 6 and len(label) >= 6 and (label.startswith(joined) or joined.startswith(label)):
+            return True
+        first = tokens[0]
+        if len(tokens) >= 2 and len(first) >= 4 and label.startswith(first):
+            rest = label[len(first):]
+            if not rest or rest[:3] == tokens[1][:3]:
+                return True
+    return False
+
+
+def _is_generic_business_phrase(client: str) -> bool:
+    words = [w for w in re.findall(r"[a-z&]+", (client or '').lower())]
+    return bool(words) and all(w in _GENERIC_BUSINESS_WORDS for w in words)
+
+
 def extract_vendor_from_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Best-effort extraction of the REAL sender's name/company/email from
     the email body, for use when the header 'From' is a mailing-list /
@@ -5741,7 +5809,13 @@ def parse_requirement(
     parsing_log = []
     try:
         from openai_parser import parse_requirement_openai
-        ai_parsed = parse_requirement_openai(safe_subject, safe_body)
+        _sender = (safe_headers.get('reply-to') or safe_headers.get('reply_to')
+                   or safe_headers.get('from') or '')
+        try:
+            ai_parsed = parse_requirement_openai(safe_subject, safe_body, sender=_sender)
+        except TypeError:
+            # older openai_parser.py without the `sender` parameter
+            ai_parsed = parse_requirement_openai(safe_subject, safe_body)
         if ai_parsed:
             parsing_log.append("OpenAI (gpt-4o-mini): Success")
         else:
@@ -5791,6 +5865,16 @@ def parse_requirement(
         parsing_log.append("Regex Fallback: Executing due to AI model failures.")
 
     ai_parsed = ai_parsed or {}
+
+    # ROOT-CAUSE FIX ("client: 'Interview : Yes'" / "client: 'Service'"):
+    # when the OpenAI step actually ran, a null client is its ANSWER ("this
+    # email names no client"), not a miss. It was treated as a miss, so the
+    # loose regex guesses below (Title-dash-Client inference and the
+    # no-colon "Client <value>" table-row reader) ran anyway and overrode
+    # the AI's correct null with junk from lines like "Client Interview :
+    # Yes". Now, once the AI has answered, only an explicit client LABEL
+    # ("Client:", "End Client -", "Client Name:" ...) may still fill it in.
+    _ai_answered_client = bool(ai_parsed) and not ai_source_is_spacy and ('client' in ai_parsed)
 
     def _ai_field(key: str, unknown_value=None):
         """Return the AI's value for `key`, or None if it's missing/blank
@@ -5945,7 +6029,7 @@ def parse_requirement(
         if client and is_email_body(client):
             client = None
         # Infer client from "Role Title – ClientName" dash pattern when no label found
-        if not client:
+        if not client and not _ai_answered_client:
             # BUG FIX ("client: 'Person'" from "...Interview – In-Person
             # Client Interviw Requirement –..."): the separator dash here had
             # no whitespace requirement on the leading side, so it matched
@@ -6379,6 +6463,39 @@ def parse_requirement(
                 client = None
                 break
 
+
+    # BUG FIX ("Client shows the VENDOR's company, e.g. 'Scalable Systems',
+    # 'Prophecy Technologies', 'concorditsystems'"): the vendor guard just
+    # above only compares against the sender's display name and a company
+    # read from the signature -- it misses the most reliable signal of
+    # all: the sending agency's own email/web DOMAIN. The AI step often
+    # returns the recruiting agency as the client when no end client is
+    # named; when that value is the name of any email/web domain appearing
+    # in the email (sender, reply-to, signature, broadcast header), it's
+    # the vendor, not a client. Same gate as the other echo guards: only
+    # when no explicit "Client:" label grounds the value (a direct client
+    # emailing about its own opening keeps its name).
+    if client and not _CLIENT_LABEL_PRESENT_RE.search(full_text):
+        if _client_matches_any_email_domain(
+            client, " ".join([from_header or "", reply_to_header or "", safe_body or ""])
+        ):
+            client = None
+
+    # BUG FIX ("client: 'Service'" from a bulleted "Customer Service" line
+    # read as a bare "Customer <value>" label -- and similar values like
+    # "Support" / "Success" / "Operations"): a client made up only of
+    # generic business nouns is never a real company name, whatever
+    # produced it (AI, label regex, or bare-label fallback).
+    # BUG FIX ("client: 'Interview : Yes'" from the line "Client Interview :
+    # Yes" -- the no-colon table fallback saw "Client" + "Interview : Yes"):
+    # a company name never contains a colon, so a colon means the value ran
+    # into a different "Label : value" field. Keep only what's before it
+    # ("Acme Corp: Dallas" -> "Acme Corp"); the generic-word check below
+    # then rejects leftovers like "Interview".
+    if client and ':' in client:
+        client = client.split(':', 1)[0].strip(' \t-–|,') or None
+    if client and _is_generic_business_phrase(client):
+        client = None
 
     vendor_contact = extract_vendor_contact(
         safe_headers, safe_body, vendor_name, vendor_email

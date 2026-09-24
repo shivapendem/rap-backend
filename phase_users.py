@@ -192,6 +192,37 @@ async def unassign_consultant(
     return {"success": True, "message": "Consultant unassigned."}
 
 
+@router.get("/recruiters/consultant-counts")
+async def recruiter_consultant_counts(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    """
+    {recruiter_user_id: number of consultants currently assigned}.
+
+    BUG FIX ("Manage Recruiters shows the wrong consultant count"): the
+    frontend used to derive these counts by downloading the consultants
+    list and tallying each row's assigned_recruiters -- but that list is
+    capped at 200 consultants (ConsultantRepository.list_all), so any
+    assignment to a consultant past the first 200 was never counted.
+    Counting in SQL is exact regardless of how many consultants exist.
+    Same definition as before: active RecruiterConsultant rows.
+    """
+    from sqlalchemy import select, func
+    from models import RecruiterConsultant, Consultant
+
+    rows = await db.execute(
+        select(
+            RecruiterConsultant.recruiter_id,
+            func.count(func.distinct(RecruiterConsultant.consultant_id)),
+        )
+        .join(Consultant, Consultant.id == RecruiterConsultant.consultant_id)
+        .where(RecruiterConsultant.is_active == True)
+        .group_by(RecruiterConsultant.recruiter_id)
+    )
+    return {str(recruiter_id): int(count) for recruiter_id, count in rows.all()}
+
+
 @router.put("/recruiters/{recruiter_id}/consultants", response_model=UpdateRecruiterConsultantsResponseDTO)
 async def update_recruiter_consultants(
     recruiter_id: int,

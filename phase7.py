@@ -647,6 +647,8 @@ async def get_application_email_preview(
             select(RecruiterConsultant).where(
                 RecruiterConsultant.recruiter_id == current_user.id,
                 RecruiterConsultant.consultant_id == app.consultant_id,
+                # Unassign sets is_active = False rather than deleting the row.
+                RecruiterConsultant.is_active == True,
             )
         )
         if not rc_result.scalars().first():

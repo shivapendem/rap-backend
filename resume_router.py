@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import re
 import uuid
 import math
@@ -12,7 +13,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, and_
 
 from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
@@ -27,6 +28,51 @@ from phase3 import _extract_text_from_docx
 # import openai
 
 router = APIRouter(prefix="/api/resume", tags=["resume"])
+
+
+def _recruiter_consultant_scope(recruiter_id):
+    """
+    SQL condition (on Consultant) for "this consultant is currently
+    assigned to this recruiter".
+
+    BUG FIX ("unassigned consultants still show for the recruiter in
+    Pending Applications / My Resumes / Apply / All Requirements"): admin
+    unassign doesn't delete the RecruiterConsultant row, it sets
+    is_active = False (phase_users_repository.unassign). The recruiter
+    checks in this file ignored is_active, so an unassigned consultant
+    still counted as assigned. They also OR'd in the legacy
+    Consultant.sales_recruiter_user_id, which no screen can change, so an
+    unassign could never take effect for those consultants.
+
+    Now:
+      - an ACTIVE RecruiterConsultant row  -> assigned
+      - the legacy sales_recruiter_user_id -> assigned ONLY if there is no
+        RecruiterConsultant row at all for this pair (i.e. it has never
+        been managed from the assignment screens). Once an admin assigns
+        or unassigns, the assignment row is the single source of truth.
+    Matches what the rest of the app already does (permission_service,
+    matching_router, main.py all require is_active == True).
+    """
+    any_mapping_for_pair = (
+        select(RecruiterConsultant.id)
+        .where(
+            RecruiterConsultant.recruiter_id == recruiter_id,
+            RecruiterConsultant.consultant_id == Consultant.id,
+        )
+        .exists()
+    )
+    return or_(
+        Consultant.id.in_(
+            select(RecruiterConsultant.consultant_id).where(
+                RecruiterConsultant.recruiter_id == recruiter_id,
+                RecruiterConsultant.is_active == True,
+            )
+        ),
+        and_(
+            Consultant.sales_recruiter_user_id == recruiter_id,
+            ~any_mapping_for_pair,
+        ),
+    )
 
 
 
@@ -72,14 +118,7 @@ async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: U
         return result.scalar_one_or_none()
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
-            or_(
-                Consultant.sales_recruiter_user_id == current_user.id,
-                Consultant.id.in_(
-                    select(RecruiterConsultant.consultant_id).where(
-                        RecruiterConsultant.recruiter_id == current_user.id
-                    )
-                )
-            )
+            _recruiter_consultant_scope(current_user.id)
         )
         result = await db.execute(select(Resume).where(
             Resume.id == resume_id,
@@ -164,14 +203,7 @@ async def _resolve_target_user(
             assigned_consultant = await db.execute(
                 select(Consultant.id).where(
                     Consultant.user_id == target_user_id,
-                    or_(
-                        Consultant.sales_recruiter_user_id == current_user.id,
-                        Consultant.id.in_(
-                            select(RecruiterConsultant.consultant_id).where(
-                                RecruiterConsultant.recruiter_id == current_user.id
-                            )
-                        ),
-                    ),
+                    _recruiter_consultant_scope(current_user.id),
                 )
             )
             if not assigned_consultant.scalar_one_or_none():
@@ -848,14 +880,7 @@ async def upload_resume(
             allowed = await db.execute(
                 select(Consultant.user_id).where(
                     Consultant.user_id == target_user_id,
-                    or_(
-                        Consultant.sales_recruiter_user_id == current_user.id,
-                        Consultant.id.in_(
-                            select(RecruiterConsultant.consultant_id).where(
-                                RecruiterConsultant.recruiter_id == current_user.id
-                            )
-                        ),
-                    ),
+                    _recruiter_consultant_scope(current_user.id),
                 )
             )
             if not allowed.scalars().first():
@@ -927,6 +952,11 @@ async def upload_resume(
     # plain-text editor instead of the structured one — see GET/PUT
     # /{id}/text below.
     extracted_text = _extract_text_from_docx(file_bytes)
+    if not (extracted_text or "").strip():
+        # Text boxes / headers / content controls -- see
+        # _deep_extract_text_from_docx. Only runs when the normal extractor
+        # found nothing, so it can't change any resume that worked before.
+        extracted_text = _deep_extract_text_from_docx(file_bytes)
 
     new_resume = Resume(
         user_id=owner_id,
@@ -956,14 +986,7 @@ async def list_resumes(
         query = select(Resume)
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
-            or_(
-                Consultant.sales_recruiter_user_id == current_user.id,
-                Consultant.id.in_(
-                    select(RecruiterConsultant.consultant_id).where(
-                        RecruiterConsultant.recruiter_id == current_user.id
-                    )
-                )
-            )
+            _recruiter_consultant_scope(current_user.id)
         )
         query = select(Resume).where(
             or_(
@@ -1342,6 +1365,76 @@ _HEURISTIC_EDU_LINE_RE = re.compile(
 )
 
 
+def _deep_extract_text_from_docx(file_bytes: bytes) -> str:
+    """
+    FALLBACK ONLY -- used when phase3._extract_text_from_docx returns
+    nothing. That extractor reads doc.paragraphs + doc.tables, which misses
+    text living in text boxes/shapes, content controls (w:sdt), nested
+    tables and page headers/footers -- common in designed resume templates
+    (name/contact in the header, sections in text boxes). For those files
+    it returned "", the upload stored data={"raw_text": ""}, the GET
+    backfill skipped it (nothing to parse), and the Edit page rendered a
+    completely blank form.
+
+    This walks every w:t in the XML in document order (headers first, then
+    body, then footers), groups runs by their nearest enclosing paragraph,
+    and skips mc:Fallback branches so text boxes aren't duplicated. It is
+    never used when the normal extractor finds text, so every resume that
+    already extracted fine keeps byte-identical raw_text.
+    """
+    try:
+        from docx import Document
+        from docx.oxml.ns import qn
+
+        doc = Document(io.BytesIO(file_bytes))
+        W_P, W_T, W_TAB, W_BR = qn("w:p"), qn("w:t"), qn("w:tab"), qn("w:br")
+        MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+        def _lines_from(root) -> list:
+            paras = {}   # nearest w:p element -> list of text pieces (insertion-ordered)
+            for node in root.iter(W_T, W_TAB, W_BR):
+                if any(anc.tag == MC_FALLBACK for anc in node.iterancestors()):
+                    continue
+                para = next(node.iterancestors(W_P), None)
+                if para is None:
+                    continue
+                if node.tag == W_T:
+                    piece = node.text or ""
+                elif node.tag == W_TAB:
+                    piece = "\t"
+                else:
+                    piece = "\n"
+                paras.setdefault(para, []).append(piece)
+            out = []
+            for pieces in paras.values():
+                for line in "".join(pieces).split("\n"):
+                    line = line.strip()
+                    if line:
+                        out.append(line)
+            return out
+
+        header_lines, footer_lines, seen_parts = [], [], set()
+        for section in doc.sections:
+            for hf, bucket in ((section.header, header_lines), (section.footer, footer_lines)):
+                try:
+                    if hf.is_linked_to_previous:
+                        continue
+                    part_id = id(hf.part)
+                    if part_id in seen_parts:
+                        continue
+                    seen_parts.add(part_id)
+                    bucket.extend(_lines_from(hf._element))
+                except Exception:
+                    continue
+
+        lines = header_lines + _lines_from(doc.element.body) + footer_lines
+        deduped = [l for i, l in enumerate(lines) if i == 0 or l != lines[i - 1]]
+        return "\n".join(deduped).replace("\x00", "")
+    except Exception as exc:
+        print(f"Deep DOCX text extraction failed: {exc}")
+        return ""
+
+
 def _heuristic_parse_resume_text(text: str) -> Optional[dict]:
     """
     Free, non-AI fallback for turning base_resume_text into the same
@@ -1486,6 +1579,378 @@ def _heuristic_parse_resume_text(text: str) -> Optional[dict]:
         "certifications": [],
         "generation_notes": "Parsed automatically from plain text (no AI used) — please review for accuracy.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Generic (non-template) resume parser -- no AI.
+# ---------------------------------------------------------------------------
+# _heuristic_parse_resume_text above only understands the in-house template
+# ("CAREER OBJECTIVE:" / "Associated with X (dates)" / "Designation: Y").
+# Most vendor/consultant resumes use the common US layout instead:
+#   Name / headline / contact lines
+#   PROFESSIONAL SUMMARY  (bullets)
+#   TECHNICAL SKILLS      (usually a 2-column table)
+#   Company – City, ST
+#   Job Title <tabs> Mon YYYY – Present
+#   Project: ... / Roles & Responsibilities / bullets ...
+#   EDUCATION / CERTIFICATIONS
+# Those fell through to the AI parser, which can't finish on long resumes
+# (2500 max_tokens, 15s timeout) -- so the resume stayed raw_text-only and
+# Edit could only offer the plain-text editor.
+#
+# SAFETY: this parser returns None (caller falls back to AI / plain-text
+# editor, exactly as before) unless it confidently placed essentially every
+# line. Content it doesn't understand is never silently dropped -- saving
+# the structured editor regenerates the DOCX from these fields, so a lossy
+# parse would lose resume content.
+
+_GENERIC_SECTION_ALIASES = {
+    "summary": (
+        "professional summary", "summary", "career summary", "profile", "professional profile",
+        "profile summary", "executive summary", "career objective", "objective", "about me",
+        "summary of qualifications", "professional overview", "overview", "highlights",
+        "key highlights", "career highlights",
+    ),
+    "skills": (
+        "technical skills", "skills", "key skills", "core competencies", "technical proficiencies",
+        "technical proficiency", "skill set", "skillset", "technical expertise", "areas of expertise",
+        "tools & technologies", "tools and technologies", "technologies", "technical summary",
+    ),
+    "experience": (
+        "professional experience", "work experience", "experience", "employment history",
+        "work history", "career history", "relevant experience", "employment",
+    ),
+    "education": (
+        "education", "educational background", "academic background", "academic qualifications",
+        "educational qualifications", "education & certifications", "education and certifications",
+        "academics", "education details", "academic details", "educational details",
+    ),
+    "certifications": (
+        "certifications", "certification", "certificates", "licenses & certifications",
+        "licenses and certifications", "professional certifications",
+    ),
+    "projects": ("projects", "key projects", "academic projects", "personal projects"),
+}
+_GENERIC_HEADER_LOOKUP = {alias: key for key, aliases in _GENERIC_SECTION_ALIASES.items() for alias in aliases}
+
+_G_MONTH = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?"
+_G_DATE = rf"(?:{_G_MONTH}\s*[,']?\s*\d{{2,4}}|\d{{1,2}}/\d{{2,4}}|\d{{4}})"
+_G_END = rf"(?:{_G_DATE}|(?:to\s+)?(?:present|current|now|ongoing|date)|till\s+date)"
+_G_RANGE_RE = re.compile(rf"\(?\b({_G_DATE})\s*(?:–|—|-|to|until|till)\s*({_G_END})\b\)?", re.I)
+_G_TITLE_WORDS_RE = re.compile(
+    r"\b(engineer|developer|analyst|manager|consultant|architect|lead|scientist|specialist|"
+    r"administrator|admin|intern|designer|director|tester|associate|officer|programmer|head|"
+    r"owner|master|coordinator|executive|support|sre|devops|qa)\b", re.I)
+_G_EMAIL_RE = re.compile(r"[\w.\-+]+@[\w\-]+(?:\.[\w\-]+)+")
+_G_PHONE_RE = re.compile(r"(\+?\d[\d\s\-().]{7,}\d)")
+_G_LINKEDIN_RE = re.compile(r"(?:https?://)?(?:[\w-]+\.)?linkedin\.com/\S+", re.I)
+_G_GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/\S+", re.I)
+_G_BULLET_PREFIX_RE = re.compile(r"^[\u2022\u25cf\u25aa\u25a0\u2023\u2043\u27a2\u2713\u2714\-\*\u00b7o]\s+")
+_G_RESP_MARKER_RE = re.compile(r"^(?:roles?\s*(?:&|and)\s*)?responsibilities\s*:?$", re.I)
+_G_PROJECT_RE = re.compile(r"^project(?:\s+name)?\s*[:\-–]\s*(.+)$", re.I)
+_G_COMPANY_PREFIX_RE = re.compile(r"^(?:client|company|employer|organization)\s*:\s*", re.I)
+_G_ROLE_PREFIX_RE = re.compile(r"^(?:role|designation|title|position|job\s+title)\s*:\s*", re.I)
+_G_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){1,4}$")
+_G_EDU_WORDS_RE = re.compile(
+    r"\b(university|college|institute|school|bachelor|master|b\.?\s?tech|m\.?\s?tech|b\.?e\b|"
+    r"m\.?e\b|b\.?sc?|m\.?sc?|mba|mca|bca|ph\.?d|diploma|degree)\b", re.I)
+
+
+def _generic_header_key(line: str) -> Optional[str]:
+    norm = re.sub(r"\s+", " ", line.strip().strip(":").strip()).lower()
+    if len(norm.split()) > 6:
+        return None
+    return _GENERIC_HEADER_LOOKUP.get(norm)
+
+
+def _generic_looks_like_unknown_header(line: str) -> bool:
+    # ALL-CAPS short line with no separators, e.g. "AWARDS", "PUBLICATIONS".
+    s = line.strip().strip(":")
+    letters = re.sub(r"[^A-Za-z]", "", s)
+    return (
+        bool(letters) and letters.isupper() and len(s.split()) <= 4
+        and not re.search(r"[–—|,@\d]|\s-\s", s)
+    )
+
+
+def _generic_clean_bullet(line: str) -> str:
+    return _G_BULLET_PREFIX_RE.sub("", line).strip()
+
+
+def _generic_parse_resume_text(text: str) -> Optional[dict]:
+    if not text or not text.strip():
+        return None
+    lines = [re.sub(r"[ \t]+", " ", l).strip() for l in text.replace("\r", "").split("\n")]
+    lines = [l for l in lines if l]
+    n = len(lines)
+    if n < 5:
+        return None
+
+    placed = set()
+
+    # --- name --------------------------------------------------------------
+    # Usually line 0. Some templates put contact details first and the name
+    # in a header table (which the extractor appends at the very END), so
+    # otherwise accept a name-like line whose words all appear in the
+    # email's local part (e.g. "DIVYA KATTA" <-> divyareddykatta99@...).
+    def _name_like(l):
+        return (
+            len(l) <= 60 and _G_NAME_RE.match(l) is not None
+            and _generic_header_key(l) is None and not _G_TITLE_WORDS_RE.search(l)
+        )
+    name, name_idx = "", None
+    if _name_like(lines[0]):
+        name_idx = 0
+    else:
+        em = next((m.group(0) for l in lines[:6] for m in [_G_EMAIL_RE.search(l)] if m), "")
+        local = re.sub(r"[^a-z]", "", em.split("@")[0].lower())
+        if local:
+            for idx, l in enumerate(lines):
+                if _name_like(l):
+                    words = [re.sub(r"[^a-z]", "", w.lower()) for w in l.split()]
+                    if all(len(w) >= 2 and w in local for w in words):
+                        name_idx = idx
+                        break
+    if name_idx is None:
+        return None
+    name = lines[name_idx].title() if lines[name_idx].isupper() else lines[name_idx]
+    placed.add(name_idx)
+    # A job-title line right after a name found in a header table is the
+    # headline (e.g. "DIVYA KATTA" / "Azure Data Engineer").
+    headline_after_name = None
+    if name_idx > 0 and name_idx + 1 < n and _G_TITLE_WORDS_RE.search(lines[name_idx + 1]) and len(lines[name_idx + 1].split()) <= 8:
+        headline_after_name = name_idx + 1
+        placed.add(headline_after_name)
+
+    # --- section headers -----------------------------------------------------
+    section_of = [None] * n        # section key for each line (None = before first header)
+    current = None
+    for i in range(0, n):
+        if i in placed:
+            continue
+        key = _generic_header_key(lines[i])
+        if key:
+            current = key
+            placed.add(i)
+            section_of[i] = "__header__"
+            continue
+        if _generic_looks_like_unknown_header(lines[i]):
+            current = "__unknown__"
+            section_of[i] = "__header__"
+            continue            # left unplaced on purpose -> trips the safety gate
+        section_of[i] = current
+
+    role_zone = {None, "experience", "skills"}
+
+    # --- trailing 2-column table (skills), appended after all paragraphs ---
+    # by the DOCX extractor. Walk back from the end in (category, values) pairs.
+    table_pairs = []
+    table_start = n
+    i = n - 1
+    while i - 1 >= 0:
+        cat, val = lines[i - 1], lines[i]
+        if i in placed or (i - 1) in placed:
+            break
+        if (
+            section_of[i] not in ("summary", "__header__") and section_of[i - 1] not in ("summary", "__header__")
+            and len(cat.split()) <= 6 and len(cat) <= 60 and not cat.endswith(".")
+            and ":" not in cat.rstrip(":")
+            and not _G_RANGE_RE.search(cat) and not _G_RANGE_RE.search(val)
+            and not _G_EDU_WORDS_RE.search(cat)
+            and ("," in val or len(val.split()) <= 8)
+        ):
+            table_pairs.insert(0, {"category": cat.rstrip(":"), "skills": val})
+            table_start = i - 1
+            i -= 2
+        else:
+            break
+    # Only trust it as a flattened skills table when it really looks like
+    # one: 2+ rows, and most value cells are comma-separated lists.
+    listy = sum(1 for p in table_pairs if p["skills"].count(",") >= 2)
+    if len(table_pairs) < 2 or listy < 0.7 * len(table_pairs):
+        table_pairs, table_start = [], n
+    placed.update(range(table_start, n))
+
+    # --- experience roles ----------------------------------------------------
+    def _role_split(line):
+        m = _G_RANGE_RE.search(line)
+        if not m:
+            return None
+        rest = (line[:m.start()] + " " + line[m.end():]).strip(" \t|,-–—()")
+        rest = re.sub(r"\s*\b(?:to)\s*$", "", rest).strip(" \t|,-–—()")
+        rest = re.sub(r"\s+", " ", rest)
+        if len(rest.split()) > 12:
+            return None                     # a sentence that merely mentions dates
+        return rest, m.group(1).strip(), re.sub(r"^to\s+", "", m.group(2).strip(), flags=re.I)
+
+    def _company_like(idx):
+        if idx < 1 or idx >= table_start or idx in placed:
+            return False
+        l = lines[idx]
+        return (
+            section_of[idx] in role_zone and len(l.split()) <= 12 and not l.endswith(".")
+            and not _G_RANGE_RE.search(l) and not _G_RESP_MARKER_RE.match(l)
+            and not _G_PROJECT_RE.match(l) and _generic_header_key(l) is None
+        )
+
+    def _split_company(l):
+        l = _G_COMPANY_PREFIX_RE.sub("", l).strip()
+        parts = re.split(r"\s+[–—|]\s+|\s+-\s+", l, maxsplit=1)
+        if len(parts) == 2 and ("," in parts[1] or len(parts[1].split()) <= 4):
+            return parts[0].strip(), parts[1].strip()
+        if "," in l:                              # "Acme Corp, Dallas, TX" / "Walgreens, Dallas TX"
+            company, loc = l.split(",", 1)
+            if l.count(",") >= 2 or (
+                len(loc.split()) <= 4 and not re.search(r"\b(inc|llc|ltd|corp|pvt|co)\b\.?", loc, re.I)
+            ):
+                return company.strip(), loc.strip()
+        return l.strip(), ""
+
+    role_idxs = [
+        i for i in range(0, table_start)
+        if section_of[i] in role_zone and i not in placed and _role_split(lines[i])
+    ]
+    if not role_idxs:
+        return None
+
+    blocks = []   # (start_idx_inclusive, role_idx, body_start, dict)
+    for r in role_idxs:
+        rest, start, end = _role_split(lines[r])
+        entry = {"client": "", "role": "", "start": start, "end": end,
+                 "location": "", "description": "", "bullets": []}
+        block_start, body_start = r, r + 1
+        if rest and _G_TITLE_WORDS_RE.search(rest) and not _G_COMPANY_PREFIX_RE.match(rest):
+            entry["role"] = _G_ROLE_PREFIX_RE.sub("", rest).strip()
+            if _company_like(r - 1):
+                entry["client"], entry["location"] = _split_company(lines[r - 1])
+                block_start = r - 1
+            elif _company_like(r + 1) and len(lines[r + 1].split()) <= 8 and not _G_TITLE_WORDS_RE.search(lines[r + 1]):
+                entry["client"], entry["location"] = _split_company(lines[r + 1])
+                body_start = r + 2
+        else:
+            # "Company  Dates" with the title on the next line
+            entry["client"], entry["location"] = _split_company(rest) if rest else ("", "")
+            if _company_like(r + 1) and _G_TITLE_WORDS_RE.search(lines[r + 1]):
+                entry["role"] = _G_ROLE_PREFIX_RE.sub("", lines[r + 1]).strip()
+                body_start = r + 2
+            elif _company_like(r - 1) and _G_TITLE_WORDS_RE.search(lines[r - 1]):
+                entry["role"] = _G_ROLE_PREFIX_RE.sub("", lines[r - 1]).strip()
+                block_start = r - 1
+        if not entry["client"] and not entry["role"]:
+            return None
+        blocks.append([block_start, r, body_start, entry])
+
+    for k, (block_start, r, body_start, entry) in enumerate(blocks):
+        placed.update(range(block_start, body_start))
+        stop = blocks[k + 1][0] if k + 1 < len(blocks) else table_start
+        for j in range(body_start, stop):
+            if section_of[j] not in role_zone:      # hit another section
+                break
+            if j in placed:
+                continue
+            l = lines[j]
+            placed.add(j)
+            if _G_RESP_MARKER_RE.match(l):
+                continue
+            pm = _G_PROJECT_RE.match(l)
+            if pm and not entry["description"]:
+                entry["description"] = f"Project: {pm.group(1).strip()}"
+                continue
+            cleaned = _generic_clean_bullet(l)
+            if cleaned:
+                entry["bullets"].append(cleaned)
+    experience = [b[3] for b in blocks]
+
+    # --- header block: contact + headline --------------------------------------
+    first_section_idx = next((i for i in range(1, n) if section_of[i] is not None), n)
+    header_end = min(first_section_idx, blocks[0][0], table_start)
+    email = phone = linkedin = github = ""
+    headline_lines = []
+    for i in range(0, header_end):
+        if i in placed:
+            continue
+        l = lines[i]
+        found = False
+        m = _G_LINKEDIN_RE.search(l)
+        if m and not linkedin:
+            linkedin, found = m.group(0).rstrip(".,"), True
+        m = _G_GITHUB_RE.search(l)
+        if m and not github:
+            github, found = m.group(0).rstrip(".,"), True
+        m = _G_EMAIL_RE.search(l)
+        if m and not email:
+            email, found = m.group(0), True
+        m = _G_PHONE_RE.search(_G_LINKEDIN_RE.sub("", l))
+        if m and not phone and len(re.sub(r"\D", "", m.group(1))) >= 10:
+            phone, found = m.group(1).strip(), True
+        if not found:
+            headline_lines.append(l)
+        placed.add(i)
+    if headline_after_name is not None:
+        headline_lines.insert(0, lines[headline_after_name])
+    headline = " ".join(headline_lines)
+    headline = re.sub(r"\s*\|\s*\|\s*", " | ", re.sub(r"\s*\|\s*", " | ", headline)).strip(" |")
+
+    # --- other sections -----------------------------------------------------------
+    summary_lines, education, certifications, projects, extra_skills = [], [], [], [], []
+    for i in range(0, table_start):
+        if i in placed:
+            continue
+        sec, l = section_of[i], lines[i]
+        if sec == "summary":
+            summary_lines.append(_generic_clean_bullet(l))
+        elif sec == "skills":
+            if ":" in l and len(l.split(":", 1)[0].split()) <= 6:
+                cat, vals = l.split(":", 1)
+                extra_skills.append({"category": _generic_clean_bullet(cat).strip(), "skills": vals.strip()})
+            else:
+                extra_skills.append({"category": "Skills", "skills": _generic_clean_bullet(l)})
+        elif sec == "education":
+            yr = re.findall(r"\b(?:19|20)\d{2}\b", l)
+            education.append({"degree": _generic_clean_bullet(l), "institution": "", "year": yr[-1] if yr else ""})
+        elif sec == "certifications":
+            certifications.append(_generic_clean_bullet(l))
+        elif sec == "projects":
+            cleaned = _generic_clean_bullet(l)
+            is_title = len(cleaned.split()) <= 12 and not cleaned.endswith(".") and cleaned == l
+            if is_title or not projects:
+                projects.append({"title": cleaned, "description": "", "responsibilities": []})
+            else:
+                projects[-1]["responsibilities"].append(cleaned)
+        else:
+            continue                                  # unknown -> stays unplaced
+        placed.add(i)
+
+    # --- safety gate: never return a lossy parse --------------------------------
+    unplaced = [i for i in range(n) if i not in placed and section_of[i] != "__header__"]
+    unknown_headers = [i for i in range(n) if section_of[i] == "__header__" and i not in placed]
+    if unknown_headers or len(unplaced) > max(1, n // 50):
+        return None
+    if not any(e["bullets"] for e in experience):
+        return None
+
+    summary = "\n".join(summary_lines)
+    career_objective = (headline + "\n" + summary).strip() if headline else summary
+
+    result = {
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "location": "",
+        "linkedin": linkedin,
+        "github": github,
+        "career_objective": career_objective,
+        "summary": "",
+        "technical_proficiencies": extra_skills + table_pairs,
+        "skills": [],
+        "experience": experience,
+        "education": education,
+        "certifications": certifications,
+        "generation_notes": "Parsed automatically from plain text (no AI used) — please review for accuracy.",
+    }
+    if projects:
+        result["key_projects"] = projects
+    return result
 
 
 def _flatten_base_resume_content_to_text(data: dict) -> str:
@@ -2630,14 +3095,7 @@ async def get_consultants_for_resumes(
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
             Consultant.status == "ACTIVE",
-            or_(
-                Consultant.sales_recruiter_user_id == current_user.id,
-                Consultant.id.in_(
-                    select(RecruiterConsultant.consultant_id).where(
-                        RecruiterConsultant.recruiter_id == current_user.id
-                    )
-                )
-            )
+            _recruiter_consultant_scope(current_user.id)
         )
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id.in_(consultant_users_query),
@@ -2688,10 +3146,76 @@ async def get_resume(
     def _is_raw_text_only(d: dict) -> bool:
         return bool(d) and set(d.keys()) <= {"raw_text"}
 
+    # RECOVERY ("Edit on an uploaded resume shows a blank form"): resumes
+    # uploaded before _deep_extract_text_from_docx existed can be stuck
+    # with data={"raw_text": ""} -- their text lived in text boxes/headers
+    # the old extractor couldn't see, so the backfill below had nothing to
+    # parse. Re-read the original DOCX once and store the recovered text,
+    # then let the normal backfill run. Scoped to raw_text-only records
+    # with EMPTY raw_text (i.e. uploads only -- generated resumes never
+    # carry raw_text), so nothing else is affected.
+    if (
+        _is_raw_text_only(resume.data or {})
+        and not (resume.data.get("raw_text") or "").strip()
+        and resume.s3_key
+        and resume.s3_key.lower().endswith(".docx")
+    ):
+        try:
+            file_body, _ = await asyncio.to_thread(download_file_from_s3, resume.s3_key)
+            if file_body:
+                recovered = _extract_text_from_docx(file_body) or _deep_extract_text_from_docx(file_body)
+                if (recovered or "").strip():
+                    resume.data = {"raw_text": recovered}
+                    await db.commit()
+                    await db.refresh(resume)
+        except Exception as e:
+            print(f"Resume raw_text recovery from S3 failed for resume {resume.id}: {e}")
+
+    # REPAIR for uploads already saved with that bad template parse. Only
+    # touches a record when ALL of these hold, so nothing a user has
+    # edited is ever overwritten:
+    #   - it still carries the automatic-parse note and its raw_text,
+    #   - it has no jobs, and
+    #   - its fields are exactly what the template parser produces from its
+    #     raw_text today (i.e. nobody has saved edits since).
+    # It's reset to raw_text-only so the corrected backfill below re-runs.
+    try:
+        _d = resume.data or {}
+        _raw = _d.get("raw_text") or ""
+        if (
+            _raw.strip()
+            and _d.get("generation_notes") == "Parsed automatically from plain text (no AI used) — please review for accuracy."
+            and not _d.get("experience")
+        ):
+            _fresh = _heuristic_parse_resume_text(_raw)
+            _stored = {k: v for k, v in _d.items() if k != "raw_text"}
+            if _fresh is not None and json.dumps(_fresh, sort_keys=True, default=str) == json.dumps(_stored, sort_keys=True, default=str):
+                resume.data = {"raw_text": _raw}
+                await db.commit()
+                await db.refresh(resume)
+    except Exception as e:
+        print(f"Resume bad-parse repair check failed for resume {resume.id}: {e}")
+
     if _is_raw_text_only(resume.data or {}) and (resume.data.get("raw_text") or "").strip():
         raw_text = resume.data["raw_text"]
         try:
-            heuristic_data = _heuristic_parse_resume_text(raw_text)
+            # In-house template parser first (unchanged), then the generic
+            # parser for common vendor layouts -- both free, no AI. The
+            # generic one returns None unless it placed every line, so
+            # anything it can't handle still falls through to AI below.
+            # BUG FIX ("uploaded resumes open with phone number as the name
+            # and job bullets inside the skills table"): the in-house
+            # template parser accepts ANY resume that merely contains a
+            # heading like "Education" or "Experience", and on a non-
+            # template resume it finds zero jobs and dumps the bullets into
+            # technical_proficiencies. Only trust it when it actually found
+            # jobs ("Associated with ..." entries); otherwise use the
+            # generic parser.
+            template_data = _heuristic_parse_resume_text(raw_text)
+            if template_data and template_data.get("experience"):
+                heuristic_data = template_data
+            else:
+                heuristic_data = _generic_parse_resume_text(raw_text)
             if heuristic_data:
                 resume.data = {**heuristic_data, "raw_text": raw_text}
                 await db.commit()

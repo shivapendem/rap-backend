@@ -33,6 +33,15 @@ CLIENT
 - "client-facing" is an extremely common phrase describing a SKILL, not a labeled field (e.g. "excellent client-facing communication skills," "strong client-facing experience"). Never treat the word "client" inside this phrase as a label and extract whatever follows "facing" as if it were a company name — that is never a real client.
 - A section heading that describes what the end client wants in a candidate — e.g. "What the Client is Looking For," "Client Requirements," "Client Expectations" — is NOT a statement naming who the client is. It introduces a description of desired skills/experience, not a company name. Extract a real client only if one is separately, explicitly named elsewhere; do not extract any part of the heading itself (e.g. never "Looking For").
 - A bare country or region name (USA, India, Canada, etc.) is NEVER a client — even when it sits right next to a dash near other job details (e.g. "Remote – USA," or a signature listing office locations like "USA - INDIA"). These are locations or the vendor's own office locations, never a company name.
+- These are NEVER the client, return null for them:
+  - The SENDER'S OWN COMPANY, however it appears: introduced in the email's opening prose ("Scalable Systems is a global data, AI and digital transformation company...", "My name is Rohit, representing Quantum World Technologies", "We at Edge Global...", "X is hiring on behalf of..."), in the signature ("Ajay Anandhan | Prophecy Technologies"), in a job-board/broadcast header ("From: John Daniel, Concord IT Systems"), or a company whose name matches the sender's email or website domain (sender "ravi@scalable-systems.com" -> "Scalable Systems" is the VENDOR). A company that introduces itself or signs the email is the vendor, not the client -- this overrides "plainly named in prose".
+  - A field whose label merely STARTS with the word Client/Customer but is about something else: "Client Interview: Yes", "Client Round: 2", "Client Details: TBD", "Customer Service" / "Customer Support" as a list item or business domain. Never return the text after such a label ("Interview : Yes", "Service", "Support").
+- Real examples (email text -> correct client):
+  - Opening "Scalable Systems is a global data, AI, and digital transformation company...", sender ravi.prakash@scalable-systems.com, no client named -> null (not "Scalable Systems" -- that is the vendor)
+  - Signature "Ajay Anandhan | Prophecy Technologies", sender anand@prophecytechs.com, no client named -> null (not "Prophecy Technologies")
+  - Broadcast header "From: John Daniel, Concord IT Systems, john.daniel@concorditsystems.com" -> null (not "Concord IT Systems" / "concorditsystems")
+  - "Client Interview : Yes" with no other client line -> null (not "Interview : Yes")
+  - A list of business domains "Sales Operations / Marketing / Customer Service / Customer Support" -> null (not "Service")
 - If nothing in the email actually names a client, do not manufacture one by pulling in a nearby unrelated sentence, a responsibility bullet, or any other stray text just because the client field expects a value — leave it null. A wrong guess is far worse than an honest null.
 - The client value must be a real ORGANIZATION NAME: a proper-noun company, bank, agency or institution (e.g. "Cigna", "Wells Fargo", "Bank of America", "State of Texas"). It is never a sentence fragment, a job title, a department, a skill, or a technical term. If what you would return is not the name of an organization, return null.
 - These are NEVER the client, return null for them:
@@ -134,7 +143,7 @@ PARSE_REQUIREMENT_SCHEMA = {
 }
 
 
-def parse_requirement_openai(subject: str, body: str) -> Optional[dict]:
+def parse_requirement_openai(subject: str, body: str, sender: Optional[str] = None) -> Optional[dict]:
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY not found, skipping OpenAI parser.")
         return None
@@ -143,7 +152,11 @@ def parse_requirement_openai(subject: str, body: str) -> Optional[dict]:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
         
-        user_prompt = f"SUBJECT: {subject}\n\nBODY: {body}"
+        # The sender's address lets the model recognise the vendor's own
+        # company (its name usually matches the sender's domain) instead of
+        # returning it as the client. Optional -- omitted when unknown.
+        sender_line = f"SENDER: {sender.strip()}\n\n" if sender and sender.strip() else ""
+        user_prompt = f"{sender_line}SUBJECT: {subject}\n\nBODY: {body}"
         
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
