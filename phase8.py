@@ -494,6 +494,15 @@ async def create_application(
     )
 
 
+def _csv_cst(value) -> str:
+    """UTC timestamp -> 'YYYY-MM-DD HH:MM:SS CDT/CST' in US Central."""
+    if not value:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(_CST_ZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 @router.get("/audit-logs/export")
 async def export_audit_logs_csv(
     db: AsyncSession = Depends(get_db),
@@ -505,8 +514,10 @@ async def export_audit_logs_csv(
     writer = csv.writer(buf)
     writer.writerow(["id", "actor_name", "actor_role", "action", "entity_type", "entity_id", "created_at"])
     for r in rows:
+        # CST fix: was r.created_at.isoformat() (UTC) -- the CSV now shows
+        # the same US Central time the Audit Logs screen shows.
         writer.writerow([r.id, r.actor_name, r.actor_role, r.action, r.entity_type, r.entity_id,
-                          r.created_at.isoformat() if r.created_at else ""])
+                          _csv_cst(r.created_at)])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),

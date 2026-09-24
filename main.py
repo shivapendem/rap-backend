@@ -31,6 +31,10 @@ import httpx
 import math
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# All user-facing date/time text is US Central (CST/CDT), like the frontend.
+_APP_TZ = ZoneInfo("America/Chicago")
 
 from database import engine, Base, get_db, AsyncSessionLocal, DATABASE_URL
 from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch, RecruiterConsultant, Application
@@ -527,7 +531,7 @@ async def login(
     new_notif = Notification(
         user_id=user.id,
         title="New Login Accessed",
-        body=f"Successful login recorded at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}."
+        body=f"Successful login recorded at {datetime.now(_APP_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')}."
     )
     db.add(new_notif)
     await db.commit()
@@ -634,7 +638,7 @@ async def google_login(
     new_notif = Notification(
         user_id=user.id,
         title="New Login Accessed",
-        body=f"Successful Google login recorded at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}."
+        body=f"Successful Google login recorded at {datetime.now(_APP_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')}."
     )
     db.add(new_notif)
     await db.commit()
