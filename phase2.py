@@ -864,6 +864,8 @@ async def get_gmail_emails(
     # search_body=true also searches the email body (slow on a large table).
     # Default: subject / from name / from address only — fast.
     search_body: bool = False,
+    # Status Desc dropdown: Parsed | Parsed - Dup | Parsed - NR | Pending | Failed
+    status_desc: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -871,6 +873,13 @@ async def get_gmail_emails(
 
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
+
+    _ALLOWED_STATUS_DESC = {"Parsed", "Parsed - Dup", "Parsed - NR", "Pending", "Failed"}
+    if status_desc and status_desc not in _ALLOWED_STATUS_DESC:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status_desc must be one of: {sorted(_ALLOWED_STATUS_DESC)}",
+        )
 
     # Build WHERE clause
     where_clauses = []
@@ -885,6 +894,21 @@ async def get_gmail_emails(
     if processed is not None:
         where_clauses.append("processed = :processed")
         params["processed"] = processed
+    if status_desc:
+        # Mirrors the page's emailStatusLabel(): a Pending/NULL row whose
+        # email is already processed or has a Requirement displays as Parsed.
+        _done = (
+            "(COALESCE(ge.processed, false) = true"
+            " OR EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id))"
+        )
+        _open = "(ge.status_desc IS NULL OR ge.status_desc = 'Pending')"
+        if status_desc == "Parsed":
+            where_clauses.append(f"(ge.status_desc = 'Parsed' OR ({_open} AND {_done}))")
+        elif status_desc == "Pending":
+            where_clauses.append(f"({_open} AND NOT {_done})")
+        else:
+            where_clauses.append("ge.status_desc = :status_desc")
+            params["status_desc"] = status_desc
     if search:
         # BUG FIX ("search shows 'no results' for a requirement that
         # genuinely exists" -- confirmed real case): only subject,
@@ -1032,7 +1056,7 @@ async def get_gmail_emails(
 
     # Count total
     count_result = await db.execute(
-        text(f"SELECT COUNT(*) FROM gmail_emails {where_sql}"),
+        text(f"SELECT COUNT(*) FROM gmail_emails ge {where_sql}"),
         params
     )
     total = count_result.scalar_one()

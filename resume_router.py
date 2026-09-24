@@ -250,9 +250,9 @@ async def _build_resume_info(
         if exp.achievements:
             bullets.extend([b.strip() for b in exp.achievements.split('\n') if b.strip()])
 
-        tech_str = ", ".join(exp.technologies) if exp.technologies else ""
-        if tech_str:
-            bullets.append(f"Technologies: {tech_str}")
+        # "Technologies:" bullet removed — the field was dropped from the
+        # Work Experience form (duplicates Skills), so old values must not
+        # keep surfacing in generated resumes.
 
         start_str = exp.start_date.strftime("%b %Y") if exp.start_date else ""
         end_str = "Present" if exp.is_present else (exp.end_date.strftime("%b %Y") if exp.end_date else "")
