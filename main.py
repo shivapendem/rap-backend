@@ -928,8 +928,22 @@ async def get_requirements(
                 .where(
                     RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids),
                     RequirementConsultantMatch.status == "MATCHING",
+                    Consultant.status == "ACTIVE",
+                    User.is_authorized == True,
                 )
             )
+            # Recruiters can only filter by their own active roster — other
+            # consultants' rows came back with an empty Matched Consultants
+            # column (that column is roster-scoped further down).
+            if current_user.role == "RECRUITER":
+                matched_consultant_subq = matched_consultant_subq.where(
+                    RequirementConsultantMatch.consultant_id.in_(
+                        select(RecruiterConsultant.consultant_id).where(
+                            RecruiterConsultant.recruiter_id == current_user.id,
+                            RecruiterConsultant.is_active == True,
+                        )
+                    )
+                )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
 
     # BUG FIX: the FilterBar (admin Requirements page) has always sent
@@ -1002,8 +1016,14 @@ async def get_requirements(
     total = (await db.execute(count_query)).scalar_one()
 
     actual_sort = "received_date" if sort_by == "received_at" else sort_by
-    sort_col = getattr(Requirement, actual_sort)   
-    query = query.order_by(sort_col.desc() if sort_dir == "desc" else sort_col.asc())
+    sort_col = getattr(Requirement, actual_sort)
+    # Tie-breaker on id: many rows share received_date/status, and without a
+    # unique secondary key Postgres may order ties differently per query, so
+    # rows repeated or went missing across pages.
+    query = query.order_by(
+        sort_col.desc() if sort_dir == "desc" else sort_col.asc(),
+        Requirement.id.desc() if sort_dir == "desc" else Requirement.id.asc(),
+    )
     query = query.offset((page - 1) * page_size).limit(page_size)
 
     reqs = (await db.execute(query)).scalars().all()

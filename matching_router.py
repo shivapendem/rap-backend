@@ -232,7 +232,11 @@ async def get_pending_matches(
     doesn't reintroduce that exact bug here too.
     """
     valid_statuses = {"MATCHING", "APPLIED", "REJECTED", "NOT_ELIGIBLE"}
-    target_status = status.upper().strip() if status and status.upper().strip() in valid_statuses else "MATCHING"
+    # "ALL" = every status (All Applications). Anything unknown/missing
+    # still defaults to MATCHING, as before.
+    requested_status = status.upper().strip() if status else ""
+    show_all_statuses = requested_status == "ALL"
+    target_status = requested_status if requested_status in valid_statuses else "MATCHING"
 
     normalized_search = None
     if search:
@@ -246,11 +250,12 @@ async def get_pending_matches(
             .join(Consultant, RequirementConsultantMatch.consultant_id == Consultant.id)
             .join(User, User.id == Consultant.user_id)
             .where(
-                RequirementConsultantMatch.status == target_status,
                 Consultant.status == "ACTIVE",
                 User.is_authorized == True,
             )
         )
+        if not show_all_statuses:
+            stmt = stmt.where(RequirementConsultantMatch.status == target_status)
         if consultant_id:
             c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
             if c_ids:
@@ -283,6 +288,7 @@ async def get_pending_matches(
         Requirement.role.label("requirement_title"),
         func.coalesce(Requirement.client, Requirement.vendor).label("requirement_company"),
         Requirement.vendor_email.label("requirement_vendor_email"),
+        Requirement.raw_email_id,
         RequirementConsultantMatch.consultant_id,
         Consultant.full_name.label("consultant_name"),
         Consultant.email.label("consultant_email"),
@@ -296,8 +302,15 @@ async def get_pending_matches(
     # Same reasoning as before: order by match quality first, not by when
     # it happened to be scored, so a stronger match always sorts above a
     # weaker one; created_at as a stable tiebreaker for equal scores.
+    # Newest match always first. Score-first buried every new match under
+    # older 100% matches, so page 1 looked like matching had stopped.
+    # Score and id are only tie-breakers (same timestamp) for stable paging.
     stmt = (
-        stmt.order_by(RequirementConsultantMatch.match_score.desc(), RequirementConsultantMatch.created_at.desc())
+        stmt.order_by(
+            RequirementConsultantMatch.created_at.desc(),
+            RequirementConsultantMatch.match_score.desc(),
+            RequirementConsultantMatch.id.desc(),
+        )
         .offset((page - 1) * pageSize)
         .limit(pageSize)
     )
@@ -312,6 +325,7 @@ async def get_pending_matches(
             "requirement_title": row["requirement_title"],
             "requirement_company": row["requirement_company"],
             "requirement_vendor_email": row["requirement_vendor_email"],
+            "raw_email_id": row["raw_email_id"],
             "consultant_id": row["consultant_id"],
             "consultant_name": row["consultant_name"],
             "consultant_email": row["consultant_email"],

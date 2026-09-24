@@ -81,7 +81,7 @@ class EmailQueueStatusUpdate(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-ANTI_SPAM_DELAY_MINUTES = 5
+ANTI_SPAM_DELAY_MINUTES = 1
 
 
 async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> datetime:
