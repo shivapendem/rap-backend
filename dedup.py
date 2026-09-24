@@ -129,12 +129,59 @@ async def is_duplicate(
     return near_result.scalars().first() is not None
 
 
+# Max gap we'll accept between a Date header and our own fetched_at before we
+# stop trusting fetched_at as the ceiling (guards against a bad/legacy
+# fetched_at collapsing a legitimate date). Real sender clock skew is minutes.
+_FETCHED_AT_TRUST_WINDOW = timedelta(hours=24)
+
+
+def clamp_received_date(received_date, fetched_at=None):
+    """
+    FUTURE-TIMESTAMP FIX: gmail_emails.date is the email's `Date:` header,
+    which the SENDER's mail client stamps from the SENDER's clock. Vendors
+    whose clocks run fast (or whose bulk-mail tools set their own Date)
+    produce requirements "received" minutes in the future, which then sort
+    to the top of every Requirements table ahead of genuinely newer mail.
+
+    An email can't have been received after we fetched it, or after now.
+    So cap received_date at our own timestamps:
+      - fetched_at (gmail_emails.fetched_at, stamped by our sync on our
+        clock) when it's timezone-aware and plausibly close to the header,
+      - otherwise the current UTC time.
+
+    Values that are already in the past are returned UNCHANGED (same object,
+    same naive/aware-ness), so every correctly-dated email behaves exactly
+    as before. None / non-datetime values pass straight through.
+    """
+    if not isinstance(received_date, datetime):
+        return received_date
+
+    rd_aware = (
+        received_date if received_date.tzinfo is not None
+        else received_date.replace(tzinfo=timezone.utc)  # same convention as _dedup_time_bucket
+    )
+
+    ceiling = datetime.now(timezone.utc)
+    if (
+        isinstance(fetched_at, datetime)
+        and fetched_at.tzinfo is not None
+        and fetched_at < ceiling
+        and rd_aware - fetched_at <= _FETCHED_AT_TRUST_WINDOW
+    ):
+        ceiling = fetched_at
+
+    if rd_aware > ceiling:
+        return ceiling
+    return received_date
+
+
 async def save_requirement(
     db: AsyncSession,
     parsed: dict,
     cleaned_jd: str,
     raw_email_id: Optional[int] = None,
     received_date=None,  # BUG FIX: this was accepted nowhere before — column stayed NULL forever
+    fetched_at=None,     # gmail_emails.fetched_at, when the caller has it -- see clamp_received_date()
 ) -> dict:
     """
     Save requirement to database if not duplicate.
@@ -160,13 +207,11 @@ async def save_requirement(
         except ValueError:
             received_date = None
 
-    # Defensive: a real email can never be "received" in the future. If the
-    # upstream value is more than a few minutes ahead of now, it's corrupted
-    # (bad timezone parsing upstream) -- don't let it through as-is.
-    if received_date is not None:
-        now_utc = datetime.now(timezone.utc)
-        if received_date > now_utc + timedelta(minutes=10):
-            received_date = None
+    # Defensive: a real email can never be "received" in the future. The old
+    # guard here nulled values >10 min ahead, which let small sender clock
+    # skew (the common case) through untouched and threw away the date
+    # entirely for larger skew. Clamp instead -- see clamp_received_date().
+    received_date = clamp_received_date(received_date, fetched_at)
 
     # Check for duplicate
     duplicate = await is_duplicate(db, vendor_email, role, jd_hash, received_date=received_date)

@@ -47,7 +47,7 @@ from auth import get_current_user
 from pipeline import process_email
 from parser import parse_requirement
 from cleaner import clean_requirement_text, html_to_text
-from dedup import create_jd_hash, build_dedup_key, save_requirement
+from dedup import create_jd_hash, build_dedup_key, save_requirement, clamp_received_date
 
 logger = logging.getLogger(__name__)
 
@@ -574,7 +574,8 @@ async def reparse_email(
     gmail_row_result = await db.execute(
         text("""
             SELECT id, message_id, thread_id, account_email, subject,
-                   from_address, from_name, reply_to, body_text, body_html, date
+                   from_address, from_name, reply_to, body_text, body_html, date,
+                   fetched_at
             FROM gmail_emails WHERE id = :id
         """),
         {"id": email_id}
@@ -588,7 +589,10 @@ async def reparse_email(
         body_html = gmail_row["body_html"] or ""
         headers = {"from": gmail_row["from_address"], "reply_to": gmail_row["reply_to"]}
         source_gmail_emails_id = gmail_row["id"]
-        received_date = gmail_row["date"]
+        # Cap sender-clock-skewed Date headers at our own fetch time -- this
+        # also covers the in-place update branch below, which writes
+        # received_date directly without going through save_requirement().
+        received_date = clamp_received_date(gmail_row["date"], gmail_row["fetched_at"])
         gmail_msg = {
             "id": gmail_message_id,
             "thread_id": gmail_row["thread_id"],
