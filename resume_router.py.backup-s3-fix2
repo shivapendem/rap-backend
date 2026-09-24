@@ -1,0 +1,3079 @@
+import os
+import io
+import re
+import uuid
+import math
+import asyncio
+from typing import Optional, List
+from pathlib import Path
+from datetime import datetime, timezone, date
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body, BackgroundTasks
+from fastapi.responses import Response
+from pydantic import BaseModel, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import func, or_
+
+from database import get_db
+from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
+from auth import get_current_user
+from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3, get_s3_file_metadata
+from claude_service import generate_tailored_resume, categorize_skills_with_tier
+from phase8_ai_usage_service import save_openai_rate_limits
+from resume_validation import get_missing_resume_fields, missing_fields_message
+from phase3 import _extract_text_from_docx
+
+# You can import openai and use it if an API key is provided
+# import openai
+
+router = APIRouter(prefix="/api/resume", tags=["resume"])
+
+
+
+# PERMANENT FIX ("QueuePool limit ... connection timed out" under rapid
+# repeated saves): sync_base_resume_text fires a NEW background DOCX-
+# regen task — its own DB session, held open for the whole build+upload
+# — on every single profile/experience save, with nothing to stop
+# several of these stacking up concurrently for the same consultant if
+# they save a few times in quick succession (exactly what happened
+# across this session's heavy testing). Only the LATEST save's data
+# actually matters — a still-running regen will pick up whatever's most
+# recently committed by the time it queries anyway — so N rapid saves
+# only ever need at most one more regen after the last one, not N
+# separate overlapping ones each holding their own connection. Tracking
+# which consultant_ids currently have a regen in flight lets a redundant
+# trigger skip cleanly instead of piling on and exhausting the pool.
+_regen_in_flight: set[int] = set()
+
+
+class ResumeCreateRequest(BaseModel):
+    title: str
+    target_role: Optional[str] = None
+    job_description: Optional[str] = None
+    experience_ids: Optional[List[int]] = [] # IDs of ConsultantExperience to include
+    draft: bool = False # If True, don't generate PDF yet
+    user_id: Optional[int] = None # The candidate user_id to generate for
+    # Set when generated from the dashboard's "no job description" custom
+    # resume flow — links this Resume back to that specific requirement so
+    # the dashboard can find it and unlock the Apply button.
+    requirement_id: Optional[int] = None
+    # BUG FIX ("experience style is missing" after generating): this
+    # endpoint had no way to receive a template at all — Resume(...) below
+    # never set `template=`, so it silently fell back to the "classic"
+    # DB column default every time, regardless of what the caller
+    # intended, and that default then stuck permanently (every later Save
+    # Changes/regenerate reads resume.template right back out). Same class
+    # of bug the finalize endpoint already had fixed for its own payload.
+    template: Optional[str] = None
+
+async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: User):
+    if current_user.role == "ADMIN":
+        result = await db.execute(select(Resume).where(Resume.id == resume_id))
+        return result.scalar_one_or_none()
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        result = await db.execute(select(Resume).where(
+            Resume.id == resume_id,
+            or_(
+                Resume.user_id == current_user.id,
+                Resume.user_id.in_(consultant_users_query)
+            )
+        ))
+        return result.scalar_one_or_none()
+    else:
+        result = await db.execute(select(Resume).where(Resume.id == resume_id, Resume.user_id == current_user.id))
+        return result.scalar_one_or_none()
+
+class ResumeUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    target_role: Optional[str] = None
+    job_description: Optional[str] = None
+    data: Optional[dict] = None
+    status: Optional[str] = None
+
+class ResumeResponse(BaseModel):
+    id: int
+    user_id: int
+    requirement_id: Optional[int] = None
+    title: str
+    target_role: Optional[str] = None
+    job_description: Optional[str] = None
+    data: dict
+    template: Optional[str] = "classic"
+    s3_key: Optional[str] = None
+    s3_url: Optional[str] = None
+    ats_score: Optional[int] = None
+    status: str
+    download_count: int
+    last_downloaded: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    is_base: bool = False
+
+    class Config:
+        from_attributes = True
+
+class PaginatedResumes(BaseModel):
+    data: List[ResumeResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+async def _resolve_target_user(
+    request_user_id: Optional[int],
+    current_user: User,
+    db: AsyncSession,
+):
+    """Resolve which consultant we're generating for, honoring the
+    ADMIN/RECRUITER "generate on behalf of" path. Shared by the /generate
+    endpoint and the /completeness pre-check so they never drift apart.
+
+    BUG FIX: this never checked that a RECRUITER was actually assigned to
+    the target consultant — any recruiter could pass any user_id in the
+    request/URL and this would happily resolve it. That's how a recruiter
+    could reach the "Generate Resume" page and even get as far as the
+    completeness check for a consultant who then failed to load on the
+    Consultant Detail page ("may not be assigned to you") — two different
+    endpoints enforcing two different rules for the same relationship.
+    _get_resume_for_user() above already has the correct check (a
+    consultant counts as assigned via EITHER the legacy single
+    sales_recruiter_user_id FK OR the RecruiterConsultant join table) —
+    reuse that same rule here so every recruiter-facing endpoint in this
+    file agrees on who's assigned to whom.
+    """
+    target_user_id = current_user.id
+    target_user = current_user
+    if request_user_id and current_user.role in ("ADMIN", "RECRUITER"):
+        target_user_id = request_user_id
+        target_user_result = await db.execute(select(User).where(User.id == target_user_id))
+        target_user = target_user_result.scalar_one_or_none()
+        if not target_user:
+            raise HTTPException(status_code=404, detail="Target user not found")
+
+        if current_user.role == "RECRUITER":
+            assigned_consultant = await db.execute(
+                select(Consultant.id).where(
+                    Consultant.user_id == target_user_id,
+                    or_(
+                        Consultant.sales_recruiter_user_id == current_user.id,
+                        Consultant.id.in_(
+                            select(RecruiterConsultant.consultant_id).where(
+                                RecruiterConsultant.recruiter_id == current_user.id
+                            )
+                        ),
+                    ),
+                )
+            )
+            if not assigned_consultant.scalar_one_or_none():
+                raise HTTPException(status_code=403, detail="This consultant is not assigned to you.")
+
+    if target_user.role != "CONSULTANT":
+        raise HTTPException(status_code=403, detail="Resumes can only be generated for consultants.")
+
+    return target_user_id, target_user
+
+
+async def _build_resume_info(
+    target_user: User,
+    db: AsyncSession,
+    experience_ids: Optional[List[int]] = None,
+):
+    """Assemble the resume_info payload (skills/experience/education/etc.)
+    used both to actually call the AI and to check profile completeness."""
+    consultant_res = await db.execute(select(Consultant).where(Consultant.user_id == target_user.id))
+    consultant = consultant_res.scalar_one_or_none()
+
+    profile_experiences = []
+    if consultant:
+        exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.consultant_id == consultant.id).order_by(ConsultantExperience.sort_order))
+        profile_experiences = exp_results.scalars().all()
+
+    explicit_experiences = []
+    if experience_ids:
+        exp_results = await db.execute(select(ConsultantExperience).where(ConsultantExperience.id.in_(experience_ids)))
+        explicit_experiences = exp_results.scalars().all()
+
+    # Merge avoiding duplicates
+    all_exps = {exp.id: exp for exp in profile_experiences}
+    for exp in explicit_experiences:
+        all_exps[exp.id] = exp
+
+    merged_exps = list(all_exps.values())
+
+    manual_exp_entries = []
+    for exp in merged_exps:
+        bullets = []
+        if exp.responsibilities:
+            bullets.extend([b.strip() for b in exp.responsibilities.split('\n') if b.strip()])
+        if exp.achievements:
+            bullets.extend([b.strip() for b in exp.achievements.split('\n') if b.strip()])
+
+        tech_str = ", ".join(exp.technologies) if exp.technologies else ""
+        if tech_str:
+            bullets.append(f"Technologies: {tech_str}")
+
+        start_str = exp.start_date.strftime("%b %Y") if exp.start_date else ""
+        end_str = "Present" if exp.is_present else (exp.end_date.strftime("%b %Y") if exp.end_date else "")
+        date_str = f"{start_str} - {end_str}".strip(" -")
+
+        # BUG FIX: this used to send ONLY a combined "dates" string (e.g.
+        # "Jan 2020 - Present"), but the AI is asked to RETURN separate
+        # "start"/"end" fields — forcing it to re-parse and split a
+        # combined string on its own instead of just carrying forward
+        # values it was already given cleanly. Sending both the combined
+        # string (kept for any code that still reads it) AND explicit
+        # start/end/is_present makes it far more likely a past role's
+        # real end date survives the AI round-trip correctly.
+        manual_exp_entries.append({
+            "title": exp.role_title,
+            "company": exp.client_name,
+            "dates": date_str,
+            "start": start_str,
+            "end": end_str,
+            "is_present": bool(exp.is_present),
+            "bullets": bullets
+        })
+
+    # Use resume_info if available, else build a basic profile from db
+    import copy
+    resume_info = copy.deepcopy(target_user.resume_info) if target_user.resume_info else {
+        "full_name": target_user.full_name or target_user.email.split('@')[0],
+        "email": target_user.email,
+        "experience": []
+    }
+
+    if "experience" not in resume_info:
+        resume_info["experience"] = []
+
+    # Prepend profile experiences so they are processed as most relevant/recent
+    resume_info["experience"] = manual_exp_entries + resume_info["experience"]
+
+    # BUG FIX ("admin edit and consultant profile edit — every change
+    # should update the json too"): this used to only ever BACKFILL a gap
+    # — if resume_info's stored blob (frozen from initial signup/import)
+    # already had ANY non-blank value for a field, an edit made afterward
+    # through either the admin's User Management screen or the
+    # consultant's own profile screen (both of which write the real
+    # Consultant/User columns, never this blob directly) was silently
+    # invisible to AI-tailored resume generation — same bug already fixed
+    # for full_name below, now applied consistently to every identity/
+    # contact field the real Consultant/User row is the source of truth
+    # for. `location` was missing from this sync entirely — admin editing
+    # "Current Location" never reached resume_info at all, at any point,
+    # gap or not.
+    #
+    # title/preferred_roles and skills are intentionally left as
+    # fill-gap-only: resume_info.title can be a deliberate per-resume
+    # override of the broader preferred_roles field, and skills are
+    # already kept in sync separately (phase_users_service.py merges
+    # primary/secondary skill edits into resume_info["skills"] directly
+    # at admin-save time).
+    if consultant:
+        def _blank(key: str) -> bool:
+            val = resume_info.get(key)
+            return val is None or (isinstance(val, str) and not val.strip())
+
+        if consultant.linkedin_url:
+            resume_info["linkedin"] = consultant.linkedin_url
+        if consultant.phone:
+            resume_info["phone"] = consultant.phone
+        if consultant.full_name:
+            resume_info["full_name"] = consultant.full_name
+        if consultant.email:
+            resume_info["email"] = consultant.email
+        if consultant.current_location:
+            resume_info["location"] = consultant.current_location
+        if consultant.education:
+            resume_info["education"] = consultant.education
+        if consultant.total_experience_years is not None:
+            resume_info["years_experience"] = float(consultant.total_experience_years)
+        if _blank("title") and _blank("target_role") and _blank("target_title") and consultant.preferred_roles:
+            resume_info["title"] = consultant.preferred_roles
+        if not resume_info.get("skills") and not resume_info.get("tech_stack") and not resume_info.get("technical_proficiencies") and consultant.primary_skills:
+            resume_info["skills"] = [s.strip() for s in consultant.primary_skills.split(",") if s.strip()]
+
+    return resume_info
+
+
+@router.get("/completeness")
+async def get_resume_completeness(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pre-check the frontend calls before letting someone hit "Generate Resume".
+    Returns which of skills/experience/education are still missing so the UI
+    can show a checklist and disable the button, instead of the person
+    finding out only after burning an AI call on a useless resume.
+    """
+    target_user_id, target_user = await _resolve_target_user(user_id, current_user, db)
+    resume_info = await _build_resume_info(target_user, db)
+    missing_fields = get_missing_resume_fields(resume_info)
+
+    # Surface the target consultant's status so the "Generate/Regenerate
+    # Resume" page (shared across admin/recruiter/consultant) can show a
+    # clear "this consultant is inactive" indicator instead of the admin/
+    # recruiter only finding out something's off after generating anyway.
+    consultant_status = None
+    consultant_res = await db.execute(select(Consultant.status).where(Consultant.user_id == target_user_id))
+    consultant_status = consultant_res.scalar_one_or_none()
+
+    return {
+        "user_id": target_user_id,
+        "complete": len(missing_fields) == 0,
+        "missing_fields": missing_fields,
+        "message": missing_fields_message(missing_fields) if missing_fields else None,
+        "consultant_status": consultant_status,
+        "is_active": bool(target_user.is_authorized),
+    }
+
+
+@router.post("/generate-from-template", response_model=dict)
+async def generate_resume_from_template(
+    request: ResumeCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    import tempfile
+    import subprocess
+    import traceback
+    import logging
+    from pathlib import Path
+    
+    logger = logging.getLogger(__name__)
+
+    target_user_id, target_user = await _resolve_target_user(request.user_id, current_user, db)
+    resume_info = await _build_resume_info(target_user, db, request.experience_ids)
+    
+    # Get the rich text template
+    result = await db.execute(select(Consultant).where(Consultant.user_id == target_user_id))
+    consultant = result.scalar_one_or_none()
+    
+    if not consultant or not consultant.resume_rich_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Consultant does not have a rich text resume template. Please create one in the editor first."
+        )
+        
+    template_html = consultant.resume_rich_text
+
+    missing_fields = get_missing_resume_fields(resume_info)
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": missing_fields_message(missing_fields),
+                "missing_fields": missing_fields,
+            },
+        )
+
+    try:
+        from claude_service import generate_template_values
+        generated_data, rate_limits, usage_info = generate_template_values(resume_info, request.job_description or "General Role")
+        if rate_limits:
+            await save_openai_rate_limits(db, rate_limits)
+        if usage_info:
+            from phase8_ai_usage_service import log_ai_usage
+            await log_ai_usage(
+                db,
+                purpose="resume_generation_template",
+                model="claude-sonnet-4-6",
+                input_tokens=usage_info["input_tokens"],
+                output_tokens=usage_info["output_tokens"],
+                consultant_id=str(target_user_id),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Generation failed: {e}")
+
+    # Parse template with generated_data
+    parsed_html = template_html
+    
+    parsed_html = parsed_html.replace("{resume_full_name}", target_user.full_name or "")
+    parsed_html = parsed_html.replace("{job_role}", generated_data.get("summary", "") or "")
+    parsed_html = parsed_html.replace("{skills}", ", ".join(generated_data.get("skills", []) or []))
+    parsed_html = parsed_html.replace("{work_role}", consultant.preferred_roles or "")
+    
+    parsed_html = parsed_html.replace("{phone}", target_user.mobile_number or consultant.phone or "")
+    parsed_html = parsed_html.replace("{email}", target_user.email or consultant.email or "")
+    parsed_html = parsed_html.replace("{linkedin}", target_user.linkedin_url or consultant.linkedin_url or "")
+    parsed_html = parsed_html.replace("{location}", consultant.current_location or "")
+    
+    education = resume_info.get("education", []) or []
+    ed_str = ", ".join([f"{e.get('degree','')} from {e.get('institution','')}" for e in education if e.get('degree') or e.get('institution')])
+    parsed_html = parsed_html.replace("{education}", ed_str)
+    
+    base_experiences = resume_info.get("experience", []) or []
+    experiences = generated_data.get("experience", []) or []
+    
+    for i, exp in enumerate(experiences):
+        n = i + 1
+        short_id = None
+        if i < len(base_experiences):
+            base_exp_id = base_experiences[i].get("id", "")
+            if base_exp_id:
+                short_id = str(base_exp_id).split("-")[0]
+                
+        tags_to_replace = [str(n)]
+        if short_id:
+            tags_to_replace.append(short_id)
+            
+        for tag in tags_to_replace:
+            parsed_html = re.sub(r'\{job_title_' + tag + r'\}', exp.get("role", "") or "", parsed_html)
+            parsed_html = re.sub(r'\{company_' + tag + r'\}', exp.get("employer", "") or exp.get("client", "") or "", parsed_html)
+            
+            start_date = exp.get("start") or (base_experiences[i].get("start_date", "") if i < len(base_experiences) else "")
+            end_date = exp.get("end") or (base_experiences[i].get("end_date", "Present") if i < len(base_experiences) else "Present")
+            duration_str = f"{start_date} to {end_date}"
+            parsed_html = re.sub(r'\{duration_' + tag + r'\}', duration_str, parsed_html)
+            parsed_html = re.sub(r'\{dates_' + tag + r'\}', duration_str, parsed_html)
+            
+            bullets = exp.get("bullets", []) or []
+            bullets_html = "<ul>" + "".join([f"<li>{b}</li>" for b in bullets]) + "</ul>" if bullets else ""
+            parsed_html = re.sub(r'\{role_' + tag + r'\}', bullets_html, parsed_html)
+            
+            base_achievements = base_experiences[i].get("achievements", "") if i < len(base_experiences) else ""
+            achievements_html = "<ul>" + "".join([f"<li>{b.strip()}</li>" for b in base_achievements.split('\n') if b.strip()]) + "</ul>" if base_achievements else ""
+            parsed_html = re.sub(r'\{achievements_' + tag + r'\}', achievements_html, parsed_html)
+
+    # BUG FIX ("Edit Resume preview shows one template, View/Download show
+    # a different one"): this used to build the final file by directly
+    # LibreOffice-converting parsed_html (the consultant's raw rich-text
+    # template) to PDF — a separate rendering path from every other
+    # screen, AND a lossy one (LibreOffice doesn't reliably preserve
+    # shading/border formatting on conversion). Edit Resume's preview and
+    # the DOCX download both render `resume.data` through _generate_docx's
+    # TEMPLATE_CONFIG layouts, keyed off resume.template — which this
+    # endpoint never set either, silently defaulting to "classic". Route
+    # through that exact same DOCX-only pipeline and persist template, so
+    # Edit, View, and Download all read the one same file.
+    s3_key = None
+    # BUG FIX ("Edit shows exact template but View/Download show a
+    # different style"): the comment above already explains the intent
+    # (Edit/View/Download all read the same _generate_docx-rendered file,
+    # keyed by resume.template) — but this line never actually read the
+    # template the request carries (ResumeCreateRequest.template, set
+    # from whatever style the consultant picked), it just hardcoded
+    # "classic" unconditionally. Edit renders straight from what was just
+    # picked in the UI, so it looked right; View/Download render from
+    # this saved Resume row, which was always "classic" regardless.
+    resume_template = request.template or "classic"
+    if not request.draft:
+        try:
+            from phase6 import _generate_docx
+
+            # BUG FIX ("education/linkedin/etc. missing while generating
+            # tailored resume"): generate_template_values() only ever
+            # returns summary/skills/experience/ats_score (see its
+            # docstring — "ONLY the core fields needed for templating"),
+            # but _generate_docx builds a FULL resume document and needs
+            # name/email/phone/location/linkedin/education/certifications
+            # too. Those were never in generated_data at all, so every
+            # DOCX built through this template flow silently rendered
+            # without them regardless of how complete the consultant's
+            # actual profile was. Merge the real profile fields in — same
+            # field names/shape generate_tailored_resume's mock_fallback
+            # already uses for the same _generate_docx call elsewhere —
+            # without touching the AI-tailored summary/skills/experience.
+            docx_data = {
+                "name": resume_info.get("full_name", ""),
+                "email": resume_info.get("email", ""),
+                "phone": resume_info.get("phone", ""),
+                "location": resume_info.get("location", ""),
+                "linkedin": resume_info.get("linkedin", ""),
+                "github": resume_info.get("github", ""),
+                "education": resume_info.get("education") or resume_info.get("educational_background") or [],
+                "certifications": resume_info.get("certifications") or [],
+                "technical_proficiencies": resume_info.get("technical_proficiencies"),
+                **generated_data,
+            }
+
+            # BUG FIX ("experience style and format missing" — the accent-
+            # box border/bold company line, timeline connector, and dates
+            # all silently disappeared): generate_template_values() asks
+            # the AI for experience entries shaped {"role", "employer",
+            # "bullets"} only (see its own prompt schema) — no dates at
+            # all, and "employer" instead of the "client"/"company" key
+            # _generate_docx's EXPERIENCE section actually reads
+            # (`exp.get("client") or exp.get("company")`). Every entry's
+            # company name and dates came back blank, which also skipped
+            # the styling attached to that header line, since it's only
+            # drawn when company_text or date_str is non-empty. Normalize
+            # field names and backfill start/end from the real profile
+            # experience (resume_info["experience"], same order the AI
+            # was given them in) rather than inventing dates.
+            real_experience = resume_info.get("experience") or []
+            normalized_experience = []
+            for i, exp in enumerate(docx_data.get("experience") or []):
+                real_exp = real_experience[i] if i < len(real_experience) else {}
+                normalized_experience.append({
+                    **exp,
+                    "company": exp.get("company") or exp.get("client") or exp.get("employer") or real_exp.get("company", ""),
+                    "start": exp.get("start") or real_exp.get("start", ""),
+                    "end": exp.get("end") or real_exp.get("end", ""),
+                })
+            docx_data["experience"] = normalized_experience
+
+            with tempfile.TemporaryDirectory(prefix="resume_template_") as tmpdir:
+                docx_path = Path(tmpdir) / "resume.docx"
+
+                _generate_docx(docx_data, docx_path, template=resume_template)
+
+                s3_key = f"resumes/{target_user_id}/{uuid.uuid4()}.docx"
+                with open(docx_path, "rb") as f:
+                    # PERF FIX: blocking boto3 upload off the event loop —
+                    # same class of fix as _regenerate_base_resume_docx_file.
+                    success = await asyncio.to_thread(
+                        upload_file_to_s3, f, s3_key,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                if not success:
+                    logger.error("Failed to upload template DOCX to S3")
+                    s3_key = None
+        except Exception as e:
+            logger.error(f"Failed to generate or upload DOCX: {e}")
+            logger.error(traceback.format_exc())
+
+    ats_score = math.floor(generated_data.get("ats_score", 0)) if generated_data.get("ats_score") else 85
+
+    new_resume = Resume(
+        user_id=target_user_id,
+        title=request.title,
+        job_description=request.job_description,
+        # Was `generated_data` — the same sparse summary/skills/
+        # experience/ats_score dict passed to _generate_docx before the
+        # merge fix above. Saving that meant any later re-read of this
+        # resume (re-edit, re-download) lost name/education/linkedin/etc.
+        # all over again, even though the DOCX itself now has them.
+        # `docx_data` is the merged, complete version — keep the two in
+        # sync.
+        data=docx_data if not request.draft else generated_data,
+        template=resume_template,
+        is_base=False,
+        is_draft=request.draft,
+        s3_key=s3_key,
+        ats_score=ats_score
+    )
+    db.add(new_resume)
+    await db.commit()
+    await db.refresh(new_resume)
+
+    return {
+        "id": new_resume.id,
+        "title": new_resume.title,
+        "is_draft": new_resume.is_draft,
+        "s3_url": generate_presigned_url(new_resume.s3_key) if new_resume.s3_key else None,
+        "ats_score": new_resume.ats_score,
+        "data": new_resume.data,
+        "parsed_html": parsed_html
+    }
+
+
+@router.post("/generate", response_model=ResumeResponse)
+async def generate_resume(
+    request: ResumeCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    target_user_id, target_user = await _resolve_target_user(request.user_id, current_user, db)
+    resume_info = await _build_resume_info(target_user, db, request.experience_ids)
+
+    # Guard rail: don't waste an AI call generating a resume from a profile
+    # that's missing skills/experience/education — that just produces a
+    # resume nobody can use. Fail fast with exactly what's missing so the
+    # frontend (or the caller) can tell the consultant what to go fill in.
+    missing_fields = get_missing_resume_fields(resume_info)
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": missing_fields_message(missing_fields),
+                "missing_fields": missing_fields,
+            },
+        )
+
+    try:
+        generated_data, rate_limits, usage_info = generate_tailored_resume(
+            resume_info, request.job_description or "General Role", target_role=request.target_role
+        )
+        if rate_limits:
+            await save_openai_rate_limits(db, rate_limits)
+        if usage_info:
+            from phase8_ai_usage_service import log_ai_usage
+            await log_ai_usage(
+                db,
+                purpose="resume_generation",
+                model="claude-sonnet-4-6",
+                input_tokens=usage_info["input_tokens"],
+                output_tokens=usage_info["output_tokens"],
+                consultant_id=str(target_user_id),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Generation failed: {e}")
+    # Compute a real ATS score from the generated resume vs. the job description.
+    # Reuses phase6's keyword scorer and phase3's skill detector. Left as None
+    # (no badge shown) when the JD has no recognizable skills to match against.
+    ats_value = None
+    try:
+        from phase6 import _ats_score
+        from phase3 import _detect_skills
+        jd_skills = list(dict.fromkeys(
+            _detect_skills(request.job_description or "")
+            + (generated_data.get("missing_skills") or [])
+        ))
+        if jd_skills:
+            text_parts = [
+                generated_data.get("summary", ""),
+                " ".join(generated_data.get("skills", []) or []),
+                request.target_role or "",
+            ]
+            for exp in generated_data.get("experience", []) or []:
+                text_parts.append(exp.get("role", ""))
+                text_parts.append(" ".join(exp.get("bullets", []) or []))
+            resume_text = " ".join(text_parts)
+            ats_total, *_ = _ats_score(jd_skills, resume_text, request.target_role or "")
+            ats_value = int(round(ats_total))
+    except Exception as e:
+        print(f"ATS scoring failed, leaving score empty: {e}")
+        from error_logger import log_db_error
+        await log_db_error(stage="ats_scoring", error=e)
+        ats_value = None
+    # BUG FIX ("Skills Gap panel still shows after finalize"): same
+    # reasoning as finalize_resume's fix below — only strip it when this
+    # call is NOT a draft (i.e. it's the final saved version with no
+    # separate /finalize call to catch it later). A draft keeps
+    # missing_skills so the review screen can still act on it before the
+    # resume is actually finalized.
+    resume_data_to_save = dict(generated_data)
+    if not request.draft:
+        resume_data_to_save.pop("missing_skills", None)
+
+    new_resume = Resume(
+        user_id=target_user_id,
+        requirement_id=request.requirement_id,
+        title=request.title,
+        target_role=request.target_role,
+        job_description=request.job_description,
+        data=resume_data_to_save,
+        status='draft' if request.draft else 'generating',
+        ats_score=ats_value,
+        template=request.template or "classic",
+    )
+
+    db.add(new_resume)
+    await db.commit()
+    await db.refresh(new_resume)
+
+    if request.draft:
+        return new_resume
+
+    # Generate DOCX using phase6 logic. No PDF step — see the matching
+    # BUG FIX comment on finalize_resume: LibreOffice's PDF conversion
+    # doesn't reliably preserve template formatting, so the DOCX itself
+    # is now the one file every screen (Edit preview, View, Download)
+    # reads from.
+    from phase6 import _generate_docx
+    from pathlib import Path
+
+    resume_dir = Path("/tmp/resumes") / str(target_user_id) / str(new_resume.id)
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    docx_path = resume_dir / "resume.docx"
+
+    try:
+        _generate_docx(generated_data, docx_path, template=new_resume.template or "classic")
+        docx_s3_key = f"users/{target_user_id}/resumes/{new_resume.id}/resume.docx"
+        with open(docx_path, "rb") as f:
+            # PERF FIX: blocking boto3 upload off the event loop.
+            if await asyncio.to_thread(
+                upload_file_to_s3,
+                f, docx_s3_key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                new_resume.s3_key = docx_s3_key
+                new_resume.status = 'completed'
+            else:
+                new_resume.status = 'failed_upload'
+    except Exception as e:
+        new_resume.status = 'failed_generation'
+        print(f"Resume generation failed: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="resume_generate_docx",
+            error=e,
+            source_type="resume",
+            source_id=str(new_resume.id),
+        )
+
+    await db.commit()
+    await db.refresh(new_resume)
+
+    return new_resume
+
+class FinalizeResumeRequest(BaseModel):
+    data: dict
+    # BUG FIX ("templates aren't saving their style — I want the same
+    # template format saved after finalize"): the frontend's template
+    # picker (ResumeRichPreview.tsx's 11 templates) has been sending this
+    # field in the finalize payload for a while, but it wasn't in this
+    # schema at all — Pydantic silently drops unknown request fields by
+    # default, so it never reached _generate_docx, which always produced
+    # the one original hardcoded layout regardless of which template was
+    # selected in the review dialog. The in-app PREVIEW correctly showed
+    # all 11 templates; only the actual attached PDF/DOCX never did.
+    template: Optional[str] = None
+
+@router.post("/{resume_id}/finalize", response_model=ResumeResponse)
+async def finalize_resume(
+    resume_id: int,
+    request: FinalizeResumeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    resume = await _get_resume_for_user(db, resume_id, current_user)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # BUG FIX ("Skills Gap panel still shows after finalize"):
+    # missing_skills lives inside resume.data, the same JSON the preview
+    # reads everywhere (Edit, View, future re-opens) — ResumeRichPreview's
+    # Skills Gap panel is marked print:hidden specifically because it's a
+    # generation-time aid ("here's what to still add"), not something
+    # meant to persist once the resume is done. Nothing ever stripped it
+    # from storage before, so a resume finalized with unresolved gaps kept
+    # showing that orange panel forever afterward. Drop it here, once,
+    # at the point the resume is actually being finalized.
+    finalized_data = dict(request.data)
+    finalized_data.pop("missing_skills", None)
+
+    resume.data = finalized_data
+    resume.template = request.template or "classic"
+    resume.status = 'generating'
+    await db.commit()
+    await db.refresh(resume)
+
+    # BUG FIX ("template picked at finalize, but View/Download show a
+    # different look than Edit's preview"): this used to build the DOCX
+    # correctly with `template`, then LibreOffice-convert it to a PDF and
+    # store THAT as resume.s3_key. LibreOffice headless doesn't reliably
+    # preserve template-specific OOXML formatting (banner header shading,
+    # boxed objective, accent-box experience blocks) on conversion, so the
+    # PDF View/Download actually served came out flatter/plainer than the
+    # DOCX it was built from — while Edit's preview (rendered client-side
+    # from `data`, never touching that PDF) always looked right. Dropping
+    # the PDF step entirely and storing the DOCX itself as resume.s3_key
+    # means every screen reads the one same rendering.
+    from phase6 import _generate_docx
+    from pathlib import Path
+
+    resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    docx_path = resume_dir / "resume.docx"
+
+    try:
+        _generate_docx(resume.data, docx_path, template=resume.template)
+        docx_s3_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+        with open(docx_path, "rb") as f:
+            # PERF FIX: blocking boto3 upload off the event loop.
+            if await asyncio.to_thread(
+                upload_file_to_s3,
+                f, docx_s3_key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                resume.s3_key = docx_s3_key
+                resume.status = 'completed'
+            else:
+                resume.status = 'failed_upload'
+    except Exception as e:
+        resume.status = 'failed_generation'
+        print(f"Resume generation failed: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="resume_finalize_docx",
+            error=e,
+            source_type="resume",
+            source_id=str(resume.id),
+        )
+
+    await db.commit()
+    await db.refresh(resume)
+
+    return resume
+
+@router.post("/upload", response_model=ResumeResponse)
+async def upload_resume(
+    title: str = Form(...),
+    target_role: str = Form(None),
+    # BUG FIX: this endpoint always saved the resume under the UPLOADER's
+    # own account (current_user.id) — so when an admin/recruiter selected
+    # a candidate on the My Resumes page and uploaded a PDF "for" them, it
+    # actually got attached to the admin/recruiter's own account instead.
+    # The upload itself succeeded (hence the success toast), but the
+    # candidate's resume list is filtered by user_id, so it could never
+    # show up there — looked exactly like "upload succeeds, nothing
+    # appears". Now accepts an optional target_user_id so the frontend can
+    # say who it's actually for.
+    target_user_id: int = Form(None),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # CHANGE: was PDF-only ("Only PDF files are supported."). Now DOCX-only
+    # instead — content-type and storage key updated to match.
+    if not file.filename.lower().endswith('.docx'):
+        raise HTTPException(status_code=400, detail="Only .docx files are supported.")
+
+    owner_id = current_user.id
+    if target_user_id and target_user_id != current_user.id:
+        if current_user.role not in ("ADMIN", "RECRUITER"):
+            raise HTTPException(status_code=403, detail="Only admins/recruiters can upload a resume for someone else.")
+        if current_user.role == "RECRUITER":
+            allowed = await db.execute(
+                select(Consultant.user_id).where(
+                    Consultant.user_id == target_user_id,
+                    or_(
+                        Consultant.sales_recruiter_user_id == current_user.id,
+                        Consultant.id.in_(
+                            select(RecruiterConsultant.consultant_id).where(
+                                RecruiterConsultant.recruiter_id == current_user.id
+                            )
+                        ),
+                    ),
+                )
+            )
+            if not allowed.scalars().first():
+                raise HTTPException(status_code=403, detail="That consultant isn't assigned to you.")
+        owner_id = target_user_id
+
+    # BUG FIX: nothing stopped uploading a resume with the exact same
+    # title an owner already has — easy to do by accident (double-
+    # clicking Upload, or re-uploading the same file after a page
+    # refresh), and it silently clutters "My Resumes" with indistinguishable
+    # duplicates. Scoped per owner_id (not per-uploader), so this applies
+    # the same way whether a consultant uploads for themselves or an
+    # admin/recruiter uploads on their behalf — and per role automatically,
+    # since every role shares this one endpoint (PdfUploadModal.tsx).
+    # Case-insensitive/trimmed so "My Resume" and "my resume " still count
+    # as the same title. The synthetic base resume entry (id=-1, injected
+    # in list_resumes rather than a real row here) is never a match target,
+    # since this only ever queries real Resume rows.
+    clean_title = title.strip()
+    existing_title = await db.execute(
+        select(Resume).where(
+            Resume.user_id == owner_id,
+            func.lower(Resume.title) == clean_title.lower(),
+        )
+    )
+    if existing_title.scalars().first():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A resume titled \"{clean_title}\" already exists. Please use a different title.",
+        )
+
+    s3_key = f"users/{owner_id}/resumes/{uuid.uuid4()}/final.docx"
+
+    # Read into memory once so the same bytes can both upload to Spaces AND
+    # feed text extraction below — file.file's stream position isn't safe
+    # to rely on after upload_fileobj() consumes it.
+    file_bytes = await file.read()
+
+    upload_error: list = []
+    # PERF FIX: blocking boto3 upload off the event loop.
+    success = await asyncio.to_thread(
+        upload_file_to_s3,
+        io.BytesIO(file_bytes),
+        s3_key,
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _error_out=upload_error,
+    )
+    if not success:
+        # BUG FIX ("Failed to upload file to S3" with no way to diagnose
+        # without server logs): same real cause as the "Upload Failed"
+        # status on generated resumes — this uses the exact same
+        # "users/{owner_id}/resumes/..." key prefix, so whatever is
+        # blocking writes there is hitting both endpoints identically.
+        # Surface the real boto3/Spaces error in the response itself.
+        detail = "Failed to upload file to S3."
+        if upload_error:
+            detail += f" (Storage error: {upload_error[0]})"
+        raise HTTPException(status_code=500, detail=detail)
+
+    # BUG FIX: manually-uploaded resumes previously had no extracted
+    # content at all — `data` stayed the JSONB column's empty-dict default
+    # forever. The "Edit" button in My Resumes always routed every non-base
+    # resume to the structured JSON editor (personal info / experience /
+    # education fields), which had nothing to populate those fields with,
+    # so it silently rendered a blank template with just the label showing
+    # — looked broken with no error anywhere. Extracting text here (same
+    # DOCX -> text logic the base resume already uses) and storing it under
+    # data["raw_text"] gives these resumes something real to edit, via a
+    # plain-text editor instead of the structured one — see GET/PUT
+    # /{id}/text below.
+    extracted_text = _extract_text_from_docx(file_bytes)
+
+    new_resume = Resume(
+        user_id=owner_id,
+        title=title,
+        target_role=target_role,
+        s3_key=s3_key,
+        status='completed',
+        data={"raw_text": extracted_text},
+    )
+
+    db.add(new_resume)
+    await db.commit()
+    await db.refresh(new_resume)
+
+    return new_resume
+
+@router.get("/list", response_model=PaginatedResumes)
+async def list_resumes(
+    page: int = 1,
+    page_size: int = 10,
+    search: Optional[str] = None,
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role == "ADMIN":
+        query = select(Resume)
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        query = select(Resume).where(
+            or_(
+                Resume.user_id == current_user.id,
+                Resume.user_id.in_(consultant_users_query)
+            )
+        )
+    else:
+        query = select(Resume).where(Resume.user_id == current_user.id)
+
+    if user_id:
+        # Additional safety to only allow filtering if they have access
+        if current_user.role == "ADMIN" or current_user.role == "RECRUITER":
+            query = query.where(Resume.user_id == user_id)
+
+    if search:
+        query = query.where(Resume.title.ilike(f"%{search}%"))
+
+    count_query = select(func.count()).select_from(query.subquery())
+    total = (await db.execute(count_query)).scalar_one()
+
+    query = query.order_by(Resume.created_at.desc())
+    query = query.offset((page - 1) * page_size).limit(page_size)
+
+    resumes = (await db.execute(query)).scalars().all()
+    total_pages = math.ceil(total / page_size) if page_size > 0 else 0
+
+    # generate s3_url for each resume
+    response_data = []
+    for r in resumes:
+        r_dict = {
+            "id": r.id,
+            "user_id": r.user_id,
+            "requirement_id": r.requirement_id,
+            "title": r.title,
+            "target_role": r.target_role,
+            "job_description": r.job_description,
+            "data": r.data or {},
+            "s3_key": r.s3_key,
+            "s3_url": generate_presigned_url(r.s3_key) if r.s3_key else None,
+            "ats_score": r.ats_score,
+            "status": r.status,
+            "download_count": r.download_count,
+            "last_downloaded": r.last_downloaded,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at
+        }
+        response_data.append(ResumeResponse(**r_dict))
+
+    # --- Pin the consultant's base resume (from their profile) at the top ---
+    # It lives on the consultants table + Spaces, not the resumes table, so we surface it
+    # here as a read-only entry instead of duplicating a row (single source of truth).
+    if page == 1:
+        base_target_user_id = None
+        if current_user.role == "CONSULTANT":
+            base_target_user_id = current_user.id
+        elif user_id:  # admin/recruiter viewing a specific candidate
+            base_target_user_id = user_id
+
+        if base_target_user_id is not None and (not search or search.lower() in "base resume"):
+            base_consultant = (await db.execute(
+                select(Consultant).where(Consultant.user_id == base_target_user_id)
+            )).scalar_one_or_none()
+
+            # FEATURE CHANGE: base resume is now generated from the
+            # profile (see sync_base_resume_text in this file, called by
+            # phase3.py on every profile/experience save) rather than
+            # uploaded — base_resume_file_path is a legacy field from the
+            # old upload flow and stays NULL forever for every consultant
+            # going forward, so gating on it alone hid this card for
+            # everyone. Show it whenever the consultant profile exists at
+            # all; an empty/just-started profile still has a valid (if
+            # sparse) generated resume to view/edit.
+            if base_consultant:
+                base_ts = base_consultant.updated_at or datetime.now(timezone.utc)
+                response_data.insert(0, ResumeResponse(
+                    id=-1,
+                    user_id=base_target_user_id,
+                    requirement_id=None,
+                    title="Base Resume",
+                    target_role="From profile",
+                    job_description=None,
+                    data={},
+                    s3_key=None,
+                    s3_url=None,  # resolved on demand via GET /api/resume/base/download
+                    ats_score=None,
+                    status="base",
+                    download_count=0,
+                    last_downloaded=None,
+                    created_at=base_ts,
+                    updated_at=base_ts,
+                    is_base=True,
+                ))
+                total += 1
+
+    return PaginatedResumes(
+        data=response_data,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages
+    )
+
+class BaseResumeTextDTO(BaseModel):
+    text: Optional[str] = ""
+    filename: Optional[str] = None
+
+class BaseResumeTextUpdateRequest(BaseModel):
+    text: str
+
+@router.get("/base/text", response_model=BaseResumeTextDTO)
+async def get_base_resume_text(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+        
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+    
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+    
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+        
+    from pathlib import Path
+    filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
+    
+    return BaseResumeTextDTO(
+        text=consultant.base_resume_text or "",
+        filename=filename
+    )
+
+@router.put("/base/text")
+async def update_base_resume_text(
+    request: BaseResumeTextUpdateRequest,
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+        
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+    
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+    
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+        
+    consultant.base_resume_text = request.text
+    # The structured JSON editor (GET/PUT /base/content) must not keep
+    # showing whatever was parsed before this plain-text edit — clear it
+    # so its backfill re-parses the NEW text next time that page loads
+    # (same reasoning as the upload endpoint in phase3.py).
+    consultant.base_resume_content = None
+    # BUG FIX: this endpoint only ever updated base_resume_text (the plain
+    # text used for AI tailoring/matching) — the actual file streamed back
+    # by GET /base/download reads consultant.base_resume_file_path, which
+    # was never touched here. Edits saved on this page had no effect on
+    # what "Download" served; it kept returning the exact original
+    # uploaded file forever. Base resumes are DOCX-only (see phase3.py's
+    # ALLOWED_RESUME_TYPES), so regenerate a DOCX from the edited text and
+    # overwrite the file in place — same path/filename, so every other
+    # place that already stores or serves base_resume_file_path keeps
+    # working unchanged.
+    import io
+    from pathlib import Path
+    from docx import Document
+    try:
+        doc = Document()
+        for line in (request.text or "").split("\n"):
+            doc.add_paragraph(line)
+        buf = io.BytesIO()
+        doc.save(buf)
+        docx_bytes = buf.getvalue()
+        stored = consultant.base_resume_file_path
+        if stored and os.path.isfile(stored):
+            # Locally stored file — how every current upload is stored (see
+            # phase3.py's _save_resume_file). Some records predate the
+            # DOCX-only upload restriction and still end in .pdf — force
+            # the extension to .docx and drop the old file rather than
+            # writing DOCX bytes under a stale .pdf name, which would
+            # mislabel the media_type the download endpoint serves.
+            old_path = Path(stored)
+            new_path = old_path.with_suffix(".docx")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            # BUG FIX: same lock-window race as _regenerate_base_resume_docx_file
+            # / download_base_resume — write to a temp sibling file, then an
+            # atomic rename, instead of holding a lock on the real path for
+            # the full write duration.
+            tmp_path = new_path.with_name(f".{new_path.stem}.{uuid.uuid4().hex}.tmp")
+            tmp_path.write_bytes(docx_bytes)
+            os.replace(tmp_path, new_path)
+            if new_path != old_path and old_path.exists():
+                old_path.unlink()
+            consultant.base_resume_file_path = str(new_path)
+            # Re-upload under a .docx key so a pre-migration .pdf key
+            # doesn't end up mislabeled the same way as the local case.
+            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
+            # PERF FIX: blocking boto3 upload off the event loop.
+            if await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                consultant.base_resume_file_path = key
+        else:
+            # No file on record yet (text entered without ever uploading a
+            # file) — create one locally, same layout _save_resume_file uses.
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
+    except Exception as e:
+        # Don't fail the save over a DOCX regen hiccup — base_resume_text
+        # itself already committed below and still powers AI tailoring.
+        print(f"Base resume DOCX regeneration on save failed for consultant {consultant.id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="base_resume_docx_regen_on_save",
+            error=e,
+            source_type="consultant",
+            source_id=str(consultant.id),
+        )
+    await db.commit()
+    return {"success": True, "message": "Base resume text updated successfully"}
+
+
+class BaseResumeContentDTO(BaseModel):
+    content: dict
+    filename: Optional[str] = None
+
+
+class BaseResumeContentUpdateRequest(BaseModel):
+    content: dict
+
+    # BUG FIX (consistency with the consultant's own "My Profile" screen
+    # and the admin's Consultant Detail / User Detail screens): this
+    # endpoint writes Full Name, Phone, LinkedIn URL, and Education
+    # straight into the same Consultant row those screens edit (see
+    # update_base_resume_content below), but `content` was a completely
+    # open, untyped dict with no validation at all — every required-field
+    # rule enforced everywhere else could be silently bypassed just by
+    # saving from this screen instead (delete every Education entry,
+    # blank Phone/LinkedIn, save — no error, no warning).
+    #
+    # Unlike the partial-update DTOs elsewhere (UpdateConsultantRequestDTO
+    # in phase_users_schema.py), this screen's Save button always submits
+    # the FULL current form state in one shot, not a single changed
+    # field — so there's no "field omitted vs explicitly cleared"
+    # ambiguity to preserve here. These checks apply unconditionally
+    # whenever this endpoint is called at all.
+    #
+    # Deliberately narrow: only validates the specific keys that map to
+    # required profile fields. Every other key in `content`
+    # (technical_proficiencies, experience, career_objective,
+    # certifications, etc.) is left exactly as permissive as before —
+    # none of those are required anywhere else in the system, so nothing
+    # here should start rejecting them.
+    @field_validator("content")
+    @classmethod
+    def validate_required_profile_fields(cls, v: dict) -> dict:
+        if not isinstance(v, dict):
+            return v
+
+        name = str(v.get("name") or "").strip()
+        if not name:
+            raise ValueError("Full Name is required and cannot be cleared")
+
+        phone = str(v.get("phone") or "").strip()
+        if not phone:
+            raise ValueError("Phone is required and cannot be cleared")
+        if not re.match(r"^\+?[\d\s\-().]{7,20}$", phone):
+            raise ValueError("Enter a valid phone number")
+
+        linkedin = str(v.get("linkedin") or "").strip()
+        if not linkedin:
+            raise ValueError("LinkedIn is required and cannot be cleared")
+        if "linkedin.com" not in linkedin.lower():
+            raise ValueError("LinkedIn must include linkedin.com")
+
+        education = v.get("education")
+        if not isinstance(education, list) or len(education) == 0:
+            raise ValueError("At least one education entry is required")
+        for entry in education:
+            if not isinstance(entry, dict):
+                raise ValueError("Each education entry must be an object")
+            degree = str(entry.get("degree") or "").strip()
+            institution = str(entry.get("institution") or "").strip()
+            year = str(entry.get("year") or "").strip()
+            if not degree or not institution or not year:
+                raise ValueError("Degree, institution, and year are all required for each education entry")
+
+        # BUG FIX (this validator's own comment warned about exactly
+        # this: "kept the exact same 'primary' substring rule so the
+        # two can't drift apart" — they drifted apart anyway once the
+        # endpoint body below moved to a per-skill {"name","isPrimary"}
+        # tag instead of guessing tier from category text. Real
+        # categories are technology-type labels ("Programming
+        # Languages", "Cloud Platforms") that never contain the literal
+        # word "primary", so has_primary here was permanently False —
+        # this validator ran BEFORE the endpoint body, so it rejected
+        # every save with a 422 before the correct, already-fixed
+        # bucketing logic further down this file ever got a chance to
+        # run. Mirrors that same per-skill tag now, with the same
+        # legacy-string fallback, so the two genuinely can't drift
+        # apart again — both read the identical shape.
+        tech_rows = v.get("technical_proficiencies")
+        tech_rows = tech_rows if isinstance(tech_rows, list) else []
+
+        def _row_skill_items(row: dict) -> list:
+            skills_val = row.get("skills")
+            if isinstance(skills_val, list):
+                return skills_val
+            return [s.strip() for s in str(skills_val or "").split(",") if s.strip()]
+
+        has_primary = False
+        has_secondary = False
+        for row in tech_rows:
+            if not isinstance(row, dict):
+                continue
+            category = str(row.get("category") or "").strip().lower()
+            legacy_bucket = "primary" if "primary" in category else "secondary"
+            for item in _row_skill_items(row):
+                if isinstance(item, dict):
+                    if not str(item.get("name") or "").strip():
+                        continue
+                    if item.get("isPrimary"):
+                        has_primary = True
+                    else:
+                        has_secondary = True
+                else:
+                    if not str(item or "").strip():
+                        continue
+                    if legacy_bucket == "primary":
+                        has_primary = True
+                    else:
+                        has_secondary = True
+
+        if not has_primary:
+            raise ValueError(
+                "Mark at least one skill as Primary in Technical Proficiencies "
+                "(click the star on a skill chip)"
+            )
+        if not has_secondary:
+            raise ValueError(
+                "Add at least one more skill that isn't marked Primary"
+            )
+
+        return v
+
+
+_HEURISTIC_SECTION_HEADERS = [
+    ("career_objective", re.compile(r'^career\s+objective\s*:?$', re.I)),
+    ("technical_proficiencies", re.compile(r'^technical\s+proficienc(?:y|ies)\s*:?$', re.I)),
+    ("experience", re.compile(r'^(?:experience|work\s+experience|professional\s+experience)\s*:?$', re.I)),
+    ("educational_background", re.compile(r'^educational\s+background\s*:?$|^education\s*:?$', re.I)),
+]
+_HEURISTIC_ASSOCIATED_RE = re.compile(r'^Associated with\s+(.+?)\s*\(([^)]*)\)\s*$', re.I)
+_HEURISTIC_DESIGNATION_RE = re.compile(r'^Designation:\s*(.+)$', re.I)
+_HEURISTIC_EDU_LINE_RE = re.compile(
+    r'(university|college|institute|bachelor|master|b\.?tech|m\.?tech|b\.?s\.?c?\b|m\.?s\.?c?\b|ph\.?d|diploma).*\(\d{4}\)\s*$',
+    re.I,
+)
+
+
+def _heuristic_parse_resume_text(text: str) -> Optional[dict]:
+    """
+    Free, non-AI fallback for turning base_resume_text into the same
+    structured shape parse_resume_text_to_structured_data produces —
+    used when the Claude call is unavailable (e.g. billing/credits, no
+    API key). Only understands the specific template these base resumes
+    follow: Name / contact line / "CAREER OBJECTIVE:" / "TECHNICAL
+    PROFICIENCIES:" (a table, so its actual content — regardless of
+    where the header sits — is appended after every other paragraph by
+    phase3.py's _extract_text_from_docx; see the pairs picked up at the
+    end below) / "EXPERIENCE:" ("Associated with X (dates)" +
+    "Designation: Y" + bullet lines per role) / "EDUCATIONAL
+    BACKGROUND:". Returns None if the text doesn't contain any of these
+    headers, so the caller knows to leave base_resume_content unset
+    (and retry via AI later) rather than saving a bad guess.
+    """
+    if not text or not text.strip():
+        return None
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 3:
+        return None
+
+    header_positions = []
+    for idx, line in enumerate(lines):
+        for key, pattern in _HEURISTIC_SECTION_HEADERS:
+            if pattern.match(line):
+                header_positions.append((key, idx))
+                break
+    if not header_positions:
+        return None
+
+    first_header_idx = header_positions[0][1]
+    name = lines[0] if first_header_idx > 0 else "Unknown"
+    contact_line = lines[1] if first_header_idx > 1 else ""
+
+    email = ""
+    phone = ""
+    linkedin = ""
+    if contact_line:
+        m = re.search(r'[\w.\-+]+@[\w.\-]+\.\w+', contact_line)
+        if m:
+            email = m.group(0)
+        m = re.search(r'(\+?\d[\d\s\-().]{7,}\d)', contact_line)
+        if m:
+            phone = m.group(1).strip()
+        m = re.search(r'https?://\S+', contact_line)
+        if m:
+            linkedin = m.group(0).rstrip('.,')
+
+    boundaries = header_positions + [("__end__", len(lines))]
+    sections: dict = {}
+    for i, (key, start) in enumerate(header_positions):
+        _, end = boundaries[i + 1]
+        sections[key] = lines[start + 1:end]
+
+    career_objective = " ".join(sections.get("career_objective", [])).strip()
+
+    experience = []
+    current = None
+    for line in sections.get("experience", []):
+        m = _HEURISTIC_ASSOCIATED_RE.match(line)
+        if m:
+            if current:
+                experience.append(current)
+            dates = m.group(2).strip()
+            start_date, sep, end_date = dates.partition("–")
+            if not sep:
+                start_date, sep, end_date = dates.partition("-")
+            current = {
+                "client": m.group(1).strip(),
+                "role": "",
+                # ResumeRichPreview/ResumeEditorPage's ResumeData type reads
+                # exp.start/exp.end (not start_date/end_date) — using the
+                # wrong keys here meant dates parsed fine but silently never
+                # rendered anywhere.
+                "start": start_date.strip(),
+                "end": end_date.strip() if sep else "",
+                "location": "",
+                "bullets": [],
+            }
+            continue
+        m = _HEURISTIC_DESIGNATION_RE.match(line)
+        if m and current is not None:
+            current["role"] = m.group(1).strip()
+            continue
+        if current is not None:
+            current["bullets"].append(line)
+    if current:
+        experience.append(current)
+
+    # Whatever's left after the last recognized section's content is the
+    # flattened technical-proficiencies table (see docstring above). When
+    # "Educational Background" is that last section there's no header to
+    # bound where the degree entries end and the table begins, so only
+    # lines that actually look like a degree entry (mentions a
+    # university/degree and ends in a "(YYYY)") are kept as education;
+    # everything after the run of those is treated as trailing table
+    # content instead of being swallowed into education.
+    last_key, last_start = header_positions[-1]
+    last_section_lines = sections.get(last_key, [])
+
+    if last_key == "educational_background":
+        education = []
+        consumed = 0
+        for line in last_section_lines:
+            if _HEURISTIC_EDU_LINE_RE.search(line):
+                education.append({"degree": line, "institution": "", "year": ""})
+                consumed += 1
+            else:
+                break
+        if not education and last_section_lines:
+            education.append({"degree": last_section_lines[0], "institution": "", "year": ""})
+            consumed = 1
+        trailing = last_section_lines[consumed:]
+    else:
+        education = [
+            {"degree": line, "institution": "", "year": ""}
+            for line in sections.get("educational_background", [])
+        ]
+        trailing = last_section_lines
+
+    technical_proficiencies = []
+    if trailing and len(trailing) % 2 == 0:
+        for i in range(0, len(trailing), 2):
+            technical_proficiencies.append({"category": trailing[i], "skills": trailing[i + 1]})
+    elif trailing:
+        technical_proficiencies.append({"category": "Skills", "skills": ", ".join(trailing)})
+
+    return {
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "location": "",
+        "linkedin": linkedin,
+        "github": "",
+        "career_objective": career_objective,
+        "summary": "",
+        "technical_proficiencies": technical_proficiencies,
+        "skills": [],
+        "experience": experience,
+        "education": education,
+        "certifications": [],
+        "generation_notes": "Parsed automatically from plain text (no AI used) — please review for accuracy.",
+    }
+
+
+def _flatten_base_resume_content_to_text(data: dict) -> str:
+    """
+    Plain-text projection of the structured base resume content, kept in
+    base_resume_text so nothing that already reads it (AI tailoring in
+    claude_service.py, candidate matching in matching_router.py) has to
+    change or even know this structured editor exists.
+    """
+    if not data:
+        return ""
+    parts: List[str] = []
+
+    def add(label: Optional[str], value):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value if v)
+        value = str(value).strip()
+        if not value:
+            return
+        parts.append(f"{label}: {value}" if label else value)
+
+    add(None, data.get("name"))
+    add("Career Objective", data.get("career_objective") or data.get("summary"))
+
+    # BUG FIX: skills can now be a list of {"name","isPrimary"} tag
+    # objects, not just plain strings — the `add()` helper's
+    # ", ".join(str(v) for v in value ...) would str() each dict
+    # directly, embedding literal Python dict-repr text (e.g.
+    # "{'name': 'Python', 'isPrimary': True}") into base_resume_text —
+    # which feeds AI tailoring and TF-IDF matching, so this would
+    # silently degrade both rather than crash outright. Extract just
+    # the display name regardless of shape.
+    def _skill_display_names(skills_val):
+        if isinstance(skills_val, list):
+            return [
+                (s.get("name") if isinstance(s, dict) else s)
+                for s in skills_val
+            ]
+        return skills_val
+
+    tech = data.get("technical_proficiencies")
+    if isinstance(tech, list) and tech:
+        for tp in tech:
+            skills = _skill_display_names(tp.get("skills")) if isinstance(tp, dict) else None
+            add(tp.get("category") if isinstance(tp, dict) else None, skills)
+    else:
+        add("Skills", data.get("skills"))
+
+    for exp in data.get("experience") or []:
+        if not isinstance(exp, dict):
+            continue
+        header = " - ".join(
+            str(v) for v in [exp.get("client") or exp.get("company"), exp.get("role") or exp.get("title")] if v
+        )
+        add(None, header)
+        add(None, exp.get("description"))
+        add(None, exp.get("bullets"))
+
+    for proj in (data.get("key_projects") or []) + (data.get("academic_projects") or []):
+        if not isinstance(proj, dict):
+            continue
+        add(None, proj.get("title") or proj.get("game_name"))
+        add(None, proj.get("description"))
+        add(None, proj.get("responsibilities"))
+
+    edu = data.get("education") or data.get("educational_background")
+    if isinstance(edu, list):
+        for e in edu:
+            if isinstance(e, dict):
+                add(None, " - ".join(str(v) for v in [e.get("degree"), e.get("institution") or e.get("college"), e.get("year")] if v))
+            else:
+                add(None, e)
+    elif edu:
+        add(None, edu)
+
+    add("Certifications", data.get("certifications"))
+    add("Non-Technical Proficiencies", data.get("non_technical_proficiencies"))
+    add("Achievements", data.get("achievements"))
+
+    return "\n".join(parts)
+
+
+_MONTH_YEAR_FORMATS = ("%b %Y", "%B %Y")
+
+
+def _parse_month_year(value: Optional[str]) -> Optional[date]:
+    """Parse the Base Resume editor's free-text 'Mon YYYY' / 'Month YYYY'
+    fields into a real date (day fixed to 1). Returns None on anything
+    unparseable rather than raising."""
+    if not value or not value.strip():
+        return None
+    cleaned = value.strip()
+    for fmt in _MONTH_YEAR_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date().replace(day=1)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_resume_editor_dates(start: Optional[str], end: Optional[str]):
+    start_date = _parse_month_year(start)
+    end_stripped = (end or "").strip().lower()
+    if not end_stripped or end_stripped in ("present", "current"):
+        return start_date, None, True
+    return start_date, _parse_month_year(end), False
+
+
+def _format_month_year(d: Optional[date]) -> str:
+    return d.strftime("%b %Y") if d else ""
+
+
+def _build_base_career_objective(consultant: Consultant) -> str:
+    """Builds a plain, factual 2-3 line Career Objective straight from the
+    consultant's own stored profile fields (years, preferred role, primary
+    skills) — used only when there's no stored `summary` to show. Without
+    this, the Base Resume preview simply skipped the whole CAREER
+    OBJECTIVE section (ResumeRichPreview only renders it when non-empty),
+    which is why Base Resume and Generated Resume looked structurally
+    different side by side even though they render through the exact same
+    component. Never invents a title, employer, or skill the profile
+    doesn't already have — same no-fabrication rule as the AI-tailored
+    path in claude_service.py, just without a JD to match against.
+    """
+    years = consultant.total_experience_years
+    years_str = None
+    if years is not None:
+        try:
+            years_num = float(years)
+            years_str = f"{years_num:.0f}+ years" if years_num == int(years_num) else f"{years_num}+ years"
+        except (TypeError, ValueError):
+            years_str = None
+
+    # BUG FIX ("DevOps Engineer Senior DevOps Engineer Cloud Engineer Cloud
+    # Infrastructure Engineer Site Reliability Engineer (SRE)..." showing
+    # up as one garbled title): this only ever split preferred_roles on
+    # commas. Several consultants' `preferred_roles` are actually stored
+    # as a space-separated list of alternative titles with no commas at
+    # all — in that case split(",")[0] returns the ENTIRE string, so the
+    # whole list got concatenated into the objective as if it were one
+    # job title. Split on comma/slash/semicolon/" and " (whichever
+    # delimiter is actually present) first; if the result is still one
+    # long undivided blob, cap it to a handful of words so it reads as a
+    # single reasonable title instead of a run-on sentence.
+    role_raw = re.split(r",|/|;|\band\b", consultant.preferred_roles or "")[0].strip()
+    role_words = role_raw.split()
+    role = " ".join(role_words[:5]) if len(role_words) > 5 else role_raw
+    role = role or None
+    skills = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()][:3]
+
+    opener_bits = []
+    if role:
+        opener_bits.append(role)
+    if years_str:
+        opener_bits.append(f"with {years_str} of experience" if role else f"Technology professional with {years_str} of experience")
+    line_a = (" ".join(opener_bits).strip() + ".") if opener_bits else "Technology professional."
+
+    line_b = f"Skilled in {', '.join(skills)}." if skills else ""
+    line_c = f"Brings hands-on experience with {', '.join(skills)} to deliver reliable, high-quality outcomes." if skills else ""
+
+    return " ".join(p for p in (line_a, line_b, line_c) if p)
+
+
+async def build_base_resume_content(
+    db: AsyncSession,
+    consultant: Consultant,
+    resume_info: Optional[dict] = None,
+) -> dict:
+    """Overlay the profile-derived fields (Skills, Experience, Education,
+    Name/Phone/Location/LinkedIn) fresh from Consultant/ConsultantExperience/
+    User.resume_info onto whatever resume-only extras (Certifications,
+    career objective wording, etc.) were previously saved. This is the
+    single source of truth both GET /base/content and the auto-sync below
+    use — nothing here is ever read from a stale cached blob.
+
+    PERF FIX ("saving profile takes a long time"): callers that already
+    have the just-written resume_info in hand (phase3.py's
+    update_own_profile sets current_user.resume_info a few lines before
+    calling this, in the same request) can now pass it directly instead
+    of this function re-querying User.resume_info from the database —
+    a full extra DB round-trip on every single profile save for data the
+    caller already has in memory. Callers without it in hand (the
+    background regen task in sync_base_resume_text below, GET
+    /base/content) simply omit it and get the old DB-fetch behavior."""
+    extra_content = dict(consultant.base_resume_content or {})
+    for _stale_key in (
+        "name", "email", "phone", "location", "linkedin",
+        "career_objective", "summary", "technical_proficiencies",
+        "experience", "education",
+    ):
+        extra_content.pop(_stale_key, None)
+
+    if resume_info is None:
+        resume_info = {}
+        if consultant.user_id:
+            info_result = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
+            resume_info = info_result.scalar_one_or_none() or {}
+    summary_text = resume_info.get("summary") or _build_base_career_objective(consultant)
+
+    # BUG FIX ("technical proficiencies want category type, not a flat
+    # Primary/Secondary split"): this used to emit exactly two rows —
+    # "Primary Skills" and "Secondary Skills" — each with ALL of that
+    # tier's skills dumped in one unsorted blob, with no grouping by
+    # technology type at all (Java and PostgreSQL sitting in the same
+    # "Primary Skills" cell). Also: `skills` here was the raw
+    # comma-separated STRING column, not a list, inconsistent with the
+    # {"category": str, "skills": string[]} shape used everywhere else.
+    # Now grouped by technology type (same categories/keywords as
+    # generate_tailored_resume's table) with primary skills bolded within
+    # each row, matching the categorized format used there.
+    primary_list = [s.strip().replace("**", "") for s in (consultant.primary_skills or "").split(",") if s.strip()]
+    technical_proficiencies = (
+        categorize_skills_with_tier(primary_list, [])
+        if primary_list else []
+    )
+
+    exp_rows_result = await db.execute(
+        select(ConsultantExperience)
+        .where(ConsultantExperience.consultant_id == consultant.id)
+        .order_by(ConsultantExperience.sort_order.asc())
+    )
+    experience_list = []
+    for exp in exp_rows_result.scalars().all():
+        bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
+        experience_list.append({
+            "id": str(exp.id),
+            "role": exp.role_title or "",
+            "client": exp.client_name or "",
+            "start": _format_month_year(exp.start_date),
+            "end": "Present" if exp.is_present else _format_month_year(exp.end_date),
+            "location": exp.location or "",
+            "bullets": bullets,
+            "technologies": exp.technologies or [],
+        })
+
+    return {
+        **extra_content,
+        "name": consultant.full_name or "",
+        "email": consultant.email or "",
+        "phone": consultant.phone or "",
+        "location": consultant.current_location or "",
+        "linkedin": consultant.linkedin_url or "",
+        "career_objective": summary_text,
+        "summary": summary_text,
+        "technical_proficiencies": technical_proficiencies,
+        "experience": experience_list,
+        "education": consultant.education or [],
+    }
+
+
+async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consultant, content: dict) -> None:
+    """Rebuild the actual downloadable/viewable DOCX from `content` and
+    overwrite it in place at consultant.base_resume_file_path (or create
+    one if none exists yet) — same logic update_base_resume_content below
+    already runs on every editor save, extracted here so
+    sync_base_resume_text can trigger it too. Best-effort: logs and
+    returns on failure rather than raising, matching the try/except
+    already wrapping this same logic at its original call site."""
+    import io
+    import tempfile
+    from pathlib import Path
+    from phase6 import _generate_docx
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            docx_path = Path(tmp_dir) / "base_resume.docx"
+            _generate_docx(content, docx_path)
+            docx_bytes = docx_path.read_bytes()
+
+        stored = consultant.base_resume_file_path
+        if stored and os.path.isfile(stored):
+            old_path = Path(stored)
+            new_path = old_path.with_suffix(".docx")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            # BUG FIX (race with concurrent "View" reads -- see the matching
+            # BUG FIX comment in download_base_resume): writing bytes
+            # directly to new_path holds a Windows file lock on it for the
+            # entire write. Writing to a sibling temp file first and then
+            # atomically replacing the real path with os.replace() shrinks
+            # that lock window from "however long the write takes" down to
+            # "a near-instant rename", making the race far less likely to
+            # ever be hit in the first place.
+            tmp_path = new_path.with_name(f".{new_path.stem}.{uuid.uuid4().hex}.tmp")
+            tmp_path.write_bytes(docx_bytes)
+            os.replace(tmp_path, new_path)
+            if new_path != old_path and old_path.exists():
+                old_path.unlink()
+            consultant.base_resume_file_path = str(new_path)
+        elif stored:
+            key = stored if stored.lower().endswith(".docx") else str(Path(stored).with_suffix(".docx"))
+            # PERF FIX ("taking long time to save" / requests timing out at
+            # exactly the client's 30s timeout, unrelated endpoints like
+            # /api/notifications also stalling): this is the S3 key branch
+            # — the one actually hit in production, since base_resume_
+            # file_path there is an S3 key, not a real local path. This
+            # runs inside a background task (_regen_in_background, fired
+            # by sync_base_resume_text on EVERY profile save) that holds
+            # its own AsyncSessionLocal() session for the task's whole
+            # duration — with DB_POOL_SIZE=2/DB_MAX_OVERFLOW=0 per worker
+            # (see database.py), a synchronous, blocking upload_fileobj()
+            # call here (no await/thread offload) freezes the entire
+            # event loop AND occupies one of only 2 DB connections for
+            # however long the upload to Spaces takes — starving every
+            # other concurrent request on that worker, save-related or
+            # not. Same fix as get_s3_file_metadata's head_object call.
+            uploaded = await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            if uploaded:
+                consultant.base_resume_file_path = key
+        else:
+            upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads/resumes")) / str(consultant.id)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            new_path = upload_dir / f"{uuid.uuid4().hex}.docx"
+            new_path.write_bytes(docx_bytes)
+            consultant.base_resume_file_path = str(new_path)
+        await db.commit()
+    except Exception as e:
+        print(f"Base resume DOCX regeneration (background sync) failed for consultant {consultant.id}: {e}")
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="base_resume_docx_regen_on_profile_sync",
+            error=e,
+            source_type="consultant",
+            source_id=str(consultant.id),
+        )
+
+
+async def sync_base_resume_text(
+    db: AsyncSession,
+    consultant: Consultant,
+    resume_info: Optional[dict] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> None:
+    """Regenerate and stage consultant.base_resume_text from CURRENT
+    profile fields — called by phase3.py whenever Skills, Experience,
+    Education, or contact info changes on My Profile, so base_resume_text
+    (read by both the completeness check and matching_router.py's TF-IDF
+    scoring) never sits stale waiting for someone to manually open and
+    save the Base Resume editor. Stages the change on consultant only —
+    caller still owns db.commit().
+
+    PERF FIX ("saving profile takes a long time"): accepts the caller's
+    already-in-hand resume_info (see build_base_resume_content above) so
+    the synchronous save path skips a redundant DB round-trip. Passed
+    through only to the foreground build below — the background regen
+    task re-fetches its own consultant row from a separate session
+    anyway, so it re-queries resume_info there rather than trying to
+    carry this dict across sessions.
+
+    BUG FIX ("edit Full Name on My Profile, View still shows the old
+    name"): this used to only update base_resume_text (the flat text used
+    for matching) — the actual downloadable/viewable DOCX file at
+    base_resume_file_path was never touched here, only when someone
+    explicitly opened and saved the Base Resume EDITOR (which is why the
+    editor always showed live data — it reads fresh from the database
+    every time — but View kept serving that same stale, unregenerated
+    file). Now also fires off a background regeneration of that file, so
+    View reflects a My Profile edit without requiring a detour through
+    the editor first. Runs as a genuinely separate background task with
+    its own DB session (not awaited inline here) — a DOCX build + S3
+    upload is real, unpredictable I/O latency that a routine profile save
+    shouldn't have to wait on synchronously, same reasoning already
+    applied to the re-matching background task in phase3.py's
+    update_own_profile."""
+    content = await build_base_resume_content(db, consultant, resume_info)
+    consultant.base_resume_text = _flatten_base_resume_content_to_text(content)
+
+    consultant_id = consultant.id
+
+    async def _regen_in_background(cid: int):
+        # BUG FIX ("Task exception was never retrieved" / unhandled
+        # sqlalchemy.exc.TimeoutError crashing this fire-and-forget task
+        # silently): _regenerate_base_resume_docx_file already wraps ITS
+        # own logic in a try/except, but that only covers the DOCX
+        # build/upload step — the very first line here (opening the
+        # session and fetching the consultant) was completely
+        # unprotected. Nothing awaits or checks the result of this task
+        # (see _run_background above), so any exception at that first
+        # step — a connection-pool timeout under load, a transient DB
+        # blip, anything — propagated all the way up unhandled and only
+        # ever surfaced as an opaque asyncio "Task exception was never
+        # retrieved" warning with no entry in error_logger, instead of
+        # being logged the same way every other background failure in
+        # this codebase already is.
+        try:
+            from database import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_session:
+                bg_consultant_result = await bg_session.execute(
+                    select(Consultant).where(Consultant.id == cid)
+                )
+                bg_consultant = bg_consultant_result.scalars().first()
+                if not bg_consultant:
+                    return
+                bg_content = await build_base_resume_content(bg_session, bg_consultant)
+                await _regenerate_base_resume_docx_file(bg_session, bg_consultant, bg_content)
+        except Exception as e:
+            print(f"Background base resume regen failed to even start for consultant {cid}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="base_resume_docx_regen_background_setup",
+                error=e,
+                source_type="consultant",
+                source_id=str(cid),
+            )
+        finally:
+            _regen_in_flight.discard(cid)
+
+    # PERMANENT FIX ("QueuePool limit ... connection timed out" under
+    # rapid repeated saves): see _regen_in_flight's definition above —
+    # skip firing a redundant overlapping regen for a consultant who
+    # already has one in flight, rather than stacking DB sessions.
+    if consultant_id not in _regen_in_flight:
+        _regen_in_flight.add(consultant_id)
+        if background_tasks:
+            background_tasks.add_task(_regen_in_background, consultant_id)
+        else:
+            # Fallback if no background_tasks provided (should not happen in normal flows)
+            # We must use asyncio.create_task here but we warn about it.
+            import logging
+            logging.getLogger(__name__).warning("sync_base_resume_text called without BackgroundTasks!")
+            asyncio.create_task(_regen_in_background(consultant_id))
+
+
+@router.get("/base/content", response_model=BaseResumeContentDTO)
+async def get_base_resume_content(
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Structured counterpart to GET /base/text — powers the rich JSON + preview
+    Base Resume editor (mirrors GET .../resume/content in phase6.py for
+    tailored resumes). Same auth/resolution as /base/text.
+    """
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+
+    from pathlib import Path
+    filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
+
+    # BACKFILL: consultants whose base resume predates this structured
+    # editor only have base_resume_text (plain text) — base_resume_content
+    # is null, which would show a blank {} editor even though a real
+    # resume exists.
+    #
+    # ORDER FIX: this used to try the AI parser first and only fall back
+    # to the free heuristic parser after it failed — meaning every page
+    # load for a not-yet-backfilled consultant blocked on a real network
+    # call to Anthropic (up to the 30s timeout below) before the page
+    # could render at all. That's exactly why loading felt inconsistent
+    # ("sometimes opens, sometimes stuck") — fast for already-backfilled
+    # consultants, but genuinely slow (not actually hung) for ones still
+    # waiting on that AI round-trip. Since these base resumes reliably
+    # follow one template, try the free, synchronous, near-instant
+    # heuristic parser FIRST — the common case now resolves immediately
+    # — and only reach for the AI parser as a fallback when the text
+    # doesn't match that template at all.
+    if not consultant.base_resume_content and (consultant.base_resume_text or "").strip():
+        try:
+            heuristic_data = _heuristic_parse_resume_text(consultant.base_resume_text)
+            if heuristic_data:
+                consultant.base_resume_content = heuristic_data
+                await db.commit()
+        except Exception as e:
+            print(f"Base resume content backfill (heuristic) failed for consultant {consultant.id}: {e}")
+
+    if not consultant.base_resume_content and (consultant.base_resume_text or "").strip():
+        from claude_service import parse_resume_text_to_structured_data
+        try:
+            # asyncio.to_thread runs the blocking Anthropic call on a
+            # worker thread so it doesn't freeze the event loop (and
+            # every other request the backend is serving) while it's in
+            # flight — see claude_service.py for the 30s timeout that
+            # bounds how long this can take.
+            parsed_data, rate_limits, usage_info = await asyncio.to_thread(
+                parse_resume_text_to_structured_data, consultant.base_resume_text
+            )
+            if rate_limits:
+                await save_openai_rate_limits(db, rate_limits)
+            if usage_info:
+                # usage_info is only non-None when the AI call actually
+                # succeeded — only THEN persist the result. Otherwise
+                # parsed_data is just its blank "Automatic parsing was
+                # unavailable..." skeleton (e.g. ANTHROPIC_API_KEY
+                # missing/invalid, no credits, or a transient API error)
+                # — saving that would look identical to a completed
+                # backfill and permanently block every future retry.
+                # Leave it unsaved so the next GET tries again.
+                from phase8_ai_usage_service import log_ai_usage
+                await log_ai_usage(
+                    db,
+                    purpose="base_resume_backfill",
+                    model="claude-sonnet-4-6",
+                    input_tokens=usage_info["input_tokens"],
+                    output_tokens=usage_info["output_tokens"],
+                    consultant_id=str(resolved_id),
+                )
+                consultant.base_resume_content = parsed_data
+                await db.commit()
+            else:
+                print(f"Base resume content backfill returned no usage_info (AI call unavailable) for consultant {consultant.id}.")
+        except Exception as e:
+            # Don't fail the read over a backfill hiccup — the next GET
+            # will just retry both parsers.
+            print(f"Base resume content backfill (AI) failed for consultant {consultant.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="base_resume_content_backfill",
+                error=e,
+                source_type="consultant",
+                source_id=str(consultant.id),
+            )
+
+    content = await build_base_resume_content(db, consultant)
+    return BaseResumeContentDTO(
+        content=content,
+        filename=filename,
+    )
+
+
+@router.put("/base/content")
+async def update_base_resume_content(
+    request: BaseResumeContentUpdateRequest,
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Structured counterpart to PUT /base/text (same bug-fix shape: the DOCX
+    served by GET /base/download must stay in sync with what was last
+    saved here). Regenerates the DOCX via phase6.py's _generate_docx —
+    the same builder tailored/uploaded resumes use — so the downloaded
+    file matches the ResumeRichPreview format the user edits against.
+    Also re-derives base_resume_text so AI tailoring/matching keep working
+    unchanged; neither base_resume_text nor base_resume_file_path's
+    resolution logic elsewhere is touched.
+    """
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    else:
+        target_user_id = user_id or current_user.id
+
+    resolved_id, target_user = await _resolve_target_user(target_user_id, current_user, db)
+
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == resolved_id)
+    )).scalar_one_or_none()
+
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant profile not found")
+
+    resume_data = dict(request.content or {})
+
+    # BUG FIX: (value.get("name") or "").strip() only protects against a
+    # missing/empty "name" — if it's present but not a plain string, the
+    # `or ""` never triggers (a non-empty dict/list is truthy) and
+    # .strip() still runs directly on the non-string value. str(...)
+    # first makes this safe regardless of shape.
+    name_val = str(resume_data.get("name") or "").strip()
+    if name_val:
+        consultant.full_name = name_val
+    if resume_data.get("phone") is not None:
+        consultant.phone = resume_data.get("phone") or None
+    if resume_data.get("location") is not None:
+        consultant.current_location = resume_data.get("location") or None
+    if resume_data.get("linkedin") is not None:
+        consultant.linkedin_url = resume_data.get("linkedin") or None
+    if "education" in resume_data:
+        consultant.education = resume_data.get("education") or []
+
+    summary_val = resume_data.get("career_objective")
+    if summary_val is None:
+        summary_val = resume_data.get("summary")
+    if summary_val is not None and consultant.user_id:
+        user_row_result = await db.execute(select(User).where(User.id == consultant.user_id))
+        user_row = user_row_result.scalar_one_or_none()
+        if user_row:
+            info = dict(user_row.resume_info or {})
+            info["summary"] = summary_val
+            user_row.resume_info = info
+
+    # UPDATED (secondary_skills column removed): every skill saved here —
+    # whether starred (isPrimary) or not — now goes into the single
+    # primary_skills column. The isPrimary tag/legacy category bucket is
+    # no longer used to split skills into two stored columns; it only
+    # still drives the star icon shown in Technical Proficiencies.
+    tech_rows = resume_data.get("technical_proficiencies") or []
+    all_bits = []
+    for row in tech_rows:
+        if not isinstance(row, dict):
+            continue
+        skills_val = row.get("skills")
+
+        items = skills_val if isinstance(skills_val, list) else (
+            [s.strip() for s in (skills_val or "").split(",") if s.strip()]
+        )
+        for item in items:
+            if isinstance(item, dict):
+                name = (item.get("name") or "").strip()
+                if not name:
+                    continue
+                all_bits.append(name)
+            else:
+                name = (item or "").strip()
+                if not name:
+                    continue
+                all_bits.append(name)
+    if all_bits:
+        # Dedupe while preserving order — a skill could appear in more
+        # than one row.
+        seen = set()
+        deduped = []
+        for b in all_bits:
+            if b.lower() not in seen:
+                seen.add(b.lower())
+                deduped.append(b)
+        consultant.primary_skills = ", ".join(deduped)
+
+    incoming_experience = resume_data.get("experience") or []
+    existing_rows_result = await db.execute(
+        select(ConsultantExperience).where(ConsultantExperience.consultant_id == consultant.id)
+    )
+    existing_by_id = {e.id: e for e in existing_rows_result.scalars().all()}
+    seen_ids = set()
+    reconciled_experience = []
+
+    for idx, item in enumerate(incoming_experience):
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        exp_id = None
+        if raw_id not in (None, "", "new"):
+            try:
+                exp_id = int(raw_id)
+            except (TypeError, ValueError):
+                exp_id = None
+
+        start_date, end_date, is_present = _parse_resume_editor_dates(item.get("start"), item.get("end"))
+        bullets = item.get("bullets") or []
+        responsibilities = bullets[0] if len(bullets) > 0 else None
+        achievements = "\n".join(bullets[1:]) if len(bullets) > 1 else None
+        technologies = item.get("technologies") or []
+
+        if exp_id is not None and exp_id in existing_by_id:
+            exp = existing_by_id[exp_id]
+            exp.client_name = item.get("client") or exp.client_name
+            exp.role_title = item.get("role") or exp.role_title
+            exp.location = item.get("location")
+            if start_date is not None:
+                exp.start_date = start_date
+            exp.end_date = end_date
+            exp.is_present = is_present
+            exp.technologies = technologies
+            exp.responsibilities = responsibilities
+            exp.achievements = achievements
+            exp.sort_order = idx
+            seen_ids.add(exp_id)
+            reconciled_experience.append(item)
+        else:
+            new_exp = ConsultantExperience(
+                consultant_id=consultant.id,
+                client_name=item.get("client") or "",
+                role_title=item.get("role") or "",
+                start_date=start_date or date.today().replace(day=1),
+                end_date=end_date,
+                is_present=is_present,
+                location=item.get("location"),
+                # BUG FIX ("Save Changes does nothing" when editing a role
+                # added from the Base Resume editor in the Work Experience
+                # drawer): this reconciler never set work_mode, leaving it
+                # NULL. The drawer's Zod schema requires workMode to be one
+                # of REMOTE/HYBRID/ONSITE with no null/optional case, and
+                # renders no error message for that field, so a NULL value
+                # failed validation silently on submit — the button click
+                # produced no visible feedback at all. Default to REMOTE
+                # here, matching the drawer's own "Add Experience" default.
+                work_mode="REMOTE",
+                technologies=technologies,
+                responsibilities=responsibilities,
+                achievements=achievements,
+                sort_order=idx,
+            )
+            db.add(new_exp)
+            await db.flush()
+            seen_ids.add(new_exp.id)
+            reconciled_experience.append({**item, "id": str(new_exp.id)})
+
+    for old_id, old_exp in existing_by_id.items():
+        if old_id not in seen_ids:
+            await db.delete(old_exp)
+
+    resume_data["experience"] = reconciled_experience
+
+    consultant.base_resume_content = resume_data
+    consultant.base_resume_text = _flatten_base_resume_content_to_text(resume_data)
+
+    # Same DOCX rebuild logic sync_base_resume_text's background task now
+    # also uses — extracted into _regenerate_base_resume_docx_file so the
+    # two call sites can't drift apart. This one still runs inline/awaited
+    # (not backgrounded) since this IS the explicit "save my edits" action
+    # on this specific screen — the person expects Save to mean the file
+    # is actually updated by the time it returns, not "eventually."
+    await _regenerate_base_resume_docx_file(db, consultant, resume_data)
+
+    # BUG FIX: this was indented inside the `except` above, so it only
+    # ran when DOCX regeneration failed — on the normal success path
+    # every profile/experience field written earlier in this function
+    # (name, phone, location, LinkedIn, education, skills, the full
+    # experience reconciliation, base_resume_content, base_resume_text)
+    # was silently discarded, never reaching the database, even though
+    # the response below still claimed success. Commit needs to happen
+    # unconditionally — whether or not the DOCX step itself succeeded.
+    await db.commit()
+    return {"success": True, "message": "Base resume content updated successfully"}
+
+
+@router.get("/{id}/text", response_model=BaseResumeTextDTO)
+async def get_resume_text(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Plain-text counterpart to the structured GET /{id} — for a manually
+    uploaded resume (see /upload above), `data` only ever holds
+    {"raw_text": "..."}, never the structured personal_info/experience/
+    education fields the JSON editor (GET /{id} + ResumeEditorPage.tsx)
+    expects. Reusing that editor for these resumes rendered a blank
+    template with every field empty and no error anywhere — this endpoint
+    (and PUT below) back a dedicated plain-text editor instead, mirroring
+    GET/PUT /base/text for the base resume.
+    """
+    resume = await _get_resume_for_user(db, id, current_user)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    return BaseResumeTextDTO(
+        text=(resume.data or {}).get("raw_text", "") or "",
+        filename=resume.title,
+    )
+
+
+@router.put("/{id}/text")
+async def update_resume_text(
+    id: int,
+    request: BaseResumeTextUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    resume = await _get_resume_for_user(db, id, current_user)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # Reassign (rather than mutate in place) so SQLAlchemy's change
+    # tracking reliably picks up the JSONB column update — mutating a
+    # dict in place on some backends/drivers doesn't always mark the
+    # attribute dirty for JSON columns.
+    existing = dict(resume.data or {})
+    existing["raw_text"] = request.text
+    resume.data = existing
+    # BUG FIX: this only ever updated data["raw_text"] — the actual file
+    # streamed back by View (/{id}/view) and Download (/{id}/download,
+    # /{id}/download/file) reads resume.s3_key, which was never touched
+    # here. Saving an edit had no effect on what View/Download served; it
+    # kept returning the exact original uploaded file forever — same class
+    # of bug as update_base_resume_text above, same fix: regenerate a DOCX
+    # from the edited text and overwrite the object at the same s3_key, so
+    # nothing else that already references s3_key needs to change.
+    if resume.s3_key:
+        import io
+        from docx import Document
+        try:
+            doc = Document()
+            for line in (request.text or "").split("\n"):
+                doc.add_paragraph(line)
+            buf = io.BytesIO()
+            doc.save(buf)
+            docx_bytes = buf.getvalue()
+            # Uploads always write s3_key ending in .docx (see /upload
+            # above) — force it here too in case this endpoint is ever
+            # reached for an older/differently-keyed record, so the
+            # extension-based media-type detection in the download
+            # endpoints doesn't end up mislabeling the content.
+            key = resume.s3_key if resume.s3_key.lower().endswith(".docx") else resume.s3_key.rsplit(".", 1)[0] + ".docx"
+            # PERF FIX: blocking boto3 upload off the event loop.
+            await asyncio.to_thread(
+                upload_file_to_s3,
+                io.BytesIO(docx_bytes), key,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            resume.s3_key = key
+        except Exception as e:
+            # Don't fail the save over a DOCX regen hiccup — the raw_text
+            # edit itself already committed below.
+            print(f"Resume DOCX regeneration on text save failed for resume {resume.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_docx_regen_on_text_save",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
+    await db.commit()
+    return {"success": True, "message": "Resume text updated successfully"}
+
+@router.get("/base/download")
+async def download_base_resume(
+    user_id: Optional[int] = None,
+    # BUG FIX ("view keeps downloading" — same root cause and same fix as
+    # phase7.py's download_application_resume): a browser can only render
+    # a PDF or image inline on its own. For a .docx base resume, there is
+    # no in-browser renderer at all — avoiding "attachment" headers isn't
+    # enough, the browser still has nothing to show it with and falls
+    # back to a download regardless. force_stream=False (View) now
+    # returns a presigned Spaces URL as JSON when the file is in object
+    # storage, for the frontend to hand to Google's Docs Viewer (whose
+    # own servers fetch it — browser CORS never applies there).
+    # force_stream=True (the actual Download button) always streams real
+    # bytes through this same-origin endpoint, since a presigned URL
+    # fetched directly by the browser fails — this bucket has no CORS
+    # policy allowing that.
+    force_stream: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Stream the consultant's BASE resume (from their profile) on demand.
+
+    Declared before /{id}/download so "base" is never parsed as an int id.
+
+    Resolves consultants.base_resume_file_path at request time rather than
+    embedding a presigned URL in the list response. Presigned URLs are a
+    snapshot: they break when the file is replaced (old key deleted ->
+    NoSuchKey) and expire after an hour. Reading fresh on each click removes
+    both failure modes and needs no cache invalidation anywhere.
+
+    Tolerates BOTH storage formats so records written before the Spaces
+    migration keep working: a value that resolves to a real file on disk is
+    streamed from disk, anything else is treated as a Spaces object key.
+    """
+    # Role scoping mirrors the base-resume injection in list_resumes().
+    if current_user.role == "CONSULTANT":
+        target_user_id = current_user.id
+    elif current_user.role == "ADMIN":
+        target_user_id = user_id or current_user.id
+    elif current_user.role == "RECRUITER":
+        if not user_id or user_id == current_user.id:
+            target_user_id = current_user.id
+        else:
+            target_consultant = (await db.execute(
+                select(Consultant).where(Consultant.user_id == user_id)
+            )).scalar_one_or_none()
+            if not target_consultant:
+                raise HTTPException(status_code=404, detail="Consultant not found")
+            allowed = (await db.execute(
+                select(RecruiterConsultant).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.consultant_id == target_consultant.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )).scalars().first()
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Consultant not assigned to this recruiter")
+            target_user_id = user_id
+    else:
+        target_user_id = current_user.id
+
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.user_id == target_user_id)
+    )).scalar_one_or_none()
+
+    if not consultant or not consultant.base_resume_file_path:
+        raise HTTPException(status_code=404, detail="No base resume uploaded yet.")
+
+    stored = consultant.base_resume_file_path
+    print(f"[base-resume-view-debug] stored={stored!r} isfile={os.path.isfile(stored) if stored else 'N/A'}")
+    ext = os.path.splitext(stored)[1].lower()
+    media_type = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if ext == ".docx" else "application/pdf"
+    )
+    display_name = f"{(consultant.full_name or 'consultant').strip().replace(' ', '_')}_base_resume{ext or '.pdf'}"
+
+    # View now always serves the real stored file as-is (DOCX stays
+    # DOCX — no on-demand PDF conversion). force_stream still exists to
+    # force real bytes through this same-origin endpoint for the actual
+    # Download button, same as before.
+    #
+    # BUG FIX ("view directly downloads instead of previewing" for a
+    # local, pre-Spaces base resume): a local file has no presigned URL
+    # to hand to Google's Docs Viewer, and a browser has no built-in
+    # renderer for DOCX regardless of Content-Disposition, so serving it
+    # as raw bytes here always just triggered a download prompt — never
+    # an actual in-browser preview. Upload it to Spaces on the fly (view
+    # path only — force_stream/the real Download button below still
+    # gets the untouched original bytes) so it gets a real presigned URL
+    # and goes through the same viewer routing as an already-migrated
+    # base resume.
+    try:
+        if os.path.isfile(stored):
+            # BUG FIX ("View works, then intermittently fails with 'file not
+            # available'"): every profile save fires a BACKGROUND task
+            # (sync_base_resume_text -> _regen_in_background) that rewrites
+            # this exact local file. If a View request's read landed while
+            # that background write was in progress, Windows raises a
+            # PermissionError (an OSError) because the file is locked by
+            # the other process. That was being silently swallowed by the
+            # bare `except OSError: pass` below, which then fell through
+            # to `generate_presigned_url(stored)` -- but `stored` here is a
+            # LOCAL FILESYSTEM PATH, not an S3 key. generate_presigned_url
+            # doesn't verify the object exists; it happily signs a URL for
+            # a Spaces object that was NEVER uploaded, and that broken URL
+            # got returned as if it were legitimate. Google's viewer then
+            # 404s trying to fetch it, which is exactly the "file wasn't
+            # available on site" error being seen.
+            # Fix: retry the local read a few times (the concurrent write
+            # is brief) instead of silently misreading a local path as a
+            # remote object key.
+            body = None
+            for attempt in range(4):
+                try:
+                    with open(stored, "rb") as fh:
+                        body = fh.read()
+                    break
+                except OSError:
+                    if attempt < 3:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+            if body is None:
+                # Still locked after retrying -- tell the frontend to try
+                # again shortly rather than returning a URL for an object
+                # that doesn't exist.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Your resume is being updated — please try View again in a moment.",
+                )
+            if not force_stream:
+                temp_s3_key = f"users/{target_user_id}/base-resume-view-temp/{uuid.uuid4().hex}{ext or '.docx'}"
+                # BUG FIX ("View works once, then fails / 'file not available'
+                # on the next click"): this upload is an outbound HTTPS call
+                # to DigitalOcean Spaces, same as every other network call in
+                # this app — a single transient network hiccup (the same
+                # Wi-Fi-related TLS flakiness already seen on the Postgres
+                # connection) made upload_file_to_s3 return False just once,
+                # which silently fell through to raw DOCX bytes below. The
+                # browser has no built-in DOCX renderer, so that always
+                # LOOKS like a broken/missing file even though nothing is
+                # actually missing — it's just an unretried network blip.
+                # Retrying a couple of times before giving up costs at most
+                # a second or two and matches the retry approach already
+                # used for the DB connection at startup.
+                uploaded = False
+                presigned = ""
+                for attempt in range(3):
+                    uploaded = await asyncio.to_thread(upload_file_to_s3, io.BytesIO(body), temp_s3_key, media_type)
+                    print(f"[base-resume-view-debug] attempt={attempt} temp_s3_key={temp_s3_key} uploaded={uploaded}")
+                    if uploaded:
+                        presigned = generate_presigned_url(temp_s3_key)
+                        print(f"[base-resume-view-debug] presigned_url={presigned!r}")
+                        if presigned:
+                            break
+                    if attempt < 2:
+                        await asyncio.sleep(0.75 * (attempt + 1))
+                if presigned:
+                    return {"url": presigned, "filename": display_name, "mimeType": media_type}
+                # Upload failed for some reason — fall through and serve
+                # the raw bytes below so viewing still degrades to a
+                # download rather than breaking outright.
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+            )
+    except HTTPException:
+        raise
+    except OSError:
+        pass
+
+    # NOTE: this fallback path is only reached when `stored` was never a
+    # local file to begin with (os.path.isfile(stored) was False from the
+    # start, e.g. it's a genuine Spaces object key) -- NOT for a local
+    # file that failed to read, which is now handled above and never
+    # falls through to here.
+    #
+    # BUG FIX ("View downloads/shows 'file wasn't available', but works
+    # on the very next click" — persisting even after the frontend added
+    # its own retry-on-503): that frontend retry only ever fires for the
+    # LOCAL-FILE branch above, which is a dev/legacy path. In production,
+    # consultants.base_resume_file_path is already an S3 key by the time
+    # anyone edits their profile (see the PERF FIX comment on
+    # _regenerate_base_resume_docx_file above), so every real request
+    # here was hitting THIS branch — which had no retry protection at
+    # all. generate_presigned_url() happily signs a URL for a key
+    # regardless of whether an object actually exists at it yet; the
+    # background regen (_regen_in_background) can still be mid-upload
+    # (or, for a consultant's very first-ever regen, hasn't uploaded
+    # anything at that key at all yet) when a View request lands, and
+    # Google's viewer then 404s trying to fetch that URL — the literal
+    # "file wasn't available on site" being seen. Verify the object is
+    # actually there first (a HEAD request, same call already used for
+    # attachment sizes in the Email Preview modal), with the same brief
+    # retry-then-503 shape as the local-file branch above, so a request
+    # that lands mid-regen gets a 503 the frontend already knows to
+    # retry — instead of a 200 pointing at a URL that's about to 404.
+    # Applies to BOTH View and the real Download button (force_stream) —
+    # download_file_from_s3 below has exactly the same race otherwise.
+    size = None
+    for attempt in range(4):
+        size, _ = await asyncio.to_thread(get_s3_file_metadata, stored)
+        if size is not None:
+            break
+        if attempt < 3:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    if size is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Your resume is being updated — please try View again in a moment.",
+        )
+
+    if not force_stream:
+        presigned = generate_presigned_url(stored)
+        print(f"[base-resume-view-debug] (S3-key branch) stored={stored!r} presigned_url={presigned!r}")
+        if presigned:
+            return {"url": presigned, "filename": display_name, "mimeType": media_type}
+
+    body, content_type = await asyncio.to_thread(download_file_from_s3, stored)
+    if body is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Base resume file is missing from storage. Please re-upload it in your profile.",
+        )
+
+    return Response(
+        content=body,
+        media_type=content_type or media_type,
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+    )
+
+@router.get("/consultants")
+async def get_consultants_for_resumes(
+    # BUG FIX: the Requirements page's "Apply" link (unlike Pending
+    # Applications, which already carries a specific consultantId) opens
+    # ApplyToRequirementPage with no consultant context at all, so its
+    # dropdown showed EVERY consultant in the system — including ones with
+    # no relevance to that requirement. Optional requirement_id restricts
+    # the list to consultants actually matched to that specific
+    # requirement (RequirementConsultantMatch), same source the
+    # Requirements table's own "Matched Consultants" column already uses.
+    requirement_id: int = None,
+    # Apply page with no consultant pre-selected: if the requirement has no
+    # MATCHING consultants, return the full roster instead of [] so it can
+    # still be applied to manually.
+    fallback_to_all: bool = False,
+    # Apply page opened for one consultant (Pending Applications / consultant
+    # filter): return only that consultant (still role-scoped below).
+    consultant_id: int = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    def map_user_consultant(u, c):
+        # BUG FIX: was reading u.skills (User.skills, a JSONB column that
+        # nothing in the consultant-profile flow ever writes to — profile
+        # edits, resume generation, and matching all read/write
+        # Consultant.primary_skills instead, see phase3.py/phase6.py/
+        # resume_router.py's own resume-building code). Real consultants
+        # therefore showed up with an empty skills list here, which fed
+        # straight into ApplyToRequirementPage's {skills} template fill
+        # and silently fell back to "relevant technologies" even when the
+        # consultant had skills on file. Prefer primary_skills split
+        # into a list; keep u.skills as a last-resort fallback for any
+        # user row that predates Consultant.
+        consultant_skills = [
+            s.strip()
+            for s in (c.primary_skills or "").split(",")
+            if s.strip()
+        ] if c else []
+        return {
+            "id": u.id, # Keep id for backward compatibility (maps to user_id)
+            "user_id": u.id,
+            "consultant_id": c.id if c else None,
+            "name": u.full_name or u.email,
+            "email": u.email,
+            "skills": consultant_skills or u.skills,
+            "experience_years": u.experience_years or (c.total_experience_years if c else 0)
+        }
+
+    matched_consultant_ids = None
+    if consultant_id:
+        matched_consultant_ids = [consultant_id]
+    elif requirement_id:
+        from models import RequirementConsultantMatch
+
+        # BUG FIX ("Select Candidate" in Compose Mail could show a
+        # consultant the matching engine explicitly disqualified):
+        # status != "REJECTED" let NOT_ELIGIBLE and APPLIED rows through
+        # too, not just real current matches — a different, looser rule
+        # than every other screen in the app (Requirements, Pending
+        # Applications, the consultant's own view all use
+        # status == "MATCHING"). Aligned to the same single rule so a
+        # candidate who's a valid match on the Requirements page is
+        # exactly who's selectable here, no more and no less.
+        rcm_result = await db.execute(
+            select(RequirementConsultantMatch.consultant_id).where(
+                RequirementConsultantMatch.requirement_id == requirement_id,
+                RequirementConsultantMatch.status == "MATCHING",
+            )
+        )
+        matched_consultant_ids = list({row[0] for row in rcm_result.all()})
+        if not matched_consultant_ids:
+            if fallback_to_all:
+                matched_consultant_ids = None  # no matches → show every candidate
+            else:
+                return []
+
+    if current_user.role == "ADMIN":
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.role == "CONSULTANT",
+            User.is_authorized == True,
+            Consultant.status == "ACTIVE"
+        )
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+    elif current_user.role == "RECRUITER":
+        consultant_users_query = select(Consultant.user_id).where(
+            Consultant.status == "ACTIVE",
+            or_(
+                Consultant.sales_recruiter_user_id == current_user.id,
+                Consultant.id.in_(
+                    select(RecruiterConsultant.consultant_id).where(
+                        RecruiterConsultant.recruiter_id == current_user.id
+                    )
+                )
+            )
+        )
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.id.in_(consultant_users_query),
+            User.role == "CONSULTANT",
+            User.is_authorized == True,
+            Consultant.status == "ACTIVE"
+        )
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+    else:
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.id == current_user.id,
+            User.role == "CONSULTANT",
+            User.is_authorized == True,
+            Consultant.status == "ACTIVE"
+        )
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
+
+@router.get("/{id}", response_model=ResumeResponse)
+async def get_resume(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
+    # class of bug as /download. Uses the shared role-scoped helper instead.
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # BACKFILL: manually-uploaded resumes only ever got data={"raw_text":
+    # ...} at upload time (see /upload above) — no structured fields, so
+    # the frontend routes these to the plain-text editor forever, even
+    # after this same backfill was added for the base resume. Mirrors
+    # get_base_resume_content's approach exactly: try the free,
+    # synchronous heuristic parser first (these resumes reliably follow
+    # one template, so this resolves instantly for the common case), and
+    # only fall back to a real AI call when that doesn't match. raw_text
+    # is kept alongside the parsed fields (not replaced) so the plain-text
+    # editor and AI tailoring/matching, which both still read raw_text,
+    # keep working unchanged.
+    def _is_raw_text_only(d: dict) -> bool:
+        return bool(d) and set(d.keys()) <= {"raw_text"}
+
+    if _is_raw_text_only(resume.data or {}) and (resume.data.get("raw_text") or "").strip():
+        raw_text = resume.data["raw_text"]
+        try:
+            heuristic_data = _heuristic_parse_resume_text(raw_text)
+            if heuristic_data:
+                resume.data = {**heuristic_data, "raw_text": raw_text}
+                await db.commit()
+                await db.refresh(resume)
+        except Exception as e:
+            print(f"Resume content backfill (heuristic) failed for resume {resume.id}: {e}")
+
+    if _is_raw_text_only(resume.data or {}) and (resume.data.get("raw_text") or "").strip():
+        raw_text = resume.data["raw_text"]
+        from claude_service import parse_resume_text_to_structured_data
+        try:
+            parsed_data, rate_limits, usage_info = await asyncio.to_thread(
+                parse_resume_text_to_structured_data, raw_text
+            )
+            if rate_limits:
+                await save_openai_rate_limits(db, rate_limits)
+            if usage_info:
+                # Only persist when the AI call actually succeeded — see
+                # the matching comment in get_base_resume_content for why
+                # (a blank "parsing unavailable" skeleton would otherwise
+                # look identical to a completed backfill and permanently
+                # block every future retry).
+                from phase8_ai_usage_service import log_ai_usage
+                await log_ai_usage(
+                    db,
+                    purpose="resume_backfill",
+                    model="claude-sonnet-4-6",
+                    input_tokens=usage_info["input_tokens"],
+                    output_tokens=usage_info["output_tokens"],
+                    consultant_id=str(resume.user_id),
+                )
+                resume.data = {**parsed_data, "raw_text": raw_text}
+                await db.commit()
+                await db.refresh(resume)
+            else:
+                print(f"Resume content backfill returned no usage_info (AI call unavailable) for resume {resume.id}.")
+        except Exception as e:
+            print(f"Resume content backfill (AI) failed for resume {resume.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_content_backfill",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
+
+    return resume
+
+@router.put("/{id}", response_model=ResumeResponse)
+async def update_resume(
+    id: int,
+    request: ResumeUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
+    # class of bug as /download. Uses the shared role-scoped helper instead.
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    if request.title is not None:
+        resume.title = request.title
+    if request.target_role is not None:
+        resume.target_role = request.target_role
+    if request.job_description is not None:
+        resume.job_description = request.job_description
+    if request.data is not None:
+        resume.data = request.data
+    if request.status is not None:
+        resume.status = request.status
+
+    await db.commit()
+    await db.refresh(resume)
+
+    # BUG FIX: this endpoint only ever updated the `data` JSON column —
+    # the actual downloadable file sitting in S3 was generated once at
+    # creation time and never touched again. Editing a resume (adding a
+    # LinkedIn URL, fixing a typo, or picking up a template fix like the
+    # Declaration section removal) had zero effect on what "Download"
+    # actually served — it kept returning the exact same stale file
+    # forever. Regenerate and re-upload whenever the content changed, so
+    # Save Changes and Download never drift apart again.
+    #
+    # BUG FIX ("view/download resume doesn't load the expected template
+    # after editing"): this used to regenerate a PDF (via LibreOffice) as
+    # the primary artifact and only patch up a separate .docx key as an
+    # afterthought — LibreOffice doesn't reliably preserve template-
+    # specific formatting (shading, borders) on conversion, so the PDF
+    # View/Download served could look plainer than the template actually
+    # selected. Generating and storing the DOCX itself as resume.s3_key
+    # removes that lossy conversion step entirely.
+    if request.data is not None:
+        from phase6 import _generate_docx
+        from pathlib import Path
+
+        resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+        resume_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = resume_dir / "resume.docx"
+
+        try:
+            _generate_docx(resume.data, docx_path, template=resume.template or "classic")
+            docx_key = resume.s3_key or f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+            with open(docx_path, "rb") as f:
+                # PERF FIX: blocking boto3 upload off the event loop.
+                if await asyncio.to_thread(
+                    upload_file_to_s3,
+                    f, docx_key,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ):
+                    resume.s3_key = docx_key
+                    resume.status = 'completed'
+                    await db.commit()
+                    await db.refresh(resume)
+        except Exception as e:
+            # Don't fail the save over a regen hiccup — the data edit
+            # itself already succeeded and committed above. The next save
+            # (or the lazy self-heal in download_resume) will retry.
+            print(f"DOCX regeneration on save failed for resume {resume.id}: {e}")
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_docx_regen_on_save",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
+
+    return resume
+
+@router.delete("/{id}")
+async def delete_resume(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # BUG FIX: was owner-only (Resume.user_id == current_user.id) — same
+    # class of bug as /download. Uses the shared role-scoped helper instead.
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    if resume.s3_key:
+        delete_file_from_s3(resume.s3_key)
+
+    await db.delete(resume)
+    await db.commit()
+
+    return {"success": True}
+
+@router.get("/{id}/download")
+async def download_resume(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # BUG FIX: was `select(Resume).where(Resume.id == id, Resume.user_id ==
+    # current_user.id)` — only ever matched when the CALLER owned the resume.
+    # /admin/apply/:reqId and /recruiter/apply/:reqId reuse this same page to
+    # apply on behalf of a consultant, so current_user is the admin/recruiter,
+    # not the consultant who owns the resume — this 404'd every single time
+    # for them ("Preparing resume attachment..." -> "Failed to download and
+    # attach resume"). Now uses the shared role-scoped helper (same one
+    # get_resume/update_resume/delete_resume already use above) instead of
+    # duplicating the ADMIN/RECRUITER/owner query logic inline: ADMIN sees
+    # any resume, RECRUITER sees their own + assigned consultants', everyone
+    # else only their own.
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # BUG FIX ("View shows a different template than Edit/Download"): this
+    # used to store a LibreOffice-converted PDF as the canonical s3_key and
+    # separately patch up a matching .docx as a rendering source — the PDF
+    # conversion doesn't reliably preserve template-specific formatting
+    # (shading, borders), so View (which preferred the PDF whenever the
+    # .docx companion was missing) could show a flatter look than the
+    # template actually selected. resume.s3_key now always points straight
+    # at the DOCX — same file Edit's Save Changes and Download both write
+    # — so there's nothing left to reconcile here.
+    if not resume.s3_key and resume.data:
+        # SELF-HEAL: some resumes have tailored content (resume.data) but
+        # never got a file — the earlier generate/finalize call hit a
+        # transient failure and left status as 'failed_generation'/
+        # 'failed_upload' with no s3_key. Previously this just 400'd
+        # forever, which is what the frontend's generic catch turns into
+        # "Failed to download and attach resume" — the user has no way to
+        # recover short of clicking "Generate Tailored Resume" again from
+        # scratch. Instead, retry building the DOCX from the data that's
+        # already there before giving up.
+        from phase6 import _generate_docx
+        from pathlib import Path
+
+        resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+        resume_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = resume_dir / "resume.docx"
+
+        upload_error: list = []
+        try:
+            _generate_docx(resume.data, docx_path, template=resume.template or "classic")
+            docx_key = f"users/{resume.user_id}/resumes/{resume.id}/resume.docx"
+            with open(docx_path, "rb") as f:
+                # PERF FIX: blocking boto3 upload off the event loop.
+                if await asyncio.to_thread(upload_file_to_s3, f, docx_key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", _error_out=upload_error):
+                    resume.s3_key = docx_key
+                    resume.status = 'completed'
+                    await db.commit()
+                    await db.refresh(resume)
+        except Exception as e:
+            print(f"Lazy DOCX regeneration failed for resume {resume.id}: {e}")
+            upload_error = [str(e)]
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="resume_lazy_docx_regen",
+                error=e,
+                source_type="resume",
+                source_id=str(resume.id),
+            )
+
+        if not resume.s3_key:
+            # BUG FIX ("View gives a generic 400 with no way to diagnose
+            # it without server log access"): the real reason (a boto3/
+            # Spaces error, most often a permissions issue scoped to a
+            # specific key prefix — this "users/" prefix is only ever
+            # used by resume generation, unlike prefixes used elsewhere
+            # in the app that may have broader write access) used to only
+            # ever reach a print() statement. Surfacing it in the 400
+            # detail itself makes this self-diagnosable from the browser
+            # alone.
+            detail = "This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one."
+            if upload_error:
+                detail += f" (Storage error: {upload_error[0]})"
+            raise HTTPException(status_code=400, detail=detail)
+
+    if not resume.s3_key:
+        raise HTTPException(status_code=400, detail="This resume doesn't have a generated file yet. Click 'Generate Tailored Resume' to create one.")
+
+    url = generate_presigned_url(resume.s3_key)
+    if not url:
+        raise HTTPException(status_code=500, detail="Failed to generate download link.")
+
+    # Update download stats
+    resume.download_count += 1
+    resume.last_downloaded = datetime.now(timezone.utc)
+    await db.commit()
+
+    safe_title = "".join(
+        c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_"
+    ).strip() or f"Resume_{id}"
+
+    return {
+        "url": url,
+        "filename": f"{safe_title}.docx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+
+@router.get("/{id}/download/file")
+async def download_resume_file(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Stream the resume PDF bytes through the API.
+
+    Why this exists alongside /{id}/download (which returns a presigned URL):
+    presigned Spaces URLs work for window.open()/navigation, but a browser
+    fetch() of one is a cross-origin XHR and is blocked unless the Space has
+    a CORS policy. The compose/apply screens need the actual bytes to build a
+    File for attachment, so they call this instead - same origin as the rest
+    of the API, auth enforced, no bucket CORS required.
+    """
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    if not resume.s3_key:
+        raise HTTPException(status_code=400, detail="Resume does not have a generated PDF.")
+
+    body, content_type = await asyncio.to_thread(download_file_from_s3, resume.s3_key)
+    if body is None:
+        raise HTTPException(status_code=502, detail="Could not retrieve the resume file from storage.")
+
+    safe_title = "".join(c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_").strip()
+    # BUG FIX: filename extension was hardcoded to ".pdf" regardless of the
+    # actual stored file — now that uploads are DOCX-only (see /upload
+    # above), this was saving downloaded files as "Title.pdf" while the
+    # bytes inside were actually a .docx, which most apps then fail to open.
+    # Derive it from the real stored key instead.
+    ext = os.path.splitext(resume.s3_key)[1] or ".docx"
+    filename = f"{safe_title or f'Resume_{id}'}{ext}"
+
+    resume.download_count += 1
+    resume.last_downloaded = datetime.now(timezone.utc)
+    await db.commit()
+
+    return Response(
+        content=body,
+        media_type=content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{id}/download/file/docx")
+async def download_resume_docx(
+    id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """DOCX counterpart of download_resume_file above. Derives the key
+    from s3_key's own naming pattern (extension swapped) rather than a
+    separate column, since the upload above always writes it that way."""
+    resume = await _get_resume_for_user(db, id, current_user)
+
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # BUG FIX ("View/Download both open the browser print dialog instead
+    # of DOCX"): this used to 400 immediately with "Resume does not have
+    # a generated file" whenever s3_key was empty — which is exactly the
+    # case for a resume that only has structured `data` and was never
+    # uploaded/finalized to an actual file. The frontend's fallback for
+    # that 400 was to render the resume client-side and trigger the
+    # browser's print dialog (Save as PDF), which is what was showing up
+    # instead of a DOCX. Now: only attempt the S3 lookup when a s3_key
+    # actually exists: no key at all skips straight to generating from
+    # resume.data below, same as the "found a key but the DOCX at that
+    # key is missing" self-heal case already handles.
+    docx_key = resume.s3_key.rsplit(".", 1)[0] + ".docx" if resume.s3_key else None
+    body, content_type = (
+        await asyncio.to_thread(download_file_from_s3, docx_key) if docx_key else (None, None)
+    )
+
+    if body is None:
+        # SELF-HEAL ("Resume does not have a generated DOCX" — this was the
+        # error the Apply page's "Choose Resume" attach step surfaced):
+        # generate/finalize_resume upload the DOCX to S3 in a try/except
+        # that only logs on failure ("DOCX upload failed (PDF result
+        # unaffected)") rather than failing the whole request — so a
+        # resume can end up with a working PDF (resume.s3_key) but no
+        # DOCX ever actually landed at docx_key. Previously that meant
+        # this endpoint 400'd forever with no way to recover short of
+        # regenerating the resume from scratch. Same self-heal pattern as
+        # download_resume's missing-PDF case above: rebuild the DOCX from
+        # resume.data (still in the DB either way) and upload it to the
+        # expected key, then serve those freshly-generated bytes directly
+        # instead of round-tripping back through S3.
+        if resume.data:
+            from phase6 import _generate_docx
+            from pathlib import Path
+
+            resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
+            resume_dir.mkdir(parents=True, exist_ok=True)
+            docx_path = resume_dir / "resume.docx"
+
+            try:
+                _generate_docx(resume.data, docx_path, template=resume.template or "classic")
+                with open(docx_path, "rb") as f:
+                    docx_bytes = f.read()
+                # Only upload back to S3 if there's actually a key to put
+                # it at — a resume with no s3_key at all has nowhere
+                # established to store it yet, so just serve the bytes
+                # this once rather than inventing a storage location.
+                if docx_key:
+                    with open(docx_path, "rb") as f:
+                        # PERF FIX: blocking boto3 upload off the event loop.
+                        await asyncio.to_thread(
+                            upload_file_to_s3,
+                            f, docx_key,
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        )
+                body = docx_bytes
+                content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            except Exception as e:
+                print(f"Lazy DOCX regeneration failed for resume {resume.id}: {e}")
+                from error_logger import log_db_error
+                await log_db_error(
+                    stage="resume_lazy_docx_regen",
+                    error=e,
+                    source_type="resume",
+                    source_id=str(resume.id),
+                )
+
+        if body is None:
+            raise HTTPException(status_code=400, detail="Resume does not have a generated DOCX.")
+
+    safe_title = "".join(c for c in (resume.title or f"Resume_{id}") if c.isalnum() or c in " -_").strip()
+    filename = f"{safe_title or f'Resume_{id}'}.docx"
+
+    return Response(
+        content=body,
+        media_type=content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
