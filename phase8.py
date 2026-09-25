@@ -802,7 +802,7 @@ async def ai_usage_stats(
     import os
     from datetime import datetime, timezone, timedelta
     
-    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
+    api_key = os.getenv("OPEN_SERVICE_API_KEY")
     budget = await get_budget_threshold(db)
     
     if not api_key:
@@ -814,32 +814,30 @@ async def ai_usage_stats(
     
     total_cost = 0.0
     total_calls = 0
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                for bucket in data.get("data", []):
-                    for res in bucket.get("results", []):
-                        m = res.get("model", "")
-                        in_t = res.get("input_tokens", 0)
-                        out_t = res.get("output_tokens", 0)
-                        total_calls += res.get("num_requests", 1)
-                        
-                        c_in, c_out = 0.0, 0.0
-                        if "gpt-4o" in m and "mini" not in m:
-                            c_in = (in_t / 1e6) * 5.0
-                            c_out = (out_t / 1e6) * 15.0
-                        elif "gpt-4o-mini" in m:
-                            c_in = (in_t / 1e6) * 0.15
-                            c_out = (out_t / 1e6) * 0.60
-                        elif "gpt-3.5" in m:
-                            c_in = (in_t / 1e6) * 0.50
-                            c_out = (out_t / 1e6) * 1.50
-                        
-                        total_cost += c_in + c_out
-    except Exception:
-        pass
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"OpenAI API Error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        for bucket in data.get("data", []):
+            for res in bucket.get("results", []):
+                m = res.get("model", "")
+                in_t = res.get("input_tokens", 0)
+                out_t = res.get("output_tokens", 0)
+                total_calls += res.get("num_requests", 1)
+                
+                c_in, c_out = 0.0, 0.0
+                if "gpt-4o" in m and "mini" not in m:
+                    c_in = (in_t / 1e6) * 5.0
+                    c_out = (out_t / 1e6) * 15.0
+                elif "gpt-4o-mini" in m:
+                    c_in = (in_t / 1e6) * 0.15
+                    c_out = (out_t / 1e6) * 0.60
+                elif "gpt-3.5" in m:
+                    c_in = (in_t / 1e6) * 0.50
+                    c_out = (out_t / 1e6) * 1.50
+                
+                total_cost += c_in + c_out
         
     used_pct = (total_cost / budget * 100) if budget > 0 else 0.0
     return AIUsageStatsDTO(
@@ -879,7 +877,7 @@ async def get_openai_usage(
     import calendar
     from datetime import datetime, timezone
     
-    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
+    api_key = os.getenv("OPEN_SERVICE_API_KEY")
     if not api_key:
         return OpenAIUsageDTO(tokens_limit="0", tokens_remaining="0", tokens_used_pct=0.0, tokens_reset="End of Month")
         
@@ -920,7 +918,7 @@ async def ai_usage_daily(
     import os
     from datetime import datetime, timezone, timedelta
     
-    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
+    api_key = os.getenv("OPEN_SERVICE_API_KEY")
     if not api_key:
         return []
 
@@ -930,36 +928,34 @@ async def ai_usage_daily(
     url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit={days}"
     
     daily = {}
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                for bucket in data.get("data", []):
-                    bucket_start = bucket.get("start_time")
-                    if not bucket_start: continue
-                    day_str = datetime.fromtimestamp(bucket_start, timezone.utc).date().isoformat()
-                    daily.setdefault(day_str, 0.0)
-                    
-                    for res in bucket.get("results", []):
-                        m = res.get("model", "")
-                        in_t = res.get("input_tokens", 0)
-                        out_t = res.get("output_tokens", 0)
-                        
-                        c_in, c_out = 0.0, 0.0
-                        if "gpt-4o" in m and "mini" not in m:
-                            c_in = (in_t / 1e6) * 5.0
-                            c_out = (out_t / 1e6) * 15.0
-                        elif "gpt-4o-mini" in m:
-                            c_in = (in_t / 1e6) * 0.15
-                            c_out = (out_t / 1e6) * 0.60
-                        elif "gpt-3.5" in m:
-                            c_in = (in_t / 1e6) * 0.50
-                            c_out = (out_t / 1e6) * 1.50
-                        
-                        daily[day_str] += c_in + c_out
-    except Exception:
-        pass
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"OpenAI API Error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        for bucket in data.get("data", []):
+            bucket_start = bucket.get("start_time")
+            if not bucket_start: continue
+            day_str = datetime.fromtimestamp(bucket_start, timezone.utc).date().isoformat()
+            daily.setdefault(day_str, 0.0)
+            
+            for res in bucket.get("results", []):
+                m = res.get("model", "")
+                in_t = res.get("input_tokens", 0)
+                out_t = res.get("output_tokens", 0)
+                
+                c_in, c_out = 0.0, 0.0
+                if "gpt-4o" in m and "mini" not in m:
+                    c_in = (in_t / 1e6) * 5.0
+                    c_out = (out_t / 1e6) * 15.0
+                elif "gpt-4o-mini" in m:
+                    c_in = (in_t / 1e6) * 0.15
+                    c_out = (out_t / 1e6) * 0.60
+                elif "gpt-3.5" in m:
+                    c_in = (in_t / 1e6) * 0.50
+                    c_out = (out_t / 1e6) * 1.50
+                
+                daily[day_str] += c_in + c_out
         
     return [{"date": d, "cost_usd": round(c, 4)} for d, c in sorted(daily.items())]
 
@@ -975,7 +971,7 @@ async def ai_usage_logs(
     import os
     from datetime import datetime, timezone, timedelta
     
-    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
+    api_key = os.getenv("OPEN_SERVICE_API_KEY")
     if not api_key:
         return PaginatedAIUsageDTO(data=[], total=0, page=page, page_size=page_size, total_pages=1)
 
@@ -985,46 +981,44 @@ async def ai_usage_logs(
     url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=30"
     
     all_logs = []
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                for bucket in data.get("data", []):
-                    bucket_start = bucket.get("start_time")
-                    dt = datetime.fromtimestamp(bucket_start, timezone.utc).isoformat() if bucket_start else ""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"OpenAI API Error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        for bucket in data.get("data", []):
+            bucket_start = bucket.get("start_time")
+            dt = datetime.fromtimestamp(bucket_start, timezone.utc).isoformat() if bucket_start else ""
+            
+            for res in bucket.get("results", []):
+                m = res.get("model", "unknown")
+                in_t = res.get("input_tokens", 0)
+                out_t = res.get("output_tokens", 0)
+                
+                c_in, c_out = 0.0, 0.0
+                if "gpt-4o" in m and "mini" not in m:
+                    c_in = (in_t / 1e6) * 5.0
+                    c_out = (out_t / 1e6) * 15.0
+                elif "gpt-4o-mini" in m:
+                    c_in = (in_t / 1e6) * 0.15
+                    c_out = (out_t / 1e6) * 0.60
+                elif "gpt-3.5" in m:
+                    c_in = (in_t / 1e6) * 0.50
+                    c_out = (out_t / 1e6) * 1.50
                     
-                    for res in bucket.get("results", []):
-                        m = res.get("model", "unknown")
-                        in_t = res.get("input_tokens", 0)
-                        out_t = res.get("output_tokens", 0)
-                        
-                        c_in, c_out = 0.0, 0.0
-                        if "gpt-4o" in m and "mini" not in m:
-                            c_in = (in_t / 1e6) * 5.0
-                            c_out = (out_t / 1e6) * 15.0
-                        elif "gpt-4o-mini" in m:
-                            c_in = (in_t / 1e6) * 0.15
-                            c_out = (out_t / 1e6) * 0.60
-                        elif "gpt-3.5" in m:
-                            c_in = (in_t / 1e6) * 0.50
-                            c_out = (out_t / 1e6) * 1.50
-                            
-                        cost = c_in + c_out
-                        all_logs.append(AIUsageLogRowDTO(
-                            id=f"{bucket_start}-{m}",
-                            timestamp=dt,
-                            purpose="ResumeGeneration",
-                            model=m,
-                            input_tokens=in_t,
-                            output_tokens=out_t,
-                            estimated_cost_usd=round(cost, 6),
-                            consultant_id=None,
-                            consultant_name=None,
-                            requirement_id=None
-                        ))
-    except Exception:
-        pass
+                cost = c_in + c_out
+                all_logs.append(AIUsageLogRowDTO(
+                    id=f"{bucket_start}-{m}",
+                    timestamp=dt,
+                    purpose="ResumeGeneration",
+                    model=m,
+                    input_tokens=in_t,
+                    output_tokens=out_t,
+                    estimated_cost_usd=round(cost, 6),
+                    consultant_id=None,
+                    consultant_name=None,
+                    requirement_id=None
+                ))
         
     all_logs.sort(key=lambda x: x.timestamp, reverse=True)
     total = len(all_logs)
