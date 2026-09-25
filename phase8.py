@@ -180,6 +180,32 @@ class ErrorRateDTO(BaseModel):
     trend: str
     prev_pct: float
 
+class AIUsageLogRowDTO(BaseModel):
+    id: str
+    timestamp: str
+    purpose: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    estimated_cost_usd: float
+    consultant_id: Optional[str] = None
+    consultant_name: Optional[str] = None
+    requirement_id: Optional[str] = None
+
+class PaginatedAIUsageDTO(BaseModel):
+    data: list[AIUsageLogRowDTO]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+class CostPerConsultantDTO(BaseModel):
+    consultant_id: str
+    consultant_name: str
+    total_cost_usd: float
+    total_resumes_generated: int
+    avg_cost_per_resume_usd: float
+
 class AdminStatsDTO(BaseModel):
     total_audit_events: int
     open_errors: int
@@ -678,6 +704,94 @@ async def reject_review(
 # ---------------------------------------------------------------------------
 # AI Usage / Cost Tracking
 # ---------------------------------------------------------------------------
+
+@router.get("/ai-usage/logs", response_model=PaginatedAIUsageDTO)
+async def ai_usage_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    sort_by: Optional[str] = Query("timestamp"),
+    sort_dir: Optional[str] = Query("desc"),
+    purpose: Optional[str] = None,
+    consultant_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    filters = []
+    if purpose:
+        filters.append(AIUsageLog.purpose == purpose)
+    if consultant_id:
+        filters.append(AIUsageLog.consultant_id == consultant_id)
+        
+    base_filter = and_(*filters) if filters else True
+
+    total = (await db.execute(select(func.count()).select_from(AIUsageLog).where(base_filter))).scalar_one()
+    
+    order_col = AIUsageLog.created_at
+    if sort_by == "estimated_cost_usd":
+        order_col = AIUsageLog.estimated_cost
+    elif sort_by == "input_tokens":
+        order_col = AIUsageLog.input_tokens
+    
+    if sort_dir == "asc":
+        order_clause = order_col.asc()
+    else:
+        order_clause = order_col.desc()
+        
+    rows = (await db.execute(
+        select(AIUsageLog).where(base_filter).order_by(order_clause)
+        .offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+
+    data = [
+        AIUsageLogRowDTO(
+            id=str(r.id),
+            timestamp=r.created_at.isoformat() if r.created_at else "",
+            purpose=r.purpose,
+            model=r.model,
+            input_tokens=r.input_tokens,
+            output_tokens=r.output_tokens,
+            estimated_cost_usd=round(float(r.estimated_cost), 6) if r.estimated_cost else 0.0,
+            consultant_id=r.consultant_id,
+            consultant_name=r.consultant_name,
+            requirement_id=r.requirement_id
+        )
+        for r in rows
+    ]
+    return PaginatedAIUsageDTO(data=data, total=total, page=page, page_size=page_size,
+                               total_pages=math.ceil(total / page_size) or 1)
+
+@router.get("/ai-usage/consultants", response_model=list[CostPerConsultantDTO])
+async def ai_usage_consultants(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    query = (
+        select(
+            AIUsageLog.consultant_id,
+            AIUsageLog.consultant_name,
+            func.sum(AIUsageLog.estimated_cost).label("total_cost"),
+            func.count().label("total_calls")
+        )
+        .where(AIUsageLog.consultant_id != None)
+        .group_by(AIUsageLog.consultant_id, AIUsageLog.consultant_name)
+    )
+    
+    res = await db.execute(query)
+    rows = res.all()
+    
+    data = []
+    for row in rows:
+        c_id, c_name, t_cost, t_calls = row
+        t_cost = float(t_cost or 0)
+        data.append(CostPerConsultantDTO(
+            consultant_id=c_id,
+            consultant_name=c_name or c_id,
+            total_cost_usd=round(t_cost, 4),
+            total_resumes_generated=t_calls,
+            avg_cost_per_resume_usd=round(t_cost / t_calls, 4) if t_calls > 0 else 0.0
+        ))
+    
+    return sorted(data, key=lambda x: x.total_cost_usd, reverse=True)
 
 @router.get("/ai-usage/stats", response_model=AIUsageStatsDTO)
 async def ai_usage_stats(
