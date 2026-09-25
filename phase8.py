@@ -164,6 +164,22 @@ class SetBudgetRequest(BaseModel):
     budget_usd: float = Field(..., gt=0, description="AI spend budget in USD, must be greater than 0")
 
 
+class EmailIntakeDayDTO(BaseModel):
+    day: str
+    Parsed: int = 0
+    Parsed_NR: int = Field(0, alias="Parsed - NR")
+    Parsed_Dup: int = Field(0, alias="Parsed - Dup")
+    Failed: int = 0
+    Pending: int = 0
+
+    class Config:
+        populate_by_name = True
+
+class ErrorRateDTO(BaseModel):
+    error_rate_pct: float
+    trend: str
+    prev_pct: float
+
 class AdminStatsDTO(BaseModel):
     total_audit_events: int
     open_errors: int
@@ -806,6 +822,120 @@ async def ai_usage_daily(
 # ---------------------------------------------------------------------------
 # Dashboard Stats & System Health
 # ---------------------------------------------------------------------------
+
+@router.get("/email-intake-chart", response_model=list[EmailIntakeDayDTO])
+async def email_intake_chart(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    from datetime import datetime, timedelta
+    import zoneinfo
+    
+    tz = zoneinfo.ZoneInfo("America/Chicago")
+    today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # 7 days including today (today and 6 previous days)
+    start_date = today - timedelta(days=6)
+    
+    # Fetch rows using raw SQL since the model might not map completely
+    res = await db.execute(
+        text("SELECT status_desc, processed, has_requirement, fetched_at, date FROM gmail_emails WHERE COALESCE(fetched_at, date) >= :start"),
+        {"start": start_date.astimezone(zoneinfo.ZoneInfo("UTC"))}
+    )
+    rows = res.mappings().all()
+    
+    days = {}
+    for i in range(7):
+        d = (today - timedelta(days=6 - i))
+        days[d.strftime("%Y-%m-%d")] = EmailIntakeDayDTO(
+            day=d.strftime("%a")
+        )
+    
+    for row in rows:
+        dt = row.get("fetched_at") or row.get("date")
+        if not dt:
+            continue
+            
+        cst_dt = dt.astimezone(tz)
+        day_key = cst_dt.strftime("%Y-%m-%d")
+        if day_key not in days:
+            continue
+            
+        bucket = days[day_key]
+        
+        status_desc = row.get("status_desc")
+        if status_desc == "Parsed":
+            bucket.Parsed += 1
+        elif status_desc == "Parsed - NR":
+            bucket.Parsed_NR += 1
+        elif status_desc == "Parsed - Dup":
+            bucket.Parsed_Dup += 1
+        elif status_desc == "Failed":
+            bucket.Failed += 1
+        elif status_desc == "Pending":
+            bucket.Pending += 1
+        elif row.get("processed") is True or row.get("has_requirement") is True:
+            bucket.Parsed += 1
+        else:
+            bucket.Pending += 1
+
+    return list(days.values())
+
+@router.get("/error-rate", response_model=ErrorRateDTO)
+async def error_rate(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    from datetime import datetime, timedelta
+    import zoneinfo
+    
+    tz = zoneinfo.ZoneInfo("America/Chicago")
+    today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    seven_days_ago = today - timedelta(days=7)
+    fourteen_days_ago = today - timedelta(days=14)
+    
+    # Current window (7 days ago to today)
+    curr_emails_res = await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE COALESCE(fetched_at, date) >= :start AND COALESCE(fetched_at, date) < :end"),
+        {"start": seven_days_ago.astimezone(zoneinfo.ZoneInfo("UTC")), "end": today.astimezone(zoneinfo.ZoneInfo("UTC"))}
+    )
+    current_emails = curr_emails_res.scalar_one() or 0
+    
+    curr_errors_res = await db.execute(
+        text("SELECT COUNT(*) FROM processing_errors WHERE occurred_at >= :start AND occurred_at < :end"),
+        {"start": seven_days_ago.astimezone(zoneinfo.ZoneInfo("UTC")), "end": today.astimezone(zoneinfo.ZoneInfo("UTC"))}
+    )
+    current_errors = curr_errors_res.scalar_one() or 0
+    
+    # Previous window (14 days ago to 7 days ago)
+    prev_emails_res = await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE COALESCE(fetched_at, date) >= :start AND COALESCE(fetched_at, date) < :end"),
+        {"start": fourteen_days_ago.astimezone(zoneinfo.ZoneInfo("UTC")), "end": seven_days_ago.astimezone(zoneinfo.ZoneInfo("UTC"))}
+    )
+    prev_emails = prev_emails_res.scalar_one() or 0
+    
+    prev_errors_res = await db.execute(
+        text("SELECT COUNT(*) FROM processing_errors WHERE occurred_at >= :start AND occurred_at < :end"),
+        {"start": fourteen_days_ago.astimezone(zoneinfo.ZoneInfo("UTC")), "end": seven_days_ago.astimezone(zoneinfo.ZoneInfo("UTC"))}
+    )
+    prev_errors = prev_errors_res.scalar_one() or 0
+    
+    error_rate_pct = (current_errors / current_emails * 100) if current_emails > 0 else 0.0
+    prev_pct = (prev_errors / prev_emails * 100) if prev_emails > 0 else 0.0
+    
+    if abs(error_rate_pct - prev_pct) < 0.1:
+        trend = "stable"
+    elif error_rate_pct > prev_pct:
+        trend = "up"
+    else:
+        trend = "down"
+        
+    return ErrorRateDTO(
+        error_rate_pct=error_rate_pct,
+        trend=trend,
+        prev_pct=prev_pct
+    )
 
 @router.get("/stats", response_model=AdminStatsDTO)
 async def admin_stats(
