@@ -839,7 +839,7 @@ async def email_intake_chart(
     
     # Fetch rows using raw SQL since the model might not map completely
     res = await db.execute(
-        text("SELECT status_desc, processed, has_requirement, fetched_at, date FROM gmail_emails WHERE COALESCE(fetched_at, date) >= :start"),
+        text("SELECT status_desc, processed, EXISTS(SELECT 1 FROM requirements r WHERE r.raw_email_id = gmail_emails.id) AS has_requirement, fetched_at, date FROM gmail_emails WHERE COALESCE(fetched_at, date) >= :start"),
         {"start": start_date.astimezone(zoneinfo.ZoneInfo("UTC"))}
     )
     rows = res.mappings().all()
