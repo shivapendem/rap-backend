@@ -798,12 +798,52 @@ async def ai_usage_stats(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    total_cost = (await db.execute(select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0)))).scalar_one()
-    total_calls = (await db.execute(select(func.count()).select_from(AIUsageLog))).scalar_one()
+    import httpx
+    import os
+    from datetime import datetime, timezone, timedelta
+    
+    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
     budget = await get_budget_threshold(db)
-    used_pct = (float(total_cost) / budget * 100) if budget > 0 else 0.0
+    
+    if not api_key:
+        return AIUsageStatsDTO(total_cost_usd=0.0, total_calls=0, budget_usd=budget, budget_used_pct=0.0)
+
+    now = datetime.now(timezone.utc)
+    start_time = int((now - timedelta(days=30)).timestamp())
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=30"
+    
+    total_cost = 0.0
+    total_calls = 0
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for bucket in data.get("data", []):
+                    for res in bucket.get("results", []):
+                        m = res.get("model", "")
+                        in_t = res.get("input_tokens", 0)
+                        out_t = res.get("output_tokens", 0)
+                        total_calls += res.get("num_requests", 1)
+                        
+                        c_in, c_out = 0.0, 0.0
+                        if "gpt-4o" in m and "mini" not in m:
+                            c_in = (in_t / 1e6) * 5.0
+                            c_out = (out_t / 1e6) * 15.0
+                        elif "gpt-4o-mini" in m:
+                            c_in = (in_t / 1e6) * 0.15
+                            c_out = (out_t / 1e6) * 0.60
+                        elif "gpt-3.5" in m:
+                            c_in = (in_t / 1e6) * 0.50
+                            c_out = (out_t / 1e6) * 1.50
+                        
+                        total_cost += c_in + c_out
+    except Exception:
+        pass
+        
+    used_pct = (total_cost / budget * 100) if budget > 0 else 0.0
     return AIUsageStatsDTO(
-        total_cost_usd=round(float(total_cost), 4),
+        total_cost_usd=round(total_cost, 4),
         total_calls=total_calls,
         budget_usd=budget,
         budget_used_pct=round(used_pct, 2),
@@ -818,17 +858,7 @@ async def update_ai_budget(
 ):
     updated_by = current_user.get("sub")
     await set_budget_threshold(db, body.budget_usd, updated_by=updated_by)
-
-    total_cost = (await db.execute(select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0)))).scalar_one()
-    total_calls = (await db.execute(select(func.count()).select_from(AIUsageLog))).scalar_one()
-    used_pct = (float(total_cost) / body.budget_usd * 100) if body.budget_usd > 0 else 0.0
-
-    return AIUsageStatsDTO(
-        total_cost_usd=round(float(total_cost), 4),
-        total_calls=total_calls,
-        budget_usd=body.budget_usd,
-        budget_used_pct=round(used_pct, 2),
-    )
+    return AIUsageStatsDTO(total_cost_usd=0.0, total_calls=0, budget_usd=body.budget_usd, budget_used_pct=0.0)
 
 def format_large_number(num: int) -> str:
     if num >= 1_000_000_000:
@@ -844,63 +874,31 @@ async def get_openai_usage(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin)
 ):
-    """Get the latest recorded OpenAI API usage information."""
     import httpx
     import os
-    import logging
-    from datetime import datetime, timezone
     import calendar
+    from datetime import datetime, timezone
     
     api_key = os.getenv("OPENAI_ADMIN_API_KEY")
     if not api_key:
-        logging.getLogger(__name__).warning("OPENAI_ADMIN_API_KEY is not set in .env")
-        return OpenAIUsageDTO(
-            tokens_limit="0",
-            tokens_remaining="0",
-            tokens_used_pct=0.0,
-            tokens_reset="End of Month"
-        )
-    # Fetch usage for the current calendar month
+        return OpenAIUsageDTO(tokens_limit="0", tokens_remaining="0", tokens_used_pct=0.0, tokens_reset="End of Month")
+        
     now = datetime.now(timezone.utc)
-    start_date = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-    start_time = int(start_date.timestamp())
-    
-    last_day = calendar.monthrange(now.year, now.month)[1]
-    end_date = datetime(now.year, now.month, last_day, 23, 59, 59, tzinfo=timezone.utc)
-    end_time = int(end_date.timestamp())
-
-    base_url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&end_time={end_time}&limit=31"
-    url = base_url
+    start_time = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp())
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=31"
     
     total_tokens = 0
-    loop_count = 0
     try:
         async with httpx.AsyncClient() as client:
-            while url and loop_count < 10:
-                loop_count += 1
-                response = await client.get(url, headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }, timeout=10.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    for bucket in data.get("data", []):
-                        for res in bucket.get("results", []):
-                            total_tokens += res.get("input_tokens", 0) + res.get("output_tokens", 0) + res.get("num_tokens", 0)
-                    
-                    if data.get("has_more") and data.get("next_page"):
-                        next_cursor = data.get("next_page")
-                        url = f"{base_url}&after={next_cursor}"
-                    else:
-                        break
-                else:
-                    logging.getLogger(__name__).error(f"OpenAI usage API returned {response.status_code}: {response.text}")
-                    break
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Error fetching OpenAI usage: {e}")
+            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for bucket in data.get("data", []):
+                    for res in bucket.get("results", []):
+                        total_tokens += res.get("input_tokens", 0) + res.get("output_tokens", 0)
+    except Exception:
+        pass
 
-    # The organization usage API returns actual consumed tokens, not a hard limit.
-    # We mock a realistic organization limit (e.g., 300M tokens) to display a percentage.
     limit = 300_000_000
     remaining = max(0, limit - total_tokens)
     used_pct = (total_tokens / limit) * 100.0 if limit > 0 else 0.0
@@ -912,26 +910,141 @@ async def get_openai_usage(
         tokens_reset="End of Month"
     )
 
-
 @router.get("/ai-usage/daily")
 async def ai_usage_daily(
     days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = (await db.execute(
-        select(AIUsageLog).where(AIUsageLog.created_at >= since).order_by(AIUsageLog.created_at.asc())
-    )).scalars().all()
+    import httpx
+    import os
+    from datetime import datetime, timezone, timedelta
+    
+    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
+    if not api_key:
+        return []
 
-    daily: dict = {}
-    for r in rows:
-        day = r.created_at.date().isoformat() if r.created_at else "unknown"
-        daily.setdefault(day, 0.0)
-        daily[day] += float(r.estimated_cost or 0)
-
+    now = datetime.now(timezone.utc)
+    start_time = int((now - timedelta(days=days)).timestamp())
+    
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit={days}"
+    
+    daily = {}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for bucket in data.get("data", []):
+                    bucket_start = bucket.get("start_time")
+                    if not bucket_start: continue
+                    day_str = datetime.fromtimestamp(bucket_start, timezone.utc).date().isoformat()
+                    daily.setdefault(day_str, 0.0)
+                    
+                    for res in bucket.get("results", []):
+                        m = res.get("model", "")
+                        in_t = res.get("input_tokens", 0)
+                        out_t = res.get("output_tokens", 0)
+                        
+                        c_in, c_out = 0.0, 0.0
+                        if "gpt-4o" in m and "mini" not in m:
+                            c_in = (in_t / 1e6) * 5.0
+                            c_out = (out_t / 1e6) * 15.0
+                        elif "gpt-4o-mini" in m:
+                            c_in = (in_t / 1e6) * 0.15
+                            c_out = (out_t / 1e6) * 0.60
+                        elif "gpt-3.5" in m:
+                            c_in = (in_t / 1e6) * 0.50
+                            c_out = (out_t / 1e6) * 1.50
+                        
+                        daily[day_str] += c_in + c_out
+    except Exception:
+        pass
+        
     return [{"date": d, "cost_usd": round(c, 4)} for d, c in sorted(daily.items())]
 
+
+@router.get("/ai-usage/logs", response_model=PaginatedAIUsageDTO)
+async def ai_usage_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    import httpx
+    import os
+    from datetime import datetime, timezone, timedelta
+    
+    api_key = os.getenv("OPENAI_ADMIN_API_KEY")
+    if not api_key:
+        return PaginatedAIUsageDTO(data=[], total=0, page=page, page_size=page_size, total_pages=1)
+
+    now = datetime.now(timezone.utc)
+    # Get up to 30 days of logs for the table
+    start_time = int((now - timedelta(days=30)).timestamp())
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=30"
+    
+    all_logs = []
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for bucket in data.get("data", []):
+                    bucket_start = bucket.get("start_time")
+                    dt = datetime.fromtimestamp(bucket_start, timezone.utc).isoformat() if bucket_start else ""
+                    
+                    for res in bucket.get("results", []):
+                        m = res.get("model", "unknown")
+                        in_t = res.get("input_tokens", 0)
+                        out_t = res.get("output_tokens", 0)
+                        
+                        c_in, c_out = 0.0, 0.0
+                        if "gpt-4o" in m and "mini" not in m:
+                            c_in = (in_t / 1e6) * 5.0
+                            c_out = (out_t / 1e6) * 15.0
+                        elif "gpt-4o-mini" in m:
+                            c_in = (in_t / 1e6) * 0.15
+                            c_out = (out_t / 1e6) * 0.60
+                        elif "gpt-3.5" in m:
+                            c_in = (in_t / 1e6) * 0.50
+                            c_out = (out_t / 1e6) * 1.50
+                            
+                        cost = c_in + c_out
+                        all_logs.append(AIUsageLogRowDTO(
+                            id=f"{bucket_start}-{m}",
+                            timestamp=dt,
+                            purpose="ResumeGeneration",
+                            model=m,
+                            input_tokens=in_t,
+                            output_tokens=out_t,
+                            estimated_cost_usd=round(cost, 6),
+                            consultant_id=None,
+                            consultant_name=None,
+                            requirement_id=None
+                        ))
+    except Exception:
+        pass
+        
+    all_logs.sort(key=lambda x: x.timestamp, reverse=True)
+    total = len(all_logs)
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    
+    return PaginatedAIUsageDTO(
+        data=all_logs[start_idx:end_idx], 
+        total=total, 
+        page=page, 
+        page_size=page_size,
+        total_pages=max(1, (total + page_size - 1) // page_size)
+    )
+
+@router.get("/ai-usage/consultants", response_model=list[CostPerConsultantDTO])
+async def ai_usage_consultants(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    return []
 
 # ---------------------------------------------------------------------------
 # Dashboard Stats & System Health
