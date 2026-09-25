@@ -821,7 +821,7 @@ async def ai_usage_stats(
         data = resp.json()
         for bucket in data.get("data", []):
             for res in bucket.get("results", []):
-                m = res.get("model", "")
+                m = res.get("model") or ""
                 in_t = res.get("input_tokens", 0)
                 out_t = res.get("output_tokens", 0)
                 total_calls += res.get("num_requests", 1)
@@ -979,7 +979,7 @@ async def ai_usage_logs(
             dt = datetime.fromtimestamp(bucket_start, timezone.utc).isoformat() if bucket_start else ""
             
             for res in bucket.get("results", []):
-                m = res.get("model", "unknown")
+                m = res.get("model") or ""
                 in_t = res.get("input_tokens", 0)
                 out_t = res.get("output_tokens", 0)
                 
