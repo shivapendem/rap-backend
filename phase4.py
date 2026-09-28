@@ -1007,14 +1007,15 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
     Location/work mode compatibility.
     REMOTE requirement matches any consultant fully (location-agnostic).
 
-    UPDATED: consultant.preferred_locations is now a fixed single-select
-    (PREFERRED_LOCATION_OPTIONS in phase_users_schema.py: "All" | "Onsite"
-    | "Hybrid" | "Remote") instead of a free-text city/state list — it is
-    compared directly against requirement.work_mode instead of
-    requirement.location text. "All" (or unset, for legacy rows saved
-    before this change) is treated as an open match, same "unspecified =
-    don't penalize" wildcard rule documented on every other Stage 0-4
-    filter and mirrored by location_passes() below.
+    UPDATED: consultant.preferred_locations comes from a checkbox group
+    (PREFERRED_LOCATION_OPTIONS in phase_users_schema.py: "Onsite" |
+    "Hybrid" | "Remote", one or more) instead of a free-text city/state
+    list — it's stored as a comma-separated string, e.g. "Onsite,Remote",
+    and compared against requirement.work_mode by membership rather than
+    exact equality. Unset, or the legacy single value "All" saved before
+    this change, is treated as an open match, same "unspecified = don't
+    penalize" wildcard rule documented on every other Stage 0-4 filter
+    and mirrored by location_passes() below.
     """
     req_work_mode = (requirement.work_mode or "").upper()
 
@@ -1023,11 +1024,13 @@ def score_location(requirement: Requirement, consultant: Consultant, experiences
 
     score = 0.0
 
-    # Preferred-location (work-mode) match
-    pref = (consultant.preferred_locations or "").strip().upper()
-    if not pref or pref == "ALL":
+    # Preferred-location (work-mode) match — membership in the
+    # comma-separated list, not exact equality (a consultant can now
+    # pick more than one).
+    prefs = {p.strip().upper() for p in (consultant.preferred_locations or "").split(",") if p.strip()}
+    if not prefs or "ALL" in prefs:
         score += 60.0
-    elif req_work_mode and pref == req_work_mode:
+    elif req_work_mode and req_work_mode in prefs:
         score += 60.0
 
     # Work mode match — compare against most recent experience entry's work_mode
@@ -1255,14 +1258,15 @@ def location_passes(
     score_location()'s existing remote/onsite/hybrid compatibility rules
     unchanged, converted from a weighted score into a boolean pass/fail.
 
-    UPDATED: consultant.preferred_locations is now a fixed single-select
-    ("All" | "Onsite" | "Hybrid" | "Remote") — "All" (or unset, for legacy
-    rows) is the wildcard equivalent of the old "not stated" case.
+    UPDATED: consultant.preferred_locations comes from a checkbox group
+    ("Onsite" | "Hybrid" | "Remote", one or more, comma-separated) —
+    unset, or the legacy single value "All" saved before this change, is
+    the wildcard equivalent of the old "not stated" case.
     """
     if not requirement.location or requirement.location.strip().upper() == "N/A":
         return True, "requirement location is N/A — passes all"
-    pref = (consultant.preferred_locations or "").strip().upper()
-    if not pref or pref == "ALL":
+    prefs = {p.strip().upper() for p in (consultant.preferred_locations or "").split(",") if p.strip()}
+    if not prefs or "ALL" in prefs:
         return True, "consultant location constraint is N/A — matches requirement"
     score = score_location(requirement, consultant, experiences)
     return score > 0, f"location score={score}"

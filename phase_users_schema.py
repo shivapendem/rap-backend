@@ -15,7 +15,7 @@
 from typing import Optional, List, Any
 
 # Preferred Location is a fixed single-select on the frontend.
-PREFERRED_LOCATION_OPTIONS = ("All", "Onsite", "Hybrid", "Remote")
+PREFERRED_LOCATION_OPTIONS = ("Onsite", "Hybrid", "Remote")  # "All" retired — see validate_preferred_locations_value
 import re
 from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
@@ -325,9 +325,16 @@ class UpdateConsultantRequestDTO(BaseModel):
     @field_validator("preferred_locations")
     @classmethod
     def validate_preferred_locations_value(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and v.strip() and v.strip() not in PREFERRED_LOCATION_OPTIONS:
-            raise ValueError(f"preferred_locations must be one of {PREFERRED_LOCATION_OPTIONS}")
-        return v
+        # Changed from a single value to a comma-separated list from a
+        # checkbox group (e.g. "Onsite,Remote") — at least one of the
+        # allowed options, if the field is being set at all. None (field
+        # not touched) still passes through unchanged.
+        if v is None or not v.strip():
+            return v
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        if not parts or any(p not in PREFERRED_LOCATION_OPTIONS for p in parts):
+            raise ValueError(f"preferred_locations must be a comma-separated list of one or more of {PREFERRED_LOCATION_OPTIONS}")
+        return ",".join(dict.fromkeys(parts))
 
     @field_validator("phone")
     @classmethod

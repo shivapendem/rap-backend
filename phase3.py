@@ -269,7 +269,7 @@ class ProfileUpdateRequest(BaseModel):
     # fields that were made required earlier (title, education, etc.).
     employmentTypes: List[str] = Field(..., min_length=1)
     preferredRoles: str = Field(..., min_length=1, max_length=200)
-    preferredLocations: str = Field(..., min_length=1, max_length=20)
+    preferredLocations: str = Field(..., min_length=1, max_length=40)
     totalExperienceYears: float = Field(..., ge=0, le=60)
     # BUG FIX: these three were never collectable anywhere — the
     # "Profile incomplete" check (resume_validation.py) has always
@@ -368,10 +368,14 @@ class ProfileUpdateRequest(BaseModel):
     @field_validator("preferredLocations")
     @classmethod
     def validate_preferred_locations(cls, v):
-        allowed = {"All", "Onsite", "Hybrid", "Remote"}
-        if v not in allowed:
-            raise ValueError(f"preferredLocations must be one of {allowed}")
-        return v
+        # Changed from a single value to a comma-separated list from a
+        # checkbox group (e.g. "Onsite,Remote") — at least one required.
+        # "All" is no longer accepted: pick the ones actually wanted.
+        allowed = {"Onsite", "Hybrid", "Remote"}
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        if not parts or any(p not in allowed for p in parts):
+            raise ValueError(f"preferredLocations must be a comma-separated list of one or more of {allowed}")
+        return ",".join(dict.fromkeys(parts))
 
 
 # BUG FIX (app crashed on startup): update_consultant_by_id below declares
@@ -400,7 +404,7 @@ class AdminConsultantUpdateRequest(BaseModel):
     workAuth: str = Field(...)
     employmentTypes: List[str] = Field(..., min_length=1)
     preferredRoles: str = Field(..., min_length=1, max_length=200)
-    preferredLocations: str = Field(..., min_length=1, max_length=20)
+    preferredLocations: str = Field(..., min_length=1, max_length=40)
     totalExperienceYears: float = Field(..., ge=0, le=60)
     education: List[EducationEntryRequest] = Field(..., min_length=1)
     resumeRichText: Optional[str] = None
@@ -434,10 +438,14 @@ class AdminConsultantUpdateRequest(BaseModel):
     @field_validator("preferredLocations")
     @classmethod
     def validate_preferred_locations(cls, v):
-        allowed = {"All", "Onsite", "Hybrid", "Remote"}
-        if v not in allowed:
-            raise ValueError(f"preferredLocations must be one of {allowed}")
-        return v
+        # Changed from a single value to a comma-separated list from a
+        # checkbox group (e.g. "Onsite,Remote") — at least one required.
+        # "All" is no longer accepted: pick the ones actually wanted.
+        allowed = {"Onsite", "Hybrid", "Remote"}
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        if not parts or any(p not in allowed for p in parts):
+            raise ValueError(f"preferredLocations must be a comma-separated list of one or more of {allowed}")
+        return ",".join(dict.fromkeys(parts))
 
 
 class ProfileResponse(BaseModel):
