@@ -80,7 +80,7 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed-backend-fallback"
+MATCHING_LOGIC_VERSION = "2026-09-28-employment-type-groups-backend-fallback"
 # BUG FIX (two engines silently overwriting each other's scores forever):
 # this used to be the exact same string as rap_python_cron/matching_engine.py's
 # MATCHING_LOGIC_VERSION — but the two engines do NOT compute the same
@@ -100,7 +100,7 @@ MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed-backend-fallback"
 # Keep this in sync by hand with rap_python_cron/matching_engine.py's own
 # MATCHING_LOGIC_VERSION whenever cron's scoring logic changes — there's
 # no shared import between these two separate deployed processes.
-CRON_MATCHING_LOGIC_VERSION = "2026-09-22-near-miss-removed"
+CRON_MATCHING_LOGIC_VERSION = "2026-09-28-employment-type-groups"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
@@ -907,6 +907,31 @@ def score_experience(requirement: Requirement, consultant: Consultant, experienc
     return round((years / required_years) * 100, 2)
 
 
+# Consultant employment-type preference -> the requirement employment
+# types it accepts. The consultant-side vocabulary (profile/admin screens:
+# CONTRACT shown as "Contract", W2, 1099, FULL_TIME; legacy rows may also hold
+# C2C) differs from the requirement parser's (C2C, C2H, CONTRACT, W2, 1099,
+# FULLTIME — and parser.normalize_employment_types() drops CONTRACT whenever
+# C2C/C2H is also present). A plain exact-string intersection therefore
+# rejected every Contract consultant against every C2C/C2H posting, and
+# every FULL_TIME consultant against every FULLTIME posting. Keys and
+# values are compared in _normalize_employment_type() form (uppercased,
+# spaces/underscores/hyphens removed), so FULL_TIME and FULLTIME are the
+# same key. A consultant value not listed here still only matches itself.
+_CONTRACT_REQUIREMENT_TYPES = frozenset({"C2C", "CONTRACT", "C2H"})
+CONSULTANT_EMPLOYMENT_PREF_GROUPS: dict[str, frozenset[str]] = {
+    "C2C": _CONTRACT_REQUIREMENT_TYPES,
+    "CONTRACT": _CONTRACT_REQUIREMENT_TYPES,
+    "W2": frozenset({"W2"}),
+    "1099": frozenset({"1099"}),
+    "FULLTIME": frozenset({"FULLTIME"}),
+}
+
+
+def _normalize_employment_type(value) -> str:
+    return "".join(ch for ch in str(value).upper() if ch not in (" ", "_", "-"))
+
+
 def score_employment_type(requirement_types: Optional[List[str]], consultant_types: Optional[List[str]]) -> float:
     """
     Employment type intersection — C2C/W2/FULLTIME.
@@ -933,10 +958,13 @@ def score_employment_type(requirement_types: Optional[List[str]], consultant_typ
     if not consultant_types:
         return 100.0
 
-    req_set = set(t.upper() for t in requirement_types)
-    cons_set = set(t.upper() for t in consultant_types)
+    req_set = {_normalize_employment_type(t) for t in requirement_types}
+    accepted: set[str] = set()
+    for pref in consultant_types:
+        key = _normalize_employment_type(pref)
+        accepted |= CONSULTANT_EMPLOYMENT_PREF_GROUPS.get(key, frozenset({key}))
 
-    overlap = req_set & cons_set
+    overlap = req_set & accepted
     return 100.0 if overlap else 0.0
 
 
