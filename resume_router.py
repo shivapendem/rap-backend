@@ -13,7 +13,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func, or_, and_
+from sqlalchemy import true, func, or_, and_
 
 from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
@@ -28,6 +28,20 @@ from phase3 import _extract_text_from_docx
 # import openai
 
 router = APIRouter(prefix="/api/resume", tags=["resume"])
+
+
+# Recruiters can apply for / open resumes of ANY active consultant they pick on
+# the Apply screen (same as an admin), not only their assigned ones. Set to
+# False to go back to "assigned consultants only" everywhere in this file.
+RECRUITER_CAN_TARGET_ANY_CONSULTANT = True
+
+
+def _recruiter_target_scope(recruiter_id):
+    """Scope for a consultant the recruiter explicitly targets (Apply flow:
+    resume list / generate / upload / open by id)."""
+    if RECRUITER_CAN_TARGET_ANY_CONSULTANT:
+        return true()
+    return _recruiter_consultant_scope(recruiter_id)
 
 
 def _recruiter_consultant_scope(recruiter_id):
@@ -118,7 +132,7 @@ async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: U
         return result.scalar_one_or_none()
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
-            _recruiter_consultant_scope(current_user.id)
+            _recruiter_target_scope(current_user.id)
         )
         result = await db.execute(select(Resume).where(
             Resume.id == resume_id,
@@ -203,7 +217,7 @@ async def _resolve_target_user(
             assigned_consultant = await db.execute(
                 select(Consultant.id).where(
                     Consultant.user_id == target_user_id,
-                    _recruiter_consultant_scope(current_user.id),
+                    _recruiter_target_scope(current_user.id),
                 )
             )
             if not assigned_consultant.scalar_one_or_none():
@@ -288,7 +302,21 @@ async def _build_resume_info(
         resume_info["experience"] = []
 
     # Prepend profile experiences so they are processed as most relevant/recent
-    resume_info["experience"] = manual_exp_entries + resume_info["experience"]
+    # De-duplicate: the same job can exist both in the profile experience
+    # (ConsultantExperience) and in the stored resume_info blob. Keep the
+    # profile entry and drop the stored copy when company + title match, so
+    # a role is never sent to the AI (and printed on the resume) twice.
+    def _exp_key(e):
+        return (
+            re.sub(r"\W+", "", str(e.get("company") or e.get("employer") or e.get("client") or "")).lower(),
+            re.sub(r"\W+", "", str(e.get("title") or e.get("role") or e.get("role_title") or "")).lower(),
+        )
+    _profile_keys = {_exp_key(e) for e in manual_exp_entries if any(_exp_key(e))}
+    _stored_exp = [
+        e for e in resume_info["experience"]
+        if not (isinstance(e, dict) and _exp_key(e) in _profile_keys)
+    ]
+    resume_info["experience"] = manual_exp_entries + _stored_exp
 
     # BUG FIX ("admin edit and consultant profile edit — every change
     # should update the json too"): this used to only ever BACKFILL a gap
@@ -880,7 +908,7 @@ async def upload_resume(
             allowed = await db.execute(
                 select(Consultant.user_id).where(
                     Consultant.user_id == target_user_id,
-                    _recruiter_consultant_scope(current_user.id),
+                    _recruiter_target_scope(current_user.id),
                 )
             )
             if not allowed.scalars().first():
@@ -999,8 +1027,14 @@ async def list_resumes(
 
     if user_id:
         # Additional safety to only allow filtering if they have access
-        if current_user.role == "ADMIN" or current_user.role == "RECRUITER":
+        if current_user.role == "ADMIN":
             query = query.where(Resume.user_id == user_id)
+        elif current_user.role == "RECRUITER":
+            if RECRUITER_CAN_TARGET_ANY_CONSULTANT:
+                # explicit candidate picked on the Apply screen (any consultant)
+                query = select(Resume).where(Resume.user_id == user_id)
+            else:
+                query = query.where(Resume.user_id == user_id)
 
     if search:
         query = query.where(Resume.title.ilike(f"%{search}%"))
@@ -3006,9 +3040,13 @@ async def download_base_resume(
         headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
 
-async def _with_applied_flag(db, requirement_id, rows):
+async def _with_applied_flag(db, requirement_id, rows, matched_ids=None):
     """Adds already_applied (SENT application or queued send for THIS
-    requirement + THAT consultant) to each consultant row."""
+    requirement + THAT consultant) and matched (consultant is matched to this
+    requirement) to each consultant row."""
+    _m = matched_ids or set()
+    for r in rows:
+        r["matched"] = r.get("consultant_id") in _m
     if not requirement_id or not rows:
         return rows
     from models import Application, EmailQueue
@@ -3112,6 +3150,8 @@ async def get_consultants_for_resumes(
             else:
                 return []
 
+    _matched_set = set(matched_consultant_ids or []) if (requirement_id and not consultant_id) else set()
+
     # BUG FIX (recruiter's Apply screen: "Select candidate" missing and the
     # whole form greyed out): the fallback above only fires when NO consultant
     # in the whole system matches the requirement. For a recruiter, matched
@@ -3132,7 +3172,7 @@ async def get_consultants_for_resumes(
             Consultant.id.in_(matched_consultant_ids),
         )
         if current_user.role == "RECRUITER":
-            visible_q = visible_q.where(_recruiter_consultant_scope(current_user.id))
+            visible_q = visible_q.where(_recruiter_target_scope(current_user.id))
         if not (await db.execute(visible_q.limit(1))).first():
             matched_consultant_ids = None
 
@@ -3145,7 +3185,24 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results])
+        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
+    elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and (requirement_id or consultant_id):
+        # Apply screen: EXACTLY the admin rule — the consultants matched to
+        # this requirement (whoever they are assigned to); if nobody matched,
+        # every active consultant.
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.role == "CONSULTANT",
+            User.is_authorized == True,
+            Consultant.status == "ACTIVE",
+        )
+        if matched_consultant_ids is not None:
+            query = query.where(Consultant.id.in_(matched_consultant_ids))
+        results = (await db.execute(query)).all()
+        return await _with_applied_flag(
+            db, requirement_id,
+            [map_user_consultant(u, c) for u, c in results],
+            matched_ids=_matched_set,
+        )
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
             Consultant.status == "ACTIVE",
@@ -3160,7 +3217,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results])
+        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
     else:
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id == current_user.id,
@@ -3171,7 +3228,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results])
+        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
 
 @router.get("/{id}", response_model=ResumeResponse)
 async def get_resume(

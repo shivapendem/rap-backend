@@ -229,3 +229,37 @@ async def resolve_employer_details(db: AsyncSession, current_user, consultant) -
     if consultant:
         return await get_handling_recruiter(db, consultant)
     return None
+
+
+async def resolve_cc_employers(db: AsyncSession, cc_email: str, current_user, consultant) -> list:
+    """Employer Details cards for the signature = the RECRUITERS actually in
+    the CC list, in CC order (whoever is CC'd is who is shown). If no
+    recruiter is in the CC (e.g. an admin CC'd only themselves) it falls back
+    to the default for the sender (see resolve_employer_details)."""
+    import re
+    from sqlalchemy import func
+    from models import User
+
+    emails = []
+    for part in re.split(r"[;,]", cc_email or ""):
+        e = part.strip().lower()
+        if e and e not in emails:
+            emails.append(e)
+
+    cards = []
+    if emails:
+        rows = (await db.execute(
+            select(User).where(
+                func.lower(User.email).in_(emails),
+                User.role == "RECRUITER",
+                User.is_authorized == True,
+            )
+        )).scalars().all()
+        by_email = {(u.email or "").strip().lower(): u for u in rows}
+        cards = [employer_details_from_user(by_email[e]) for e in emails if e in by_email]
+
+    if not cards:
+        default = await resolve_employer_details(db, current_user, consultant)
+        if default:
+            cards = [default]
+    return cards

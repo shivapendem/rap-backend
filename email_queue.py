@@ -449,9 +449,10 @@ async def create_email_queue(
         # consultant, shown as a second block below the consultant's own
         # signature regardless of who is sending. Omitted entirely (empty
         # dict) when the consultant has no assigned recruiter either way.
-        from permission_service import resolve_employer_details
-        employer = await resolve_employer_details(db, current_user, consultant)
-        employer = employer or {}
+        from permission_service import resolve_cc_employers
+        employer_cards = await resolve_cc_employers(db, final_cc, current_user, consultant)
+        employer = employer_cards[0] if employer_cards else {}
+        extra_employers = employer_cards[1:]
 
         # Custom signature editor/save removed — always use the default
         # signature card built from the consultant's own profile details
@@ -469,6 +470,7 @@ async def create_email_queue(
             employer_email=employer.get("employer_email"),
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
+            extra_employers=extra_employers,
         )
         signature_html = build_signature_html(
             sender["sender_name"],
@@ -483,6 +485,7 @@ async def create_email_queue(
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
             employer_linkedin_url=employer.get("employer_linkedin_url"),
+            extra_employers=extra_employers,
         )
 
         final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
@@ -1051,9 +1054,10 @@ async def send_email_now(
         # consultant, shown as a second block below the consultant's own
         # signature regardless of who is sending. Omitted entirely (empty
         # dict) when the consultant has no assigned recruiter either way.
-        from permission_service import resolve_employer_details
-        employer = await resolve_employer_details(db, current_user, consultant)
-        employer = employer or {}
+        from permission_service import resolve_cc_employers
+        employer_cards = await resolve_cc_employers(db, final_cc, current_user, consultant)
+        employer = employer_cards[0] if employer_cards else {}
+        extra_employers = employer_cards[1:]
 
         # Custom signature editor/save removed — always use the default
         # signature card built from the consultant's own profile details
@@ -1071,6 +1075,7 @@ async def send_email_now(
             employer_email=employer.get("employer_email"),
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
+            extra_employers=extra_employers,
         )
         signature_html = build_signature_html(
             sender["sender_name"],
@@ -1085,6 +1090,7 @@ async def send_email_now(
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
             employer_linkedin_url=employer.get("employer_linkedin_url"),
+            extra_employers=extra_employers,
         )
 
         final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
