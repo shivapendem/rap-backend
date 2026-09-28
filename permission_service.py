@@ -204,12 +204,18 @@ async def get_handling_recruiter(db: AsyncSession, consultant) -> dict | None:
     }
 
 
+# ONE switch for "recruiters see / act on ALL consultants (same as admin)".
+# resume_router.py and main.py import it. False = assigned consultants only.
+RECRUITER_CAN_TARGET_ANY_CONSULTANT = True
+
+
 def employer_details_from_user(user) -> dict:
     """Same shape as get_handling_recruiter's result, built straight from a
     recruiter's own User row (used when the recruiter is the one sending)."""
     return {
         "employer_name": user.full_name or "",
-        "employer_title": getattr(user, "designation", None) or "Recruiter",
+        "employer_title": getattr(user, "designation", None)
+        or ("Recruiter" if getattr(user, "role", None) == "RECRUITER" else None),
         "employer_email": user.email or "",
         "employer_phone": getattr(user, "mobile_number", None),
         "employer_extension": extract_extension_digits(getattr(user, "extension", None)),
@@ -232,10 +238,10 @@ async def resolve_employer_details(db: AsyncSession, current_user, consultant) -
 
 
 async def resolve_cc_employers(db: AsyncSession, cc_email: str, current_user, consultant) -> list:
-    """Employer Details cards for the signature = the RECRUITERS actually in
-    the CC list, in CC order (whoever is CC'd is who is shown). If no
-    recruiter is in the CC (e.g. an admin CC'd only themselves) it falls back
-    to the default for the sender (see resolve_employer_details)."""
+    """Employer Details cards for the signature = the recruiters AND admins
+    actually in the CC list, in CC order (whoever is CC'd is who is shown).
+    If none of them is in the CC it falls back to the default for the sender
+    (see resolve_employer_details)."""
     import re
     from sqlalchemy import func
     from models import User
@@ -251,7 +257,7 @@ async def resolve_cc_employers(db: AsyncSession, cc_email: str, current_user, co
         rows = (await db.execute(
             select(User).where(
                 func.lower(User.email).in_(emails),
-                User.role == "RECRUITER",
+                User.role.in_(["RECRUITER", "ADMIN"]),
                 User.is_authorized == True,
             )
         )).scalars().all()
@@ -263,3 +269,20 @@ async def resolve_cc_employers(db: AsyncSession, cc_email: str, current_user, co
         if default:
             cards = [default]
     return cards
+
+
+async def default_cc_for_sender(db: AsyncSession, current_user, consultant) -> str:
+    """The CC list an application gets when nobody edited it:
+      ADMIN      -> the admin + the consultant's assigned recruiter
+      RECRUITER  -> the sending recruiter
+      CONSULTANT -> the consultant's assigned recruiter (falls back to self)"""
+    own = (current_user.email or "").strip()
+    handling = None
+    if consultant and current_user.role in ("ADMIN", "CONSULTANT"):
+        h = await get_handling_recruiter(db, consultant)
+        handling = ((h or {}).get("employer_email") or "").strip() or None
+    if current_user.role == "ADMIN":
+        return ",".join([e for e in (own, handling) if e])
+    if current_user.role == "CONSULTANT":
+        return handling or own
+    return own

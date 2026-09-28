@@ -725,14 +725,17 @@ async def list_email_queue(
 @router.get("/api/consultant/email-queue/signature-employer")
 async def get_signature_employer(
     consultant_id: Optional[int] = Query(None),
+    cc: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Employer Details card for the Apply screen's signature preview. Every
-    role: consultant -> their assigned recruiter, recruiter -> themselves,
-    admin -> the selected consultant's assigned recruiter."""
+    """Employer Details cards for the Apply screen's signature preview — the
+    same ones the sent email gets: one per admin/recruiter in the CC. Pass
+    ?cc= (comma list) to preview an edited CC; otherwise the default CC for
+    the caller's role is used (admin -> admin + assigned recruiter,
+    recruiter -> themselves, consultant -> assigned recruiter)."""
     from models import Consultant
-    from permission_service import resolve_employer_details
+    from permission_service import resolve_cc_employers, default_cc_for_sender
 
     cons = None
     if current_user.role == "CONSULTANT":
@@ -743,7 +746,10 @@ async def get_signature_employer(
         cons = (await db.execute(
             select(Consultant).where(Consultant.id == consultant_id)
         )).scalars().first()
-    return {"employer": await resolve_employer_details(db, current_user, cons)}
+    cc_list = cc if (cc is not None and current_user.role in ("ADMIN", "RECRUITER")) \
+        else await default_cc_for_sender(db, current_user, cons)
+    cards = await resolve_cc_employers(db, cc_list, current_user, cons)
+    return {"employers": cards, "employer": cards[0] if cards else None}
 
 
 @router.get("/api/consultant/email-queue/cc-options")

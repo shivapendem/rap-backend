@@ -31,9 +31,9 @@ router = APIRouter(prefix="/api/resume", tags=["resume"])
 
 
 # Recruiters can apply for / open resumes of ANY active consultant they pick on
-# the Apply screen (same as an admin), not only their assigned ones. Set to
-# False to go back to "assigned consultants only" everywhere in this file.
-RECRUITER_CAN_TARGET_ANY_CONSULTANT = True
+# the Apply screen (same as an admin), not only their assigned ones. The
+# switch lives in permission_service.py so main.py uses the same one.
+from permission_service import RECRUITER_CAN_TARGET_ANY_CONSULTANT
 
 
 def _recruiter_target_scope(recruiter_id):
@@ -3092,6 +3092,9 @@ async def get_consultants_for_resumes(
     # Apply page opened for one consultant (Pending Applications / consultant
     # filter): return only that consultant (still role-scoped below).
     consultant_id: int = None,
+    # Requirements page candidate filter: recruiters get the same full list
+    # as an admin instead of only their assigned roster.
+    all_consultants: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -3186,6 +3189,14 @@ async def get_consultants_for_resumes(
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
         return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
+    elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and all_consultants and not (requirement_id or consultant_id):
+        query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
+            User.role == "CONSULTANT",
+            User.is_authorized == True,
+            Consultant.status == "ACTIVE",
+        )
+        results = (await db.execute(query)).all()
+        return [map_user_consultant(u, c) for u, c in results]
     elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and (requirement_id or consultant_id):
         # Apply screen: EXACTLY the admin rule — the consultants matched to
         # this requirement (whoever they are assigned to); if nobody matched,
