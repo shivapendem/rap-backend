@@ -810,7 +810,7 @@ async def ai_usage_stats(
 
     now = datetime.now(timezone.utc)
     start_time = int((now - timedelta(days=30)).timestamp())
-    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=30"
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&group_by=model&limit=30"
     
     total_cost = 0.0
     total_calls = 0
@@ -824,7 +824,7 @@ async def ai_usage_stats(
                 m = res.get("model") or ""
                 in_t = res.get("input_tokens", 0)
                 out_t = res.get("output_tokens", 0)
-                total_calls += res.get("num_requests", 1)
+                total_calls += res.get("num_model_requests", 1)
                 
                 c_in, c_out = 0.0, 0.0
                 if "gpt-4o" in m and "mini" not in m:
@@ -893,7 +893,7 @@ async def get_openai_usage(
         
     now = datetime.now(timezone.utc)
     start_time = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp())
-    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=31"
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&group_by=model&limit=31"
     
     total_tokens = 0
     try:
@@ -935,7 +935,7 @@ async def ai_usage_daily(
     now = datetime.now(timezone.utc)
     start_time = int((now - timedelta(days=days)).timestamp())
     
-    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit={days}"
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&group_by=model&limit={days}"
     
     daily = {}
     async with httpx.AsyncClient() as client:
@@ -997,7 +997,7 @@ async def ai_usage_logs(
     now = datetime.now(timezone.utc)
     # Get up to 30 days of logs for the table
     start_time = int((now - timedelta(days=30)).timestamp())
-    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&limit=30"
+    url = f"https://api.openai.com/v1/organization/usage/completions?start_time={start_time}&bucket_width=1d&group_by=model&limit=30"
     
     all_logs = []
     async with httpx.AsyncClient() as client:
