@@ -175,7 +175,7 @@ class EditUserRequestDTO(BaseModel):
     def validate_work_authorization(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return v
-        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        valid = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
         if v not in valid:
             raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
         return v
@@ -402,7 +402,7 @@ class UpdateConsultantRequestDTO(BaseModel):
             return v
         if v == "":
             raise ValueError("work_authorization is required and cannot be cleared")
-        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        valid = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
         if v not in valid:
             raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
         return v
