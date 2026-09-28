@@ -833,11 +833,21 @@ async def ai_usage_stats(
                 elif "gpt-4o-mini" in m:
                     c_in = (in_t / 1e6) * 0.15
                     c_out = (out_t / 1e6) * 0.60
+                elif "gpt-4" in m and "turbo" in m:
+                    c_in = (in_t / 1e6) * 10.0
+                    c_out = (out_t / 1e6) * 30.0
+                elif "gpt-4" in m:
+                    c_in = (in_t / 1e6) * 30.0
+                    c_out = (out_t / 1e6) * 60.0
                 elif "gpt-3.5" in m:
                     c_in = (in_t / 1e6) * 0.50
                     c_out = (out_t / 1e6) * 1.50
+                else:
+                    c_in = (in_t / 1e6) * 2.5
+                    c_out = (out_t / 1e6) * 10.0
                 
-                total_cost += c_in + c_out
+                cost_val = c_in + c_out
+                total_cost += cost_val
         
     used_pct = (total_cost / budget * 100) if budget > 0 else 0.0
     return AIUsageStatsDTO(
@@ -940,10 +950,31 @@ async def ai_usage_daily(
             daily.setdefault(day_str, 0.0)
             
             for res in bucket.get("results", []):
+                m = res.get("model") or ""
                 in_t = res.get("input_tokens", 0)
                 out_t = res.get("output_tokens", 0)
+                c_in, c_out = 0.0, 0.0
+                if "gpt-4o" in m and "mini" not in m:
+                    c_in = (in_t / 1e6) * 5.0
+                    c_out = (out_t / 1e6) * 15.0
+                elif "gpt-4o-mini" in m:
+                    c_in = (in_t / 1e6) * 0.15
+                    c_out = (out_t / 1e6) * 0.60
+                elif "gpt-4" in m and "turbo" in m:
+                    c_in = (in_t / 1e6) * 10.0
+                    c_out = (out_t / 1e6) * 30.0
+                elif "gpt-4" in m:
+                    c_in = (in_t / 1e6) * 30.0
+                    c_out = (out_t / 1e6) * 60.0
+                elif "gpt-3.5" in m:
+                    c_in = (in_t / 1e6) * 0.50
+                    c_out = (out_t / 1e6) * 1.50
+                else:
+                    c_in = (in_t / 1e6) * 2.5
+                    c_out = (out_t / 1e6) * 10.0
                 
-                daily[day_str] += (in_t + out_t)
+                cost_val = c_in + c_out
+                daily[day_str] += cost_val
                 
     return [{"date": d, "cost_usd": c} for d, c in sorted(daily.items())]
 
@@ -990,11 +1021,21 @@ async def ai_usage_logs(
                 elif "gpt-4o-mini" in m:
                     c_in = (in_t / 1e6) * 0.15
                     c_out = (out_t / 1e6) * 0.60
+                elif "gpt-4" in m and "turbo" in m:
+                    c_in = (in_t / 1e6) * 10.0
+                    c_out = (out_t / 1e6) * 30.0
+                elif "gpt-4" in m:
+                    c_in = (in_t / 1e6) * 30.0
+                    c_out = (out_t / 1e6) * 60.0
                 elif "gpt-3.5" in m:
                     c_in = (in_t / 1e6) * 0.50
                     c_out = (out_t / 1e6) * 1.50
-                    
-                cost = c_in + c_out
+                else:
+                    c_in = (in_t / 1e6) * 2.5
+                    c_out = (out_t / 1e6) * 10.0
+                
+                cost_val = c_in + c_out
+                cost = cost_val
                 all_logs.append(AIUsageLogRowDTO(
                     id=f"{bucket_start}-{m}",
                     timestamp=dt,
