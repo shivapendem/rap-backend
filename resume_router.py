@@ -3112,6 +3112,30 @@ async def get_consultants_for_resumes(
             else:
                 return []
 
+    # BUG FIX (recruiter's Apply screen: "Select candidate" missing and the
+    # whole form greyed out): the fallback above only fires when NO consultant
+    # in the whole system matches the requirement. For a recruiter, matched
+    # consultants who belong to OTHER recruiters still counted, so this
+    # recruiter's scoped list came back empty — no candidate picker, form
+    # locked. Now the fallback is decided AFTER role scoping: if none of the
+    # matched consultants are visible to this admin/recruiter, show their
+    # full (role-scoped) roster instead, same as the admin gets.
+    if (
+        matched_consultant_ids is not None
+        and fallback_to_all
+        and requirement_id
+        and not consultant_id
+        and current_user.role in ("ADMIN", "RECRUITER")
+    ):
+        visible_q = select(Consultant.id).where(
+            Consultant.status == "ACTIVE",
+            Consultant.id.in_(matched_consultant_ids),
+        )
+        if current_user.role == "RECRUITER":
+            visible_q = visible_q.where(_recruiter_consultant_scope(current_user.id))
+        if not (await db.execute(visible_q.limit(1))).first():
+            matched_consultant_ids = None
+
     if current_user.role == "ADMIN":
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.role == "CONSULTANT",
