@@ -430,6 +430,7 @@ async def _ai_usage_openai_prefix_compat_redirect(request: Request):
     return RedirectResponse(url=f"/api/v1/admin/ai-usage/openai{query}", status_code=307)
 
 from resume_router import router as resume_router  # noqa: E402
+from permission_service import RECRUITER_CAN_TARGET_ANY_CONSULTANT  # noqa: E402
 app.include_router(resume_router)
 
 from templates_router import router as templates_router  # noqa: E402
@@ -939,7 +940,7 @@ async def get_requirements(
             # Recruiters can only filter by their own active roster — other
             # consultants' rows came back with an empty Matched Consultants
             # column (that column is roster-scoped further down).
-            if current_user.role == "RECRUITER":
+            if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
                 matched_consultant_subq = matched_consultant_subq.where(
                     RequirementConsultantMatch.consultant_id.in_(
                         select(RecruiterConsultant.consultant_id).where(
@@ -1051,7 +1052,7 @@ async def get_requirements(
                 RequirementConsultantMatch.status == "MATCHING",
             )
         )
-        if current_user.role == "RECRUITER":
+        if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
             assigned_result = await db.execute(
                 select(RecruiterConsultant.consultant_id).where(
                     RecruiterConsultant.recruiter_id == current_user.id,
@@ -1093,7 +1094,7 @@ async def get_requirements(
                 Application.status == "SENT",
             )
         )
-        if current_user.role == "RECRUITER":
+        if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
             submitted_q = submitted_q.where(Application.consultant_id.in_(assigned_ids))
         if filter_consultant_ids:
             submitted_q = submitted_q.where(Application.consultant_id.in_(filter_consultant_ids))

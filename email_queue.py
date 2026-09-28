@@ -55,6 +55,38 @@ def _normalize_cc(raw: Optional[str], exclude: list) -> str:
     return ",".join(out)
 
 
+async def _assert_not_already_applied(db, requirement_id, consultant_id, consultant_name=None):
+    """409 if THIS consultant already has a SENT application (or a send still
+    queued) for THIS requirement. The check is per (requirement_id, consultant_id):
+    other consultants on the same requirement are unaffected, and FAILED
+    applications can still be retried."""
+    if not requirement_id or not consultant_id:
+        return
+    from models import Application, EmailQueue
+    sent = (await db.execute(
+        select(Application.id).where(
+            Application.requirement_id == requirement_id,
+            Application.consultant_id == consultant_id,
+            Application.status == "SENT",
+        ).limit(1)
+    )).first()
+    queued = None
+    if not sent:
+        queued = (await db.execute(
+            select(EmailQueue.id).where(
+                EmailQueue.requirement_id == requirement_id,
+                EmailQueue.consultant_id == consultant_id,
+                EmailQueue.status.in_(["QUEUED", "PROCESSING"]),
+            ).limit(1)
+        )).first()
+    if sent or queued:
+        who = consultant_name or "This consultant"
+        raise HTTPException(
+            status_code=409,
+            detail=f"{who} has already applied to this requirement. Select a different consultant.",
+        )
+
+
 class EmailQueueCreateRequest(BaseModel):
     consultant_id: Optional[int] = None
     requirement_id: Optional[int] = None
@@ -385,6 +417,11 @@ async def create_email_queue(
     # recruiter's own email (current_user.email, set by default above) —
     # no extra branch needed here.
 
+    # Per-consultant duplicate check (requirement_id + consultant_id).
+    await _assert_not_already_applied(
+        db, body.requirement_id, consultant_id, getattr(consultant, "full_name", None)
+    )
+
     # Optional CC override — ADMIN / RECRUITER only. CONSULTANT sends keep
     # the automatic CC (their assigned recruiter) and any client-sent
     # cc_email is ignored. cc_email omitted (None) keeps the auto CC above.
@@ -412,9 +449,10 @@ async def create_email_queue(
         # consultant, shown as a second block below the consultant's own
         # signature regardless of who is sending. Omitted entirely (empty
         # dict) when the consultant has no assigned recruiter either way.
-        from permission_service import resolve_employer_details
-        employer = await resolve_employer_details(db, current_user, consultant)
-        employer = employer or {}
+        from permission_service import resolve_cc_employers
+        employer_cards = await resolve_cc_employers(db, final_cc, current_user, consultant)
+        employer = employer_cards[0] if employer_cards else {}
+        extra_employers = employer_cards[1:]
 
         # Custom signature editor/save removed — always use the default
         # signature card built from the consultant's own profile details
@@ -432,6 +470,7 @@ async def create_email_queue(
             employer_email=employer.get("employer_email"),
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
+            extra_employers=extra_employers,
         )
         signature_html = build_signature_html(
             sender["sender_name"],
@@ -446,6 +485,7 @@ async def create_email_queue(
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
             employer_linkedin_url=employer.get("employer_linkedin_url"),
+            extra_employers=extra_employers,
         )
 
         final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
@@ -458,6 +498,7 @@ async def create_email_queue(
         )
     except Exception as sig_err:
         print(f"[email_queue] signature build failed, sending without one: {sig_err}")
+        traceback.print_exc()
         final_content = body.content or ""
         final_html_content = None
 
@@ -681,6 +722,36 @@ async def list_email_queue(
     }
 
 
+@router.get("/api/consultant/email-queue/signature-employer")
+async def get_signature_employer(
+    consultant_id: Optional[int] = Query(None),
+    cc: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Employer Details cards for the Apply screen's signature preview — the
+    same ones the sent email gets: one per admin/recruiter in the CC. Pass
+    ?cc= (comma list) to preview an edited CC; otherwise the default CC for
+    the caller's role is used (admin -> admin + assigned recruiter,
+    recruiter -> themselves, consultant -> assigned recruiter)."""
+    from models import Consultant
+    from permission_service import resolve_cc_employers, default_cc_for_sender
+
+    cons = None
+    if current_user.role == "CONSULTANT":
+        cons = (await db.execute(
+            select(Consultant).where(Consultant.user_id == current_user.id)
+        )).scalars().first()
+    elif consultant_id:
+        cons = (await db.execute(
+            select(Consultant).where(Consultant.id == consultant_id)
+        )).scalars().first()
+    cc_list = cc if (cc is not None and current_user.role in ("ADMIN", "RECRUITER")) \
+        else await default_cc_for_sender(db, current_user, cons)
+    cards = await resolve_cc_employers(db, cc_list, current_user, cons)
+    return {"employers": cards, "employer": cards[0] if cards else None}
+
+
 @router.get("/api/consultant/email-queue/cc-options")
 async def get_cc_options(
     consultant_id: Optional[int] = Query(None),
@@ -692,14 +763,14 @@ async def get_cc_options(
         raise HTTPException(status_code=403, detail="CC options are only available to recruiters and admins.")
 
     from models import Consultant, RecruiterConsultant
-    from permission_service import get_handling_recruiter
+    from permission_service import get_handling_recruiter, resolve_employer_details
 
     me = (current_user.email or "").strip().lower()
 
     def row(u, tag):
         return {"user_id": u.id, "name": u.full_name, "email": u.email, "tag": tag}
 
-    assigned, handling_email = [], None
+    assigned, handling_email, cons = [], None, None
     if consultant_id:
         r = await db.execute(
             select(User)
@@ -720,30 +791,25 @@ async def get_cc_options(
     r = await db.execute(select(User).where(User.role == "RECRUITER", User.is_authorized == True))
     other_recruiters = [u for u in r.scalars().all() if u.id not in assigned_ids]
 
-    q = (
-        select(User)
-        .join(Consultant, Consultant.user_id == User.id)
-        .where(Consultant.status == "ACTIVE", User.is_authorized == True)
-    )
-    if consultant_id:
-        q = q.where(Consultant.id != consultant_id)
-    other_consultants = (await db.execute(q)).scalars().all()
-
     def keep(users):
         return [u for u in users if (u.email or "").strip().lower() != me]
 
     groups = [
         {"title": "Assigned recruiters", "items": [row(u, "assigned") for u in keep(assigned)]},
         {"title": "Other recruiters", "items": [row(u, "recruiter") for u in keep(other_recruiters)]},
-        {"title": "Other consultants", "items": [row(u, "consultant") for u in keep(other_consultants)]},
     ]
 
     default_selected = [current_user.email]
     if current_user.role == "ADMIN" and handling_email and handling_email.strip().lower() != me:
         default_selected.append(handling_email)
 
+    # Employer Details card that goes in the signature (recruiter sending ->
+    # themselves; admin -> the consultant's assigned recruiter).
+    employer = await resolve_employer_details(db, current_user, cons)
+
     return {
         "sender": {"name": current_user.full_name, "email": current_user.email},
+        "employer": employer,
         "default_selected": default_selected,
         "groups": [g for g in groups if g["items"]],
     }
@@ -951,6 +1017,11 @@ async def send_email_now(
     # recruiter's own email (current_user.email, set by default above) —
     # no extra branch needed here.
 
+    # Per-consultant duplicate check (requirement_id + consultant_id).
+    await _assert_not_already_applied(
+        db, body.requirement_id, consultant_id, getattr(consultant, "full_name", None)
+    )
+
     # Optional CC override — ADMIN / RECRUITER only (see create path).
     if body.cc_email is not None and current_user.role in ("ADMIN", "RECRUITER"):
         final_cc = _normalize_cc(body.cc_email, [effective_from_email, body.to_email])
@@ -989,9 +1060,10 @@ async def send_email_now(
         # consultant, shown as a second block below the consultant's own
         # signature regardless of who is sending. Omitted entirely (empty
         # dict) when the consultant has no assigned recruiter either way.
-        from permission_service import resolve_employer_details
-        employer = await resolve_employer_details(db, current_user, consultant)
-        employer = employer or {}
+        from permission_service import resolve_cc_employers
+        employer_cards = await resolve_cc_employers(db, final_cc, current_user, consultant)
+        employer = employer_cards[0] if employer_cards else {}
+        extra_employers = employer_cards[1:]
 
         # Custom signature editor/save removed — always use the default
         # signature card built from the consultant's own profile details
@@ -1009,6 +1081,7 @@ async def send_email_now(
             employer_email=employer.get("employer_email"),
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
+            extra_employers=extra_employers,
         )
         signature_html = build_signature_html(
             sender["sender_name"],
@@ -1023,6 +1096,7 @@ async def send_email_now(
             employer_phone=employer.get("employer_phone"),
             employer_extension=employer.get("employer_extension"),
             employer_linkedin_url=employer.get("employer_linkedin_url"),
+            extra_employers=extra_employers,
         )
 
         final_content = f"{body.content.rstrip()}\n\n{signature.strip()}" if (body.content or "").strip() else signature.strip()
@@ -1035,6 +1109,7 @@ async def send_email_now(
         )
     except Exception as sig_err:
         print(f"[email_queue] signature build failed, sending without one: {sig_err}")
+        traceback.print_exc()
         final_content = body.content or ""
         final_html_content = None
 

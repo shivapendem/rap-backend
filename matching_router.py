@@ -5,11 +5,11 @@ import math
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from models import User, Consultant, Requirement, RequirementConsultantMatch, RecruiterConsultant
+from models import User, Consultant, Requirement, RequirementConsultantMatch, RecruiterConsultant, Application
 from database import get_db, AsyncSessionLocal
 from auth import get_current_user
 from phase4 import match_requirement
@@ -243,6 +243,16 @@ async def get_pending_matches(
         _search_table = str.maketrans({c: " " for c in _INVISIBLE_SPACE_CHARS})
         normalized_search = re.sub(r"\s+", " ", search.translate(_search_table)).strip()
 
+    # A match whose consultant already has a SENT application for that same
+    # requirement is APPLIED, whatever the match row still says — this is the
+    # per-consultant (requirement + consultant) check, so other consultants
+    # on the same requirement are unaffected.
+    applied_exists = exists().where(
+        Application.requirement_id == RequirementConsultantMatch.requirement_id,
+        Application.consultant_id == RequirementConsultantMatch.consultant_id,
+        Application.status == "SENT",
+    )
+
     def _base_stmt(select_clause):
         stmt = (
             select_clause
@@ -255,7 +265,15 @@ async def get_pending_matches(
             )
         )
         if not show_all_statuses:
-            stmt = stmt.where(RequirementConsultantMatch.status == target_status)
+            if target_status in ("MATCHING", "NOT_ELIGIBLE"):
+                stmt = stmt.where(RequirementConsultantMatch.status == target_status, ~applied_exists)
+            elif target_status == "APPLIED":
+                stmt = stmt.where(or_(
+                    RequirementConsultantMatch.status == "APPLIED",
+                    applied_exists & (RequirementConsultantMatch.status != "REJECTED"),
+                ))
+            else:
+                stmt = stmt.where(RequirementConsultantMatch.status == target_status)
         if consultant_id:
             c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
             if c_ids:
@@ -298,6 +316,7 @@ async def get_pending_matches(
         RequirementConsultantMatch.status,
         RequirementConsultantMatch.resume_status,
         RequirementConsultantMatch.created_at,
+        applied_exists.label("has_sent_application"),
     ))
     # Same reasoning as before: order by match quality first, not by when
     # it happened to be scored, so a stronger match always sorts above a
@@ -332,7 +351,11 @@ async def get_pending_matches(
             "match_score": _safe_float(row["match_score"]),
             "score_breakdown": row["score_breakdown"] or {},
             "match_reason": row["match_reason"],
-            "status": row["status"],
+            "status": (
+                "APPLIED"
+                if row["has_sent_application"] and row["status"] in ("MATCHING", "NOT_ELIGIBLE")
+                else row["status"]
+            ),
             "resume_status": row["resume_status"],
             "created_at": row["created_at"],
         }

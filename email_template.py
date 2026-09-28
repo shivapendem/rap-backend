@@ -113,6 +113,7 @@ def build_signature_text(
     employer_email: Optional[str] = None,
     employer_phone: Optional[str] = None,
     employer_extension: Optional[str] = None,
+    extra_employers: Optional[list] = None,
 ) -> str:
     """Plain-text fallback signature — used as the multipart/plain part of
     the sent email, and shown in the (plain-text) preview UI.
@@ -141,6 +142,23 @@ def build_signature_text(
         if employer_extension:
             lines.append(f"T: {COMPANY_LINE_NUMBER}")
             lines.append(f"EXT {employer_extension}")
+        lines.append("")
+
+    # One more Employer Details block per additional recruiter in CC.
+    for ex in (extra_employers or []):
+        if not ex.get("employer_name"):
+            continue
+        lines.append("Employer Details:")
+        lines.append(ex["employer_name"])
+        if ex.get("employer_title"):
+            lines.append(ex["employer_title"])
+        if ex.get("employer_email"):
+            lines.append(f"E: {ex['employer_email']}")
+        if ex.get("employer_phone"):
+            lines.append(f"D: {ex['employer_phone']}")
+        if ex.get("employer_extension"):
+            lines.append(f"T: {COMPANY_LINE_NUMBER}")
+            lines.append(f"EXT {ex['employer_extension']}")
         lines.append("")
 
     lines.append("Best regards,")
@@ -180,6 +198,7 @@ def build_signature_html(
     employer_phone: Optional[str] = None,
     employer_extension: Optional[str] = None,
     employer_linkedin_url: Optional[str] = None,
+    extra_employers: Optional[list] = None,
 ) -> str:
     """Rich HTML signature — matches the provided card layout. Sent as the
     multipart/html part (see gmail_send_service.build_mime_message), so it
@@ -279,6 +298,40 @@ def build_signature_html(
     </td>
     <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
       {employer_contact_html}
+    </td>
+  </tr>
+</table>
+"""
+
+    # Additional recruiters in CC: same card, one per recruiter.
+    for ex in (extra_employers or []):
+        if not ex.get("employer_name"):
+            continue
+        ex_rows = []
+        if ex.get("employer_email"):
+            ex_rows.append(f'<b>E:</b> <a href="mailto:{esc(ex["employer_email"])}" style="color:#2563eb;text-decoration:underline;">{esc(ex["employer_email"])}</a>')
+        if ex.get("employer_phone"):
+            ex_rows.append(f'<b>D:</b> {esc(ex["employer_phone"])}')
+        if ex.get("employer_extension"):
+            ex_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)}')
+            ex_rows.append(f'EXT {esc(ex["employer_extension"])}')
+        ex_title = f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(ex.get("employer_title"))}</div>' if ex.get("employer_title") else ""
+        ex_linkedin = (
+            f'<div style="margin-top:8px;"><a href="{esc(ex["employer_linkedin_url"])}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(ex["employer_linkedin_url"])}</a></div>'
+            if ex.get("employer_linkedin_url") else ""
+        )
+        employer_block_html += f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Employer Details:</div>
+<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;margin-bottom:16px;">
+  <tr>
+    <td style="vertical-align:top;padding-right:20px;">
+      <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(ex["employer_name"])}</div>
+      {ex_title}
+      {ex_linkedin}
+      <div style="margin-top:4px;"><a href="https://{esc(COMPANY_WEBSITE)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(COMPANY_WEBSITE)}</a></div>
+    </td>
+    <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
+      {"<br>".join(ex_rows)}
     </td>
   </tr>
 </table>
