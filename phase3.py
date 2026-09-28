@@ -355,7 +355,10 @@ class ProfileUpdateRequest(BaseModel):
     @field_validator("employmentTypes")
     @classmethod
     def validate_employment_types(cls, v):
-        allowed = {"FULL_TIME", "CONTRACT"}
+        # W2 and 1099 added alongside FULL_TIME/CONTRACT (CONTRACT is shown
+        # as "Contract" in the UI) -- see CONSULTANT_EMPLOYMENT_PREF_GROUPS in
+        # phase4.py for how each value is matched against requirements.
+        allowed = {"FULL_TIME", "CONTRACT", "W2", "1099"}
         return list(dict.fromkeys(t for t in v if t in allowed))
 
     @field_validator("preferredLocations")
@@ -422,7 +425,10 @@ class AdminConsultantUpdateRequest(BaseModel):
     @field_validator("employmentTypes")
     @classmethod
     def validate_employment_types(cls, v):
-        allowed = {"FULL_TIME", "CONTRACT"}
+        # W2 and 1099 added alongside FULL_TIME/CONTRACT (CONTRACT is shown
+        # as "Contract" in the UI) -- see CONSULTANT_EMPLOYMENT_PREF_GROUPS in
+        # phase4.py for how each value is matched against requirements.
+        allowed = {"FULL_TIME", "CONTRACT", "W2", "1099"}
         return list(dict.fromkeys(t for t in v if t in allowed))
 
     @field_validator("preferredLocations")
@@ -488,7 +494,14 @@ class ProfileResponse(BaseModel):
 # shape exactly, same as the per-endpoint casing convention phase5.py uses.
 # ---------------------------------------------------------------------------
 
-_ADMIN_WORK_AUTHS = {"USC", "GC", "H1B", "OPT", "CPT", "EAD", "TN", "Other"}
+# BUG FIX ("Failed to create consultant" for F1 / STEM OPT / GC EAD / L1 /
+# U Visa): the frontend Add Consultant forms (AddConsultantDrawer.tsx,
+# AddEditUserDrawer.tsx) moved to the canonical work-auth list below, and
+# ProfileUpdateRequest / AdminConsultantUpdateRequest above were updated to
+# match — but this create-endpoint set was left on the old list, so 5 of the
+# 9 dropdown options were rejected with a 422. Kept identical to those two
+# update validators and to the matching engine's WORK_AUTH_BATCH_1/2/3.
+_ADMIN_WORK_AUTHS = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
 _ADMIN_EMPLOYMENT_PREFS = {"C2C", "W2", "1099", "FULL_TIME", "CONTRACT"}
 
 
@@ -1088,7 +1101,7 @@ def _detect_skills(text: str) -> list[str]:
 
 
 # See the BUG FIX note on ProfileUpdateRequest.validate_employment_types
-# above — `cleaned` has already been filtered to {FULL_TIME, CONTRACT} by
+# above — `cleaned` has already been filtered to {FULL_TIME, CONTRACT, W2, 1099} by
 # then. An empty result there is ambiguous (genuine clear vs. a legacy
 # value just being carried forward untouched); resolve that ambiguity
 # here, where we actually have the stored row: only a real, non-empty
