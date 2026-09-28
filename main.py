@@ -691,11 +691,20 @@ async def google_login(
         has_send_scope = "https://www.googleapis.com/auth/gmail.send" in granted_scopes
 
         if access_token and has_send_scope:
+            # BUG FIX (recruiter/admin logins attached their Gmail token to an
+            # arbitrary consultant): for any role other than CONSULTANT this
+            # used select(Consultant) with no filter and took .first() -- an
+            # unordered "some consultant" -- so a staff member's token was saved
+            # under (and overwrote the Gmail connection of) whichever consultant
+            # Postgres returned, and the startup sync then marked that unrelated
+            # consultant "Connected". Only a CONSULTANT login has a consultant
+            # profile to attach a token to; @savantisintelli.com senders go
+            # through the service account in the cron's email_queue.py and never
+            # read this token.
+            consultant = None
             if user.role == "CONSULTANT":
                 cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
-            else:
-                cons_result = await db.execute(select(Consultant))
-            consultant = cons_result.scalars().first()
+                consultant = cons_result.scalars().first()
             
             if consultant:
                 # Find existing token or create new one
@@ -722,6 +731,10 @@ async def google_login(
                     email_token.token_expiry = expiry_dt
                     email_token.send_permission_granted = True
                 
+                # The roster reads consultants.gmail_connected, which was only ever
+                # recomputed at process startup - so a freshly connected consultant
+                # showed "Not Connected" until the next restart. Set it with the token.
+                consultant.gmail_connected = True
                 await db.commit()
 
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
