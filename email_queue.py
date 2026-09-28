@@ -36,6 +36,25 @@ SEND_NOW_TIMEOUT_SECONDS = 20.0
 # Schemas
 # ---------------------------------------------------------------------------
 
+def _normalize_cc(raw: Optional[str], exclude: list) -> str:
+    """Validate, lowercase, dedupe a comma/semicolon separated CC list.
+    Drops From/To addresses. Raises 400 on a bad address or >10 recipients."""
+    import re
+    skip = {(e or "").strip().lower() for e in exclude}
+    out, seen = [], set()
+    for part in re.split(r"[;,]", raw or ""):
+        e = part.strip().lower()
+        if not e or e in skip or e in seen:
+            continue
+        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", e):
+            raise HTTPException(status_code=400, detail=f"Invalid CC email: {e}")
+        seen.add(e)
+        out.append(e)
+    if len(out) > 10:
+        raise HTTPException(status_code=400, detail="Too many CC recipients (max 10).")
+    return ",".join(out)
+
+
 class EmailQueueCreateRequest(BaseModel):
     consultant_id: Optional[int] = None
     requirement_id: Optional[int] = None
@@ -353,16 +372,24 @@ async def create_email_queue(
         # CONSULTANT applying for themselves — CC their recruiter.
         final_cc = recruiter_email
     elif (
-        current_user.role in ("ADMIN", "RECRUITER")
+        current_user.role == "ADMIN"
         and recruiter_email
         and recruiter_email.strip().lower() not in final_cc.strip().lower()
     ):
-        # FEATURE CHANGE: admin or recruiter applying on the consultant's behalf now
-        # CCs both the sender AND the consultant's assigned recruiter.
+        # ADMIN applying on the consultant's behalf CCs the admin AND the
+        # consultant's assigned recruiter. A RECRUITER sending CCs only
+        # themselves (the sending recruiter); a CONSULTANT CCs their
+        # assigned recruiter (self-apply branch above).
         final_cc = f"{final_cc},{recruiter_email}"
     # RECRUITER applying on behalf: final_cc already equals the
     # recruiter's own email (current_user.email, set by default above) —
     # no extra branch needed here.
+
+    # Optional CC override — ADMIN / RECRUITER only. CONSULTANT sends keep
+    # the automatic CC (their assigned recruiter) and any client-sent
+    # cc_email is ignored. cc_email omitted (None) keeps the auto CC above.
+    if body.cc_email is not None and current_user.role in ("ADMIN", "RECRUITER"):
+        final_cc = _normalize_cc(body.cc_email, [body.from_email, body.to_email])
 
     scheduled_at = await calculate_next_scheduled_at(db, body.from_email)
 
@@ -385,7 +412,8 @@ async def create_email_queue(
         # consultant, shown as a second block below the consultant's own
         # signature regardless of who is sending. Omitted entirely (empty
         # dict) when the consultant has no assigned recruiter either way.
-        employer = await get_handling_recruiter(db, consultant) if consultant else None
+        from permission_service import resolve_employer_details
+        employer = await resolve_employer_details(db, current_user, consultant)
         employer = employer or {}
 
         # Custom signature editor/save removed — always use the default
@@ -653,6 +681,74 @@ async def list_email_queue(
     }
 
 
+@router.get("/api/consultant/email-queue/cc-options")
+async def get_cc_options(
+    consultant_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CC suggestions for the Apply / Compose screens. ADMIN and RECRUITER only."""
+    if current_user.role not in ("ADMIN", "RECRUITER"):
+        raise HTTPException(status_code=403, detail="CC options are only available to recruiters and admins.")
+
+    from models import Consultant, RecruiterConsultant
+    from permission_service import get_handling_recruiter
+
+    me = (current_user.email or "").strip().lower()
+
+    def row(u, tag):
+        return {"user_id": u.id, "name": u.full_name, "email": u.email, "tag": tag}
+
+    assigned, handling_email = [], None
+    if consultant_id:
+        r = await db.execute(
+            select(User)
+            .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
+            .where(
+                RecruiterConsultant.consultant_id == consultant_id,
+                RecruiterConsultant.is_active == True,
+                User.is_authorized == True,
+            )
+        )
+        assigned = r.scalars().all()
+        cons = (await db.execute(select(Consultant).where(Consultant.id == consultant_id))).scalars().first()
+        if cons:
+            handling = await get_handling_recruiter(db, cons)
+            handling_email = (handling or {}).get("employer_email") or None
+
+    assigned_ids = {u.id for u in assigned}
+    r = await db.execute(select(User).where(User.role == "RECRUITER", User.is_authorized == True))
+    other_recruiters = [u for u in r.scalars().all() if u.id not in assigned_ids]
+
+    q = (
+        select(User)
+        .join(Consultant, Consultant.user_id == User.id)
+        .where(Consultant.status == "ACTIVE", User.is_authorized == True)
+    )
+    if consultant_id:
+        q = q.where(Consultant.id != consultant_id)
+    other_consultants = (await db.execute(q)).scalars().all()
+
+    def keep(users):
+        return [u for u in users if (u.email or "").strip().lower() != me]
+
+    groups = [
+        {"title": "Assigned recruiters", "items": [row(u, "assigned") for u in keep(assigned)]},
+        {"title": "Other recruiters", "items": [row(u, "recruiter") for u in keep(other_recruiters)]},
+        {"title": "Other consultants", "items": [row(u, "consultant") for u in keep(other_consultants)]},
+    ]
+
+    default_selected = [current_user.email]
+    if current_user.role == "ADMIN" and handling_email and handling_email.strip().lower() != me:
+        default_selected.append(handling_email)
+
+    return {
+        "sender": {"name": current_user.full_name, "email": current_user.email},
+        "default_selected": default_selected,
+        "groups": [g for g in groups if g["items"]],
+    }
+
+
 @router.post("/api/consultant/email-queue/send-now")
 async def send_email_now(
     body: EmailQueueCreateRequest,
@@ -814,7 +910,10 @@ async def send_email_now(
             detail="from_email does not match the current user or the resolved consultant — refusing to send.",
         )
 
-    final_cc = body.cc_email.strip() if body.cc_email else ""
+    # CC input is honoured for ADMIN / RECRUITER only; a CONSULTANT's
+    # cc_email is ignored so their assigned recruiter is always CC'd below.
+    _cc_in = body.cc_email if current_user.role in ("ADMIN", "RECRUITER") else None
+    final_cc = _cc_in.strip() if _cc_in else ""
     if final_cc:
         if current_user.email not in final_cc:
             final_cc = f"{final_cc},{current_user.email}"
@@ -839,16 +938,22 @@ async def send_email_now(
         # CONSULTANT applying for themselves — CC their recruiter.
         final_cc = recruiter_email
     elif (
-        current_user.role in ("ADMIN", "RECRUITER")
+        current_user.role == "ADMIN"
         and recruiter_email
         and recruiter_email.strip().lower() not in final_cc.strip().lower()
     ):
-        # FEATURE CHANGE: admin or recruiter applying on the consultant's behalf now
-        # CCs both the sender AND the consultant's assigned recruiter.
+        # ADMIN applying on the consultant's behalf CCs the admin AND the
+        # consultant's assigned recruiter. A RECRUITER sending CCs only
+        # themselves (the sending recruiter); a CONSULTANT CCs their
+        # assigned recruiter (self-apply branch above).
         final_cc = f"{final_cc},{recruiter_email}"
     # RECRUITER applying on behalf: final_cc already equals the
     # recruiter's own email (current_user.email, set by default above) —
     # no extra branch needed here.
+
+    # Optional CC override — ADMIN / RECRUITER only (see create path).
+    if body.cc_email is not None and current_user.role in ("ADMIN", "RECRUITER"):
+        final_cc = _normalize_cc(body.cc_email, [effective_from_email, body.to_email])
 
     # Auto-append the sender's contact-card signature (name, title/
     # designation, LinkedIn, email/mobile/office-extension, address) after
@@ -884,7 +989,8 @@ async def send_email_now(
         # consultant, shown as a second block below the consultant's own
         # signature regardless of who is sending. Omitted entirely (empty
         # dict) when the consultant has no assigned recruiter either way.
-        employer = await get_handling_recruiter(db, consultant) if consultant else None
+        from permission_service import resolve_employer_details
+        employer = await resolve_employer_details(db, current_user, consultant)
         employer = employer or {}
 
         # Custom signature editor/save removed — always use the default
