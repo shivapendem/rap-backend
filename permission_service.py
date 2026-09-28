@@ -202,3 +202,30 @@ async def get_handling_recruiter(db: AsyncSession, consultant) -> dict | None:
         "employer_extension": extract_extension_digits(getattr(recruiter, "extension", None)),
         "employer_linkedin_url": getattr(recruiter, "linkedin_url", None),
     }
+
+
+def employer_details_from_user(user) -> dict:
+    """Same shape as get_handling_recruiter's result, built straight from a
+    recruiter's own User row (used when the recruiter is the one sending)."""
+    return {
+        "employer_name": user.full_name or "",
+        "employer_title": getattr(user, "designation", None) or "Recruiter",
+        "employer_email": user.email or "",
+        "employer_phone": getattr(user, "mobile_number", None),
+        "employer_extension": extract_extension_digits(getattr(user, "extension", None)),
+        "employer_linkedin_url": getattr(user, "linkedin_url", None),
+    }
+
+
+async def resolve_employer_details(db: AsyncSession, current_user, consultant) -> dict | None:
+    """Who the signature's Employer Details card shows — always the recruiter
+    who is CC'd by default:
+      - RECRUITER sending  -> the sending recruiter
+      - ADMIN sending      -> the consultant's assigned recruiter
+      - CONSULTANT sending -> the consultant's assigned recruiter
+    """
+    if current_user.role == "RECRUITER":
+        return employer_details_from_user(current_user)
+    if consultant:
+        return await get_handling_recruiter(db, consultant)
+    return None
