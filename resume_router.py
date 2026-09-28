@@ -3006,6 +3006,36 @@ async def download_base_resume(
         headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
 
+async def _with_applied_flag(db, requirement_id, rows):
+    """Adds already_applied (SENT application or queued send for THIS
+    requirement + THAT consultant) to each consultant row."""
+    if not requirement_id or not rows:
+        return rows
+    from models import Application, EmailQueue
+    ids = [r["consultant_id"] for r in rows if r.get("consultant_id")]
+    applied = set()
+    if ids:
+        res = await db.execute(
+            select(Application.consultant_id).where(
+                Application.requirement_id == requirement_id,
+                Application.consultant_id.in_(ids),
+                Application.status == "SENT",
+            )
+        )
+        applied |= {x[0] for x in res.all()}
+        res = await db.execute(
+            select(EmailQueue.consultant_id).where(
+                EmailQueue.requirement_id == requirement_id,
+                EmailQueue.consultant_id.in_(ids),
+                EmailQueue.status.in_(["QUEUED", "PROCESSING"]),
+            )
+        )
+        applied |= {x[0] for x in res.all()}
+    for r in rows:
+        r["already_applied"] = r.get("consultant_id") in applied
+    return rows
+
+
 @router.get("/consultants")
 async def get_consultants_for_resumes(
     # BUG FIX: the Requirements page's "Apply" link (unlike Pending
@@ -3091,7 +3121,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
+        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results])
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
             Consultant.status == "ACTIVE",
@@ -3106,7 +3136,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
+        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results])
     else:
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id == current_user.id,
@@ -3117,7 +3147,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
+        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results])
 
 @router.get("/{id}", response_model=ResumeResponse)
 async def get_resume(
