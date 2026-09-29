@@ -1333,6 +1333,84 @@ _PATCH_FIELD_SEQ: Dict[tuple, int] = {}
 # Consultant Profile endpoints
 # ---------------------------------------------------------------------------
 
+async def _profile_version(db: AsyncSession, consultant: Consultant) -> str:
+    """Cheap change marker: newest updated_at of Consultant, linked User and
+    experience rows (+count for deletes). Clients refetch only on change."""
+    parts = [consultant.updated_at]
+    if consultant.user_id:
+        parts.append((await db.execute(
+            select(User.updated_at).where(User.id == consultant.user_id)
+        )).scalar_one_or_none())
+    exp_max, exp_count = (await db.execute(
+        select(func.max(ConsultantExperience.updated_at), func.count())
+        .where(ConsultantExperience.consultant_id == consultant.id)
+    )).one()
+    parts.append(exp_max)
+    newest = max((p for p in parts if p is not None), default=None)
+    return f"{newest.isoformat() if newest else '0'}|{exp_count}"
+
+
+@router.get("/api/consultant/profile/version", summary="Change marker for own profile")
+async def get_own_profile_version(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+    return {"version": await _profile_version(db, consultant)}
+
+
+@router.get("/api/consultants/{consultant_id}/version", summary="Change marker for a consultant profile")
+async def get_consultant_profile_version(
+    consultant_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    if current_user.role == "RECRUITER":
+        await _assert_recruiter_mapped(db, current_user.id, consultant_id)
+    consultant = await _get_consultant_or_404(db, consultant_id)
+    return {"version": await _profile_version(db, consultant)}
+
+async def _profile_version(db: AsyncSession, consultant: Consultant) -> str:
+    """Cheap change marker: newest updated_at of Consultant, linked User and
+    experience rows (+count for deletes). Clients refetch only on change."""
+    parts = [consultant.updated_at]
+    if consultant.user_id:
+        parts.append((await db.execute(
+            select(User.updated_at).where(User.id == consultant.user_id)
+        )).scalar_one_or_none())
+    exp_max, exp_count = (await db.execute(
+        select(func.max(ConsultantExperience.updated_at), func.count())
+        .where(ConsultantExperience.consultant_id == consultant.id)
+    )).one()
+    parts.append(exp_max)
+    newest = max((p for p in parts if p is not None), default=None)
+    return f"{newest.isoformat() if newest else '0'}|{exp_count}"
+
+
+@router.get("/api/consultant/profile/version", summary="Change marker for own profile")
+async def get_own_profile_version(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+    return {"version": await _profile_version(db, consultant)}
+
+
+@router.get("/api/consultants/{consultant_id}/version", summary="Change marker for a consultant profile")
+async def get_consultant_profile_version(
+    consultant_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    if current_user.role == "RECRUITER":
+        await _assert_recruiter_mapped(db, current_user.id, consultant_id)
+    consultant = await _get_consultant_or_404(db, consultant_id)
+    return {"version": await _profile_version(db, consultant)}
+
 @router.get(
     "/api/consultant/profile",
     response_model=ProfileResponse,
@@ -1739,7 +1817,21 @@ async def admin_create_consultant(
         # the AI resume draft. Previously this creation flow had no way to
         # set it at all, so every new consultant started with an empty
         # profile until someone separately edited them via Users → Edit.
-        resume_info=payload.resume_info,
+        # FIX: seed resume_info from the create form so the JSON matches the
+        # profile from day one; keys admin typed into the JSON still win.
+        resume_info={
+            **{k: v for k, v in {
+                "full_name": payload.name,
+                "email": payload.email,
+                "phone": payload.phone,
+                "location": payload.current_location,
+                "linkedin": payload.linkedin_url,
+                "years_experience": payload.total_experience_years,
+                "skills": [s.strip() for s in (payload.primary_skills or "").split(",") if s.strip()],
+                "education": [e.model_dump() for e in payload.education],
+            }.items() if v not in (None, "", [])},
+            **(payload.resume_info or {}),
+        },
     )
     _set_password_on_user(user, _hash_password(temp_password))
     db.add(user)
