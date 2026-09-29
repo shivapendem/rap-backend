@@ -1353,38 +1353,25 @@ class BaseResumeContentUpdateRequest(BaseModel):
                 return skills_val
             return [s.strip() for s in str(skills_val or "").split(",") if s.strip()]
 
-        has_primary = False
-        has_secondary = False
+        # CHANGE (secondary skills removed): there is no Primary/Secondary
+        # tier any more -- the editor no longer shows a star toggle and every
+        # skill is saved into the single primary_skills column. Require at
+        # least one non-empty skill anywhere, whatever its isPrimary flag or
+        # (legacy) category text says.
+        has_any_skill = False
         for row in tech_rows:
             if not isinstance(row, dict):
                 continue
-            category = str(row.get("category") or "").strip().lower()
-            legacy_bucket = "primary" if "primary" in category else "secondary"
             for item in _row_skill_items(row):
-                if isinstance(item, dict):
-                    if not str(item.get("name") or "").strip():
-                        continue
-                    if item.get("isPrimary"):
-                        has_primary = True
-                    else:
-                        has_secondary = True
-                else:
-                    if not str(item or "").strip():
-                        continue
-                    if legacy_bucket == "primary":
-                        has_primary = True
-                    else:
-                        has_secondary = True
+                name = item.get("name") if isinstance(item, dict) else item
+                if str(name or "").strip():
+                    has_any_skill = True
+                    break
+            if has_any_skill:
+                break
 
-        if not has_primary:
-            raise ValueError(
-                "Mark at least one skill as Primary in Technical Proficiencies "
-                "(click the star on a skill chip)"
-            )
-        if not has_secondary:
-            raise ValueError(
-                "Add at least one more skill that isn't marked Primary"
-            )
+        if not has_any_skill:
+            raise ValueError("Add at least one skill in Technical Proficiencies")
 
         return v
 
