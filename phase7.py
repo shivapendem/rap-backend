@@ -276,6 +276,10 @@ async def confirm_send(
         # consultants who have no token on file yet.
         token_res = await db.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id))
         token = token_res.scalars().first()
+        if token and getattr(token, "is_active", True) is False:
+            # Consultant is logged out or inactive — Gmail access is paused.
+            from gmail_status_sync import GMAIL_PAUSED_MESSAGE
+            raise HTTPException(status_code=403, detail=GMAIL_PAUSED_MESSAGE)
         if token and not token.send_permission_granted:
             raise HTTPException(
                 status_code=403,
