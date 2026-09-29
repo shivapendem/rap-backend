@@ -51,6 +51,9 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
 
 
 async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdminRowDTO:
+    # Local import avoids a circular import at module load (phase3.py is
+    # the module that owns preferred_locations normalization).
+    from phase3 import normalize_preferred_locations_or_none
     recruiters = await ConsultantRepository.get_assigned_recruiters(db, c.id)
 
     exp_count_result = await db.execute(
@@ -137,7 +140,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         phone=c.phone,
         sales_recruiter_user_id=str(c.sales_recruiter_user_id) if c.sales_recruiter_user_id else None,
         current_location=c.current_location,
-        preferred_locations=c.preferred_locations,
+        preferred_locations=normalize_preferred_locations_or_none(c.preferred_locations),
         availability_status=c.availability_status,
         total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
         preferred_roles=c.preferred_roles,
@@ -174,6 +177,9 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
 
 
 async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consultant]) -> List[ConsultantAdminRowDTO]:
+    # Local import avoids a circular import at module load (phase3.py is
+    # the module that owns preferred_locations normalization).
+    from phase3 import normalize_preferred_locations_or_none
     """
     Batched version of _consultant_to_dto() for list endpoints.
 
@@ -302,7 +308,7 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
             phone=c.phone,
             sales_recruiter_user_id=str(c.sales_recruiter_user_id) if c.sales_recruiter_user_id else None,
             current_location=c.current_location,
-            preferred_locations=c.preferred_locations,
+            preferred_locations=normalize_preferred_locations_or_none(c.preferred_locations),
             availability_status=c.availability_status,
             total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
                 preferred_roles=c.preferred_roles,
@@ -717,7 +723,10 @@ class ConsultantAssignmentService:
                     existing_info["linkedin"] = linkedin_url
                 if total_experience_years is not None:
                     existing_info["years_experience"] = total_experience_years
-                if preferred_roles is not None:
+                # FIX: don't overwrite the consultant's own "Target Title"
+                # (My Profile reads it from resume_info["title"]) every time
+                # admin edits Preferred Roles — only seed it when empty.
+                if preferred_roles is not None and not (existing_info.get("title") or "").strip():
                     existing_info["title"] = preferred_roles
                 linked_user.resume_info = existing_info
 
@@ -752,6 +761,15 @@ class ConsultantAssignmentService:
             metadata={"type": "consultant_profile_update"},
         )
         await db.commit()
+
+        # FIX: admin edits now re-run matching the same way the consultant's
+        # own profile save does, so both sides see the same match results.
+        try:
+            from phase3 import _trigger_consultant_rematch
+            _trigger_consultant_rematch(consultant.id)
+        except Exception:  # never fail the save because of the rematch trigger
+            pass
+
         return await _consultant_to_dto(db, consultant)
 
     @staticmethod

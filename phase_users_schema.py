@@ -331,10 +331,13 @@ class UpdateConsultantRequestDTO(BaseModel):
         # not touched) still passes through unchanged.
         if v is None or not v.strip():
             return v
-        parts = [p.strip() for p in v.split(",") if p.strip()]
-        if not parts or any(p not in PREFERRED_LOCATION_OPTIONS for p in parts):
-            raise ValueError(f"preferred_locations must be a comma-separated list of one or more of {PREFERRED_LOCATION_OPTIONS}")
-        return ",".join(dict.fromkeys(parts))
+        # FIX: same normalizer as the consultant's own profile (legacy
+        # "All", "on-site", "Remote/Hybrid" etc. → canonical order).
+        from phase3 import normalize_preferred_locations  # local import avoids circular import at module load
+        normalized = normalize_preferred_locations(v)
+        if not normalized:
+            raise ValueError("Select at least one preferred location (Onsite, Hybrid, Remote)")
+        return normalized
 
     @field_validator("phone")
     @classmethod
