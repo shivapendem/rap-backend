@@ -1739,6 +1739,13 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                             f"but item.from_email={item.from_email!r}"
                         )
 
+        # Consultant logged out / inactive: their Gmail access is paused.
+        # Block the send here (and don't fall back to the service account),
+        # and keep the token so it can be resumed on their next login.
+        if email_tok is not None and getattr(email_tok, "is_active", True) is False:
+            from gmail_status_sync import GMAIL_PAUSED_MESSAGE
+            raise ValueError(GMAIL_PAUSED_MESSAGE)
+
         if email_tok and email_tok.access_token_encrypted:
             from datetime import datetime, timezone, timedelta
             import httpx

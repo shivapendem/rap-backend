@@ -111,6 +111,9 @@ async def assert_gmail_connected(db: AsyncSession, consultant_id: int):
             status_code=400,
             detail="Consultant Gmail not connected. Please connect Gmail first.",
         )
+    if getattr(token, "is_active", True) is False:
+        from gmail_status_sync import GMAIL_PAUSED_MESSAGE
+        raise HTTPException(status_code=403, detail=GMAIL_PAUSED_MESSAGE)
     if not token.send_permission_granted:
         raise HTTPException(
             status_code=403,

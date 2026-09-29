@@ -371,11 +371,12 @@ class ProfileUpdateRequest(BaseModel):
         # Changed from a single value to a comma-separated list from a
         # checkbox group (e.g. "Onsite,Remote") — at least one required.
         # "All" is no longer accepted: pick the ones actually wanted.
-        allowed = {"Onsite", "Hybrid", "Remote"}
-        parts = [p.strip() for p in v.split(",") if p.strip()]
-        if not parts or any(p not in allowed for p in parts):
-            raise ValueError(f"preferredLocations must be a comma-separated list of one or more of {allowed}")
-        return ",".join(dict.fromkeys(parts))
+        # FIX: normalize legacy/variant spellings ("All", "on-site",
+        # "Remote/Hybrid") instead of rejecting them — see preferred_locations.py.
+        normalized = normalize_preferred_locations(v)
+        if not normalized:
+            raise ValueError("Select at least one preferred location (Onsite, Hybrid, Remote)")
+        return normalized
 
 
 # BUG FIX (app crashed on startup): update_consultant_by_id below declares
@@ -395,57 +396,195 @@ class ProfileUpdateRequest(BaseModel):
 # omitting title/summary/clientWriteSeq — this is an admin or recruiter
 # editing someone ELSE's profile, not the consultant's own profile form,
 # and the endpoint never reads those three fields.
-class AdminConsultantUpdateRequest(BaseModel):
-    fullName: str = Field(..., min_length=1, max_length=200)
-    location: str = Field(..., min_length=2, max_length=100)
-    phone: str = Field(..., pattern=r"^\+?[\d\s\-().]{7,20}$")
-    linkedInUrl: str = Field(..., min_length=1)
-    primarySkills: List[str] = Field(..., min_length=1)
-    workAuth: str = Field(...)
-    employmentTypes: List[str] = Field(..., min_length=1)
-    preferredRoles: str = Field(..., min_length=1, max_length=200)
-    preferredLocations: str = Field(..., min_length=1, max_length=40)
-    totalExperienceYears: float = Field(..., ge=0, le=60)
-    education: List[EducationEntryRequest] = Field(..., min_length=1)
+# ── Shared PARTIAL-update base ─────────────────────────────────────────────
+# FIX ("changing Work Authorization shows 'Preferred Location is required'";
+# "each field must save independently"): the profile used to be saved as a
+# FULL overwrite, so every save re-sent every field and ANY invalid/legacy
+# value elsewhere (preferred location, education, title...) rejected the
+# unrelated change. These models are partial: only keys present in the
+# request body are validated and written (model_fields_set). A key that IS
+# sent must still be valid, and required fields can't be cleared with null.
+# ── Preferred Location normalization ────────────────────────────────────────
+# Single source of truth for Consultant.preferred_locations, used by this
+# file's own validators/response below AND (via a local import, same
+# pattern as _trigger_consultant_rematch elsewhere in this codebase) by
+# phase_users_schema.py's admin validator and phase_users_service.py's
+# admin response. Stored as a comma-separated string of one or more of
+# Onsite / Hybrid / Remote, always in canonical order
+# ("Onsite,Hybrid,Remote"). Older rows hold legacy spellings ("All",
+# "on-site", "remote ", "Remote/Hybrid", ...) that the strict validators
+# used to reject outright — which blocked EVERY profile save (work auth,
+# skills, ...) because the whole profile used to be re-sent on every save.
+PREFERRED_LOCATION_OPTIONS = ("Onsite", "Hybrid", "Remote")
+
+_LOCATION_ALIASES = {
+    "onsite": "Onsite", "on-site": "Onsite", "on site": "Onsite",
+    "office": "Onsite", "in office": "Onsite", "in-office": "Onsite",
+    "hybrid": "Hybrid",
+    "remote": "Remote", "wfh": "Remote", "work from home": "Remote",
+}
+_LOCATION_ALL = {"all", "any", "both", "flexible", "open", "anywhere"}
+
+
+# FIX: real production data (see the one-time cleanup output) included
+# full sentences like "Willing to go Onsite at Houston, TX, USA" and
+# "Atlanta, GA ( Remote )" — the exact-token match above (requiring the
+# WHOLE token to equal "onsite"/"remote"/etc.) missed these entirely and
+# silently cleared them. Search each token for the KEYWORD anywhere in it
+# (word-boundary, so "onsite" inside "consite" wouldn't false-match) as a
+# second pass. Free-text city/state names with no work-mode word at all
+# ("Dallas TX", "Texas", "Willingness to relocate") still correctly clear —
+# there is nothing there to recover, and (see score_location in phase4.py)
+# a value like that was ALREADY not contributing to matching before this
+# fix, since it never equaled ONSITE/HYBRID/REMOTE either.
+_RE_HYBRID = re.compile(r"\bhybrid\b")
+_RE_ONSITE = re.compile(r"\bon[\s-]?site\b|\bin[\s-]?office\b")
+_RE_REMOTE = re.compile(r"\bremote\b|\bwfh\b|\bwork\s*from\s*home\b")
+_RE_ANYWHERE = re.compile(r"\bany\s*-?\s*(?:wher?e|ware)\b")  # "any where"/"anywhere"/"any ware" typos
+
+
+def normalize_preferred_locations(value) -> str:
+    """Return canonical "Onsite,Hybrid,Remote"-style string, or "" if nothing valid."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        tokens = [str(v) for v in value]
+    else:
+        tokens = re.split(r"[,;/|]+", str(value))
+    picked = set()
+    for t in tokens:
+        key = " ".join(t.strip().lower().split())
+        if not key:
+            continue
+        if key in _LOCATION_ALL:
+            picked.update(PREFERRED_LOCATION_OPTIONS)
+            continue
+        canon = _LOCATION_ALIASES.get(key)
+        if canon:
+            picked.add(canon)
+            continue
+        # Second pass: the token wasn't an exact match (e.g. it's a full
+        # sentence) — look for a recognizable keyword inside it instead.
+        if _RE_ANYWHERE.search(key):
+            picked.update(PREFERRED_LOCATION_OPTIONS)
+            continue
+        if _RE_HYBRID.search(key):
+            picked.add("Hybrid")
+        if _RE_ONSITE.search(key):
+            picked.add("Onsite")
+        if _RE_REMOTE.search(key):
+            picked.add("Remote")
+    return ",".join(o for o in PREFERRED_LOCATION_OPTIONS if o in picked)
+
+
+def normalize_preferred_locations_or_none(value):
+    """Read-side helper: canonical string, or None when nothing valid is stored."""
+    return normalize_preferred_locations(value) or None
+
+
+_PROFILE_REQUIRED_FIELDS = (
+    "fullName", "location", "phone", "linkedInUrl", "primarySkills", "workAuth",
+    "employmentTypes", "preferredRoles", "preferredLocations",
+    "totalExperienceYears", "title", "education",
+)
+_VALID_WORK_AUTHS = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+
+
+class _ProfilePartialBase(BaseModel):
+    fullName: Optional[str] = Field(None, min_length=1, max_length=200)
+    location: Optional[str] = Field(None, min_length=2, max_length=100)
+    phone: Optional[str] = Field(None, pattern=r"^\+?[\d\s\-().]{7,20}$")
+    linkedInUrl: Optional[str] = None
+    primarySkills: Optional[List[str]] = None
+    workAuth: Optional[str] = None
+    employmentTypes: Optional[List[str]] = None
+    preferredRoles: Optional[str] = Field(None, min_length=1, max_length=200)
+    preferredLocations: Optional[str] = None
+    totalExperienceYears: Optional[float] = Field(None, ge=0, le=60)
+    education: Optional[List[EducationEntryRequest]] = None
     resumeRichText: Optional[str] = None
+
+    @field_validator(*[f for f in _PROFILE_REQUIRED_FIELDS if f != "title"])
+    @classmethod
+    def _required_not_null(cls, v, info):
+        if v is None:
+            raise ValueError(f"{info.field_name} is required and cannot be cleared")
+        return v
 
     @field_validator("workAuth")
     @classmethod
     def validate_work_auth(cls, v):
-        valid = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
-        if v not in valid:
-            raise ValueError(f"workAuth must be one of {', '.join(sorted(valid))}")
+        if v is not None and v not in _VALID_WORK_AUTHS:
+            raise ValueError(f"workAuth must be one of {', '.join(sorted(_VALID_WORK_AUTHS))}")
         return v
 
     @field_validator("linkedInUrl")
     @classmethod
     def validate_linkedin_url(cls, v):
+        if v is None:
+            return v
         if not re.match(r"^https?://", v):
             raise ValueError("linkedInUrl must be a valid URL")
         if "linkedin.com" not in v:
             raise ValueError("linkedInUrl must be a LinkedIn URL")
         return v
 
+    @field_validator("primarySkills")
+    @classmethod
+    def validate_primary_skills(cls, v):
+        if v is None:
+            return v
+        cleaned = [s.strip() for s in v if s and s.strip()]
+        if not cleaned:
+            raise ValueError("Add at least one skill")
+        return cleaned
+
     @field_validator("employmentTypes")
     @classmethod
     def validate_employment_types(cls, v):
-        # W2 and 1099 added alongside FULL_TIME/CONTRACT (CONTRACT is shown
-        # as "Contract" in the UI) -- see CONSULTANT_EMPLOYMENT_PREF_GROUPS in
-        # phase4.py for how each value is matched against requirements.
+        if v is None:
+            return v
         allowed = {"FULL_TIME", "CONTRACT", "W2", "1099"}
         return list(dict.fromkeys(t for t in v if t in allowed))
 
     @field_validator("preferredLocations")
     @classmethod
     def validate_preferred_locations(cls, v):
-        # Changed from a single value to a comma-separated list from a
-        # checkbox group (e.g. "Onsite,Remote") — at least one required.
-        # "All" is no longer accepted: pick the ones actually wanted.
-        allowed = {"Onsite", "Hybrid", "Remote"}
-        parts = [p.strip() for p in v.split(",") if p.strip()]
-        if not parts or any(p not in allowed for p in parts):
-            raise ValueError(f"preferredLocations must be a comma-separated list of one or more of {allowed}")
-        return ",".join(dict.fromkeys(parts))
+        if v is None:
+            return v
+        normalized = normalize_preferred_locations(v)
+        if not normalized:
+            raise ValueError("Select at least one preferred location (Onsite, Hybrid, Remote)")
+        return normalized
+
+    @field_validator("education")
+    @classmethod
+    def validate_education(cls, v):
+        if v is not None and len(v) == 0:
+            raise ValueError("Add at least one education entry")
+        return v
+
+
+# Admin / assigned-recruiter edit of another consultant (PUT /api/consultants/{id}).
+# Now partial — recruiter screen sends only the edited field. Previously it
+# required education (which the recruiter screen never sent → every save 422'd)
+# and silently wiped resume_rich_text on every save.
+class AdminConsultantUpdateRequest(_ProfilePartialBase):
+    pass
+
+
+# Consultant's own profile, PATCH /api/consultant/profile.
+class ProfilePatchRequest(_ProfilePartialBase):
+    title: Optional[str] = Field(None, min_length=2, max_length=150)
+    summary: Optional[str] = None
+    clientWriteSeq: Optional[int] = None
+
+    @field_validator("title")
+    @classmethod
+    def _title_not_null(cls, v):
+        if v is None:
+            raise ValueError("title is required and cannot be cleared")
+        return v
 
 
 class ProfileResponse(BaseModel):
@@ -527,6 +666,22 @@ class AdminConsultantCreateRequest(BaseModel):
     resume_rich_text: Optional[str] = None
     linkedin_url: Optional[str] = None
     education: List[EducationEntryRequest] = []
+
+    # FIX (missed in the first pass): this create-path validator had no
+    # normalization at all, unlike every other place preferred_locations is
+    # saved (ProfileUpdateRequest, AdminConsultantUpdateRequest,
+    # UpdateConsultantRequestDTO) -- a consultant created here with a legacy
+    # value ("All", "on-site", "Remote/Hybrid") would disagree with their own
+    # profile screen the moment they first logged in and saved anything.
+    @field_validator("preferred_locations")
+    @classmethod
+    def validate_preferred_locations(cls, v):
+        if v is None or not v.strip():
+            return v
+        normalized = normalize_preferred_locations(v)
+        if not normalized:
+            raise ValueError("preferred_locations must be one or more of Onsite, Hybrid, Remote")
+        return normalized
 
     @field_validator("email")
     @classmethod
@@ -872,7 +1027,7 @@ async def _consultant_to_profile_response(
         atsScore=float(latest_ats_score) if latest_ats_score is not None else 0.0,
         status=c.status,
         preferredRoles=c.preferred_roles,
-        preferredLocations=c.preferred_locations,
+        preferredLocations=normalize_preferred_locations_or_none(c.preferred_locations),
         resume_info=resume_info,
         title=resume_info.get("title"),
         summary=resume_info.get("summary"),
@@ -1118,9 +1273,143 @@ def _resolve_employment_types(existing: Optional[List[str]], cleaned: List[str])
     return cleaned if cleaned else (existing or [])
 
 
+# ── Partial-update helpers (shared by PATCH own profile + admin/recruiter PUT)
+def _apply_profile_fields(consultant: Consultant, payload: BaseModel, sent: set) -> None:
+    """Write ONLY the fields present in the request onto the Consultant row."""
+    if "fullName" in sent:
+        consultant.full_name = payload.fullName
+    if "location" in sent:
+        consultant.current_location = payload.location
+    if "phone" in sent:
+        consultant.phone = payload.phone
+    if "linkedInUrl" in sent:
+        consultant.linkedin_url = payload.linkedInUrl
+    if "primarySkills" in sent:
+        consultant.primary_skills = ", ".join(payload.primarySkills)
+    if "workAuth" in sent:
+        consultant.work_authorization = payload.workAuth
+    if "employmentTypes" in sent:
+        consultant.preferred_employment_types = _resolve_employment_types(
+            consultant.preferred_employment_types, payload.employmentTypes
+        )
+    if "preferredRoles" in sent:
+        consultant.preferred_roles = payload.preferredRoles
+    if "preferredLocations" in sent:
+        consultant.preferred_locations = payload.preferredLocations
+    if "totalExperienceYears" in sent:
+        consultant.total_experience_years = payload.totalExperienceYears
+    if "education" in sent:
+        consultant.education = [e.model_dump() for e in payload.education]
+    if "resumeRichText" in sent:
+        consultant.resume_rich_text = payload.resumeRichText
+
+
+def _merge_resume_info(info: Dict[str, Any], payload: BaseModel, sent: set) -> None:
+    """Merge ONLY the sent fields into User.resume_info (keys FIELD_CHECKS expects)."""
+    mapping = {
+        "fullName": "full_name", "phone": "phone", "linkedInUrl": "linkedin",
+        "location": "location", "title": "title", "summary": "summary",
+        "totalExperienceYears": "years_experience", "primarySkills": "skills",
+    }
+    for field, key in mapping.items():
+        if field in sent:
+            info[key] = getattr(payload, field)
+    if "education" in sent:
+        info["education"] = [e.model_dump() for e in payload.education]
+
+
+# Fields whose change should re-run matching for the consultant.
+_REMATCH_FIELDS = {
+    "primarySkills", "workAuth", "employmentTypes", "preferredRoles",
+    "preferredLocations", "totalExperienceYears", "location", "title",
+}
+
+# Per-field out-of-order guard for PATCH (in-process). Independent fields
+# never block each other; only an OLDER write to the SAME field is dropped.
+_PATCH_FIELD_SEQ: Dict[tuple, int] = {}
+
+
 # ---------------------------------------------------------------------------
 # Consultant Profile endpoints
 # ---------------------------------------------------------------------------
+
+async def _profile_version(db: AsyncSession, consultant: Consultant) -> str:
+    """Cheap change marker: newest updated_at of Consultant, linked User and
+    experience rows (+count for deletes). Clients refetch only on change."""
+    parts = [consultant.updated_at]
+    if consultant.user_id:
+        parts.append((await db.execute(
+            select(User.updated_at).where(User.id == consultant.user_id)
+        )).scalar_one_or_none())
+    exp_max, exp_count = (await db.execute(
+        select(func.max(ConsultantExperience.updated_at), func.count())
+        .where(ConsultantExperience.consultant_id == consultant.id)
+    )).one()
+    parts.append(exp_max)
+    newest = max((p for p in parts if p is not None), default=None)
+    return f"{newest.isoformat() if newest else '0'}|{exp_count}"
+
+
+@router.get("/api/consultant/profile/version", summary="Change marker for own profile")
+async def get_own_profile_version(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+    return {"version": await _profile_version(db, consultant)}
+
+
+@router.get("/api/consultants/{consultant_id}/version", summary="Change marker for a consultant profile")
+async def get_consultant_profile_version(
+    consultant_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    if current_user.role == "RECRUITER":
+        await _assert_recruiter_mapped(db, current_user.id, consultant_id)
+    consultant = await _get_consultant_or_404(db, consultant_id)
+    return {"version": await _profile_version(db, consultant)}
+
+async def _profile_version(db: AsyncSession, consultant: Consultant) -> str:
+    """Cheap change marker: newest updated_at of Consultant, linked User and
+    experience rows (+count for deletes). Clients refetch only on change."""
+    parts = [consultant.updated_at]
+    if consultant.user_id:
+        parts.append((await db.execute(
+            select(User.updated_at).where(User.id == consultant.user_id)
+        )).scalar_one_or_none())
+    exp_max, exp_count = (await db.execute(
+        select(func.max(ConsultantExperience.updated_at), func.count())
+        .where(ConsultantExperience.consultant_id == consultant.id)
+    )).one()
+    parts.append(exp_max)
+    newest = max((p for p in parts if p is not None), default=None)
+    return f"{newest.isoformat() if newest else '0'}|{exp_count}"
+
+
+@router.get("/api/consultant/profile/version", summary="Change marker for own profile")
+async def get_own_profile_version(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+    return {"version": await _profile_version(db, consultant)}
+
+
+@router.get("/api/consultants/{consultant_id}/version", summary="Change marker for a consultant profile")
+async def get_consultant_profile_version(
+    consultant_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    if current_user.role == "RECRUITER":
+        await _assert_recruiter_mapped(db, current_user.id, consultant_id)
+    consultant = await _get_consultant_or_404(db, consultant_id)
+    return {"version": await _profile_version(db, consultant)}
 
 @router.get(
     "/api/consultant/profile",
@@ -1260,6 +1549,56 @@ async def update_own_profile(
     return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
 
 
+@router.patch(
+    "/api/consultant/profile",
+    response_model=ProfileResponse,
+    summary="Partially update own consultant profile (only fields sent are changed)",
+)
+async def patch_own_profile(
+    payload: ProfilePatchRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CONSULTANT role only. Each profile card saves ONLY its own field(s),
+    so a bad/legacy value in one field can never block saving another."""
+    _require_role(current_user, "CONSULTANT")
+    consultant = await _get_consultant_for_user(db, current_user)
+
+    sent = set(payload.model_fields_set) - {"clientWriteSeq"}
+    if payload.clientWriteSeq is not None:
+        for field in list(sent):
+            key = (consultant.id, field)
+            last = _PATCH_FIELD_SEQ.get(key)
+            if last is not None and payload.clientWriteSeq <= last:
+                sent.discard(field)  # a newer write to this same field already landed
+            else:
+                _PATCH_FIELD_SEQ[key] = payload.clientWriteSeq
+
+    if sent:
+        _apply_profile_fields(consultant, payload, sent)
+
+        info = dict(current_user.resume_info or {})
+        info["email"] = current_user.email
+        _merge_resume_info(info, payload, sent)
+        current_user.resume_info = info
+
+        from resume_router import sync_base_resume_text
+        await sync_base_resume_text(db, consultant, info, background_tasks)
+
+        await db.commit()
+        await db.refresh(consultant)
+
+        if sent & _REMATCH_FIELDS:
+            _trigger_consultant_rematch(consultant.id)
+
+    count_result = await db.execute(
+        select(func.count()).where(ConsultantExperience.consultant_id == consultant.id)
+    )
+    exp_count = count_result.scalar_one()
+    return await _consultant_to_profile_response(db, consultant, exp_count, include_resume_size=False)
+
+
 @router.get(
     "/api/consultants",
     response_model=ConsultantListResponse,
@@ -1388,20 +1727,19 @@ async def update_consultant_by_id(
 
     consultant = await _get_consultant_or_404(db, consultant_id)
 
-    consultant.full_name = payload.fullName
-    consultant.current_location = payload.location
-    consultant.phone = payload.phone
-    consultant.work_authorization = payload.workAuth
-    consultant.primary_skills = ", ".join(payload.primarySkills)
-    consultant.linkedin_url = payload.linkedInUrl
-    consultant.preferred_employment_types = _resolve_employment_types(
-        consultant.preferred_employment_types, payload.employmentTypes
-    )
-    consultant.preferred_roles = payload.preferredRoles
-    consultant.preferred_locations = payload.preferredLocations
-    consultant.total_experience_years = payload.totalExperienceYears
-    consultant.education = [e.model_dump() for e in payload.education]
-    consultant.resume_rich_text = payload.resumeRichText
+    # FIX: partial update — only the fields actually sent are written.
+    sent = set(payload.model_fields_set)
+    _apply_profile_fields(consultant, payload, sent)
+
+    # Keep User.resume_info in sync so the consultant's own "My Profile"
+    # (which reads title/summary/education/linkedin from there) and resume
+    # generation show exactly what admin/recruiter just saved.
+    if consultant.user_id:
+        linked_user = (await db.execute(select(User).where(User.id == consultant.user_id))).scalars().first()
+        if linked_user:
+            info = dict(linked_user.resume_info or {})
+            _merge_resume_info(info, payload, sent)
+            linked_user.resume_info = info
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
@@ -1479,7 +1817,21 @@ async def admin_create_consultant(
         # the AI resume draft. Previously this creation flow had no way to
         # set it at all, so every new consultant started with an empty
         # profile until someone separately edited them via Users → Edit.
-        resume_info=payload.resume_info,
+        # FIX: seed resume_info from the create form so the JSON matches the
+        # profile from day one; keys admin typed into the JSON still win.
+        resume_info={
+            **{k: v for k, v in {
+                "full_name": payload.name,
+                "email": payload.email,
+                "phone": payload.phone,
+                "location": payload.current_location,
+                "linkedin": payload.linkedin_url,
+                "years_experience": payload.total_experience_years,
+                "skills": [s.strip() for s in (payload.primary_skills or "").split(",") if s.strip()],
+                "education": [e.model_dump() for e in payload.education],
+            }.items() if v not in (None, "", [])},
+            **(payload.resume_info or {}),
+        },
     )
     _set_password_on_user(user, _hash_password(temp_password))
     db.add(user)

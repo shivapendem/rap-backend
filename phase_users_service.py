@@ -51,6 +51,9 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
 
 
 async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdminRowDTO:
+    # Local import avoids a circular import at module load (phase3.py is
+    # the module that owns preferred_locations normalization).
+    from phase3 import normalize_preferred_locations_or_none
     recruiters = await ConsultantRepository.get_assigned_recruiters(db, c.id)
 
     exp_count_result = await db.execute(
@@ -137,7 +140,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         phone=c.phone,
         sales_recruiter_user_id=str(c.sales_recruiter_user_id) if c.sales_recruiter_user_id else None,
         current_location=c.current_location,
-        preferred_locations=c.preferred_locations,
+        preferred_locations=normalize_preferred_locations_or_none(c.preferred_locations),
         availability_status=c.availability_status,
         total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
         preferred_roles=c.preferred_roles,
@@ -155,7 +158,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         # use identical fallback logic; both write paths still write the
         # real column going forward, so this only matters for old rows.
         linkedin_url=c.linkedin_url if c.linkedin_url is not None else (resume_info or {}).get("linkedin"),
-        education=c.education or (resume_info or {}).get("education") or [],
+        education=c.education if c.education is not None else ((resume_info or {}).get("education") or []),
         # BUG FIX (the actual "Resume Info JSON is missing" cause): this
         # fetched User.resume_info into the local `resume_info` variable
         # above purely for the linkedin_url/education fallback, but never
@@ -174,6 +177,9 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
 
 
 async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consultant]) -> List[ConsultantAdminRowDTO]:
+    # Local import avoids a circular import at module load (phase3.py is
+    # the module that owns preferred_locations normalization).
+    from phase3 import normalize_preferred_locations_or_none
     """
     Batched version of _consultant_to_dto() for list endpoints.
 
@@ -302,7 +308,7 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
             phone=c.phone,
             sales_recruiter_user_id=str(c.sales_recruiter_user_id) if c.sales_recruiter_user_id else None,
             current_location=c.current_location,
-            preferred_locations=c.preferred_locations,
+            preferred_locations=normalize_preferred_locations_or_none(c.preferred_locations),
             availability_status=c.availability_status,
             total_experience_years=float(c.total_experience_years) if c.total_experience_years is not None else None,
                 preferred_roles=c.preferred_roles,
@@ -465,8 +471,20 @@ class UserService:
                 consultant.preferred_employment_types = req.preferred_employment_types
             if req.primary_skills is not None:
                 consultant.primary_skills = req.primary_skills
+            # FIX: Users-page Resume Info JSON must reach the real columns too.
+            if req.resume_info is not None:
+                _sync_resume_info_to_columns(
+                    consultant, req.resume_info,
+                    {"full_name"} | ({"primary_skills"} if req.primary_skills is not None else set()),
+                )
             consultant.full_name = user.full_name
             consultant.email = user.email
+            # FIX: keep resume_info name/email in step with admin name/email edit.
+            _info = dict(user.resume_info or {})
+            if _info.get("full_name") != user.full_name or _info.get("email") != user.email:
+                _info["full_name"] = user.full_name
+                _info["email"] = user.email
+                user.resume_info = _info
             # BUG FIX ("toggle Authorize/Unauthorize in User Management
             # doesn't stick — Consultants list still shows the old
             # status"): user.is_authorized was updated above, but
@@ -475,8 +493,14 @@ class UserService:
             # sync, so the two screens silently disagreed after every
             # toggle. Mirror it here the same way deactivate/activate
             # already do for the Consultants page's own toggle.
-            consultant.status = "ACTIVE" if req.is_authorized else "INACTIVE"
+            # FIX: name/email edit reset BENCH / ON_PROJECT to ACTIVE.
+            if not req.is_authorized:
+                consultant.status = "INACTIVE"
+            elif consultant.status in (None, "", "INACTIVE"):
+                consultant.status = "ACTIVE"
             await ConsultantRepository.update(db, consultant)
+            from resume_router import sync_base_resume_text
+            await sync_base_resume_text(db, consultant)
             if req.recruiter_id:
                 rid = int(req.recruiter_id)
                 already = await RecruiterConsultantRepository.exists(db, rid, consultant.id)
@@ -585,6 +609,64 @@ def _split_categorized_segment(segment: str) -> List[str]:
     return out
 
 
+def _sync_resume_info_to_columns(
+    consultant: Consultant, info: Any, skip: set, linked_user: Optional[User] = None,
+) -> None:
+    """FIX: Resume Info JSON edits never reached the real Consultant columns
+    (what My Profile + admin field rows read). Push valid, changed values back.
+    Fields sent explicitly in the same request (skip) win. Email never synced."""
+    if not isinstance(info, dict):
+        return
+
+    def _text(key: str) -> Optional[str]:
+        v = info.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    name = _text("full_name")
+    if "full_name" not in skip and name and name != consultant.full_name:
+        consultant.full_name = name
+        if linked_user is not None:
+            linked_user.full_name = name
+
+    for key, attr in (("phone", "phone"), ("location", "current_location"), ("linkedin", "linkedin_url")):
+        v = _text(key)
+        if attr not in skip and v and v != getattr(consultant, attr):
+            setattr(consultant, attr, v)
+
+    if "total_experience_years" not in skip and "years_experience" in info:
+        try:
+            yrs = float(info["years_experience"])
+        except (TypeError, ValueError):
+            yrs = None
+        if yrs is not None and 0 <= yrs <= 60:
+            consultant.total_experience_years = yrs
+
+    if "primary_skills" not in skip and "skills" in info:
+        skills = info["skills"]
+        if isinstance(skills, str):
+            skills = skills.split(",")
+        if isinstance(skills, list):
+            cleaned = [str(s).strip() for s in skills if isinstance(s, (str, int, float)) and str(s).strip()]
+            current = [s.lower() for s in _skills_to_list(consultant.primary_skills or "")]
+            # Only rewrite when really changed — keeps categorized "Cat: a ‖ ..." format.
+            if cleaned and [s.lower() for s in cleaned] != current:
+                consultant.primary_skills = ", ".join(cleaned)
+
+    if "education" not in skip and isinstance(info.get("education"), list):
+        edu = [
+            {
+                "degree": str(e.get("degree") or "").strip(),
+                "institution": str(e.get("institution") or "").strip(),
+                "year": str(e.get("year") or "").strip(),
+                "details": e.get("details"),
+            }
+            for e in info["education"] if isinstance(e, dict)
+        ]
+        edu = [e for e in edu if e["degree"] or e["institution"]]
+        if edu:
+            consultant.education = edu
+
+
 def _skills_to_list(value: Optional[str]) -> List[str]:
     """Same categorized-format parsing as the frontend chip editor
     (‖/| category separators, leftover 'Label:' prefixes, stray
@@ -663,8 +745,6 @@ class ConsultantAssignmentService:
             consultant.linkedin_url = linkedin_url
         if education is not None:
             consultant.education = education
-        if resume_info is not RESUME_INFO_NOT_PROVIDED:
-            consultant.resume_info = resume_info
         if resume_rich_text is not None:
             consultant.resume_rich_text = resume_rich_text
 
@@ -682,6 +762,12 @@ class ConsultantAssignmentService:
             linked_user = user_result.scalars().first()
             if linked_user:
                 linked_user.resume_info = resume_info
+            explicit = {k for k, v in {
+                "phone": phone, "current_location": current_location, "linkedin_url": linkedin_url,
+                "total_experience_years": total_experience_years, "primary_skills": primary_skills,
+                "education": education,
+            }.items() if v is not None}
+            _sync_resume_info_to_columns(consultant, resume_info, explicit, linked_user)
 
         # BUG FIX (resume_info JSON silently drifting out of sync): this
         # used to merge ONLY "skills" into the linked User's resume_info
@@ -696,7 +782,9 @@ class ConsultantAssignmentService:
         # the linked User's EXISTING resume_info, leaving every other key
         # (summary, experience, etc.) untouched — same one-field-at-a-time
         # merge shape skills already used, just no longer skills-only.
-        elif consultant.user_id and (
+        # FIX: was `elif` — a field sent together with resume_info in the
+        # same request was never merged into the JSON.
+        if consultant.user_id and (
             primary_skills is not None or education is not None
             or phone is not None or current_location is not None or linkedin_url is not None
             or total_experience_years is not None or preferred_roles is not None
@@ -717,7 +805,10 @@ class ConsultantAssignmentService:
                     existing_info["linkedin"] = linkedin_url
                 if total_experience_years is not None:
                     existing_info["years_experience"] = total_experience_years
-                if preferred_roles is not None:
+                # FIX: don't overwrite the consultant's own "Target Title"
+                # (My Profile reads it from resume_info["title"]) every time
+                # admin edits Preferred Roles — only seed it when empty.
+                if preferred_roles is not None and not (existing_info.get("title") or "").strip():
                     existing_info["title"] = preferred_roles
                 linked_user.resume_info = existing_info
 
@@ -752,6 +843,15 @@ class ConsultantAssignmentService:
             metadata={"type": "consultant_profile_update"},
         )
         await db.commit()
+
+        # FIX: admin edits now re-run matching the same way the consultant's
+        # own profile save does, so both sides see the same match results.
+        try:
+            from phase3 import _trigger_consultant_rematch
+            _trigger_consultant_rematch(consultant.id)
+        except Exception:  # never fail the save because of the rematch trigger
+            pass
+
         return await _consultant_to_dto(db, consultant)
 
     @staticmethod

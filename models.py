@@ -1,6 +1,7 @@
 import os
 from sqlalchemy import Column, BigInteger, Integer, Text, Boolean, Numeric, ForeignKey, Date, UniqueConstraint, String
 from sqlalchemy.sql import func
+from sqlalchemy.sql.expression import true as _sa_true
 from sqlalchemy import TIMESTAMP
 from sqlalchemy.orm import validates
 from database import Base, DATABASE_URL
@@ -613,6 +614,10 @@ class ConsultantEmailToken(Base):
     refresh_token_encrypted = Column(Text, nullable=True)
     token_expiry = Column(TIMESTAMP(timezone=True), nullable=True)
     send_permission_granted = Column(Boolean, nullable=False, default=False)
+    # FALSE while the consultant is logged out / inactive: token is kept so
+    # re-login can refresh it, but sending is blocked and the roster shows
+    # "Not Connected". See gmail_status_sync.py.
+    is_active = Column(Boolean, nullable=False, default=True, server_default=_sa_true())
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(
         TIMESTAMP(timezone=True),
@@ -882,3 +887,79 @@ class ApplicationsDetailView(Base):
     
     recruiter_name = Column(Text)
     recruiter_email = Column(Text)
+
+
+# ---------------------------------------------------------------------------
+# Gmail connection lifecycle — keep consultants.gmail_connected equal to
+# "has an ACTIVE token row", and pause tokens when a consultant becomes
+# INACTIVE or their user is deauthorized. See gmail_status_sync.py.
+# On PostgreSQL DB triggers do the same job (and also cover manual pgAdmin
+# edits); these ORM listeners are the portable fallback for SQLite dev or a
+# DB user that couldn't create triggers. Both write the same values, so
+# running both is harmless. Runs inside the same flush/transaction.
+# ---------------------------------------------------------------------------
+from sqlalchemy import event as _sa_event, select as _sa_select, update as _sa_update
+from sqlalchemy import inspect as _sa_inspect
+from sqlalchemy.orm.attributes import set_committed_value as _sa_set_committed
+
+
+def _rap_sync_gmail_connected(connection, consultant_id):
+    if consultant_id is None:
+        return
+    tokens = ConsultantEmailToken.__table__
+    consultants = Consultant.__table__
+    has_active_token = (
+        _sa_select(tokens.c.id)
+        .where(tokens.c.consultant_id == consultant_id, tokens.c.is_active.is_(True))
+        .exists()
+    )
+    connection.execute(
+        _sa_update(consultants)
+        .where(consultants.c.id == consultant_id)
+        .values(gmail_connected=has_active_token)
+    )
+
+
+def _rap_pause_gmail(connection, consultant_ids):
+    tokens = ConsultantEmailToken.__table__
+    for cid in consultant_ids:
+        connection.execute(
+            _sa_update(tokens)
+            .where(tokens.c.consultant_id == cid, tokens.c.is_active.is_(True))
+            .values(is_active=False)
+        )
+        _rap_sync_gmail_connected(connection, cid)
+
+
+@_sa_event.listens_for(ConsultantEmailToken, "after_insert")
+@_sa_event.listens_for(ConsultantEmailToken, "after_delete")
+def _rap_token_inserted_or_deleted(mapper, connection, target):
+    _rap_sync_gmail_connected(connection, target.consultant_id)
+
+
+@_sa_event.listens_for(ConsultantEmailToken, "after_update")
+def _rap_token_updated(mapper, connection, target):
+    _rap_sync_gmail_connected(connection, target.consultant_id)
+    # If the row was moved to a different consultant, recompute the old one too.
+    for old_id in _sa_inspect(target).attrs.consultant_id.history.deleted or ():
+        if old_id != target.consultant_id:
+            _rap_sync_gmail_connected(connection, old_id)
+
+
+@_sa_event.listens_for(Consultant, "after_update")
+def _rap_consultant_updated(mapper, connection, target):
+    hist = _sa_inspect(target).attrs.status.history
+    if hist.has_changes() and target.status == "INACTIVE":
+        _rap_pause_gmail(connection, [target.id])
+        _sa_set_committed(target, "gmail_connected", False)
+
+
+@_sa_event.listens_for(User, "after_update")
+def _rap_user_updated(mapper, connection, target):
+    hist = _sa_inspect(target).attrs.is_authorized.history
+    if hist.has_changes() and target.is_authorized is False:
+        consultants = Consultant.__table__
+        ids = [row[0] for row in connection.execute(
+            _sa_select(consultants.c.id).where(consultants.c.user_id == target.id)
+        )]
+        _rap_pause_gmail(connection, ids)
