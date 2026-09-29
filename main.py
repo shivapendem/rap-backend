@@ -15,7 +15,7 @@ if sys.platform.startswith("win"):
     _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 # ---------------------------------------------------------------------------
 
-from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, func, update
 from pydantic import BaseModel, EmailStr, field_validator, model_validator, Field
@@ -220,6 +220,11 @@ async def _connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
 async def lifespan(app: FastAPI):
     await _connect_with_retry()
 
+    # consultant_email_tokens.is_active must exist before the gmail_connected
+    # sync below reads it (create_all doesn't add columns to existing tables).
+    from gmail_status_sync import ensure_gmail_token_schema
+    await ensure_gmail_token_schema(engine)
+
     # Insert-if-not-exists keyed by email — never touches rows that already exist.
     # SECURITY FIX: this used to unconditionally create admin@rap.io /
     # recruiter@rap.io with a hardcoded password ("password123!") on every
@@ -268,7 +273,7 @@ async def lifespan(app: FastAPI):
             await session.execute(text("""
                 UPDATE consultants
                 SET gmail_connected = CASE
-                    WHEN id IN (SELECT consultant_id FROM consultant_email_tokens) THEN TRUE
+                    WHEN id IN (SELECT consultant_id FROM consultant_email_tokens WHERE is_active = TRUE) THEN TRUE
                     ELSE FALSE
                 END;
             """))
@@ -276,6 +281,15 @@ async def lifespan(app: FastAPI):
             print("Successfully synchronized gmail_connected state with active tokens.")
         except Exception as sync_err:
             print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
+
+    # BUG FIX ("Gmail status not updated until server restart"): the UPDATE
+    # above only reconciles gmail_connected once, at boot. Install DB
+    # triggers so every later change (token saved/paused/deleted, consultant
+    # made INACTIVE, user deauthorized) updates the flag immediately, whether
+    # it comes from the backend, the cron worker, or a manual pgAdmin edit.
+    # See gmail_status_sync.py for the full lifecycle.
+    from gmail_status_sync import prepare_gmail_status_sync
+    await prepare_gmail_status_sync(engine)
 
     yield
 
@@ -483,6 +497,7 @@ def _clear_failed_logins(email: str) -> None:
 async def login(
     request: LoginRequest,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     _check_login_rate_limit(request.email)
@@ -537,11 +552,36 @@ async def login(
     db.add(new_notif)
     await db.commit()
 
+    # Consultant logged back in: refresh their saved Gmail token (if any) so
+    # sending access is restored straight away. Runs after the response is
+    # sent, so it never slows down or breaks the login itself.
+    if user.role == "CONSULTANT":
+        from gmail_status_sync import refresh_consultant_gmail_token_on_login
+        background_tasks.add_task(refresh_consultant_gmail_token_on_login, user.id)
+
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
 
 @app.post("/auth/logout")
-async def logout():
+async def logout(request: Request, db: AsyncSession = Depends(get_db)):
+    # Consultant logout pauses their Gmail access: sending stops and the
+    # recruiter roster shows "Not Connected" until they log in again. The
+    # token is kept (not deleted) so the next login can refresh it. Logout
+    # itself must never fail, so any problem here is only logged.
+    try:
+        auth_header = request.headers.get("authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            payload = decode_access_token(auth_header[7:].strip())
+            email = payload.get("sub")
+            if email:
+                from gmail_status_sync import pause_consultant_gmail
+                await pause_consultant_gmail(db, email)
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        print(f"[logout] Gmail pause skipped: {exc!r}")
     return {"message": "Logged out successfully"}
 
 
@@ -549,6 +589,7 @@ async def logout():
 async def google_login(
     request: GoogleLoginRequest,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     client_id = os.getenv("GOOGLE_CLIENT_ID")
@@ -721,6 +762,7 @@ async def google_login(
                         refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
                         token_expiry=expiry_dt,
                         send_permission_granted=True,
+                        is_active=True,
                     )
                     db.add(email_token)
                 else:
@@ -730,12 +772,20 @@ async def google_login(
                         email_token.refresh_token_encrypted = encrypt_token(refresh_token)
                     email_token.token_expiry = expiry_dt
                     email_token.send_permission_granted = True
+                    email_token.is_active = True  # resume access paused by logout/inactive
                 
                 # The roster reads consultants.gmail_connected, which was only ever
                 # recomputed at process startup - so a freshly connected consultant
                 # showed "Not Connected" until the next restart. Set it with the token.
                 consultant.gmail_connected = True
                 await db.commit()
+        elif user.role == "CONSULTANT":
+            # This Google login didn't grant gmail.send (e.g. the consultant
+            # unticked it on the consent screen), so the block above left any
+            # previously saved token alone. Still refresh that saved token so
+            # logging back in restores sending access where possible.
+            from gmail_status_sync import refresh_consultant_gmail_token_on_login
+            background_tasks.add_task(refresh_consultant_gmail_token_on_login, user.id)
 
     return LoginResponse(role=user.role, name=user.full_name, access_token=token)
 
