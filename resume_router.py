@@ -17,6 +17,7 @@ from sqlalchemy import true, func, or_, and_
 
 from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
+from experience_order import renumber_experiences_chronologically, sort_experiences_chronologically
 from auth import get_current_user
 from s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3, download_file_from_s3, get_s3_file_metadata
 from claude_service import generate_tailored_resume, categorize_skills_with_tier
@@ -254,7 +255,10 @@ async def _build_resume_info(
     for exp in explicit_experiences:
         all_exps[exp.id] = exp
 
-    merged_exps = list(all_exps.values())
+    # Chronological (current/most recent first) — see experience_order.py.
+    # Also covers explicitly selected experience_ids, which were loaded in
+    # no particular order.
+    merged_exps = sort_experiences_chronologically(all_exps.values())
 
     manual_exp_entries = []
     for exp in merged_exps:
@@ -2209,7 +2213,8 @@ async def build_base_resume_content(
         .order_by(ConsultantExperience.sort_order.asc())
     )
     experience_list = []
-    for exp in exp_rows_result.scalars().all():
+    # Chronological (current/most recent first) — see experience_order.py.
+    for exp in sort_experiences_chronologically(exp_rows_result.scalars().all()):
         bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
         experience_list.append({
             "id": str(exp.id),
@@ -2653,8 +2658,13 @@ async def update_base_resume_content(
             exp.location = item.get("location")
             if start_date is not None:
                 exp.start_date = start_date
-            exp.end_date = end_date
+            # BUG FIX: is_present MUST be assigned before end_date —
+            # models.py's @validates("end_date") discards the end date
+            # while the row is still marked is_present, so changing a
+            # "Present" role to a real end date used to lose that date.
+            # (Same fix as phase3.py's update_experience.)
             exp.is_present = is_present
+            exp.end_date = end_date
             exp.technologies = technologies
             exp.responsibilities = responsibilities
             exp.achievements = achievements
@@ -2693,6 +2703,15 @@ async def update_base_resume_content(
     for old_id, old_exp in existing_by_id.items():
         if old_id not in seen_ids:
             await db.delete(old_exp)
+
+    # Experience is always current/most recent first (see
+    # experience_order.py) regardless of the order it was arranged in the
+    # editor: renumber the rows chronologically, then put the saved
+    # base-resume entries in that same order so the DOCX matches.
+    await db.flush()
+    ordered_rows = await renumber_experiences_chronologically(db, consultant.id)
+    _rank = {str(e.id): i for i, e in enumerate(ordered_rows)}
+    reconciled_experience.sort(key=lambda it: _rank.get(str(it.get("id")), len(_rank)))
 
     resume_data["experience"] = reconciled_experience
 

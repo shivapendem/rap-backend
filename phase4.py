@@ -344,7 +344,8 @@ ADJACENT_ROLES: dict[str, set[str]] = {
 # Stage 2 — Work Authorization batches (post-role-match filter pipeline spec)
 #
 #   Batch 1 = F1 / STEM OPT            (least restrictive requirement)
-#   Batch 2 = H1B
+#   Batch 2 = H1B / H4 EAD  (H4 EAD also passes a Batch 3 requirement that
+#                            explicitly accepts it, e.g. "USC & H4 EAD only")
 #   Batch 3 = USC / GC / GC EAD / L1 / TN / U Visa   (most restrictive)
 #
 # Push rule: a requirement asking for Batch 1 or Batch 2 work auth pushes to
@@ -355,7 +356,11 @@ ADJACENT_ROLES: dict[str, set[str]] = {
 # ---------------------------------------------------------------------------
 
 WORK_AUTH_BATCH_1: set[str] = {"F1", "STEMOPT"}
-WORK_AUTH_BATCH_2: set[str] = {"H1B"}
+# H4 EAD sits with H1B: it passes every requirement H1B passes (Batch 1/2 or
+# no stated restriction) and, like H1B, is filtered out of Batch 3 (USC/GC-
+# only) requirements -- except when that requirement explicitly names H4 EAD
+# as accepted, see _requirement_accepts_h4_ead() / work_auth_passes().
+WORK_AUTH_BATCH_2: set[str] = {"H1B", "H4EAD"}
 WORK_AUTH_BATCH_3: set[str] = {"USC", "GC", "GCEAD", "L1", "TN", "UVISA"}
 
 
@@ -375,7 +380,11 @@ def get_batch(work_auth_value: Optional[str]) -> Optional[int]:
     return None
 
 
-def work_auth_passes(requirement_work_auth: Optional[str], consultant_work_auth: Optional[str]) -> tuple[bool, str]:
+def work_auth_passes(
+    requirement_work_auth: Optional[str],
+    consultant_work_auth: Optional[str],
+    requirement_accepts_h4_ead: bool = False,
+) -> tuple[bool, str]:
     """
     Stage 2 — Work Authorization push rule (batched, see module docstring
     above). N/A/empty on EITHER side passes everyone for this field — same
@@ -411,6 +420,14 @@ def work_auth_passes(requirement_work_auth: Optional[str], consultant_work_auth:
     cons_batch = get_batch(consultant_work_auth)
     if cons_batch == 3:
         return True, "requirement is Batch 3, consultant is Batch 3 — match"
+    # H4 EAD exception: a Batch 3 requirement that explicitly names H4 EAD as
+    # accepted ("USC & H4 EAD only") lets an H4 EAD consultant through. Any
+    # other non-Batch-3 value (including H1B) is still filtered out.
+    if (
+        requirement_accepts_h4_ead
+        and consultant_work_auth.upper().replace(" ", "").replace("-", "") == "H4EAD"
+    ):
+        return True, "requirement is Batch 3 but explicitly accepts H4 EAD; consultant is H4 EAD — match"
     return False, f"requirement requires Batch 3; consultant is Batch {cons_batch or 'unmapped'} ({consultant_work_auth!r})"
 
 
@@ -1181,6 +1198,27 @@ def _requirement_work_auth_text(requirement: Requirement) -> Optional[str]:
     return None
 
 
+# H4 EAD as written in postings/parsed fields: "H4 EAD", "H4-EAD", "H4EAD",
+# "H-4 EAD", or a bare "H4" (the parser's token scan often keeps only "H4";
+# an H4 without EAD cannot work, so in a work-authorization context a bare
+# H4 means H4 EAD).
+_WA_H4EAD_TOKENS = re.compile(r'(?i)\bh-?4[\s\-]*(?:ead)?\b')
+
+
+def _requirement_accepts_h4_ead(requirement: Requirement) -> bool:
+    """True if the requirement explicitly lists H4 EAD as accepted (a
+    non-negated mention -- "No H4 EAD" does not count). Checks the
+    structured work_authorization field first, then the raw JD text, since
+    the structured field can drop the "EAD" part or the token entirely.
+    Only consulted for an H4 EAD consultant against a Batch 3 requirement
+    (see validate_match()), so it never affects any other consultant."""
+    structured = (requirement.work_authorization or "").strip()
+    if structured and structured.upper() != "N/A":
+        if _batch_mentioned_positively(structured, _WA_H4EAD_TOKENS):
+            return True
+    return _batch_mentioned_positively(requirement.job_description or "", _WA_H4EAD_TOKENS)
+
+
 
 def experience_passes(
     requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]
@@ -1307,7 +1345,16 @@ def validate_match(
 
     # Stage 2 — Work Authorization (batched push rule)
     req_work_auth = _requirement_work_auth_text(requirement)
-    passed, reason = work_auth_passes(req_work_auth, consultant.work_authorization)
+    # Only evaluated for an H4 EAD consultant facing a Batch 3 requirement
+    # -- the one case where it can change the outcome -- so the extra JD
+    # scan never runs for anyone else.
+    accepts_h4_ead = bool(
+        consultant.work_authorization
+        and consultant.work_authorization.upper().replace(" ", "").replace("-", "") == "H4EAD"
+        and get_batch(req_work_auth) == 3
+        and _requirement_accepts_h4_ead(requirement)
+    )
+    passed, reason = work_auth_passes(req_work_auth, consultant.work_authorization, accepts_h4_ead)
     if not passed:
         return {"eligible": False, "stage_failed": "work_authorization", "role_raw": role_raw, "reason": reason}
 

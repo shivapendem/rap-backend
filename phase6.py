@@ -43,6 +43,7 @@ from auth import get_current_user
 from database import get_db
 from claude_service import generate_tailored_resume
 from resume_validation import get_missing_resume_fields, missing_fields_message
+from experience_order import sort_experiences_chronologically
 from models import (
     Consultant,
     ConsultantExperience,
@@ -244,7 +245,8 @@ def _build_profile_resume_info(
     # Key names mirror claude_service's internal mock_fallback shape so its
     # offline fallback still yields sensible data instead of placeholders.
     experience_payload: List[Dict[str, Any]] = []
-    for exp in sorted(experiences, key=lambda e: e.sort_order):
+    # Chronological (current/most recent first) — see experience_order.py.
+    for exp in sort_experiences_chronologically(experiences):
         raw = f"{exp.responsibilities or ''}\n{exp.achievements or ''}"
         bullets = [ln.strip(" -*\u2022\t") for ln in re.split(r"[\r\n]+", raw) if ln.strip(" -*\u2022\t")]
         experience_payload.append(

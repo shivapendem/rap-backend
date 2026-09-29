@@ -61,6 +61,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from database import get_db
+from experience_order import (
+    renumber_experiences_chronologically,
+    sort_experiences_chronologically,
+)
 from models import (
     User,
     Consultant,
@@ -303,7 +307,7 @@ class ProfileUpdateRequest(BaseModel):
         # spaces and hyphens before comparing, so an underscore-separated
         # value here would silently fail to match any batch and get every
         # consultant wrongly rejected at Stage 2 of validate_match().
-        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        valid = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
         if v not in valid:
             raise ValueError(f"workAuth must be one of {', '.join(sorted(valid))}")
         return v
@@ -408,7 +412,7 @@ class AdminConsultantUpdateRequest(BaseModel):
     @field_validator("workAuth")
     @classmethod
     def validate_work_auth(cls, v):
-        valid = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+        valid = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
         if v not in valid:
             raise ValueError(f"workAuth must be one of {', '.join(sorted(valid))}")
         return v
@@ -485,8 +489,9 @@ class ProfileResponse(BaseModel):
 # response shape verified against the actual frontend form component
 # (AddConsultantDrawer.tsx): its useCreateConsultant() hook posts snake_case
 # keys straight from `form` state, validates work_auth against WORK_AUTHS =
-# ["USC","GC","H1B","OPT","CPT","EAD","TN","Other"] and employment_prefs
-# against EMP_PREFS = ["C2C","W2","1099","FULL_TIME","CONTRACT"], and reads
+# ["F1","STEM OPT","H1B","H4 EAD","USC","GC","GC EAD","L1","TN","U Visa"]
+# (same set as _ADMIN_WORK_AUTHS below) and employment_prefs against
+# EMP_PREFS = ["CONTRACT","W2","1099","FULL_TIME"], and reads
 # result.message / result.temp_password back from CreateConsultantResponseDTO
 # to show the "temporary password — shown once" panel. This DTO intentionally
 # does NOT follow the camelCase convention ProfileUpdateRequest uses — its
@@ -501,7 +506,7 @@ class ProfileResponse(BaseModel):
 # match — but this create-endpoint set was left on the old list, so 5 of the
 # 9 dropdown options were rejected with a 422. Kept identical to those two
 # update validators and to the matching engine's WORK_AUTH_BATCH_1/2/3.
-_ADMIN_WORK_AUTHS = {"F1", "STEM OPT", "H1B", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
+_ADMIN_WORK_AUTHS = {"F1", "STEM OPT", "H1B", "H4 EAD", "USC", "GC", "GC EAD", "L1", "TN", "U Visa"}
 _ADMIN_EMPLOYMENT_PREFS = {"C2C", "W2", "1099", "FULL_TIME", "CONTRACT"}
 
 
@@ -700,7 +705,8 @@ async def _sync_experience_into_resume_info(db: AsyncSession, consultant: Consul
         .order_by(ConsultantExperience.sort_order.asc())
     )
     experience_list = []
-    for exp in exp_result.scalars().all():
+    # Chronological (current/most recent first) — see experience_order.py.
+    for exp in sort_experiences_chronologically(exp_result.scalars().all()):
         bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
         experience_list.append({
             "id": str(exp.id),
@@ -1710,7 +1716,7 @@ async def admin_delete_resume(
 @router.get(
     "/api/consultant/experience",
     response_model=List[ExperienceResponse],
-    summary="List own experience entries ordered by sortOrder",
+    summary="List own experience entries, current/most recent first",
 )
 async def list_own_experience(
     user_id: Optional[int] = Query(None, description="Admin/recruiter only — list a specific consultant's experience"),
@@ -1724,7 +1730,15 @@ async def list_own_experience(
         .where(ConsultantExperience.consultant_id == consultant.id)
         .order_by(ConsultantExperience.sort_order.asc())
     )
-    return [_exp_to_response(e) for e in result.scalars().all()]
+    # Always chronological (current/most recent first), including rows saved
+    # before automatic ordering existed. sortOrder in the response is the
+    # chronological position, since the frontend sorts by it client-side.
+    responses = []
+    for idx, e in enumerate(sort_experiences_chronologically(result.scalars().all())):
+        resp = _exp_to_response(e)
+        resp.sortOrder = idx
+        responses.append(resp)
+    return responses
 
 
 @router.post(
@@ -1742,22 +1756,9 @@ async def create_experience(
 ):
     consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
-    # BUG FIX: new experiences are meant to always land at the TOP
-    # (sort_order 0) — but simply setting sort_order=0 collides with
-    # whatever entry already holds that position (e.g. right after a
-    # manual drag-reorder reassigns sort_order 0..N to match the new
-    # visual order). Two rows tied at sort_order=0 then depend on the
-    # database's tie-breaking (typically insertion order/id), which
-    # favored the OLDER entry over the genuinely new one — showing the
-    # new entry second instead of first. Shift every existing entry down
-    # by one first, so sort_order=0 is actually free before the new row
-    # claims it — no tie possible.
-    await db.execute(
-        update(ConsultantExperience)
-        .where(ConsultantExperience.consultant_id == consultant.id)
-        .values(sort_order=ConsultantExperience.sort_order + 1)
-    )
-
+    # Position is decided by dates, not by insertion: the new row is placed
+    # by renumber_experiences_chronologically() right after it's flushed
+    # below (current/most recent first — see experience_order.py).
     exp = ConsultantExperience(
         consultant_id=consultant.id,
         client_name=payload.clientName,
@@ -1776,6 +1777,7 @@ async def create_experience(
     )
     db.add(exp)
     await db.flush()
+    await renumber_experiences_chronologically(db, consultant.id)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
@@ -1815,15 +1817,26 @@ async def update_experience(
     exp.implementation_partner = payload.implementationPartner
     exp.role_title = payload.roleTitle
     exp.start_date = date(payload.startDate.year, payload.startDate.month, 1)
-    exp.end_date = date(payload.endDate.year, payload.endDate.month, 1) if payload.endDate else None
+    # BUG FIX ("edit 2025–Present to 2016–2017 saves as 2016 – —"):
+    # is_present MUST be assigned before end_date. models.py's
+    # @validates("end_date") discards the end date whenever the row is
+    # still marked is_present at the moment end_date is set — so assigning
+    # end_date first (while the row still held its OLD is_present=True)
+    # silently dropped the new end date, leaving end_date NULL with
+    # is_present False. Setting is_present first lets the validator see
+    # the new value.
     exp.is_present = payload.isPresent
+    exp.end_date = date(payload.endDate.year, payload.endDate.month, 1) if payload.endDate else None
     exp.location = payload.location
     exp.work_mode = payload.workMode
     exp.work_mode_detail = payload.workModeDetail
     exp.technologies = payload.technologies
     exp.responsibilities = payload.responsibilities
     exp.achievements = payload.achievements
-    exp.sort_order = payload.sortOrder
+    # sort_order is no longer client-controlled (drag-to-reorder removed):
+    # re-derive every row's position from dates, since an edited date can
+    # move this entry.
+    await renumber_experiences_chronologically(db, consultant.id)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
@@ -1865,6 +1878,8 @@ async def delete_experience(
     # code. The endpoint ran to completion, committed successfully, and
     # returned 204 every time — without ever actually deleting anything.
     await db.delete(exp)
+    await db.flush()
+    await renumber_experiences_chronologically(db, consultant.id)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
@@ -1875,7 +1890,7 @@ async def delete_experience(
 
 @router.patch(
     "/api/consultant/experience/reorder",
-    summary="Save drag-drop sort order — accepts { orderedIds: [str, ...] }",
+    summary="Legacy: drag-to-reorder was removed — re-applies chronological order",
 )
 async def reorder_experience(
     payload: ReorderRequest,
@@ -1885,26 +1900,15 @@ async def reorder_experience(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Reorder experience entries. orderedIds is a list of experience IDs
-    in the desired display order. Each entry's sort_order is set to its
-    index in the list.
+    Kept only so an older cached frontend calling it doesn't error.
+    Manual drag-to-reorder was removed: experience is always ordered by
+    date (current/most recent first — see experience_order.py), so the
+    submitted orderedIds are ignored and the chronological order is
+    re-applied instead.
     """
     consultant = await _resolve_experience_consultant(db, current_user, user_id)
 
-    for idx, exp_id_str in enumerate(payload.orderedIds):
-        try:
-            exp_id = int(exp_id_str)
-        except (ValueError, TypeError):
-            raise HTTPException(422, f"Invalid experience id: {exp_id_str}")
-
-        await db.execute(
-            update(ConsultantExperience)
-            .where(
-                ConsultantExperience.id == exp_id,
-                ConsultantExperience.consultant_id == consultant.id,
-            )
-            .values(sort_order=idx)
-        )
+    await renumber_experiences_chronologically(db, consultant.id)
 
     from resume_router import sync_base_resume_text
     await sync_base_resume_text(db, consultant, None, background_tasks)
