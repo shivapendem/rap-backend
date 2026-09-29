@@ -45,9 +45,15 @@ from database import get_db
 from models import User, Requirement, Email
 from auth import get_current_user
 from pipeline import process_email
-from parser import parse_requirement
+from parser import parse_requirement, parse_requirements, is_reply_email, is_hotlist_email
 from cleaner import clean_requirement_text, html_to_text
-from dedup import create_jd_hash, build_dedup_key, save_requirement, clamp_received_date
+from dedup import (
+    create_jd_hash, build_dedup_key, save_requirement, clamp_received_date,
+    normalize_text, NEAR_DUPLICATE_WINDOW_HOURS,
+)
+# Same HTML-in-body_text detection the background sync uses, so manual
+# Reparse and auto-sync read the email body exactly the same way.
+from requirements_sync import _looks_like_html
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +544,52 @@ async def get_raw_email(
     }
 
 
+async def _is_duplicate_of_other(
+    db: AsyncSession,
+    vendor_email: str,
+    role: str,
+    jd_hash: str,
+    received_date=None,
+    exclude_ids: Optional[List[int]] = None,
+) -> bool:
+    """
+    Same two checks as dedup.is_duplicate() (exact dedup_key match, then
+    same vendor+role within NEAR_DUPLICATE_WINDOW_HOURS), but ignoring this
+    email's OWN Requirement rows. Needed by Reparse's in-place update path:
+    plain is_duplicate() would always match the row being updated itself
+    and flag every reparse of an already-parsed email as a duplicate.
+    """
+    exclude_ids = [i for i in (exclude_ids or []) if i is not None]
+    dedup_key = build_dedup_key(vendor_email, role, jd_hash)
+
+    exact_q = select(Requirement.id).where(Requirement.dedup_key == dedup_key)
+    if exclude_ids:
+        exact_q = exact_q.where(Requirement.id.notin_(exclude_ids))
+    if (await db.execute(exact_q.limit(1))).scalars().first() is not None:
+        return True
+
+    norm_vendor = normalize_text(vendor_email)
+    norm_role = normalize_text(role)
+    if not norm_vendor or norm_vendor == "unknown@unknown.com" or not norm_role or norm_role == "unknown":
+        return False
+
+    anchor_time = received_date if isinstance(received_date, datetime) else datetime.now(timezone.utc)
+    if anchor_time.tzinfo is None:
+        anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+    window_start = anchor_time - timedelta(hours=NEAR_DUPLICATE_WINDOW_HOURS)
+    window_end = anchor_time + timedelta(hours=NEAR_DUPLICATE_WINDOW_HOURS)
+
+    near_q = select(Requirement.id).where(
+        func.lower(func.trim(Requirement.vendor_email)) == norm_vendor,
+        func.lower(func.trim(Requirement.role)) == norm_role,
+        Requirement.created_at >= window_start,
+        Requirement.created_at <= window_end,
+    )
+    if exclude_ids:
+        near_q = near_q.where(Requirement.id.notin_(exclude_ids))
+    return (await db.execute(near_q.limit(1))).scalars().first() is not None
+
+
 @router.post(
     "/api/admin/raw-emails/{email_id}/reparse",
     summary="Actually re-run an email through the parser and refresh its requirement",
@@ -587,8 +639,18 @@ async def reparse_email(
         subject = gmail_row["subject"] or ""
         body_text = gmail_row["body_text"] or ""
         body_html = gmail_row["body_html"] or ""
-        headers = {"from": gmail_row["from_address"], "reply_to": gmail_row["reply_to"]}
+        # Same header shape requirements_sync.py builds ("Name <addr>"), so
+        # vendor/contact extraction behaves identically on Reparse.
+        headers = {}
+        if gmail_row["from_address"]:
+            headers["from"] = (
+                f'{gmail_row["from_name"]} <{gmail_row["from_address"]}>'
+                if gmail_row["from_name"] else gmail_row["from_address"]
+            )
+        if gmail_row["reply_to"]:
+            headers["reply_to"] = gmail_row["reply_to"]
         source_gmail_emails_id = gmail_row["id"]
+        fetched_at = gmail_row["fetched_at"]
         # Cap sender-clock-skewed Date headers at our own fetch time -- this
         # also covers the in-place update branch below, which writes
         # received_date directly without going through save_requirement().
@@ -619,6 +681,7 @@ async def reparse_email(
         source_gmail_emails_id = None
         gmail_msg = None
         received_date = email.received_at
+        fetched_at = None
 
     try:
         # ---- Step 2: ensure a real emails row exists, get its id ----
@@ -677,84 +740,130 @@ async def reparse_email(
         # the legacy case where this email never had a gmail_emails row.
         fk_raw_email_id = source_gmail_emails_id if source_gmail_emails_id is not None else real_email_id
 
-        # ---- Step 3: re-run parser + cleaner on the raw text ----
-        body = body_text or html_to_text(body_html)
-        parsed = parse_requirement(subject, body, headers)
-        cleaned_jd = clean_requirement_text(body)
-
-        # ---- Step 4: update existing requirement in place, or create one ----
-        existing_req_result = await db.execute(
-            select(Requirement).where(Requirement.raw_email_id == fk_raw_email_id)
-        )
-        existing_req = existing_req_result.scalars().first()
-
-        vendor_email = parsed.get("vendor_email", "unknown@unknown.com")
-        role = parsed.get("role", "UNKNOWN")
-        jd_hash = create_jd_hash(cleaned_jd)
-        dedup_key = build_dedup_key(vendor_email, role, jd_hash)
-
-        if existing_req:
-            existing_req.role = role
-            existing_req.vendor = parsed.get("vendor")
-            existing_req.vendor_email = vendor_email
-            existing_req.vendor_contact = parsed.get("vendor_contact")
-            existing_req.client = parsed.get("client")
-            existing_req.location = parsed.get("location")
-            existing_req.work_mode = parsed.get("work_mode")
-            existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
-            existing_req.rate = parsed.get("rate")
-            existing_req.duration = parsed.get("duration")
-            existing_req.job_description = cleaned_jd
-            existing_req.jd_hash = jd_hash
-            existing_req.dedup_key = dedup_key
-            # experience/skills aren't real columns on Requirement (they live
-            # inside parsed_fields) — assigning them directly was a no-op that
-            # silently dropped the data; parsed_fields below carries them.
-            existing_req.parsed_fields = parsed
-            existing_req.parse_confidence = parsed.get("parse_confidence", 0.0)
-            if received_date and not existing_req.received_date:
-                existing_req.received_date = received_date
-            await db.commit()
-            requirement_status = "updated"
-            requirement_id = existing_req.id
+        # ---- Step 3: same "is this a real job posting?" gate as the ----
+        # ---- background sync (requirements_sync.py)                   ----
+        # BUG FIX (Reparse turned ANY email into a Requirement): this used
+        # to run the single parse_requirement() and save whatever came back
+        # -- no reply check, no hotlist check, no is_likely_requirement
+        # check -- so newsletters/invites/replies/hotlists all became
+        # Requirements marked "Parsed", and "Parsed - NR" could never be
+        # set from here. Now Reparse applies the exact same rules as the
+        # auto-sync: reply/hotlist -> NR; parse_requirements() (multi-post
+        # aware); only is_likely_requirement pieces are saved; dedup
+        # decides Parsed vs Parsed - Dup.
+        # Also HTML sitting inside body_text is converted first (was only
+        # converted when body_text was empty -> role UNKNOWN).
+        if _looks_like_html(body_text):
+            body = html_to_text(body_text)
+        elif body_text:
+            body = body_text
         else:
-            result = await save_requirement(
-                db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=fk_raw_email_id,
-                received_date=received_date,
-            )
-            requirement_status = result["status"]
-            requirement_id = result["id"]
+            body = html_to_text(body_html)
 
-        # ---- Step 5: mark processed/parsed on whichever raw source we used ----
-        # BUG FIX ("Reparse a 'Parsed - Dup' email -> briefly shows Parsed,
-        # then corrects itself back to Parsed - Dup a little later" --
-        # confirmed real case, and worse than a display glitch): this
-        # unconditionally hardcoded status_desc = 'Pending', regardless of
-        # what requirement_status (available right above, from Step 4) had
-        # just determined. 'Pending' isn't a display bug in isolation --
-        # it's requirements_sync.py's own SELECT criteria for "still needs
-        # processing" (`status_desc IS NULL OR = 'Pending' OR = 'Failed'`,
-        # combined with `NOT EXISTS (... WHERE raw_email_id = ge.id)`,
-        # which a correctly-identified duplicate always satisfies since it
-        # has no Requirement of its own). So every reparse -- duplicate or
-        # not -- silently made this email eligible to be picked up and
-        # reprocessed AGAIN by the next background sync cycle: a second,
-        # completely invisible, wasted AI call for every single reparse.
-        # For a duplicate, THAT second pass is what actually set the
-        # correct 'Parsed - Dup' -- the "self-correction" the person saw
-        # was this hidden extra reprocessing quietly doing the job Step 5
-        # should have done immediately. Mapping requirement_status directly
-        # to the same status_desc convention requirements_sync.py's own
-        # final_status logic already uses ("duplicate" -> "Parsed - Dup",
-        # everything else -> "Parsed") sets the right value the first time
-        # and removes it from the background loop's pending queue for good.
-        status_desc = "Parsed - Dup" if requirement_status == "duplicate" else "Parsed"
+        likely_items = []
+        if not (is_reply_email(subject, body) or is_hotlist_email(body)):
+            for parsed, segment_text in parse_requirements(subject, body, headers):
+                if parsed.get("is_likely_requirement"):
+                    likely_items.append((parsed, segment_text))
+
+        # ---- Step 4: update this email's own rows in place, or create ----
+        # Requirement rows already linked to this email are NEVER deleted
+        # here (they may have applications/matches attached). They are
+        # reused in order for the re-parsed postings; any extra postings
+        # go through the normal save_requirement() dedup path.
+        existing_req_result = await db.execute(
+            select(Requirement)
+            .where(Requirement.raw_email_id == fk_raw_email_id)
+            .order_by(Requirement.id)
+        )
+        existing_reqs = list(existing_req_result.scalars().all())
+        own_ids = [r.id for r in existing_reqs]
+
+        saved_ids: list = []
+        any_new = False
+        any_duplicate = False
+
+        for idx, (parsed, segment_text) in enumerate(likely_items):
+            # Clean/hash THIS posting's own segment, not the whole email.
+            cleaned_jd = clean_requirement_text(segment_text)
+
+            if idx < len(existing_reqs):
+                existing_req = existing_reqs[idx]
+                vendor_email = parsed.get("vendor_email", "unknown@unknown.com")
+                role = parsed.get("role", "UNKNOWN")
+                jd_hash = create_jd_hash(cleaned_jd)
+                dedup_key = build_dedup_key(vendor_email, role, jd_hash)
+
+                # BUG FIX: the in-place update used to skip dedup entirely.
+                # Check against every OTHER email's requirements; if this
+                # posting already exists elsewhere, leave this row as-is
+                # and count it as a duplicate.
+                if await _is_duplicate_of_other(
+                    db, vendor_email, role, jd_hash,
+                    received_date=received_date, exclude_ids=own_ids,
+                ):
+                    any_duplicate = True
+                    continue
+
+                existing_req.role = role
+                existing_req.vendor = parsed.get("vendor")
+                existing_req.vendor_email = vendor_email
+                existing_req.vendor_contact = parsed.get("vendor_contact")
+                existing_req.client = parsed.get("client")
+                existing_req.location = parsed.get("location")
+                existing_req.work_mode = parsed.get("work_mode")
+                existing_req.employment_types = parsed.get("employment_types", ["UNKNOWN"])
+                existing_req.rate = parsed.get("rate")
+                existing_req.duration = parsed.get("duration")
+                existing_req.work_authorization = parsed.get("work_authorization")
+                existing_req.job_description = cleaned_jd
+                existing_req.jd_hash = jd_hash
+                existing_req.dedup_key = dedup_key
+                # experience/skills aren't real columns on Requirement (they live
+                # inside parsed_fields) — parsed_fields below carries them.
+                existing_req.parsed_fields = parsed
+                existing_req.parse_confidence = parsed.get("parse_confidence", 0.0)
+                if received_date and not existing_req.received_date:
+                    existing_req.received_date = received_date
+                await db.commit()
+                saved_ids.append(existing_req.id)
+            else:
+                result = await save_requirement(
+                    db=db, parsed=parsed, cleaned_jd=cleaned_jd, raw_email_id=fk_raw_email_id,
+                    received_date=received_date, fetched_at=fetched_at,
+                )
+                if result["status"] == "saved":
+                    any_new = True
+                    saved_ids.append(result["id"])
+                elif result["status"] == "duplicate":
+                    any_duplicate = True
+
+        # ---- Step 5: status, same convention as requirements_sync.py ----
+        # nothing likely -> "Parsed - NR"; anything saved/updated ->
+        # "Parsed"; only duplicates -> "Parsed - Dup".
+        if not likely_items:
+            status_desc = "Parsed - NR"
+            requirement_status = "not_requirement"
+        elif saved_ids:
+            status_desc = "Parsed"
+            requirement_status = "saved" if any_new else "updated"
+        elif any_duplicate:
+            status_desc = "Parsed - Dup"
+            requirement_status = "duplicate"
+        else:
+            status_desc = "Parsed"
+            requirement_status = "saved"
+        requirement_id = saved_ids[0] if saved_ids else None
+
+        # Writing the final status_desc (never 'Pending') also keeps this
+        # email out of requirements_sync.py's pending queue, so it isn't
+        # silently reprocessed a second time by the background job.
         if source_gmail_emails_id is not None:
             await db.execute(
                 text("UPDATE gmail_emails SET processed = true, status_desc = :status_desc WHERE id = :id"),
                 {"id": source_gmail_emails_id, "status_desc": status_desc}
             )
-        email.parse_status = "PARSED"
+        email.parse_status = "SKIPPED" if status_desc == "Parsed - NR" else "PARSED"
         await db.commit()
     except HTTPException:
         raise
@@ -775,20 +884,22 @@ async def reparse_email(
     # ones did (see requirements_sync.py) until an admin separately
     # clicked "Rematch"/"Match All". Trigger it here too so reparse
     # always leaves the requirement with a real match count.
-    if requirement_id is not None:
+    # Only real postings that were saved/updated get matched -- NR and
+    # duplicate emails no longer create junk matches.
+    for match_req_id in saved_ids:
         try:
             # Single engine — one call refreshes RequirementConsultantMatch
             # directly; there's no second table left to catch up separately.
             from phase4 import match_requirement
-            await match_requirement(db, requirement_id)
+            await match_requirement(db, match_req_id)
         except Exception as match_err:
-            print(f"[reparse_email] auto-match FAILED for requirement_id={requirement_id}: {match_err}")
+            print(f"[reparse_email] auto-match FAILED for requirement_id={match_req_id}: {match_err}")
             from error_logger import log_db_error
             await log_db_error(
                 stage="reparse_email_automatch",
                 error=match_err,
                 source_type="requirement",
-                source_id=requirement_id,
+                source_id=match_req_id,
             )
 
     logger.info(
@@ -801,6 +912,8 @@ async def reparse_email(
         "message": f"Email {email_id} reparsed",
         "requirement_status": requirement_status,
         "requirement_id": str(requirement_id) if requirement_id is not None else None,
+        "requirement_ids": [str(i) for i in saved_ids],
+        "status_desc": status_desc,
     }
 
 
