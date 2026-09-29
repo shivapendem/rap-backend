@@ -45,7 +45,10 @@ from database import get_db
 from models import User, Requirement, Email
 from auth import get_current_user
 from pipeline import process_email
-from parser import parse_requirement, parse_requirements, is_reply_email, is_hotlist_email
+from parser import (
+    parse_requirement, parse_requirements, is_reply_email, is_hotlist_email,
+    is_job_requirement_email,
+)
 from cleaner import clean_requirement_text, html_to_text
 from dedup import (
     create_jd_hash, build_dedup_key, save_requirement, clamp_received_date,
@@ -760,11 +763,43 @@ async def reparse_email(
         else:
             body = html_to_text(body_html)
 
+        # BUG FIX ("real posting reparsed as Parsed - NR / 'Parser did not
+        # find a likely job requirement'"): Reparse is a MANUAL action --
+        # someone looked at this email and asked for it to be parsed -- so
+        # it is less strict than the background sync:
+        #   * A "RE:" subject or quoted ">" lines no longer auto-reject.
+        #     Vendors often send real requirements in RE: threads. A reply
+        #     is only NR if the parser also finds no posting in it.
+        #   * If the parser's confidence gate says "not likely" but it DID
+        #     find a role (parse_confidence > 0) and the text has normal
+        #     JD indicators (rate/location/skills/C2C/...), accept it.
+        # Hotlist/bench broadcasts are still always NR.
         likely_items = []
-        if not (is_reply_email(subject, body) or is_hotlist_email(body)):
-            for parsed, segment_text in parse_requirements(subject, body, headers):
-                if parsed.get("is_likely_requirement"):
-                    likely_items.append((parsed, segment_text))
+        nr_reason = ""
+        if is_hotlist_email(body):
+            nr_reason = "Hotlist/bench broadcast email"
+        else:
+            parsed_items = parse_requirements(subject, body, headers)
+            likely_items = [
+                (p, seg) for p, seg in parsed_items if p.get("is_likely_requirement")
+            ]
+            if not likely_items:
+                likely_items = [
+                    (p, seg) for p, seg in parsed_items
+                    if (p.get("parse_confidence") or 0) > 0
+                    and (p.get("role") or "UNKNOWN").strip().upper() != "UNKNOWN"
+                    and is_job_requirement_email(f"{subject}\n{seg}")
+                ]
+            if not likely_items:
+                if is_reply_email(subject, body):
+                    nr_reason = "Reply email with no job posting in it"
+                elif not any(
+                    (p.get("role") or "UNKNOWN").strip().upper() != "UNKNOWN"
+                    for p, _ in parsed_items
+                ):
+                    nr_reason = "Parser could not find a job title/role"
+                else:
+                    nr_reason = "Parser did not find a likely job requirement"
 
         # ---- Step 4: update this email's own rows in place, or create ----
         # Requirement rows already linked to this email are NEVER deleted
@@ -841,18 +876,27 @@ async def reparse_email(
         # ---- Step 5: status, same convention as requirements_sync.py ----
         # nothing likely -> "Parsed - NR"; anything saved/updated ->
         # "Parsed"; only duplicates -> "Parsed - Dup".
+        # category/reason are written too (same values the cron sync
+        # uses) -- previously Reparse never touched them, so a real
+        # posting that was fixed by Reparse kept showing the OLD NR
+        # reason "Parser did not find a likely job requirement".
         if not likely_items:
             status_desc = "Parsed - NR"
             requirement_status = "not_requirement"
+            category = "ignore" if nr_reason.startswith("Hotlist") else "unclassified"
+            reason = nr_reason
         elif saved_ids:
             status_desc = "Parsed"
             requirement_status = "saved" if any_new else "updated"
+            category, reason = "job_posting", ""
         elif any_duplicate:
             status_desc = "Parsed - Dup"
             requirement_status = "duplicate"
+            category, reason = "job_posting", "Duplicate of an existing requirement"
         else:
             status_desc = "Parsed"
             requirement_status = "saved"
+            category, reason = "job_posting", ""
         requirement_id = saved_ids[0] if saved_ids else None
 
         # Writing the final status_desc (never 'Pending') also keeps this
@@ -860,8 +904,14 @@ async def reparse_email(
         # silently reprocessed a second time by the background job.
         if source_gmail_emails_id is not None:
             await db.execute(
-                text("UPDATE gmail_emails SET processed = true, status_desc = :status_desc WHERE id = :id"),
-                {"id": source_gmail_emails_id, "status_desc": status_desc}
+                text(
+                    "UPDATE gmail_emails SET processed = true, status_desc = :status_desc, "
+                    "category = :category, reason = :reason WHERE id = :id"
+                ),
+                {
+                    "id": source_gmail_emails_id, "status_desc": status_desc,
+                    "category": category, "reason": reason,
+                }
             )
         email.parse_status = "SKIPPED" if status_desc == "Parsed - NR" else "PARSED"
         await db.commit()
@@ -914,6 +964,7 @@ async def reparse_email(
         "requirement_id": str(requirement_id) if requirement_id is not None else None,
         "requirement_ids": [str(i) for i in saved_ids],
         "status_desc": status_desc,
+        "reason": reason,
     }
 
 
