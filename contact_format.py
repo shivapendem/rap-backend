@@ -1,9 +1,11 @@
-"""Consultant contact fields: US phone number + LinkedIn URL.
+"""Contact fields: US phone number + LinkedIn URL.
 
-Backend mirror of the frontend's src/lib/contactFormat.ts. Used ONLY for a
-CONSULTANT's phone / LinkedIn URL (profile save, admin/recruiter consultant
-edits, admin consultant create, Base Resume save). Admin/Recruiter mobile
-number, extension and LinkedIn (email signature fields) are NOT touched.
+Backend mirror of the frontend's src/lib/contactFormat.ts. Phone: every
+phone field -- a CONSULTANT's phone (profile save, admin/recruiter
+consultant edits, admin consultant create, Base Resume save) and an
+Admin/Recruiter's mobile number + extension base number (User Management
+create/edit, Email Signature settings). LinkedIn: consultant LinkedIn only
+(Admin/Recruiter LinkedIn is NOT touched).
 
 Regression rule: these helpers only ever ADD formatting. A value that is a
 valid US number / LinkedIn URL is stored in the standard form; anything
@@ -90,3 +92,18 @@ def linkedin_for_storage(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     return normalize_linkedin_url(value) or value
+
+
+_EXT_SEPARATOR = " EXT "
+
+
+def extension_for_storage(value: Optional[str]) -> Optional[str]:
+    """Admin/Recruiter extension column ("<base number> EXT <digits>", or
+    just the base number): formats the base number like phone_for_storage;
+    the EXT part and any other value are kept exactly as sent."""
+    if value is None:
+        return None
+    idx = value.find(_EXT_SEPARATOR)
+    if idx == -1:
+        return phone_for_storage(value)
+    return phone_for_storage(value[:idx]) + value[idx:]

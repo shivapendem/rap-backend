@@ -19,6 +19,8 @@ from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, 
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, func, update
 from pydantic import BaseModel, EmailStr, field_validator, model_validator, Field
+# Direct Number / Extension -> "+1 (469) 392-4030"; see contact_format.py
+from contact_format import phone_for_storage, extension_for_storage
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import or_
@@ -1218,6 +1220,20 @@ class UpdateMeRequest(BaseModel):
     linkedin_url: Optional[str] = None
     designation: Optional[str] = None
     email_signature: Optional[str] = None
+
+    # CHANGE (Email Signature settings): Direct Number + Extension base
+    # number are stored as "+1 (469) 392-4030" when they are valid US
+    # numbers (the " EXT 123" part is kept). Anything else is saved exactly
+    # as before -- no new rejections (contact_format.py).
+    @field_validator("mobile_number")
+    @classmethod
+    def format_mobile_number(cls, v: Optional[str]) -> Optional[str]:
+        return phone_for_storage(v)
+
+    @field_validator("extension")
+    @classmethod
+    def format_extension(cls, v: Optional[str]) -> Optional[str]:
+        return extension_for_storage(v)
 
 
 @app.get("/auth/me")

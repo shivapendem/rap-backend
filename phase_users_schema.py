@@ -20,7 +20,7 @@ import re
 from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
 # Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
-from contact_format import phone_for_storage, linkedin_for_storage
+from contact_format import phone_for_storage, linkedin_for_storage, extension_for_storage
 
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 VALID_STATUSES = {"Active", "Inactive"}
@@ -104,6 +104,20 @@ class CreateUserRequestDTO(BaseModel):
             raise ValueError(f"role must be one of {sorted(VALID_ROLES)}")
         return v
 
+    # CHANGE: Admin/Recruiter Direct Number + Extension base number are
+    # stored as "+1 (469) 392-4030" when they are valid US numbers (the
+    # " EXT 123" part is kept). Anything else is saved exactly as before --
+    # no new rejections (contact_format.py).
+    @field_validator("mobile_number")
+    @classmethod
+    def format_mobile_number(cls, v: Optional[str]) -> Optional[str]:
+        return phone_for_storage(v)
+
+    @field_validator("extension")
+    @classmethod
+    def format_extension(cls, v: Optional[str]) -> Optional[str]:
+        return extension_for_storage(v)
+
     @field_validator("email")
     @classmethod
     def normalize_email(cls, v: str) -> str:
@@ -161,6 +175,20 @@ class EditUserRequestDTO(BaseModel):
         if v not in VALID_ROLES:
             raise ValueError(f"role must be one of {sorted(VALID_ROLES)}")
         return v
+
+    # CHANGE: Admin/Recruiter Direct Number + Extension base number are
+    # stored as "+1 (469) 392-4030" when they are valid US numbers (the
+    # " EXT 123" part is kept). Anything else is saved exactly as before --
+    # no new rejections (contact_format.py).
+    @field_validator("mobile_number")
+    @classmethod
+    def format_mobile_number(cls, v: Optional[str]) -> Optional[str]:
+        return phone_for_storage(v)
+
+    @field_validator("extension")
+    @classmethod
+    def format_extension(cls, v: Optional[str]) -> Optional[str]:
+        return extension_for_storage(v)
 
     @field_validator("email")
     @classmethod
