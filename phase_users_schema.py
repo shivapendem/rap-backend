@@ -19,6 +19,9 @@ PREFERRED_LOCATION_OPTIONS = ("Onsite", "Hybrid", "Remote")  # "All" retired —
 import re
 from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
+# Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
+from contact_format import phone_for_storage, linkedin_for_storage
+
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 VALID_STATUSES = {"Active", "Inactive"}
 VALID_CONSULTANT_STATUSES = {"ACTIVE", "INACTIVE", "BENCH", "ON_PROJECT"}  # matches your Consultant.VALID_STATUSES
@@ -349,7 +352,9 @@ class UpdateConsultantRequestDTO(BaseModel):
         # Same pattern as ProfileFormSchema's phone regex.
         if not re.match(r"^\+?[\d\s\-().]{7,20}$", v.strip()):
             raise ValueError("Enter a valid phone number")
-        return v
+        # CHANGE: store a valid US number as "+1 (469) 392-4030"; any other
+        # value that passed the check above is saved exactly as before.
+        return phone_for_storage(v)
 
     @field_validator("linkedin_url")
     @classmethod
@@ -360,7 +365,10 @@ class UpdateConsultantRequestDTO(BaseModel):
             raise ValueError("linkedin_url is required and cannot be cleared")
         if "linkedin.com" not in v.strip().lower():
             raise ValueError("linkedin_url must include linkedin.com")
-        return v
+        # CHANGE: store a valid LinkedIn URL (www./no-scheme accepted) as
+        # "https://..."; anything else that passed the check above is saved
+        # exactly as before.
+        return linkedin_for_storage(v)
 
     @field_validator("total_experience_years")
     @classmethod

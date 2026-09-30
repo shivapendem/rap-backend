@@ -83,6 +83,8 @@ from models import (
 # ---------------------------------------------------------------------------
 from auth import get_current_user, decode_access_token
 from s3_service import upload_file_to_s3, delete_file_from_s3
+# Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
+from contact_format import phone_for_storage, linkedin_for_storage
 
 logger = logging.getLogger(__name__)
 
@@ -320,11 +322,25 @@ class ProfileUpdateRequest(BaseModel):
     @field_validator("linkedInUrl")
     @classmethod
     def validate_linkedin_url(cls, v):
+        # CHANGE: accept "www.linkedin.com/in/x" / "linkedin.com/in/x"
+        # (no http(s)://) and store every valid LinkedIn URL as
+        # "https://...". Anything else falls through to the existing
+        # checks below, unchanged.
+        normalized = linkedin_for_storage(v)
+        if normalized != v:
+            return normalized
         if not re.match(r"^https?://", v):
             raise ValueError("linkedInUrl must be a valid URL")
         if "linkedin.com" not in v:
             raise ValueError("linkedInUrl must be a LinkedIn URL")
-        return v
+        return normalized
+
+    # CHANGE: store a valid US number as "+1 (469) 392-4030". The Field
+    # pattern above still decides what is accepted (runs first, unchanged).
+    @field_validator("phone")
+    @classmethod
+    def format_phone(cls, v):
+        return phone_for_storage(v)
 
     # BUG FIX ("selecting Contract and hard-refreshing unselects it", then
     # "every save fails with Invalid employmentTypes: ['C2C']"): narrowing
@@ -523,11 +539,24 @@ class _ProfilePartialBase(BaseModel):
     def validate_linkedin_url(cls, v):
         if v is None:
             return v
+        # CHANGE: same as ProfileUpdateRequest -- accept www./no-scheme
+        # LinkedIn URLs and store them as "https://..."; anything else
+        # goes through the existing checks, unchanged.
+        normalized = linkedin_for_storage(v)
+        if normalized != v:
+            return normalized
         if not re.match(r"^https?://", v):
             raise ValueError("linkedInUrl must be a valid URL")
         if "linkedin.com" not in v:
             raise ValueError("linkedInUrl must be a LinkedIn URL")
-        return v
+        return normalized
+
+    # CHANGE: store a valid US number as "+1 (469) 392-4030" (the Field
+    # pattern above still decides what is accepted).
+    @field_validator("phone")
+    @classmethod
+    def format_phone(cls, v):
+        return phone_for_storage(v)
 
     @field_validator("primarySkills")
     @classmethod
@@ -687,6 +716,19 @@ class AdminConsultantCreateRequest(BaseModel):
     @classmethod
     def normalise_email(cls, v):
         return v.lower().strip()
+
+    # CHANGE: store a valid US number as "+1 (469) 392-4030" and a valid
+    # LinkedIn URL (www./no-scheme accepted) as "https://...". Any other
+    # value is saved exactly as before -- no new rejections on this path.
+    @field_validator("phone")
+    @classmethod
+    def format_phone(cls, v):
+        return phone_for_storage(v)
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def format_linkedin_url(cls, v):
+        return linkedin_for_storage(v)
 
     @field_validator("work_auth")
     @classmethod

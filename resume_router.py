@@ -24,6 +24,8 @@ from claude_service import generate_tailored_resume, categorize_skills_with_tier
 from phase8_ai_usage_service import save_openai_rate_limits
 from resume_validation import get_missing_resume_fields, missing_fields_message
 from phase3 import _extract_text_from_docx
+# Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
+from contact_format import format_us_phone, normalize_linkedin_url
 
 # You can import openai and use it if an API key is provided
 # import openai
@@ -1311,12 +1313,24 @@ class BaseResumeContentUpdateRequest(BaseModel):
             raise ValueError("Phone is required and cannot be cleared")
         if not re.match(r"^\+?[\d\s\-().]{7,20}$", phone):
             raise ValueError("Enter a valid phone number")
+        # CHANGE: this content's phone is written to the Consultant row
+        # (update_base_resume_content) -- store a valid US number as
+        # "+1 (469) 392-4030", same as every other consultant phone save.
+        # Any other value that passed the check above is kept as-is.
+        formatted_phone = format_us_phone(phone)
+        if formatted_phone:
+            v["phone"] = formatted_phone
 
         linkedin = str(v.get("linkedin") or "").strip()
         if not linkedin:
             raise ValueError("LinkedIn is required and cannot be cleared")
         if "linkedin.com" not in linkedin.lower():
             raise ValueError("LinkedIn must include linkedin.com")
+        # CHANGE: same for LinkedIn -- www./no-scheme accepted, stored as
+        # "https://...". Anything else that passed above is kept as-is.
+        normalized_linkedin = normalize_linkedin_url(linkedin)
+        if normalized_linkedin:
+            v["linkedin"] = normalized_linkedin
 
         education = v.get("education")
         if not isinstance(education, list) or len(education) == 0:
