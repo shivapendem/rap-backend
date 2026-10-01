@@ -271,7 +271,9 @@ class ProfileUpdateRequest(BaseModel):
     # fields that were made required earlier (title, education, etc.).
     employmentTypes: List[str] = Field(..., min_length=1)
     preferredRoles: str = Field(..., min_length=1, max_length=200)
-    preferredLocations: str = Field(..., min_length=1, max_length=40)
+    # max_length raised from 40: the value now also holds typed places
+    # ("Remote,Dallas TX,Austin", up to 20 places x 60 chars).
+    preferredLocations: str = Field(..., min_length=1, max_length=1500)
     totalExperienceYears: float = Field(..., ge=0, le=60)
     # BUG FIX: these three were never collectable anywhere — the
     # "Profile incomplete" check (resume_validation.py) has always
@@ -384,14 +386,14 @@ class ProfileUpdateRequest(BaseModel):
     @field_validator("preferredLocations")
     @classmethod
     def validate_preferred_locations(cls, v):
-        # Changed from a single value to a comma-separated list from a
-        # checkbox group (e.g. "Onsite,Remote") — at least one required.
-        # "All" is no longer accepted: pick the ones actually wanted.
+        # Comma-separated: work modes (Onsite/Hybrid/Remote) + typed places
+        # (e.g. "Remote,Dallas TX") — at least one mode OR place required.
+        # "All" is no longer offered: pick the ones actually wanted.
         # FIX: normalize legacy/variant spellings ("All", "on-site",
-        # "Remote/Hybrid") instead of rejecting them — see preferred_locations.py.
+        # "Remote/Hybrid") instead of rejecting them — see normalize_preferred_locations.
         normalized = normalize_preferred_locations(v)
         if not normalized:
-            raise ValueError("Select at least one preferred location (Onsite, Hybrid, Remote)")
+            raise ValueError(PREFERRED_LOCATION_REQUIRED_MSG)
         return normalized
 
 
@@ -425,9 +427,14 @@ class ProfileUpdateRequest(BaseModel):
 # file's own validators/response below AND (via a local import, same
 # pattern as _trigger_consultant_rematch elsewhere in this codebase) by
 # phase_users_schema.py's admin validator and phase_users_service.py's
-# admin response. Stored as a comma-separated string of one or more of
-# Onsite / Hybrid / Remote, always in canonical order
-# ("Onsite,Hybrid,Remote"). Older rows hold legacy spellings ("All",
+# admin response. Stored as ONE comma-separated string:
+#   work modes first, canonical order  -> Onsite, Hybrid, Remote
+#   then free-text places, typed order -> Dallas TX, Austin
+#   e.g. "Remote,Dallas TX,Austin"
+# "All" is retired as a choice on every screen (the UI now has
+# Onsite/Hybrid/Remote chips + a type-and-Enter box for places — see
+# PreferredLocationInput / normalizePreferredLocations in rap-react
+# src/components/admin/consultants/SkillChipEditor.tsx, which mirror this function). Older rows hold legacy spellings ("All",
 # "on-site", "remote ", "Remote/Hybrid", ...) that the strict validators
 # used to reject outright — which blocked EVERY profile save (work auth,
 # skills, ...) because the whole profile used to be re-sent on every save.
@@ -448,26 +455,44 @@ _LOCATION_ALL = {"all", "any", "both", "flexible", "open", "anywhere"}
 # WHOLE token to equal "onsite"/"remote"/etc.) missed these entirely and
 # silently cleared them. Search each token for the KEYWORD anywhere in it
 # (word-boundary, so "onsite" inside "consite" wouldn't false-match) as a
-# second pass. Free-text city/state names with no work-mode word at all
-# ("Dallas TX", "Texas", "Willingness to relocate") still correctly clear —
-# there is nothing there to recover, and (see score_location in phase4.py)
-# a value like that was ALREADY not contributing to matching before this
-# fix, since it never equaled ONSITE/HYBRID/REMOTE either.
+# second pass.
+# CHANGE (typed places): a token with NO work-mode word at all ("Dallas TX",
+# "Austin", "New Jersey") is now KEPT as a preferred place instead of being
+# cleared — that's what the new type-and-Enter box saves. score_location()
+# in phase4.py / rap_python_cron matching_engine.py matches those places
+# against requirement.location.
 _RE_HYBRID = re.compile(r"\bhybrid\b")
 _RE_ONSITE = re.compile(r"\bon[\s-]?site\b|\bin[\s-]?office\b")
 _RE_REMOTE = re.compile(r"\bremote\b|\bwfh\b|\bwork\s*from\s*home\b")
 _RE_ANYWHERE = re.compile(r"\bany\s*-?\s*(?:wher?e|ware)\b")  # "any where"/"anywhere"/"any ware" typos
 
 
-def normalize_preferred_locations(value) -> str:
-    """Return canonical "Onsite,Hybrid,Remote"-style string, or "" if nothing valid."""
+PREFERRED_PLACE_MAX_COUNT = 20
+PREFERRED_PLACE_MAX_LENGTH = 60
+
+
+def _is_mode_word(key: str) -> bool:
+    return key in _LOCATION_ALL or key in _LOCATION_ALIASES
+
+
+def parse_preferred_locations(value) -> tuple[list, list]:
+    """Split a stored/submitted value into (work_modes, places).
+
+    work_modes: subset of PREFERRED_LOCATION_OPTIONS, canonical order.
+    places:     free-text places in the order given, de-duplicated
+                case-insensitively, max PREFERRED_PLACE_MAX_COUNT.
+    """
     if value is None:
-        return ""
+        return [], []
     if isinstance(value, (list, tuple, set)):
         tokens = [str(v) for v in value]
     else:
-        tokens = re.split(r"[,;/|]+", str(value))
+        # "/" is NOT a top-level separator any more — "Dallas/Fort Worth"
+        # is one place. Legacy "Remote/Hybrid" is handled per token below.
+        tokens = re.split(r"[,;|]+", str(value))
     picked = set()
+    places = []
+    seen_places = set()
     for t in tokens:
         key = " ".join(t.strip().lower().split())
         if not key:
@@ -479,18 +504,50 @@ def normalize_preferred_locations(value) -> str:
         if canon:
             picked.add(canon)
             continue
+        # Legacy "Remote/Hybrid", "onsite / remote": only when EVERY slash
+        # part is a work-mode word.
+        parts = [p.strip() for p in key.split("/") if p.strip()]
+        if len(parts) > 1 and all(_is_mode_word(p) for p in parts):
+            for p in parts:
+                if p in _LOCATION_ALL:
+                    picked.update(PREFERRED_LOCATION_OPTIONS)
+                else:
+                    picked.add(_LOCATION_ALIASES[p])
+            continue
         # Second pass: the token wasn't an exact match (e.g. it's a full
-        # sentence) — look for a recognizable keyword inside it instead.
+        # legacy sentence) — look for a recognizable keyword inside it.
+        found_mode = False
         if _RE_ANYWHERE.search(key):
             picked.update(PREFERRED_LOCATION_OPTIONS)
+            found_mode = True
+        else:
+            if _RE_HYBRID.search(key):
+                picked.add("Hybrid")
+                found_mode = True
+            if _RE_ONSITE.search(key):
+                picked.add("Onsite")
+                found_mode = True
+            if _RE_REMOTE.search(key):
+                picked.add("Remote")
+                found_mode = True
+        if found_mode:
             continue
-        if _RE_HYBRID.search(key):
-            picked.add("Hybrid")
-        if _RE_ONSITE.search(key):
-            picked.add("Onsite")
-        if _RE_REMOTE.search(key):
-            picked.add("Remote")
-    return ",".join(o for o in PREFERRED_LOCATION_OPTIONS if o in picked)
+        # No work-mode word at all -> a typed place ("Dallas TX").
+        place = " ".join(t.split())[:PREFERRED_PLACE_MAX_LENGTH].strip()
+        if place and place.lower() not in seen_places and len(places) < PREFERRED_PLACE_MAX_COUNT:
+            seen_places.add(place.lower())
+            places.append(place)
+    modes = [o for o in PREFERRED_LOCATION_OPTIONS if o in picked]
+    return modes, places
+
+
+def normalize_preferred_locations(value) -> str:
+    """Return canonical "Onsite,Remote,Dallas TX"-style string, or "" if nothing valid."""
+    modes, places = parse_preferred_locations(value)
+    return ",".join(modes + places)
+
+
+PREFERRED_LOCATION_REQUIRED_MSG = "Select a work mode (Onsite, Hybrid, Remote) or add at least one preferred location"
 
 
 def normalize_preferred_locations_or_none(value):
@@ -583,7 +640,7 @@ class _ProfilePartialBase(BaseModel):
             return v
         normalized = normalize_preferred_locations(v)
         if not normalized:
-            raise ValueError("Select at least one preferred location (Onsite, Hybrid, Remote)")
+            raise ValueError(PREFERRED_LOCATION_REQUIRED_MSG)
         return normalized
 
     @field_validator("education")
@@ -709,7 +766,7 @@ class AdminConsultantCreateRequest(BaseModel):
             return v
         normalized = normalize_preferred_locations(v)
         if not normalized:
-            raise ValueError("preferred_locations must be one or more of Onsite, Hybrid, Remote")
+            raise ValueError(PREFERRED_LOCATION_REQUIRED_MSG)
         return normalized
 
     @field_validator("email")

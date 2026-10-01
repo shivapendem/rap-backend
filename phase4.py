@@ -1002,36 +1002,228 @@ STATE_ABBREVIATIONS: dict[str, str] = {
 }
 
 
+# ─── Preferred Location helpers ────────────────────────────────────────────
+# consultant.preferred_locations = work modes + typed places, comma-separated,
+# e.g. "Remote,Dallas TX" (see phase3.py normalize_preferred_locations in the
+# main backend). Modes are matched against requirement.work_mode, places
+# against requirement.location (see _preferred_location_decision). Legacy
+# "All" = all three work modes.
+_PREF_WORK_MODES = {"ONSITE", "HYBRID", "REMOTE"}
+
+
+_PREF_MODE_ALIASES = {
+    "onsite": "ONSITE", "on-site": "ONSITE", "on site": "ONSITE",
+    "office": "ONSITE", "in office": "ONSITE", "in-office": "ONSITE",
+    "hybrid": "HYBRID",
+    "remote": "REMOTE", "wfh": "REMOTE", "work from home": "REMOTE",
+}
+_PREF_ALL_WORDS = {"all", "any", "both", "flexible", "open", "anywhere"}
+_PREF_RE_HYBRID = re.compile(r"\bhybrid\b")
+_PREF_RE_ONSITE = re.compile(r"\bon[\s-]?site\b|\bin[\s-]?office\b")
+_PREF_RE_REMOTE = re.compile(r"\bremote\b|\bwfh\b|\bwork\s*from\s*home\b")
+_PREF_RE_ANYWHERE = re.compile(r"\bany\s*-?\s*(?:wher?e|ware)\b")
+
+
+def _split_preferred_locations(raw):
+    """
+    Return (modes_upper: set, places: list) from consultant.preferred_locations.
+
+    Same parsing as normalize_preferred_locations() in the main backend's
+    phase3.py, so matching sees exactly what the profile screens show —
+    including legacy rows saved before normalization ("All", "on-site",
+    "Remote/Hybrid", "Willing to go Onsite at Houston"). "All" = all three
+    work modes (so it passes any work mode).
+    """
+    modes = set()
+    places = []
+    seen = set()
+    for token in re.split(r"[,;|]+", raw or ""):
+        key = " ".join(token.strip().lower().split())
+        if not key:
+            continue
+        if key in _PREF_ALL_WORDS:
+            modes.update(_PREF_WORK_MODES)
+            continue
+        if key in _PREF_MODE_ALIASES:
+            modes.add(_PREF_MODE_ALIASES[key])
+            continue
+        parts = [p.strip() for p in key.split("/") if p.strip()]
+        if len(parts) > 1 and all(p in _PREF_MODE_ALIASES or p in _PREF_ALL_WORDS for p in parts):
+            for p in parts:
+                if p in _PREF_ALL_WORDS:
+                    modes.update(_PREF_WORK_MODES)
+                else:
+                    modes.add(_PREF_MODE_ALIASES[p])
+            continue
+        found = False
+        if _PREF_RE_ANYWHERE.search(key):
+            modes.update(_PREF_WORK_MODES)
+            found = True
+        else:
+            for rx, mode in ((_PREF_RE_HYBRID, "HYBRID"), (_PREF_RE_ONSITE, "ONSITE"), (_PREF_RE_REMOTE, "REMOTE")):
+                if rx.search(key):
+                    modes.add(mode)
+                    found = True
+        if found:
+            continue
+        place = " ".join(token.split())[:60].strip()
+        if place and place.lower() not in seen and len(places) < 20:
+            seen.add(place.lower())
+            places.append(place)
+    return modes, places
+
+
+# Metro / city short names. Each maps to one or more real place names
+# (alternatives): a typed place "DFW" matches a job in Dallas OR Fort Worth,
+# and a job location "DFW" is read as "dallas fort worth". Applied on BOTH
+# sides (consultant's typed places and requirement.location). Add new ones
+# here — lower-case keys, whole words only.
+# "LA" is deliberately NOT here: it is the state code for Louisiana.
+_CITY_ALIASES: dict[str, list[str]] = {
+    "nyc": ["new york"], "new york city": ["new york"], "manhattan": ["new york"],
+    "dfw": ["dallas", "fort worth"], "dallas fort worth": ["dallas", "fort worth"],
+    "sf": ["san francisco"], "sfo": ["san francisco"],
+    "bay area": ["san francisco", "san jose", "oakland"],
+    "silicon valley": ["san jose", "santa clara", "sunnyvale", "mountain view", "palo alto"],
+    "philly": ["philadelphia"], "atl": ["atlanta"], "nola": ["new orleans"],
+    "vegas": ["las vegas"], "slc": ["salt lake city"], "kc": ["kansas city"],
+    "okc": ["oklahoma city"], "stl": ["st louis"], "phx": ["phoenix"],
+    "twin cities": ["minneapolis", "st paul"], "msp": ["minneapolis", "st paul"],
+    "rtp": ["raleigh", "durham"], "research triangle": ["raleigh", "durham"],
+    "nova": ["arlington", "reston", "mclean", "herndon", "fairfax"],
+    "northern virginia": ["arlington", "reston", "mclean", "herndon", "fairfax"],
+    "hou": ["houston"], "htx": ["houston"], "atx": ["austin"],
+    "bos": ["boston"], "pdx": ["portland"], "mia": ["miami"],
+    "clt": ["charlotte"], "jax": ["jacksonville"], "cbus": ["columbus"],
+    "chi": ["chicago"], "chitown": ["chicago"],
+}
+_CITY_ALIAS_RES = {
+    alias: re.compile(r"(?<![a-z0-9])" + r"[\s.-]*".join(re.escape(w) for w in alias.split()) + r"(?![a-z0-9])", re.IGNORECASE)
+    for alias in sorted(_CITY_ALIASES, key=len, reverse=True)
+}
+# Word spellings treated as the same on both sides.
+_LOCATION_WORD_SYNONYMS = {"saint": "st", "ft": "fort"}
+
+
+def _expand_city_aliases(text):
+    """Requirement side: replace every short name with all of its place names."""
+    out = text or ""
+    for alias, rx in _CITY_ALIAS_RES.items():
+        out = rx.sub(" " + " ".join(_CITY_ALIASES[alias]) + " ", out)
+    return out
+
+
+def _place_variants(place):
+    """Consultant side: "DFW" -> ["dallas", "fort worth"]; plain places unchanged."""
+    for alias, rx in _CITY_ALIAS_RES.items():
+        if rx.search(place):
+            return [rx.sub(" " + alt + " ", place, count=1) for alt in _CITY_ALIASES[alias]]
+    return [place]
+
+
+def _location_words(text, expand_lowercase_states):
+    """
+    Lower-cased words of a location, with US state codes expanded via
+    STATE_ABBREVIATIONS ("TX" -> "texas", "NY" -> "new", "york").
+    Requirement text expands only UPPER-case 2-letter codes, so prose
+    words like "in"/"or"/"me" aren't read as states; a place the
+    consultant typed expands either case ("dallas tx").
+    """
+    words = []
+    for m in re.finditer(r"[A-Za-z0-9]+", text or ""):
+        w = m.group(0)
+        lw = w.lower()
+        if len(w) == 2 and lw in STATE_ABBREVIATIONS and (expand_lowercase_states or w.isupper()):
+            words.extend(STATE_ABBREVIATIONS[lw].split())
+        else:
+            words.append(_LOCATION_WORD_SYNONYMS.get(lw, lw))
+    return words
+
+
+def _place_matches_location(places, requirement_location):
+    """
+    True when ALL words of any one typed place appear in requirement.location
+    (case-insensitive, state codes and names treated the same, city short
+    names from _CITY_ALIASES expanded on both sides):
+      "Dallas TX" matches "Dallas, TX 75201", "Dallas, Texas", "Dallas-Fort Worth, TX"
+      "Texas"     matches "Austin, TX"
+      "NYC"       matches "New York, NY"      "New York" matches "NYC"
+      "DFW"       matches "Fort Worth, TX"    "Dallas"   matches "DFW"
+      "Austin"    does not match "Houston, TX"
+    """
+    loc_words = set(_location_words(_expand_city_aliases(requirement_location), expand_lowercase_states=False))
+    if not loc_words or not places:
+        return False
+    for place in places:
+        for variant in _place_variants(place):
+            place_words = _location_words(variant, expand_lowercase_states=True)
+            if place_words and set(place_words) <= loc_words:
+                return True
+    return False
+
+
+def _preferred_location_decision(requirement: Requirement, consultant: Consultant) -> tuple[bool, str]:
+    """
+    Preferred Location rule (single source of truth for score_location()
+    and location_passes()). The consultant's preferred_locations holds
+    work modes and/or typed places, e.g. "Onsite,Dallas TX":
+
+      - requirement location empty / "N/A"      -> pass (wildcard)
+      - consultant set nothing, or legacy "All" -> pass (wildcard)
+      - only work modes set  -> requirement.work_mode must be one of them
+      - only places set      -> requirement.location must contain one of them
+      - modes AND places set -> BOTH must match
+      - requirement.work_mode empty / UNKNOWN -> the work-mode check is skipped
+
+    REMOTE requirements follow the same rules (no longer an automatic pass).
+    """
+    if not requirement.location or requirement.location.strip().upper() == "N/A":
+        return True, "requirement location is N/A — passes all"
+
+    modes, places = _split_preferred_locations(consultant.preferred_locations)
+    if not modes and not places:
+        return True, "consultant location constraint is N/A — matches requirement"
+
+    req_work_mode = (requirement.work_mode or "").strip().upper()
+    if modes and req_work_mode in _PREF_WORK_MODES and req_work_mode not in modes:
+        return False, (
+            f"requirement work mode {req_work_mode} not in consultant work modes "
+            f"({', '.join(sorted(modes))})"
+        )
+
+    if places and not _place_matches_location(places, requirement.location):
+        return False, (
+            f"requirement location '{requirement.location}' matches none of consultant "
+            f"locations ({', '.join(places)})"
+        )
+
+    checked = []
+    if modes and req_work_mode in _PREF_WORK_MODES:
+        checked.append(f"work mode {req_work_mode}")
+    if places:
+        checked.append("location")
+    return True, ("matched " + " + ".join(checked)) if checked else "work mode not stated on requirement — passes"
+
+
 def score_location(requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]) -> float:
     """
     Location/work mode compatibility.
-    REMOTE requirement matches any consultant fully (location-agnostic).
 
-    UPDATED: consultant.preferred_locations comes from a checkbox group
-    (PREFERRED_LOCATION_OPTIONS in phase_users_schema.py: "Onsite" |
-    "Hybrid" | "Remote", one or more) instead of a free-text city/state
-    list — it's stored as a comma-separated string, e.g. "Onsite,Remote",
-    and compared against requirement.work_mode by membership rather than
-    exact equality. Unset, or the legacy single value "All" saved before
-    this change, is treated as an open match, same "unspecified = don't
-    penalize" wildcard rule documented on every other Stage 0-4 filter
-    and mirrored by location_passes() below.
+    Pass/fail comes ONLY from _preferred_location_decision() above:
+    work modes only -> work mode checked; places only -> location checked;
+    both -> both checked. A fail scores 0.
+
+    A pass scores 60, plus 40 when the consultant's most recent experience
+    has the same work mode as the requirement — that 40 only RANKS
+    consultants who already passed; it can no longer make a failed
+    preferred-location check pass on its own.
     """
-    req_work_mode = (requirement.work_mode or "").upper()
+    passed, _reason = _preferred_location_decision(requirement, consultant)
+    if not passed:
+        return 0.0
 
-    if req_work_mode == "REMOTE":
-        return 100.0
-
-    score = 0.0
-
-    # Preferred-location (work-mode) match — membership in the
-    # comma-separated list, not exact equality (a consultant can now
-    # pick more than one).
-    prefs = {p.strip().upper() for p in (consultant.preferred_locations or "").split(",") if p.strip()}
-    if not prefs or "ALL" in prefs:
-        score += 60.0
-    elif req_work_mode and req_work_mode in prefs:
-        score += 60.0
+    score = 60.0
+    req_work_mode = (requirement.work_mode or "").strip().upper()
 
     # Work mode match — compare against most recent experience entry's work_mode
     if req_work_mode and experiences:
@@ -1253,23 +1445,12 @@ def location_passes(
     requirement: Requirement, consultant: Consultant, experiences: List[ConsultantExperience]
 ) -> tuple[bool, str]:
     """
-    Stage 4 — Location filter. N/A on EITHER side matches everyone — same
-    wildcard rule as every other Stage 1-4 filter. Otherwise reuses
-    score_location()'s existing remote/onsite/hybrid compatibility rules
-    unchanged, converted from a weighted score into a boolean pass/fail.
-
-    UPDATED: consultant.preferred_locations comes from a checkbox group
-    ("Onsite" | "Hybrid" | "Remote", one or more, comma-separated) —
-    unset, or the legacy single value "All" saved before this change, is
-    the wildcard equivalent of the old "not stated" case.
+    Stage 4 — Location filter. Same rule as score_location(), see
+    _preferred_location_decision(): work modes only -> work mode checked;
+    typed locations only -> location checked; both -> both must match.
+    N/A on either side matches everyone.
     """
-    if not requirement.location or requirement.location.strip().upper() == "N/A":
-        return True, "requirement location is N/A — passes all"
-    prefs = {p.strip().upper() for p in (consultant.preferred_locations or "").split(",") if p.strip()}
-    if not prefs or "ALL" in prefs:
-        return True, "consultant location constraint is N/A — matches requirement"
-    score = score_location(requirement, consultant, experiences)
-    return score > 0, f"location score={score}"
+    return _preferred_location_decision(requirement, consultant)
 
 
 def validate_match(
