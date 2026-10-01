@@ -100,6 +100,82 @@ COMPANY_BANNER_CID = "company_banner_img"
 COMPANY_BANNER_S3_KEY = "company-assets/banner.png"
 
 
+# ---------------------------------------------------------------------------
+# Sent-email signature layout (CHANGE, per the reference screenshots):
+# plain stacked blocks instead of the old two-column card with a divider.
+#
+#   Employer Details:
+#   <Name>                      (teal, bold)
+#   <Title>                     (italic, grey)
+#   E: <email>                  (link)
+#   D: <phone>                  (link, US format)
+#
+#   (one blank line)
+#
+#   Best regards,
+#   <Consultant name>           (teal, bold; no "Consultant" label under it)
+#   E: <email>
+#   D: <phone>
+#   <LinkedIn URL>
+#
+# Removed on purpose: the "A:" address line, the "T:/EXT" rows and the
+# LinkedIn/website links in the Employer Details block, and the company
+# name/tagline lines at the end of the plain-text version.
+# ---------------------------------------------------------------------------
+import re as _re_phone
+
+
+def format_us_phone(raw: Optional[str]) -> str:
+    """Format a US number as "+1 (XXX) XXX-XXXX". Accepts 10 digits or 11
+    digits starting with 1, in any punctuation ("4696630621",
+    "+1 469 663 0621", "(469) 663-0621"). Anything else -- a non-US number,
+    an extension, a number with letters -- is returned exactly as stored
+    (trimmed), never guessed at. Area codes can't start with 0 or 1, so a
+    digit string that does is left alone too."""
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    if _re_phone.search(r"[A-Za-z]", text):
+        return text
+    digits = _re_phone.sub(r"\D", "", text)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10 and digits[0] in "23456789":
+        return f"+1 ({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return text
+
+
+def _tel_href(raw: Optional[str]) -> Optional[str]:
+    """tel: target for a phone as stored/formatted, or None when it has no
+    digits. Keeps a leading "+" (international), adds +1 for US numbers."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    digits = _re_phone.sub(r"\D", "", text)
+    if not digits:
+        return None
+    if text.startswith("+"):
+        return "tel:+" + digits
+    if len(digits) == 10:
+        return "tel:+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "tel:+" + digits
+    return "tel:" + digits
+
+
+def _employer_text_block(lines: list, name: str, title: Optional[str],
+                         email: Optional[str], phone: Optional[str]) -> None:
+    lines.append("Employer Details:")
+    lines.append(name)
+    if title:
+        lines.append(title)
+    if email:
+        lines.append(f"E: {email}")
+    if phone:
+        lines.append(f"D: {format_us_phone(phone)}")
+    lines.append("")
+
+
 def build_signature_text(
     name: str,
     title: Optional[str],
@@ -115,72 +191,79 @@ def build_signature_text(
     employer_extension: Optional[str] = None,
     extra_employers: Optional[list] = None,
 ) -> str:
-    """Plain-text fallback signature — used as the multipart/plain part of
-    the sent email, and shown in the (plain-text) preview UI.
-
-    FEATURE CHANGE — layout order: Employer Details (the recruiter
-    actually handling this consultant — see permission_service.
-    get_handling_recruiter) now comes FIRST, directly after the message
-    body, followed by the "Best regards," sign-off and then the
-    consultant's own name/contact card. Previously the consultant's card
-    came first and Employer Details was appended after it — reordered per
-    updated requirement so the sign-off reads naturally right before the
-    actual signer's identity. The employer_* fields are all optional;
-    the whole Employer Details block is omitted when employer_name isn't
-    provided, e.g. a consultant with no assigned recruiter."""
+    """Plain-text fallback signature -- used as the multipart/plain part of
+    the sent email, and shown in the (plain-text) preview UI. Same order and
+    content as build_signature_html(): Employer Details block(s) first, one
+    blank line, then "Best regards," and the consultant's own details.
+    employer_extension is accepted but no longer shown (see the layout note
+    above); the whole Employer Details block is omitted when employer_name
+    isn't provided, e.g. a consultant with no assigned recruiter."""
     lines = []
 
     if employer_name:
-        lines.append("Employer Details:")
-        lines.append(employer_name)
-        if employer_title:
-            lines.append(employer_title)
-        if employer_email:
-            lines.append(f"E: {employer_email}")
-        if employer_phone:
-            lines.append(f"D: {employer_phone}")
-        if employer_extension:
-            lines.append(f"T: {COMPANY_LINE_NUMBER}")
-            lines.append(f"EXT {employer_extension}")
-        lines.append("")
+        _employer_text_block(lines, employer_name, employer_title, employer_email, employer_phone)
 
     # One more Employer Details block per additional recruiter in CC.
     for ex in (extra_employers or []):
         if not ex.get("employer_name"):
             continue
-        lines.append("Employer Details:")
-        lines.append(ex["employer_name"])
-        if ex.get("employer_title"):
-            lines.append(ex["employer_title"])
-        if ex.get("employer_email"):
-            lines.append(f"E: {ex['employer_email']}")
-        if ex.get("employer_phone"):
-            lines.append(f"D: {ex['employer_phone']}")
-        if ex.get("employer_extension"):
-            lines.append(f"T: {COMPANY_LINE_NUMBER}")
-            lines.append(f"EXT {ex['employer_extension']}")
-        lines.append("")
+        _employer_text_block(
+            lines, ex["employer_name"], ex.get("employer_title"),
+            ex.get("employer_email"), ex.get("employer_phone"),
+        )
 
     lines.append("Best regards,")
     lines.append(name)
     if title:
         lines.append(title)
-    if linkedin_url:
-        lines.append(linkedin_url)
-    lines.append("")
     if email:
         lines.append(f"E: {email}")
     if direct_number:
-        lines.append(f"D: {direct_number}")
+        lines.append(f"D: {format_us_phone(direct_number)}")
     if extension:
         lines.append(f"T: {COMPANY_LINE_NUMBER}")
         lines.append(f"EXT {extension}")
-    lines.append(f"A: {COMPANY_ADDRESS}")
+    if linkedin_url:
+        lines.append(linkedin_url)
+    return "\n".join(lines).rstrip()
 
-    lines.append("")
-    lines.append(COMPANY_NAME)
-    lines.append(f'"{COMPANY_TAGLINE}"')
-    return "\n".join(lines)
+
+_SIG_FONT = "font-family:Arial,Helvetica,sans-serif;"
+_SIG_LINK = "color:#2563eb;text-decoration:underline;"
+
+
+def _phone_row_html(esc, phone: Optional[str]) -> str:
+    shown = format_us_phone(phone)
+    href = _tel_href(shown)
+    if href:
+        return f'<div><b>D:</b> <a href="{esc(href)}" style="{_SIG_LINK}">{esc(shown)}</a></div>'
+    return f'<div><b>D:</b> {esc(shown)}</div>'
+
+
+def _employer_html_block(esc, name: str, title: Optional[str],
+                         email: Optional[str], phone: Optional[str]) -> str:
+    title_html = (
+        f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(title)}</div>'
+        if title else ""
+    )
+    email_html = (
+        f'<div><b>E:</b> <a href="mailto:{esc(email)}" style="{_SIG_LINK}">{esc(email)}</a></div>'
+        if email else ""
+    )
+    phone_html = _phone_row_html(esc, phone) if phone else ""
+    rows_html = (
+        f'<div style="margin-top:6px;line-height:1.6;">{email_html}{phone_html}</div>'
+        if (email_html or phone_html) else ""
+    )
+    # The closing spacer is the one blank line between this block and
+    # whatever follows it (the next Employer Details block, or "Best regards,").
+    return (
+        f'<div style="{_SIG_FONT}font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Employer Details:</div>'
+        f'<div style="{_SIG_FONT}font-size:13px;color:#334155;margin-top:6px;">'
+        f'<div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(name)}</div>'
+        f'{title_html}{rows_html}</div>'
+        f'<div style="{_SIG_FONT}font-size:13px;line-height:20px;">&nbsp;</div>'
+    )
 
 
 def build_signature_html(
@@ -200,158 +283,61 @@ def build_signature_html(
     employer_linkedin_url: Optional[str] = None,
     extra_employers: Optional[list] = None,
 ) -> str:
-    """Rich HTML signature — matches the provided card layout. Sent as the
+    """Rich HTML signature in the stacked layout described above. Sent as the
     multipart/html part (see gmail_send_service.build_mime_message), so it
-    only actually renders in HTML-capable email clients; plain-text
-    clients fall back to build_signature_text() above.
+    only renders in HTML-capable clients; plain-text clients fall back to
+    build_signature_text().
 
-    FEATURE CHANGE — layout order: Employer Details (the recruiter
-    actually handling this consultant — see permission_service.
-    get_handling_recruiter) now comes FIRST, directly after the message
-    body, followed by a "Best regards," line and then the consultant's
-    own contact card. Previously the consultant's card came first and
-    Employer Details was appended after it — reordered per updated
-    requirement. The employer_* fields are all optional; the whole
-    Employer Details block is omitted when employer_name isn't provided,
-    e.g. a consultant with no assigned recruiter.
-
-    FEATURE CHANGE: the company banner image has been removed from this
-    signature entirely per updated requirement — banner_src is kept as a
-    parameter (unused) only so existing call sites that still pass it
-    don't break.
-    """
+    Employer Details (the recruiter handling this consultant -- see
+    permission_service.get_handling_recruiter) comes FIRST, then one blank
+    line, then "Best regards," and the consultant's own details. The
+    employer_* fields are optional; the whole block is omitted when
+    employer_name isn't provided. employer_extension, employer_linkedin_url
+    and banner_src are accepted so existing call sites keep working, but are
+    no longer shown."""
     import html as _html
 
     def esc(s: Optional[str]) -> str:
         return _html.escape(s) if s else ""
 
-    contact_rows = []
-    if email:
-        contact_rows.append(f'<b>E:</b> <a href="mailto:{esc(email)}" style="color:#2563eb;text-decoration:underline;">{esc(email)}</a>')
-    if direct_number:
-        contact_rows.append(f'<b>D:</b> {esc(direct_number)}')
-    if extension:
-        # CHANGE ("move the EXT number to a new line"): was one row
-        # ("T: <company number> EXT <extension>") — split into its own
-        # <br>-separated row below the phone number instead.
-        contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)}')
-        contact_rows.append(f'EXT {esc(extension)}')
-    contact_rows.append(f'<b>A:</b> {esc(COMPANY_ADDRESS)}')
-    contact_html = "<br>".join(contact_rows)
-
-    linkedin_html = (
-        f'<div style="margin-top:8px;"><a href="{esc(linkedin_url)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(linkedin_url)}</a></div>'
-        if linkedin_url else ""
-    )
-    title_html = f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(title)}</div>' if title else ""
-
-    # Employer Details — a visually distinct card identifying the
-    # recruiter actually handling this consultant (see permission_service.
-    # get_handling_recruiter), rendered BEFORE the consultant's own card
-    # below. Omitted entirely when employer_name isn't provided, e.g. a
-    # consultant with no assigned recruiter, rather than rendering an
-    # empty/broken-looking block.
     employer_block_html = ""
     if employer_name:
-        employer_contact_rows = []
-        if employer_email:
-            employer_contact_rows.append(f'<b>E:</b> <a href="mailto:{esc(employer_email)}" style="color:#2563eb;text-decoration:underline;">{esc(employer_email)}</a>')
-        if employer_phone:
-            employer_contact_rows.append(f'<b>D:</b> {esc(employer_phone)}')
-        if employer_extension:
-            # CHANGE ("move the EXT number to a new line" — this is the
-            # row shown in the screenshot, "T: <number> EXT <number> EXT
-            # <ext>" reading as one glued-together line): split into its
-            # own <br>-separated row below the phone number.
-            employer_contact_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)}')
-            employer_contact_rows.append(f'EXT {esc(employer_extension)}')
-        employer_contact_html = "<br>".join(employer_contact_rows)
+        employer_block_html += _employer_html_block(esc, employer_name, employer_title, employer_email, employer_phone)
 
-        employer_linkedin_html = (
-            f'<div style="margin-top:8px;"><a href="{esc(employer_linkedin_url)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(employer_linkedin_url)}</a></div>'
-            if employer_linkedin_url else ""
-        )
-        # CHANGE (match reference layout): a company website link under
-        # LinkedIn, same style. COMPANY_WEBSITE is a fixed constant (like
-        # COMPANY_ADDRESS above), not a per-recruiter field — same for
-        # every Employer Details block, always shown.
-        employer_website_html = f'<div style="margin-top:4px;"><a href="https://{esc(COMPANY_WEBSITE)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(COMPANY_WEBSITE)}</a></div>'
-        # CHANGED: smaller than the name above it (was inheriting the
-        # table's 13px, same size as the name) so it reads as a
-        # subordinate label, not competing with it.
-        employer_title_html = f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(employer_title)}</div>' if employer_title else ""
-
-        # CHANGED: was a distinct small-caps uppercase label style
-        # (11px, bold, letter-spacing) — now matches "Best regards,"
-        # below exactly (same font-size, weight, color, and the same
-        # margin-top, so the gap above both reads the same too),
-        # per updated design.
-        employer_block_html = f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Employer Details:</div>
-<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;margin-bottom:16px;">
-  <tr>
-    <td style="vertical-align:top;padding-right:20px;">
-      <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(employer_name)}</div>
-      {employer_title_html}
-      {employer_linkedin_html}
-      {employer_website_html}
-    </td>
-    <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
-      {employer_contact_html}
-    </td>
-  </tr>
-</table>
-"""
-
-    # Additional recruiters in CC: same card, one per recruiter.
+    # Additional recruiters in CC: same stacked block, one per recruiter.
     for ex in (extra_employers or []):
         if not ex.get("employer_name"):
             continue
-        ex_rows = []
-        if ex.get("employer_email"):
-            ex_rows.append(f'<b>E:</b> <a href="mailto:{esc(ex["employer_email"])}" style="color:#2563eb;text-decoration:underline;">{esc(ex["employer_email"])}</a>')
-        if ex.get("employer_phone"):
-            ex_rows.append(f'<b>D:</b> {esc(ex["employer_phone"])}')
-        if ex.get("employer_extension"):
-            ex_rows.append(f'<b>T:</b> {esc(COMPANY_LINE_NUMBER)}')
-            ex_rows.append(f'EXT {esc(ex["employer_extension"])}')
-        ex_title = f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(ex.get("employer_title"))}</div>' if ex.get("employer_title") else ""
-        ex_linkedin = (
-            f'<div style="margin-top:8px;"><a href="{esc(ex["employer_linkedin_url"])}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(ex["employer_linkedin_url"])}</a></div>'
-            if ex.get("employer_linkedin_url") else ""
+        employer_block_html += _employer_html_block(
+            esc, ex["employer_name"], ex.get("employer_title"),
+            ex.get("employer_email"), ex.get("employer_phone"),
         )
-        employer_block_html += f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Employer Details:</div>
-<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;margin-bottom:16px;">
-  <tr>
-    <td style="vertical-align:top;padding-right:20px;">
-      <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(ex["employer_name"])}</div>
-      {ex_title}
-      {ex_linkedin}
-      <div style="margin-top:4px;"><a href="https://{esc(COMPANY_WEBSITE)}" style="color:#2563eb;text-decoration:underline;font-weight:600;">{esc(COMPANY_WEBSITE)}</a></div>
-    </td>
-    <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
-      {"<br>".join(ex_rows)}
-    </td>
-  </tr>
-</table>
-"""
 
+    title_html = (
+        f'<div style="font-style:italic;color:#334155;font-size:11px;margin-top:2px;">{esc(title)}</div>'
+        if title else ""
+    )
+    rows = []
+    if email:
+        rows.append(f'<div><b>E:</b> <a href="mailto:{esc(email)}" style="{_SIG_LINK}">{esc(email)}</a></div>')
+    if direct_number:
+        rows.append(_phone_row_html(esc, direct_number))
+    if extension:
+        rows.append(f'<div><b>T:</b> {esc(COMPANY_LINE_NUMBER)}</div>')
+        rows.append(f'<div>EXT {esc(extension)}</div>')
+    if linkedin_url:
+        rows.append(f'<div style="margin-top:6px;"><a href="{esc(linkedin_url)}" style="{_SIG_LINK}font-weight:600;">{esc(linkedin_url)}</a></div>')
+    rows_html = f'<div style="margin-top:6px;line-height:1.6;">{"".join(rows)}</div>' if rows else ""
+
+    # With an Employer Details block above, its closing spacer already is the
+    # one blank line, so "Best regards," needs no extra top margin.
+    best_regards_margin = "0" if employer_block_html else "12px"
     return f"""
-{employer_block_html}
-<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000000;font-weight:600;margin-top:12px;">Best regards,</div>
-<table cellpadding="0" cellspacing="0" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#334155;margin-top:6px;">
-  <tr>
-    <td style="vertical-align:top;padding-right:20px;">
-      <div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(name)}</div>
-      {title_html}
-      {linkedin_html}
-    </td>
-    <td style="vertical-align:top;border-left:1px solid #cbd5e1;padding-left:20px;line-height:1.6;">
-      {contact_html}
-    </td>
-  </tr>
-</table>
+{employer_block_html}<div style="{_SIG_FONT}font-size:13px;color:#000000;font-weight:600;margin-top:{best_regards_margin};">Best regards,</div>
+<div style="{_SIG_FONT}font-size:13px;color:#334155;margin-top:6px;">
+<div style="font-weight:700;color:#0f766e;font-size:14px;">{esc(name)}</div>
+{title_html}{rows_html}
+</div>
 """.strip()
 
 
@@ -480,7 +466,8 @@ def resolve_sender_fields(current_user, consultant) -> dict:
     custom signature editor/save feature was removed."""
     return {
         "sender_name": (consultant.full_name if consultant else "") or "",
-        "sender_title": "Consultant",
+        # No "Consultant" label under the consultant's name in the sent email.
+        "sender_title": None,
         "sender_email": (consultant.email if consultant else "") or "",
         "sender_direct_number": consultant.phone if consultant else None,
         "sender_extension": None,

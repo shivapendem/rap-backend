@@ -155,6 +155,13 @@ class ResumeUpdateRequest(BaseModel):
     job_description: Optional[str] = None
     data: Optional[dict] = None
     status: Optional[str] = None
+    # Visual template for the DOCX/PDF (same ids as the frontend's
+    # RESUME_TEMPLATES and phase6._generate_docx's TEMPLATE_CONFIG).
+    # Optional: callers that don't send it keep the resume's current template.
+    template: Optional[str] = None
+
+
+RESUME_TEMPLATE_IDS = {"classic", "compact", "modern", "executive", "timeline"}
 
 class ResumeResponse(BaseModel):
     id: int
@@ -3430,6 +3437,15 @@ async def update_resume(
         resume.data = request.data
     if request.status is not None:
         resume.status = request.status
+    template_changed = False
+    if request.template is not None:
+        if request.template not in RESUME_TEMPLATE_IDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown template '{request.template}'. Allowed: {', '.join(sorted(RESUME_TEMPLATE_IDS))}",
+            )
+        template_changed = request.template != (resume.template or "classic")
+        resume.template = request.template
 
     await db.commit()
     await db.refresh(resume)
@@ -3451,7 +3467,10 @@ async def update_resume(
     # View/Download served could look plainer than the template actually
     # selected. Generating and storing the DOCX itself as resume.s3_key
     # removes that lossy conversion step entirely.
-    if request.data is not None:
+    # Rebuild the DOCX when the content changed, or when only the template
+    # changed (e.g. Download right after picking a new template), so
+    # View/Download always use the chosen layout.
+    if request.data is not None or template_changed:
         from phase6 import _generate_docx
         from pathlib import Path
 
