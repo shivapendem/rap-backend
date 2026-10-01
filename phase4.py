@@ -227,6 +227,751 @@ def extract_skills(text: Optional[str]) -> List[str]:
     return sorted(found)
 
 
+# ---------------------------------------------------------------------------
+# Context-aware skill extraction for requirement text.
+#
+# SKILL_ALIASES was built for SKILL LISTS ("Go, TS, React, Spark"), where
+# every short alias really is a skill. The requirement side also scans raw
+# job-description PROSE (the fallback in _requirement_skills()), and there
+# many aliases are ordinary English words or name OTHER technologies.
+# Full audit of all 84 aliases — the ones that misfire, and the rule used:
+#
+#   alias     false positive in a JD                      rule
+#   --------  ------------------------------------------  --------------------------
+#   go        "we go live", "go-live", "ready to go"      "Go"/"GO" not used as a verb;
+#                                                           lowercase only as a list item
+#   ts        "TS/SCI", "active TS clearance"             "TS" only, no clearance words near
+#   js        "Nuxt.js", "Express.js", "D3.js"            not glued to "<name>." (framework)
+#   react     "React Native", "able to react quickly"     not "Native", not the verb
+#   ai        "Ai Chen" (a name), random "ai"             "AI", or lowercase next to ML/LLM
+#   ml        "5 ml", stray "ml"                          not after a number; "ML", or
+#                                                           lowercase next to AI/data/model
+#   spark     "spark innovation", "Spark Hire"            not the noun/verb use
+#   airflow   HVAC / data-center "airflow management"     no HVAC/cooling words near
+#   tailwind  "market tailwind", "economic tailwinds"     no market/economy words near
+#   flask     lab JDs: "volumetric flask"                 no lab/chemistry words near
+#   jenkins   recruiter name "Sarah Jenkins" + email      not a person's name/signature
+#   (any)     emails / URLs / domains in signatures and   blanked before scanning
+#             apply links ("jobs@golang-shop.com")
+#
+# All other aliases (python, java, c#, django, docker, aws, kafka, sql, ...)
+# were checked and are unambiguous — unchanged.
+#
+# Two entry points, both used ONLY by _requirement_skills():
+#   extract_skills_from_free_text() — raw JD prose fallback: all rules above.
+#   _alias_matches_skill_item()     — one parser-extracted skill string:
+#       only the "different technology" rules (js, react native, ts
+#       clearance), since a parsed item is already a skill, not prose.
+# extract_skills() itself is untouched, so consultant primary_skills, the
+# role-title skill top-up and claude_service.py behave exactly as before
+# (on a consultant's own skill list "Go", "TS", "JS" are real skills).
+# ---------------------------------------------------------------------------
+
+_FT_NON_PROSE = re.compile(
+    r"(https?://\S+|www\.\S+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+    r"|\b[\w-]+(?:\.[\w-]+)*\.(?:com|org|io|co|us|in|dev|app|tech|jobs)\b(?:/\S*)?)",
+    re.IGNORECASE,
+)
+
+_GO_VERB_FOLLOWERS: frozenset[str] = frozenset({
+    "live", "to", "ahead", "through", "over", "back", "out", "beyond", "above",
+    "into", "forward", "get", "getter", "getters", "home", "away", "down", "up",
+    "on", "off", "along", "around", "further", "extra", "no", "a", "the",
+    "for", "with", "and", "in", "by", "far", "deep", "deeper",
+})
+_GO_VERB_PRECEDERS: frozenset[str] = frozenset({
+    "to", "let's", "lets", "the", "we", "you", "i", "they", "will", "can",
+    "must", "should", "would", "could", "may", "might", "not",
+    "ready", "good", "can't", "cannot", "won't",
+})
+_REACT_VERB_PRECEDERS: frozenset[str] = frozenset({
+    "to", "will", "must", "can", "should", "could", "would", "may", "quickly",
+})
+_REACT_VERB_FOLLOWERS: frozenset[str] = frozenset({
+    "to", "quickly", "promptly", "accordingly", "appropriately", "swiftly",
+    "fast", "calmly", "immediately", "positively", "rapidly",
+})
+_SPARK_WORD_PRECEDERS: frozenset[str] = frozenset({
+    "a", "the", "to", "will", "can", "that", "which", "help", "helps", "creative",
+})
+_SPARK_WORD_FOLLOWERS: frozenset[str] = frozenset({
+    "innovation", "creativity", "joy", "interest", "change", "ideas", "idea",
+    "conversation", "conversations", "growth", "hire", "curiosity",
+    "excitement", "engagement", "new", "passion", "debate", "action",
+})
+
+_CTX_TS_CLEARANCE = re.compile(r"\b(sci|clearance|cleared|secret|poly|polygraph|fsp|dod|clr)\b")
+_CTX_AI = re.compile(r"\b(ml|machine learning|llm|llms|genai|nlp|deep learning)\b")
+_CTX_ML = re.compile(r"\b(ai|artificial intelligence|machine|model|models|modeling|data|llm|nlp|mlops)\b")
+_CTX_HVAC = re.compile(r"\b(hvac|cooling|ventilation|duct|ducts|ductwork|fans?|cfm|thermal|heating|exhaust|air handling|containment|chiller|chillers|crac|crah)\b")
+_CTX_ECONOMY = re.compile(r"\b(headwinds?|market|markets|economic|economy|macro|revenue|industry)\b")
+_CTX_LAB = re.compile(r"\b(lab|labs|laboratory|volumetric|erlenmeyer|beaker|beakers|pipettes?|reagents?|chemical|chemicals|chemistry|titration|glassware|sample|samples)\b")
+_CTX_SIGNATURE_BEFORE = re.compile(r"\b(regards|thanks|thank you|sincerely|recruiter|contact|reach out to|name)\b")
+_CTX_PHONE = re.compile(r"\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}")
+
+
+def _ft_next_word(lower: str, end: int) -> Optional[str]:
+    m = re.match(r"[\s\-]+([a-z']+)", lower[end:end + 40])
+    return m.group(1) if m else None
+
+
+def _ft_prev_word(lower: str, start: int) -> Optional[str]:
+    m = re.search(r"([a-z0-9'.]+)[\s\-]+$", lower[max(0, start - 40):start])
+    return m.group(1) if m else None
+
+
+def _ft_prev_char(lower: str, start: int) -> str:
+    before = lower[:start].rstrip()
+    return before[-1] if before else ""
+
+
+def _ft_window(lower: str, start: int, end: int, size: int) -> str:
+    return lower[max(0, start - size):end + size]
+
+
+def _free_text_occurrence_ok(alias: str, original: str, lower: str, raw_lower: str, start: int, end: int) -> bool:
+    """Context check for ONE occurrence of an ambiguous alias in JD prose.
+    original = JD with its own casing; lower = lowercased with URLs/emails
+    blanked out (same length); raw_lower = lowercased, nothing blanked.
+    All three share the same indices."""
+    tok = original[start:end]
+    nxt = _ft_next_word(lower, end)
+    prv = _ft_prev_word(lower, start)
+
+    if alias == "go":
+        if nxt in _GO_VERB_FOLLOWERS or prv in _GO_VERB_PRECEDERS:
+            return False
+        if tok in ("Go", "GO"):
+            return True
+        # lowercase "go" only as an item in a skill list ("skills: go, python")
+        return _ft_prev_char(lower, start) in {",", "/", "(", "|", ";", ":"}
+
+    if alias == "ts":
+        if tok != "TS":
+            return False
+        return _CTX_TS_CLEARANCE.search(_ft_window(lower, start, end, 25)) is None
+
+    if alias == "js":
+        return not (start > 0 and lower[start - 1] == ".")
+
+    if alias == "react":
+        if nxt == "native":
+            return False
+        return not (nxt in _REACT_VERB_FOLLOWERS or prv in _REACT_VERB_PRECEDERS)
+
+    if alias == "ai":
+        if tok == "AI":
+            return True
+        return _CTX_AI.search(_ft_window(lower, start, end, 20)) is not None
+
+    if alias == "ml":
+        if prv is not None and re.fullmatch(r"\d+(\.\d+)?", prv):
+            return False  # "5 ml" — millilitres
+        if tok == "ML":
+            return True
+        return _CTX_ML.search(_ft_window(lower, start, end, 20)) is not None
+
+    if alias == "spark":
+        return not (prv in _SPARK_WORD_PRECEDERS or nxt in _SPARK_WORD_FOLLOWERS)
+
+    if alias == "airflow":
+        return _CTX_HVAC.search(_ft_window(lower, start, end, 60)) is None
+
+    if alias == "tailwind":
+        return _CTX_ECONOMY.search(_ft_window(lower, start, end, 40)) is None
+
+    if alias == "flask":
+        return _CTX_LAB.search(_ft_window(lower, start, end, 60)) is None
+
+    if alias == "jenkins":
+        if prv in {"mr", "ms", "mrs", "dr", "mr.", "ms.", "mrs.", "dr."}:
+            return False
+        # "Sarah Jenkins" followed by an email/phone, or after "Regards,"
+        # / "Contact" -> a person's name in a signature, not the CI tool.
+        m = re.search(r"([A-Za-z]+) $", original[max(0, start - 30):start])
+        if m and m.group(1)[:1].isupper() and m.group(1)[1:].islower():
+            after = raw_lower[end:end + 80]
+            if "@" in after or _CTX_PHONE.search(after):
+                return False
+            if _CTX_SIGNATURE_BEFORE.search(lower[max(0, start - 40):start]):
+                return False
+        return True
+
+    return True
+
+
+_FREE_TEXT_GUARDED_ALIASES: frozenset[str] = frozenset({
+    "go", "ts", "js", "react", "ai", "ml", "spark", "airflow", "tailwind", "flask", "jenkins",
+})
+_ALIAS_PATTERNS: dict[str, re.Pattern] = {}
+
+
+def _alias_pattern(alias: str) -> re.Pattern:
+    """Same boundary rule as _alias_matches(), compiled once per alias."""
+    p = _ALIAS_PATTERNS.get(alias)
+    if p is None:
+        p = re.compile(r'(?<![a-zA-Z0-9])' + re.escape(alias) + r'(?![a-zA-Z0-9])')
+        _ALIAS_PATTERNS[alias] = p
+    return p
+
+
+def _alias_matches_free_text(alias: str, original: str, lower: str, raw_lower: str) -> bool:
+    if alias not in lower:  # cheap pre-filter: the regex needs this substring anyway
+        return False
+    if alias not in _FREE_TEXT_GUARDED_ALIASES:
+        return _alias_pattern(alias).search(lower) is not None
+    for m in _alias_pattern(alias).finditer(lower):
+        if _free_text_occurrence_ok(alias, original, lower, raw_lower, m.start(), m.end()):
+            return True
+    return False
+
+
+def extract_skills_from_free_text(text: Optional[str]) -> List[str]:
+    """extract_skills() for raw job-description prose. Same
+    SKILL_ALIASES dictionary, same output (sorted canonical names); URLs/
+    emails are ignored and ambiguous aliases get a context check."""
+    if not text:
+        return []
+    raw_lower = text.lower()
+    lower = _FT_NON_PROSE.sub(lambda m: " " * len(m.group(0)), raw_lower)
+    found = set()
+    for canonical, aliases in SKILL_ALIASES.items():
+        if any(_alias_matches_free_text(alias, text, lower, raw_lower) for alias in aliases):
+            found.add(canonical)
+    return sorted(found)
+
+
+def _alias_matches_skill_item(alias: str, lower_item: str) -> bool:
+    """_alias_matches() for ONE parser-extracted requirement skill string
+    The item is already a skill, so English-word rules don't
+    apply — only aliases that point at a DIFFERENT technology are checked:
+    "Nuxt.js" is not JavaScript, "React Native" is not React, and
+    "TS/SCI Clearance" is not TypeScript."""
+    if alias not in lower_item:  # cheap pre-filter: the regex needs this substring anyway
+        return False
+    if alias not in ("js", "react", "ts"):
+        return _alias_pattern(alias).search(lower_item) is not None  # == _alias_matches(), precompiled
+    for m in _alias_pattern(alias).finditer(lower_item):
+        s, e = m.start(), m.end()
+        if alias == "js" and s > 0 and lower_item[s - 1] == ".":
+            continue
+        if alias == "react" and re.match(r"[\s\-]*native\b", lower_item[e:]):
+            continue
+        if alias == "ts" and _CTX_TS_CLEARANCE.search(lower_item):
+            continue
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Extended skill vocabulary — every skill offered in the consultant skill
+# picker.
+#
+# The picker (rap-react/.../skillsLibrary.ts, CANONICAL_SKILLS) offers 268
+# skills; SKILL_ALIASES above only knew 37 of them exactly (+ Tailwind CSS
+# via "tailwind"). A consultant who picked .NET, Kotlin, PHP, Flutter, Jest,
+# Cypress, gRPC, ... got NO credit for them anywhere: the cron skill gate
+# could reject them and the title-skill top-up in score_role() could not
+# credit them.
+#
+# EXTRA_SKILL_ALIASES adds the other 230 picker skills. It is a SEPARATE
+# dictionary on purpose — SKILL_ALIASES, extract_skills(),
+# _consultant_skills() and _requirement_skills() are NOT changed, so
+# everything built on them keeps its exact current output: the cron
+# semantic embedding text, claude_service.py's JD skill helpers, the
+# legacy skill lists and every existing score.
+#
+# The extended vocabulary is ADDITIVE ONLY — it can raise a result, never
+# lower it:
+#   * Skill gate / skill display (_prefer_extended_skill_result): the
+#     current score is computed exactly as before; the extended score
+#     (legacy + extra skills on both sides) is used only if it is HIGHER.
+#     The gate's thresholds (20 / 10) and its "only when the requirement
+#     has skills" condition are untouched, so a consultant who passed
+#     before still passes.
+#   * Title-skill top-up in score_role(): the current top-up is computed
+#     exactly as before; the extended top-up replaces it only if HIGHER.
+#     The 55 / 65 caps still hold, so title skills alone still can't turn
+#     a missing role into a confident (>=70) match.
+#
+# Ambiguous names get context rules (_EXTRA_ALIAS_RULES):
+#   structural rules (all text): "Azure Key Vault" is not HashiCorp Vault,
+#       "Apache Kafka" is not the Apache web server, "Windows XP" is not
+#       Extreme Programming, "American Express" is not Express.js.
+#   prose rules (raw JD / role title only — a consultant's skill list and
+#       a parser-extracted skill are already skills):
+#       case  — "Swift", "Ruby", "Rust", "Agile", "SAFe", "SOLID", "ELK"
+#       ctx   — word must sit near a related tech word ("Chef" near
+#               Puppet/Ansible/DevOps, "Cypress" near testing, "Lambda"
+#               near AWS, "Gin"/"Echo"/"Fiber" near Go, ...), or appear as
+#               an item in a comma/slash skill list
+#       not_ctx — "dbt" in a therapy JD, "Ionic" in chemistry, "Apollo"
+#               hospitals, "Apache" helicopter
+# ---------------------------------------------------------------------------
+
+import functools as _functools_b5
+
+EXTRA_SKILL_ALIASES: dict[str, list[str]] = {
+    # Frontend
+    "svelte": ["svelte", "sveltekit"],
+    "nuxt.js": ["nuxt.js", "nuxtjs", "nuxt"],
+    "html5": ["html5", "html"],
+    "css3": ["css3", "css"],
+    "sass": ["sass", "scss"],
+    "zustand": ["zustand"],
+    "mobx": ["mobx"],
+    "recoil": ["recoil"],
+    "jotai": ["jotai"],
+    "react query": ["react query", "tanstack query"],
+    "swr": ["swr"],
+    "apollo client": ["apollo client", "apollo graphql", "apollo"],
+    "relay": ["relay", "relay modern"],
+    "webpack": ["webpack"],
+    "vite": ["vite"],
+    "rollup": ["rollup", "rollup.js"],
+    "parcel": ["parcel"],
+    "esbuild": ["esbuild"],
+    "jest": ["jest"],
+    "vitest": ["vitest"],
+    "cypress": ["cypress"],
+    "playwright": ["playwright"],
+    "testing library": ["testing library", "react testing library"],
+    "storybook": ["storybook"],
+    "figma": ["figma"],
+    "framer motion": ["framer motion", "framer"],
+    "gsap": ["gsap"],
+    "three.js": ["three.js", "threejs"],
+    "webgl": ["webgl"],
+    "canvas api": ["canvas api", "html5 canvas", "html canvas"],
+    "d3.js": ["d3.js", "d3js"],
+    "recharts": ["recharts"],
+    "chart.js": ["chart.js", "chartjs"],
+    "react native": ["react native", "react-native"],
+    "expo": ["expo"],
+    "flutter": ["flutter"],
+    "ionic": ["ionic"],
+    # Backend
+    "express.js": ["express.js", "expressjs", "express"],
+    "fastify": ["fastify"],
+    "nestjs": ["nestjs", "nest.js"],
+    "hapi.js": ["hapi.js", "hapi"],
+    "koa.js": ["koa.js", "koa"],
+    "sqlalchemy": ["sqlalchemy"],
+    "spring mvc": ["spring mvc", "spring web mvc"],
+    "hibernate": ["hibernate"],
+    "maven": ["maven"],
+    "gradle": ["gradle"],
+    "kotlin": ["kotlin"],
+    "scala": ["scala"],
+    "play framework": ["play framework"],
+    "akka": ["akka"],
+    "gin": ["gin", "gin-gonic"],
+    "echo": ["echo"],
+    "fiber": ["fiber", "gofiber"],
+    "ruby": ["ruby"],
+    "ruby on rails": ["ruby on rails", "rails"],
+    "sinatra": ["sinatra"],
+    "php": ["php"],
+    "laravel": ["laravel"],
+    "symfony": ["symfony"],
+    "codeigniter": ["codeigniter"],
+    ".net": [".net", "dotnet", ".net core", ".net framework", "asp.net"],
+    "asp.net core": ["asp.net core", "asp.net", "asp.net mvc", "asp.net web api"],
+    "entity framework": ["entity framework", "entity framework core", "ef core"],
+    "rust": ["rust"],
+    "actix": ["actix", "actix-web", "actix web"],
+    "axum": ["axum"],
+    "tokio": ["tokio"],
+    "grpc": ["grpc"],
+    "websockets": ["websockets", "websocket", "web sockets"],
+    "mqtt": ["mqtt"],
+    "event-driven architecture": ["event-driven architecture", "event driven architecture", "event-driven", "event driven"],
+    "cqrs": ["cqrs"],
+    "ddd": ["ddd", "domain-driven design", "domain driven design"],
+    # Databases
+    "sqlite": ["sqlite"],
+    "mariadb": ["mariadb"],
+    "sql server": ["sql server", "mssql", "ms sql", "microsoft sql server", "t-sql", "tsql"],
+    "dynamodb": ["dynamodb", "dynamo db"],
+    "couchdb": ["couchdb"],
+    "firestore": ["firestore"],
+    "ravendb": ["ravendb"],
+    "memcached": ["memcached", "memcache"],
+    "cassandra": ["cassandra", "apache cassandra"],
+    "scylladb": ["scylladb", "scylla"],
+    "opensearch": ["opensearch"],
+    "solr": ["solr", "apache solr"],
+    "neo4j": ["neo4j"],
+    "arangodb": ["arangodb"],
+    "tigergraph": ["tigergraph"],
+    "clickhouse": ["clickhouse"],
+    "bigquery": ["bigquery", "big query"],
+    "snowflake": ["snowflake"],
+    "redshift": ["redshift", "amazon redshift", "aws redshift"],
+    "databricks": ["databricks"],
+    "prismaorm": ["prismaorm", "prisma orm", "prisma"],
+    "typeorm": ["typeorm"],
+    "sequelize": ["sequelize"],
+    "drizzle orm": ["drizzle orm", "drizzle-orm"],
+    "knex.js": ["knex.js", "knex"],
+    # Cloud & DevOps
+    "ec2": ["ec2", "amazon ec2", "aws ec2"],
+    "s3": ["s3", "amazon s3", "aws s3"],
+    "lambda": ["lambda", "aws lambda"],
+    "rds": ["rds", "amazon rds", "aws rds"],
+    "ecs": ["ecs", "amazon ecs", "aws ecs"],
+    "eks": ["eks", "amazon eks", "aws eks"],
+    "cloudfront": ["cloudfront"],
+    "api gateway": ["api gateway", "aws api gateway"],
+    "sqs": ["sqs", "amazon sqs", "aws sqs"],
+    "sns": ["sns", "amazon sns", "aws sns"],
+    "kinesis": ["kinesis"],
+    "cloudwatch": ["cloudwatch"],
+    "gke": ["gke"],
+    "cloud run": ["cloud run", "google cloud run"],
+    "cloud functions": ["cloud functions", "google cloud functions"],
+    "aks": ["aks"],
+    "azure functions": ["azure functions"],
+    "cosmos db": ["cosmos db", "cosmosdb", "azure cosmos db"],
+    "azure devops": ["azure devops"],
+    "docker compose": ["docker compose", "docker-compose"],
+    "helm": ["helm"],
+    "istio": ["istio"],
+    "pulumi": ["pulumi"],
+    "cdk": ["cdk", "aws cdk"],
+    "chef": ["chef"],
+    "puppet": ["puppet"],
+    "github actions": ["github actions"],
+    "gitlab ci": ["gitlab ci", "gitlab ci/cd", "gitlab-ci"],
+    "circleci": ["circleci", "circle ci"],
+    "argocd": ["argocd", "argo cd"],
+    "flux": ["flux", "fluxcd", "flux cd"],
+    "spinnaker": ["spinnaker"],
+    "tekton": ["tekton"],
+    "nginx": ["nginx"],
+    "apache": ["apache", "apache httpd", "apache http server"],
+    "caddy": ["caddy"],
+    "haproxy": ["haproxy"],
+    "traefik": ["traefik"],
+    "prometheus": ["prometheus"],
+    "grafana": ["grafana"],
+    "datadog": ["datadog"],
+    "new relic": ["new relic", "newrelic"],
+    "pagerduty": ["pagerduty"],
+    "splunk": ["splunk"],
+    "elk stack": ["elk stack", "elk"],
+    "loki": ["loki"],
+    "jaeger": ["jaeger"],
+    "zipkin": ["zipkin"],
+    # Data & ML
+    "pandas": ["pandas"],
+    "numpy": ["numpy"],
+    "scipy": ["scipy"],
+    "matplotlib": ["matplotlib"],
+    "seaborn": ["seaborn"],
+    "tensorflow": ["tensorflow"],
+    "pytorch": ["pytorch"],
+    "keras": ["keras"],
+    "scikit-learn": ["scikit-learn", "sklearn", "scikit learn"],
+    "xgboost": ["xgboost"],
+    "hadoop": ["hadoop", "apache hadoop"],
+    "flink": ["flink", "apache flink"],
+    "prefect": ["prefect"],
+    "dbt": ["dbt"],
+    "fivetran": ["fivetran"],
+    "stitch": ["stitch"],
+    "airbyte": ["airbyte"],
+    "mlflow": ["mlflow"],
+    "kubeflow": ["kubeflow"],
+    "sagemaker": ["sagemaker", "sage maker", "amazon sagemaker"],
+    "vertex ai": ["vertex ai"],
+    "azure ml": ["azure ml", "azure machine learning"],
+    "langchain": ["langchain"],
+    "openai api": ["openai api", "openai"],
+    "hugging face": ["hugging face", "huggingface"],
+    "faiss": ["faiss"],
+    "pinecone": ["pinecone"],
+    # Security
+    "oauth 2.0": ["oauth 2.0", "oauth2", "oauth 2", "oauth"],
+    "openid connect": ["openid connect", "oidc", "openid"],
+    "saml": ["saml"],
+    "jwt": ["jwt"],
+    "mtls": ["mtls", "mutual tls"],
+    "owasp": ["owasp"],
+    "penetration testing": ["penetration testing", "pen testing", "pentesting", "pentest"],
+    "sast": ["sast"],
+    "dast": ["dast"],
+    "sbom": ["sbom"],
+    "vault": ["vault", "hashicorp vault"],
+    "aws kms": ["aws kms", "kms"],
+    "azure key vault": ["azure key vault", "key vault"],
+    "siem": ["siem"],
+    "soc 2": ["soc 2", "soc2", "soc ii"],
+    "gdpr": ["gdpr"],
+    "hipaa": ["hipaa"],
+    "pci-dss": ["pci-dss", "pci dss", "pcidss"],
+    "iso 27001": ["iso 27001", "iso/iec 27001", "iso27001"],
+    # Mobile
+    "ios": ["ios"],
+    "swift": ["swift"],
+    "swiftui": ["swiftui"],
+    "objective-c": ["objective-c", "objective c", "objc"],
+    "xcode": ["xcode"],
+    "android": ["android"],
+    "jetpack compose": ["jetpack compose"],
+    "android studio": ["android studio"],
+    "capacitor": ["capacitor", "capacitorjs"],
+    # Tools & Practices
+    "git": ["git"],
+    "github": ["github"],
+    "gitlab": ["gitlab"],
+    "bitbucket": ["bitbucket"],
+    "jira": ["jira"],
+    "confluence": ["confluence"],
+    "agile": ["agile"],
+    "scrum": ["scrum"],
+    "kanban": ["kanban"],
+    "safe": ["safe", "scaled agile", "scaled agile framework"],
+    "xp": ["xp", "extreme programming"],
+    "tdd": ["tdd", "test-driven development", "test driven development"],
+    "bdd": ["bdd", "behavior-driven development", "behaviour-driven development", "behavior driven development"],
+    "clean architecture": ["clean architecture"],
+    "solid": ["solid", "solid principles"],
+    "design patterns": ["design patterns", "design pattern"],
+    "code review": ["code review", "code reviews"],
+    "pair programming": ["pair programming"],
+    "technical writing": ["technical writing"],
+    "system design": ["system design", "systems design"],
+    "api design": ["api design"],
+    "database design": ["database design"],
+    "performance optimisation": ["performance optimisation", "performance optimization", "performance tuning"],
+    "seo": ["seo", "search engine optimization", "search engine optimisation"],
+    "accessibility (wcag)": ["accessibility (wcag)", "wcag", "web accessibility", "a11y"],
+    "internationalisation (i18n)": ["internationalisation (i18n)", "i18n", "internationalization", "internationalisation"],
+    "feature flags": ["feature flags", "feature flag", "feature toggles", "feature toggle"],
+    "a/b testing": ["a/b testing", "ab testing", "a/b test", "a/b tests", "split testing"],
+}
+
+
+def _b5_ctx(words: str) -> re.Pattern:
+    return re.compile(r"\b(" + words + r")\b")
+
+
+_B5_CTX_TESTING = _b5_ctx(r"test|tests|testing|e2e|end-to-end|automation|automated|qa|selenium|playwright|cypress|jest|webdriver|javascript|typescript")
+_B5_CTX_BUNDLER = _b5_ctx(r"webpack|vite|esbuild|bundler|bundlers|bundling|bundle|parcel|rollup|javascript|typescript|build tool|build tools")
+_B5_CTX_CONFIG_MGMT = _b5_ctx(r"chef|puppet|ansible|salt|saltstack|devops|configuration|automation|infrastructure|terraform|cookbook|cookbooks|manifests")
+_B5_CTX_GO = _b5_ctx(r"go|golang")
+_B5_CTX_MOBILE = _b5_ctx(r"react|native|mobile|ios|android|app|apps|cordova|ionic|capacitor|hybrid|angular|cross-platform")
+_B5_CTX_AWS = _b5_ctx(r"aws|amazon|serverless|api gateway|dynamodb|s3|sqs|sns|kinesis|cloud|lambda|queue|queues|notification|notifications")
+_B5_CTX_DATA_WH = _b5_ctx(r"data|warehouse|warehousing|sql|etl|elt|dbt|cloud|analytics|aws|snowpipe|bigquery|redshift|snowflake|databricks|pipeline|pipelines")
+
+_EXTRA_ALIAS_RULES: dict[str, dict] = {
+    # --- structural (checked on every kind of text) ---
+    "vault": {"not_prev": {"key"}, "ctx": _b5_ctx(r"hashicorp|secret|secrets|consul|terraform|nomad|pki|credentials|encryption")},
+    "apache": {
+        "not_next": {
+            "kafka", "spark", "airflow", "flink", "hadoop", "beam", "nifi", "cassandra", "solr", "tomcat",
+            "camel", "hive", "pulsar", "iceberg", "druid", "superset", "zookeeper", "storm", "lucene",
+            "maven", "groovy", "hbase", "kylin", "ignite", "arrow", "parquet", "avro", "jmeter", "struts",
+            "poi", "commons", "cxf", "activemq", "karaf", "ant", "sling", "velocity", "flume", "sqoop", "oozie",
+        },
+        "ctx": _b5_ctx(r"server|servers|web|nginx|httpd|proxy|lamp|linux|hosting|virtual hosts?|php"),
+        "not_ctx": _b5_ctx(r"helicopter|helicopters|ah-64|tribe|county|junction|pilot"),
+    },
+    "xp": {"not_prev": {"windows", "of", "years", "yrs", "year", "yr", "+"}, "case": "exact:XP",
+           "ctx": _b5_ctx(r"extreme|pair programming|agile|tdd|scrum|kanban"), "no_list": True},
+    "express": {"not_prev": {"american", "federal"}, "case": "title",
+                "ctx": _b5_ctx(r"node|node\.js|nodejs|javascript|typescript|api|apis|backend|rest|mern|mean|server|middleware")},
+    "kms": {"ctx": _b5_ctx(r"aws|amazon|key|keys|encryption|cloud|secrets")},
+    # --- prose-only (raw JD text / role title) ---
+    "ruby": {"case": "title", "ctx": _b5_ctx(r"rails|ror|gem|gems|rspec|sinatra|developer|developers|engineer|engineers|programming|backend|scripting")},
+    "rails": {"not_prev": {"guard", "hand", "safety", "the"}, "case": "title",
+              "ctx": _b5_ctx(r"ruby|ror|developer|developers|engineer|engineers|web|backend|rspec|activerecord")},
+    "rust": {"case": "title", "ctx": _b5_ctx(r"systems|programming|cargo|tokio|actix|axum|wasm|webassembly|developer|developers|engineer|engineers|memory|embedded|backend|c\+\+")},
+    "swift": {"case": "title", "ctx": _b5_ctx(r"ios|xcode|swiftui|mobile|apple|objective-c|objective|developer|developers|engineer|engineers|app|apps|cocoa|uikit")},
+    "flutter": {"case": "title", "ctx": _b5_ctx(r"dart|mobile|android|ios|app|apps|cross-platform|widget|widgets|developer|developers|engineer|engineers")},
+    "ionic": {"ctx": _b5_ctx(r"angular|capacitor|cordova|mobile|hybrid|app|apps|framework|ios|android"),
+              "not_ctx": _b5_ctx(r"bond|bonds|compound|compounds|chemistry|liquid|liquids|salt|salts|solution")},
+    "capacitor": {"ctx": _B5_CTX_MOBILE,
+                  "not_ctx": _b5_ctx(r"circuit|circuits|resistor|resistors|voltage|pcb|electrical|electronic|electronics|inductor|farad")},
+    "expo": {"ctx": _B5_CTX_MOBILE, "not_ctx": _b5_ctx(r"career|careers|job fair|trade show|convention|booth|exhibition")},
+    "gin": {"ctx": _B5_CTX_GO, "no_list": True},
+    "echo": {"ctx": _B5_CTX_GO, "no_list": True},
+    "fiber": {"ctx": _B5_CTX_GO, "no_list": True},
+    "lambda": {"not_next": {"expression", "expressions", "calculus"}, "ctx": _B5_CTX_AWS},
+    "sns": {"ctx": _B5_CTX_AWS},
+    "helm": {"not_prev": {"the", "at"}, "ctx": _b5_ctx(r"kubernetes|k8s|chart|charts|deploy|deployment|deployments|argo|argocd|istio|cluster|clusters")},
+    "chef": {"ctx": _B5_CTX_CONFIG_MGMT},
+    "puppet": {"ctx": _B5_CTX_CONFIG_MGMT},
+    "flux": {"not_prev": {"in"}, "ctx": _b5_ctx(r"gitops|kubernetes|k8s|argo|argocd|helm|cd|deploy|deployment")},
+    "caddy": {"ctx": _b5_ctx(r"server|servers|proxy|nginx|tls|https|web|reverse|traefik|haproxy")},
+    "prometheus": {"ctx": _b5_ctx(r"grafana|monitoring|metrics|alert|alerts|alerting|observability|exporter|exporters|promql")},
+    "loki": {"ctx": _b5_ctx(r"grafana|log|logs|logging|promtail|observability|prometheus")},
+    "jaeger": {"ctx": _b5_ctx(r"tracing|trace|traces|opentelemetry|observability|zipkin|span|spans")},
+    "cassandra": {"ctx": _b5_ctx(r"database|databases|db|nosql|cql|data|datastax|dynamodb|mongodb|hbase|redis")},
+    "snowflake": {"ctx": _B5_CTX_DATA_WH},
+    "redshift": {"ctx": _B5_CTX_DATA_WH},
+    "stitch": {"case": "title", "ctx": _b5_ctx(r"data|etl|elt|pipeline|pipelines|fivetran|airbyte|warehouse|ingestion|connector|connectors")},
+    "prefect": {"ctx": _b5_ctx(r"workflow|workflows|pipeline|pipelines|orchestration|orchestrate|airflow|dagster|data|python")},
+    "pinecone": {"ctx": _b5_ctx(r"vector|vectors|embedding|embeddings|llm|llms|rag|faiss|weaviate|database|semantic")},
+    "dbt": {"not_ctx": _b5_ctx(r"therapy|therapist|therapists|behavioral|behavioural|dialectical|clinical|counsel|counseling|counselling|mental health|cbt|patient|patients")},
+    "relay": {"ctx": _b5_ctx(r"graphql|react|apollo|facebook|meta")},
+    "recoil": {"ctx": _b5_ctx(r"react|state|redux|zustand|mobx|jotai")},
+    "rollup": {"ctx": _B5_CTX_BUNDLER},
+    "parcel": {"ctx": _B5_CTX_BUNDLER},
+    "jest": {"not_prev": {"in"}},
+    "cypress": {"ctx": _B5_CTX_TESTING},
+    "playwright": {"ctx": _B5_CTX_TESTING},
+    "maven": {"not_prev": {"a", "an"}, "ctx": _b5_ctx(r"java|gradle|build|builds|spring|jenkins|ant|pom|artifact|artifacts|dependency|dependencies|kotlin")},
+    "hibernate": {"ctx": _b5_ctx(r"java|jpa|orm|spring|jdbc|database|sql")},
+    "sinatra": {"ctx": _b5_ctx(r"ruby|rails|rack|web|framework")},
+    "confluence": {"case": "title", "ctx": _b5_ctx(r"jira|atlassian|documentation|wiki|bitbucket|trello")},
+    "agile": {"case": "title"},
+    "safe": {"case": "exact:SAFe"},
+    "solid": {"case": "exact:SOLID"},
+    "elk": {"case": "exact:ELK"},
+    "apollo": {"ctx": _b5_ctx(r"graphql|react|client|server|federation"),
+               "not_ctx": _b5_ctx(r"hospital|hospitals|healthcare|mission|nasa|pharmacy")},
+}
+# Rules applied to EVERY kind of text (consultant skill list, parsed
+# requirement skill, raw JD). Everything else in a rule is prose-only.
+_B5_STRUCTURAL_KEYS = ("not_prev", "not_next")
+_B5_LIST_SEPARATORS = {",", "/", "(", "|", ";", ":", "\u2016", "-", "\u2022", "*"}
+
+
+def _extra_occurrence_ok(alias: str, rule: dict, original: str, lower: str, start: int, end: int, prose: bool) -> bool:
+    nxt = _ft_next_word(lower, end)
+    prv = _ft_prev_word(lower, start)
+    if "not_prev" in rule and prv in rule["not_prev"]:
+        return False
+    if "not_next" in rule and nxt in rule["not_next"]:
+        return False
+    if not prose:
+        return True
+    tok = original[start:end]
+    case = rule.get("case")
+    if case == "title" and not tok[:1].isupper():
+        return False
+    if case and case.startswith("exact:") and tok != case[len("exact:"):]:
+        return False
+    window = _ft_window(lower, start, end, 60)
+    not_ctx = rule.get("not_ctx")
+    if not_ctx is not None and not_ctx.search(window):
+        return False
+    ctx = rule.get("ctx")
+    if ctx is not None:
+        if not rule.get("no_list") and _ft_prev_char(lower, start) in _B5_LIST_SEPARATORS:
+            return True  # an item in a skill list: "Skills: Ruby, Swift"
+        # the window must hold a related word OTHER than the alias itself
+        window_wo_alias = lower[max(0, start - 60):start] + " " + lower[end:end + 60]
+        return ctx.search(window_wo_alias) is not None
+    return True
+
+
+@_functools_b5.lru_cache(maxsize=8192)
+def _extract_extra_skills(text: str, prose: bool) -> tuple:
+    """Canonical EXTRA_SKILL_ALIASES skills found in `text`. prose=True for
+    raw JD / role-title text (all rules + emails/URLs ignored); prose=False
+    for a skill list or one parsed skill (structural rules only)."""
+    if not text:
+        return ()
+    raw_lower = text.lower()
+    lower = _FT_NON_PROSE.sub(lambda m: " " * len(m.group(0)), raw_lower) if prose else raw_lower
+    found = set()
+    for canonical, aliases in EXTRA_SKILL_ALIASES.items():
+        for alias in aliases:
+            if alias not in lower:  # cheap pre-filter before the regex
+                continue
+            rule = _EXTRA_ALIAS_RULES.get(alias)
+            for m in _alias_pattern(alias).finditer(lower):
+                if rule is None or _extra_occurrence_ok(alias, rule, text, lower, m.start(), m.end(), prose):
+                    found.add(canonical)
+                    break
+            if canonical in found:
+                break
+    return tuple(sorted(found))
+
+
+def _legacy_extract_skills_fast(text: str) -> List[str]:
+    """Same result as extract_skills(text) (same SKILL_ALIASES, same
+    boundary regex) — just precompiled and substring-prefiltered."""
+    if not text:
+        return []
+    lower = text.lower()
+    return sorted(
+        canonical for canonical, aliases in SKILL_ALIASES.items()
+        if any(a in lower and _alias_pattern(a).search(lower) is not None for a in aliases)
+    )
+
+
+@_functools_b5.lru_cache(maxsize=8192)
+def _consultant_skills_extended_cached(primary_skills: str) -> tuple:
+    legacy = _legacy_extract_skills_fast(primary_skills)  # == _consultant_skills()
+    return tuple(sorted(set(legacy) | set(_extract_extra_skills(primary_skills, False))))
+
+
+def _consultant_skills_extended(consultant: Consultant) -> List[str]:
+    """_consultant_skills() + the picker skills SKILL_ALIASES didn't know."""
+    return list(_consultant_skills_extended_cached(consultant.primary_skills or ""))
+
+
+@_functools_b5.lru_cache(maxsize=4096)
+def _requirement_extra_skills_cached(parsed_items: tuple, jd_text: str) -> tuple:
+    found = set()
+    for item in parsed_items:
+        found.update(_extract_extra_skills(item, False))
+    if not found:
+        found.update(_extract_extra_skills(jd_text, True))
+    return tuple(sorted(found))
+
+
+def _requirement_skills_extended(requirement: Requirement, requirement_skills: Optional[List[str]] = None) -> List[str]:
+    """_requirement_skills() + the extra skills. Same sources in the same
+    order of preference: parser-extracted skills first, raw JD fallback."""
+    if requirement_skills is None:
+        requirement_skills = _requirement_skills(requirement)
+    raw = requirement.parsed_fields.get("skills") if requirement.parsed_fields else None
+    if isinstance(raw, str):
+        items = tuple(p.strip() for p in raw.split(",") if p.strip())
+    elif isinstance(raw, (list, tuple)):
+        items = tuple(str(x) for x in raw if x is not None and str(x).strip())
+    else:
+        items = ()
+    jd_text = (requirement.job_description or "")[:1500]
+    extra = _requirement_extra_skills_cached(items, jd_text)
+    return sorted(set(requirement_skills) | set(extra))
+
+
+@_functools_b5.lru_cache(maxsize=4096)
+def _title_embedded_skills_extended(requirement_role: Optional[str]) -> tuple:
+    """_title_embedded_skills() + extra skills named in the role title."""
+    legacy = _title_embedded_skills(requirement_role)  # unchanged legacy helper
+    return tuple(sorted(set(legacy) | set(_extract_extra_skills(requirement_role or "", True))))
+
+
+def _prefer_extended_skill_result(
+    legacy_result: tuple,
+    requirement: Requirement,
+    requirement_skills: Optional[List[str]],
+    consultant: Consultant,
+) -> tuple:
+    """(score, matched, missing) — the unchanged legacy result, replaced by
+    the extended-vocabulary result ONLY when that one scores HIGHER. Can
+    therefore never lower a skill score or fail a skill gate that passed."""
+    legacy_score = legacy_result[0]
+    if legacy_score >= 100.0:
+        return legacy_result
+    try:
+        extended = score_skills(
+            _requirement_skills_extended(requirement, requirement_skills),
+            _consultant_skills_extended(consultant),
+        )
+    except Exception:
+        logger.exception("extended skill scoring failed — keeping legacy skill result")
+        return legacy_result
+    return extended if extended[0] > legacy_score else legacy_result
+
+
 def _consultant_skills(consultant: Consultant) -> List[str]:
     """Extract the consultant's skill list."""
     return extract_skills(consultant.primary_skills or "")
@@ -252,13 +997,17 @@ def _requirement_skills(requirement: Requirement) -> List[str]:
                 # "JavaScript" would false-match the "java" alias via
                 # plain substring containment. Reuses the same
                 # word-boundary-aware check.
-                if any(_alias_matches(alias, lower) for alias in aliases) or lower == canonical:
+                # _alias_matches_skill_item() = _alias_matches() plus
+                # the "different technology" checks (Nuxt.js, React Native, TS/SCI).
+                if any(_alias_matches_skill_item(alias, lower) for alias in aliases) or lower == canonical:
                     canonical_req.add(canonical)
         requirement_skills = sorted(canonical_req)
 
     if not requirement_skills:
         jd_text = (requirement.job_description or "")[:1500]
-        requirement_skills = extract_skills(jd_text)
+        # Raw JD prose -> context-aware scan, see
+        # extract_skills_from_free_text().
+        requirement_skills = extract_skills_from_free_text(jd_text)
 
     return requirement_skills
 
@@ -616,6 +1365,7 @@ def score_role(
     experiences: Optional[List[ConsultantExperience]] = None,
     requirement_skills: Optional[List[str]] = None,
     consultant_skills: Optional[List[str]] = None,
+    consultant_skills_extended: Optional[List[str]] = None,  # optional, default = old behaviour
 ) -> float:
     """
     Role title match — deterministic, word/domain-based. Role is the
@@ -720,6 +1470,25 @@ def score_role(
         skill_ratio = len(matched) / len(title_skills)
         topped_up = base_score + (cap - base_score) * skill_ratio
         return round(min(topped_up, cap), 2)
+
+    # Extended-vocabulary title top-up. The legacy top-up above
+    # is kept exactly as it was and still runs first; the extended one
+    # (title skills + consultant skills from EXTRA_SKILL_ALIASES too) only
+    # replaces it when HIGHER. Same formula, same cap. When no
+    # consultant_skills_extended is passed, behaviour is identical to before.
+    _title_skill_topup_legacy = _title_skill_topup
+
+    def _title_skill_topup(base_score: float, cap: float = 100.0) -> float:
+        legacy = _title_skill_topup_legacy(base_score, cap)
+        if not consultant_skills_extended or base_score >= cap:
+            return legacy
+        title_skills_ext = _title_embedded_skills_extended(requirement_role)
+        if not title_skills_ext:
+            return legacy
+        matched_ext = set(title_skills_ext) & set(consultant_skills_extended)
+        ratio_ext = len(matched_ext) / len(title_skills_ext)
+        extended = round(min(base_score + (cap - base_score) * ratio_ext, cap), 2)
+        return max(legacy, extended)
 
     # Cap for the "no real role signal at all" branches — high enough that
     # a strong title-skill overlap visibly moves a 0 somewhere useful, low
@@ -1506,7 +2275,8 @@ def validate_match(
     consultant_skills = _consultant_skills(consultant)
 
     role_raw = score_role(
-        requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills
+        requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills,
+        consultant_skills_extended=_consultant_skills_extended(consultant),
     )
 
     # Confident-match bar: role_raw >= 70 (a real, strong role fit).
@@ -1592,8 +2362,14 @@ def score_match(
     consultant_skills = _consultant_skills(consultant)
 
     skill_raw, matched_skills, missing_skills = score_skills(requirement_skills, consultant_skills)
+    # Use the extended skill vocabulary only if it scores HIGHER
+    # (see _prefer_extended_skill_result) — never lowers the legacy result.
+    skill_raw, matched_skills, missing_skills = _prefer_extended_skill_result(
+        (skill_raw, matched_skills, missing_skills), requirement, requirement_skills, consultant,
+    )
     role_raw = score_role(
-        requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills
+        requirement.role, consultant.preferred_roles, experiences, requirement_skills, consultant_skills,
+        consultant_skills_extended=_consultant_skills_extended(consultant),
     )
     exp_raw = score_experience(requirement, consultant, experiences)
     employment_raw = score_employment_type(requirement.employment_types, consultant.preferred_employment_types)
