@@ -80,7 +80,7 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 # version) still gets the full re-check exactly once — bump this string
 # whenever scoring/gate logic changes, and every affected row gets
 # re-validated on the next run, then stays skipped until the next bump.
-MATCHING_LOGIC_VERSION = "2026-09-28-employment-type-groups-backend-fallback"
+MATCHING_LOGIC_VERSION = "2026-10-02-role-current-plus-1-else-last-2-backend-fallback"
 # BUG FIX (two engines silently overwriting each other's scores forever):
 # this used to be the exact same string as rap_python_cron/matching_engine.py's
 # MATCHING_LOGIC_VERSION — but the two engines do NOT compute the same
@@ -100,7 +100,7 @@ MATCHING_LOGIC_VERSION = "2026-09-28-employment-type-groups-backend-fallback"
 # Keep this in sync by hand with rap_python_cron/matching_engine.py's own
 # MATCHING_LOGIC_VERSION whenever cron's scoring logic changes — there's
 # no shared import between these two separate deployed processes.
-CRON_MATCHING_LOGIC_VERSION = "2026-09-28-employment-type-groups"
+CRON_MATCHING_LOGIC_VERSION = "2026-10-02-role-current-plus-1-else-last-2"
 
 # BUG FIX (rap-backend crash loop — SIGABRT under pm2, hundreds of
 # restarts): PostgreSQL's wire protocol caps bind parameters at 32,767
@@ -610,6 +610,36 @@ def _clear_role_text(requirement_role: str) -> str:
     return requirement_role
 
 
+# Which experience titles count toward role matching (preferred_roles is
+# always used regardless):
+#   - consultant HAS a current job -> every current job + the single most
+#     recent previous job.
+#   - NO current job -> the 2 most recent previous jobs (no age limit).
+# Older job titles (e.g. "Java Developer" from 3 jobs ago) no longer
+# qualify a consultant for that role today.
+ROLE_PAST_JOBS_WITH_CURRENT = 1
+ROLE_PAST_JOBS_WITHOUT_CURRENT = 2
+
+
+def _recent_role_experiences(experiences: Optional[List[ConsultantExperience]]) -> List[ConsultantExperience]:
+    """
+    Experience rows whose role_title feeds score_role(). "Current" uses the
+    same convention as _calculate_total_experience_years(): is_present or
+    a missing end_date means ongoing. Previous jobs are ranked newest
+    first by end_date, then start_date.
+    """
+    if not experiences:
+        return []
+    current = [e for e in experiences if e.is_present or not e.end_date]
+    past = sorted(
+        (e for e in experiences if not (e.is_present or not e.end_date)),
+        key=lambda e: (e.end_date, e.start_date or date.min),
+        reverse=True,
+    )
+    keep = ROLE_PAST_JOBS_WITH_CURRENT if current else ROLE_PAST_JOBS_WITHOUT_CURRENT
+    return current + past[:keep]
+
+
 def score_role(
     requirement_role: Optional[str],
     consultant_preferred_roles: Optional[str],
@@ -676,13 +706,13 @@ def score_role(
     if not requirement_role or not requirement_role.strip():
         return 50.0
 
-    # Build the consultant's role-token pool (preferred_roles + every
-    # experience row's role_title).
+    # Build the consultant's role-token pool (preferred_roles + role_title
+    # of the rows picked by _recent_role_experiences()).
     pref_tokens: set[str] = set()
     if consultant_preferred_roles:
         pref_tokens |= _tokenize_role(consultant_preferred_roles)
     if experiences:
-        for exp in experiences:
+        for exp in _recent_role_experiences(experiences):
             if exp.role_title:
                 pref_tokens |= _tokenize_role(exp.role_title)
 
