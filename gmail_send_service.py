@@ -66,6 +66,50 @@ def _resolve_banner_bytes():
     return None, None
 
 
+def build_resume_attachment_name(
+    candidate_name: Optional[str],
+    role: Optional[str],
+    experience_years,
+    ext: Optional[str] = None,
+) -> Optional[str]:
+    """Build the resume attachment filename shown on the sent application
+    mail: <CandidateName>_<Role>_<Exp>Yrs<ext>, e.g.
+    "Anusha_Reddy_Java_Developer_7Yrs.pdf".
+
+    Each part is stripped of characters outside letters/digits/space/dash,
+    and spaces collapse to "_". A part that is missing/blank is simply
+    left out. Returns None when no part is usable so callers keep the
+    original filename (never produces a bare extension).
+    """
+    import re
+
+    def _clean(value) -> str:
+        text = re.sub(r"[^\w\s-]", "", str(value or ""), flags=re.UNICODE)
+        text = re.sub(r"[\s_]+", "_", text.strip())
+        return text.strip("_-")
+
+    parts = [_clean(candidate_name), _clean(role)]
+
+    exp_part = ""
+    if experience_years is not None and str(experience_years).strip() != "":
+        try:
+            exp_val = float(experience_years)
+            if exp_val >= 0:
+                exp_text = str(int(exp_val)) if exp_val == int(exp_val) else f"{exp_val:g}"
+                exp_part = f"{exp_text}Yrs"
+        except (TypeError, ValueError):
+            exp_part = ""
+    parts.append(exp_part)
+
+    stem = "_".join(p for p in parts if p)
+    if not stem:
+        return None
+    ext = (ext or "").strip()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    return f"{stem[:150]}{ext}"
+
+
 def build_mime_message(
     sender: str,
     to: str,
