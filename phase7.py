@@ -405,6 +405,31 @@ async def confirm_send(
                     source_id=request.generated_resume_id,
                 )
 
+        # Resume filename on the sent mail: <CandidateName>_<Role>_<N>Yrs.<ext>
+        # (Role = the requirement being applied to). Display name only --
+        # falls back to the existing filename if anything is missing.
+        attachment_names = {}
+        if attachment_path:
+            try:
+                from gmail_send_service import build_resume_attachment_name
+                _name_exp = getattr(consultant, "total_experience_years", None)
+                if _name_exp is None and getattr(consultant, "user_id", None):
+                    from models import User as _NameUser
+                    _name_user = (await db.execute(
+                        select(_NameUser).where(_NameUser.id == consultant.user_id)
+                    )).scalars().first()
+                    _name_exp = getattr(_name_user, "experience_years", None)
+                _new_name = build_resume_attachment_name(
+                    consultant.full_name,
+                    requirement.role,
+                    _name_exp,
+                    os.path.splitext(attachment_path)[1],
+                )
+                if _new_name:
+                    attachment_names[attachment_path] = _new_name
+            except Exception as _name_err:
+                print(f"[confirm_send] resume filename build skipped: {_name_err!r}")
+
         try:
             send_result = await send_application_email_async(
                 access_token=access_token,
@@ -414,6 +439,7 @@ async def confirm_send(
                 subject=email_content["subject"],
                 body=email_content["body"],
                 attachment_paths=[attachment_path] if attachment_path else [],
+                attachment_names=attachment_names,
                 html_body=email_content["html_body"],
                 inline_images=email_content.get("inline_images"),
             )

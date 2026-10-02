@@ -1964,6 +1964,42 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     pass
             return
 
+        # Resume filename on the sent mail: <CandidateName>_<Role>_<N>Yrs.<ext>
+        # (Role = the requirement being applied to). Only the display name
+        # in the outgoing mail changes -- stored refs/keys are untouched.
+        # Only the FIRST resume-type attachment (.pdf/.doc/.docx) is
+        # renamed so extra files keep their names and nothing collides.
+        # Wrapped so any failure here keeps the original filename and can
+        # never block the send.
+        if item.requirement_id and attachment_paths:
+            try:
+                from gmail_send_service import build_resume_attachment_name
+                from models import Consultant as _NameConsultant, Requirement as _NameRequirement, User as _NameUser
+                _name_cons = (await session.execute(
+                    select(_NameConsultant).where(_NameConsultant.id == item.consultant_id)
+                )).scalars().first()
+                _name_req = (await session.execute(
+                    select(_NameRequirement).where(_NameRequirement.id == item.requirement_id)
+                )).scalars().first()
+                if _name_cons and _name_req:
+                    _name_exp = _name_cons.total_experience_years
+                    if _name_exp is None and _name_cons.user_id:
+                        _name_user = (await session.execute(
+                            select(_NameUser).where(_NameUser.id == _name_cons.user_id)
+                        )).scalars().first()
+                        _name_exp = getattr(_name_user, "experience_years", None)
+                    for _name_path in attachment_paths:
+                        _name_ext = os.path.splitext(attachment_names.get(_name_path) or _name_path)[1]
+                        if _name_ext.lower() in (".pdf", ".doc", ".docx"):
+                            _new_name = build_resume_attachment_name(
+                                _name_cons.full_name, _name_req.role, _name_exp, _name_ext
+                            )
+                            if _new_name:
+                                attachment_names[_name_path] = _new_name
+                            break
+            except Exception as _name_err:
+                print(f"[email-queue debug {item.id}] resume filename build skipped: {_name_err!r}")
+
         try:
             print(f"[email-queue debug {item.id}] Attachments resolved successfully. Sending via Gmail API...")
             # BUG FIX: this only ever sent item.content (plain text) — the
