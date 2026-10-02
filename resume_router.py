@@ -3122,6 +3122,12 @@ async def get_consultants_for_resumes(
     # Requirements page candidate filter: recruiters get the same full list
     # as an admin instead of only their assigned roster.
     all_consultants: bool = False,
+    # Apply page (admin/recruiter, no consultant pre-selected): list EVERY
+    # eligible consultant instead of only the ones matched to
+    # requirement_id, with the matched ones sorted first (each row still
+    # carries matched=True/False). Ignored for the consultant role and
+    # whenever consultant_id is given.
+    include_all: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -3175,12 +3181,29 @@ async def get_consultants_for_resumes(
         )
         matched_consultant_ids = list({row[0] for row in rcm_result.all()})
         if not matched_consultant_ids:
-            if fallback_to_all:
+            if fallback_to_all or (include_all and current_user.role in ("ADMIN", "RECRUITER")):
                 matched_consultant_ids = None  # no matches → show every candidate
             else:
                 return []
 
     _matched_set = set(matched_consultant_ids or []) if (requirement_id and not consultant_id) else set()
+
+    # include_all (admin/recruiter Apply page): keep _matched_set above for
+    # the matched flag, but stop restricting the query to matched ids, and
+    # order matched consultants first (then A-Z within each group).
+    _list_all_with_matched_first = bool(
+        include_all
+        and requirement_id
+        and not consultant_id
+        and current_user.role in ("ADMIN", "RECRUITER")
+    )
+    if _list_all_with_matched_first:
+        matched_consultant_ids = None
+
+    def _matched_first(rows):
+        if not _list_all_with_matched_first:
+            return rows
+        return sorted(rows, key=lambda r: (not r.get("matched"), (r.get("name") or "").lower()))
 
     # BUG FIX (recruiter's Apply screen: "Select candidate" missing and the
     # whole form greyed out): the fallback above only fires when NO consultant
@@ -3215,7 +3238,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
+        return _matched_first(await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set))
     elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and all_consultants and not (requirement_id or consultant_id):
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.role == "CONSULTANT",
@@ -3236,11 +3259,11 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return await _with_applied_flag(
+        return _matched_first(await _with_applied_flag(
             db, requirement_id,
             [map_user_consultant(u, c) for u, c in results],
             matched_ids=_matched_set,
-        )
+        ))
     elif current_user.role == "RECRUITER":
         consultant_users_query = select(Consultant.user_id).where(
             Consultant.status == "ACTIVE",
@@ -3255,7 +3278,7 @@ async def get_consultants_for_resumes(
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
         results = (await db.execute(query)).all()
-        return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
+        return _matched_first(await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set))
     else:
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
             User.id == current_user.id,
