@@ -112,8 +112,14 @@ async def get_db():
             raise
         except Exception as e:
             await session.rollback()
-            from error_logger import log_db_error
-            await log_db_error(stage="get_db_dependency", error=e)
+            import sqlalchemy.exc as _sa_exc
+            if isinstance(e, _sa_exc.TimeoutError):
+                # DB-POOL FIX: the pool is already exhausted -- logging to the
+                # DB would wait for yet another connection and make it worse.
+                print(f"[get_db] connection pool exhausted (not logged to DB): {e}")
+            else:
+                from error_logger import log_db_error
+                await log_db_error(stage="get_db_dependency", error=e)
             raise
         finally:
             await session.close()
