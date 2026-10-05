@@ -158,6 +158,12 @@ class AIUsageStatsDTO(BaseModel):
     total_calls: int
     budget_usd: float
     budget_used_pct: float
+    # AI-USAGE FIX: optional extras (defaults keep older clients working)
+    total_tokens: int = 0
+    resume_generation_tokens: int = 0
+    resume_generation_cost_usd: float = 0.0
+    resume_generation_count: int = 0
+    period: str = "month_to_date"
 
 
 class SetBudgetRequest(BaseModel):
@@ -417,11 +423,24 @@ async def list_applications(
     status: Optional[str] = None,
     search: Optional[str] = None,
     sort_dir: str = Query("desc"),
+    created_from: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ) -> PaginatedApplicationsDTO:
     """Return paginated applications with optional filters."""
     filters = []
+    # DASHBOARD FIX: optional date filter so the dashboard can get a real
+    # count. "YYYY-MM-DD" = start of that day in US Central time.
+    if created_from:
+        try:
+            _cf = created_from.strip()
+            if len(_cf) == 10:
+                _cf_dt = datetime.strptime(_cf, "%Y-%m-%d").replace(tzinfo=ZoneInfo("America/Chicago"))
+            else:
+                _cf_dt = datetime.fromisoformat(_cf.replace("Z", "+00:00"))
+            filters.append(ApplicationsDetailView.created_at >= _cf_dt)
+        except ValueError:
+            pass
     if consultant_id:
         try:
             ids = [int(x.strip()) for x in consultant_id.split(",") if x.strip()]
@@ -798,6 +817,50 @@ async def ai_usage_stats(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
+    # AI-USAGE FIX: calendar month-to-date (was trailing 30 days labelled
+    # "this month"); one cached, paginated OpenAI fetch shared with the other
+    # endpoints; OpenAI is called BEFORE any DB query so no DB connection is
+    # held while waiting on it; null model names no longer crash; cached
+    # input tokens priced correctly.
+    import openai_usage_client as ouc
+
+    try:
+        buckets = await ouc.fetch_buckets(ouc.month_start_ts())
+    except ouc.OpenAIUsageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"OpenAI usage API unavailable: {e}")
+
+    summary = ouc.summarize(buckets or [])
+
+    # Claude resume-generation usage this month (our own ai_usage_logs;
+    # 'email_parsing' rows are excluded -- they are OpenAI, counted above).
+    month_start = datetime.fromtimestamp(ouc.month_start_ts(), timezone.utc)
+    resume_tokens, resume_cost, resume_count = (await db.execute(
+        select(
+            func.coalesce(func.sum(AIUsageLog.input_tokens + AIUsageLog.output_tokens), 0),
+            func.coalesce(func.sum(AIUsageLog.estimated_cost), 0),
+            func.count(AIUsageLog.id),
+        ).where(AIUsageLog.created_at >= month_start, AIUsageLog.purpose != "email_parsing")
+    )).one()
+
+    budget = await get_budget_threshold(db)
+    total_cost = summary["cost_usd"]
+    used_pct = (total_cost / budget * 100) if budget > 0 else 0.0
+    return AIUsageStatsDTO(
+        total_cost_usd=round(total_cost, 4),
+        total_calls=summary["requests"],
+        budget_usd=budget,
+        budget_used_pct=round(used_pct, 2),
+        total_tokens=summary["tokens"],
+        resume_generation_tokens=int(resume_tokens or 0),
+        resume_generation_cost_usd=round(float(resume_cost or 0), 4),
+        resume_generation_count=int(resume_count or 0),
+    )
+async def ai_usage_stats(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
     import httpx
     import os
     from datetime import datetime, timezone, timedelta
@@ -882,6 +945,37 @@ async def get_openai_usage(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin)
 ):
+    # AI-USAGE FIX: uses the shared cached fetch. The limit was a hardcoded
+    # 300M; it is now your own monthly token budget from
+    # OPENAI_MONTHLY_TOKEN_LIMIT (default still 300M). OpenAI itself has no
+    # monthly token cap -- this is a planning budget, not an API limit.
+    import os
+    import openai_usage_client as ouc
+
+    if not os.getenv("OPENAI_ADMIN_API_KEY"):
+        return OpenAIUsageDTO(tokens_limit="0", tokens_remaining="0", tokens_used_pct=0.0, tokens_reset="End of Month")
+
+    total_tokens = 0
+    try:
+        buckets = await ouc.fetch_buckets(ouc.month_start_ts())
+        total_tokens = ouc.summarize(buckets or [])["tokens"]
+    except Exception:
+        pass
+
+    limit = int(os.getenv("OPENAI_MONTHLY_TOKEN_LIMIT", "300000000"))
+    remaining = max(0, limit - total_tokens)
+    used_pct = (total_tokens / limit) * 100.0 if limit > 0 else 0.0
+
+    return OpenAIUsageDTO(
+        tokens_limit=format_large_number(limit),
+        tokens_remaining=format_large_number(remaining),
+        tokens_used_pct=round(used_pct, 2),
+        tokens_reset="End of Month"
+    )
+async def get_openai_usage(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin)
+):
     import httpx
     import os
     import calendar
@@ -919,6 +1013,43 @@ async def get_openai_usage(
     )
 
 @router.get("/ai-usage/daily")
+async def ai_usage_daily(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    # AI-USAGE FIX: paginated + includes today (limit=30 used to drop the
+    # newest day), shared cached fetch, correct prices. Adds
+    # resume_cost_usd per day (Claude resume generation, from ai_usage_logs)
+    # so the chart shows both real series instead of one mislabeled one.
+    import openai_usage_client as ouc
+
+    start_ts = ouc.days_start_ts(days)
+    try:
+        buckets = await ouc.fetch_buckets(start_ts)
+    except ouc.OpenAIUsageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"OpenAI usage API unavailable: {e}")
+
+    openai_daily = ouc.daily_costs(buckets or [])
+
+    start_dt = datetime.fromtimestamp(start_ts, timezone.utc)
+    day_col = func.date(func.timezone("UTC", AIUsageLog.created_at))
+    rows = (await db.execute(
+        select(day_col, func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
+        .where(AIUsageLog.created_at >= start_dt, AIUsageLog.purpose != "email_parsing")
+        .group_by(day_col)
+    )).all()
+    resume_daily = {str(d): float(c or 0) for d, c in rows}
+
+    if buckets is None and not resume_daily:
+        return []
+    all_days = sorted(set(openai_daily) | set(resume_daily))
+    return [
+        {"date": d, "cost_usd": openai_daily.get(d, 0.0), "resume_cost_usd": resume_daily.get(d, 0.0)}
+        for d in all_days
+    ]
 async def ai_usage_daily(
     days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
@@ -1199,7 +1330,15 @@ async def admin_stats(
     pending_reviews = (await db.execute(
         select(func.count()).select_from(ManualReviewQueue).where(ManualReviewQueue.status == "OPEN")
     )).scalar_one()
-    total_ai_cost = (await db.execute(select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0)))).scalar_one()
+    # DASHBOARD FIX: was a LIFETIME sum shown as "AI Cost This Month".
+    # Now current calendar month, Claude/resume usage only -- the frontend
+    # adds the OpenAI month-to-date cost from /ai-usage/stats, so
+    # 'email_parsing' rows are excluded here to avoid counting them twice.
+    _month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    total_ai_cost = (await db.execute(
+        select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
+        .where(AIUsageLog.created_at >= _month_start, AIUsageLog.purpose != "email_parsing")
+    )).scalar_one()
 
     return AdminStatsDTO(
         total_audit_events=total_audit,
@@ -1215,7 +1354,10 @@ async def classifier_health(
     _: dict = Depends(require_admin),
 ):
     unclassified_count = (await db.execute(
-        text("SELECT COUNT(*) FROM gmail_emails WHERE category IS NULL OR category = 'unclassified'")
+        # DASHBOARD FIX: the sync itself sets category='unclassified' on
+        # every "not a requirement" email, so the old count only ever grew.
+        # Now: unclassified emails that are still waiting to be processed.
+        text("SELECT COUNT(*) FROM gmail_emails WHERE (category IS NULL OR category = 'unclassified') AND (status_desc IS NULL OR status_desc = 'Pending')")
     )).scalar_one()
 
     processed_last_5_min = (await db.execute(
