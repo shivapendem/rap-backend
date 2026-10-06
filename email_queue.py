@@ -2055,6 +2055,21 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                     except Exception as sig_img_err:
                         print(f"[email-queue] skipping signature image {sig_img['key']}: {sig_img_err}")
 
+            # FIX: show the consultant's NAME (not just the email's local
+            # part) as the sender in Gmail. Self-contained lookup wrapped so
+            # any failure just falls back to the bare address and can never
+            # block the send.
+            _from_display_name = None
+            try:
+                from models import Consultant as _FromNameConsultant
+                _from_name_cons = (await session.execute(
+                    select(_FromNameConsultant).where(_FromNameConsultant.id == item.consultant_id)
+                )).scalars().first()
+                if _from_name_cons and (_from_name_cons.full_name or "").strip():
+                    _from_display_name = _from_name_cons.full_name.strip()
+            except Exception as _from_name_err:
+                print(f"[email-queue] sender display name lookup skipped: {_from_name_err!r}")
+
             send_result = await send_application_email_async(
                 access_token=access_token,
                 from_email=item.from_email,
@@ -2066,6 +2081,7 @@ async def process_single_email_queue_item(session: AsyncSession, item) -> None:
                 attachment_names=attachment_names,
                 html_body=send_html_body,
                 inline_images=inline_images,
+                from_name=_from_display_name,
             )
             print(f"[email-queue debug {item.id}] Gmail API returned successfully. Marking status as SENT...")
             item.status = "SENT"

@@ -120,6 +120,7 @@ def build_mime_message(
     attachment_names: Optional[dict] = None,  # maps path -> original display filename
     html_body: Optional[str] = None,
     inline_images: Optional[List[dict]] = None,
+    from_name: Optional[str] = None,
 ) -> str:
     """
     Build MIME email message with optional attachments (one or many) and
@@ -194,7 +195,20 @@ def build_mime_message(
     else:
         msg = core
 
-    msg["From"] = sender
+    # FIX: the From header was the bare email address, so Gmail's Sent
+    # folder / recipients' inboxes showed the local part of the address
+    # (e.g. "saikiran.bhushaboina") instead of the consultant's name.
+    # When a display name is supplied, send "Name <email>" (formataddr
+    # handles quoting/non-ASCII). Falls back to the bare address if no name
+    # is given or formatting fails, so sending is never blocked by this.
+    _from_header = sender
+    if from_name and str(from_name).strip() and sender:
+        try:
+            from email.utils import formataddr
+            _from_header = formataddr((str(from_name).strip(), sender))
+        except Exception:
+            _from_header = sender
+    msg["From"] = _from_header
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
@@ -229,6 +243,7 @@ def send_via_gmail_api(
     attachment_names: Optional[dict] = None,
     html_body: Optional[str] = None,
     inline_images: Optional[List[dict]] = None,
+    from_name: Optional[str] = None,
 ) -> dict:
     """
     Send email via Gmail API using consultant's OAuth access token.
@@ -249,6 +264,7 @@ def send_via_gmail_api(
             attachment_names=attachment_names,
             html_body=html_body,
             inline_images=inline_images,
+            from_name=from_name,
         )
 
         response = httpx.post(
@@ -310,6 +326,7 @@ async def send_application_email_async(
     attachment_names: Optional[dict] = None,
     html_body: Optional[str] = None,
     inline_images: Optional[List[dict]] = None,
+    from_name: Optional[str] = None,
 ) -> dict:
     """
     Async wrapper for Gmail send. Used by FastAPI endpoints.
@@ -350,6 +367,7 @@ async def send_application_email_async(
             attachment_names=attachment_names,
             html_body=html_body,
             inline_images=inline_images,
+            from_name=from_name,
         ),
     )
     return result

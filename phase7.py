@@ -442,6 +442,7 @@ async def confirm_send(
                 attachment_names=attachment_names,
                 html_body=email_content["html_body"],
                 inline_images=email_content.get("inline_images"),
+                from_name=((consultant.full_name or "").strip() or None) if consultant else None,
             )
         except Exception as send_exc:
             # BUG FIX ("Gmail API error 403: {raw JSON}" shown verbatim to
