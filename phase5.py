@@ -1608,6 +1608,8 @@ async def get_consultant_applications(
 ):
     _require_role(current_user, "CONSULTANT")
     consultant = await _get_consultant_for_user(db, current_user)
+    # Consultants see every application made for them — sent by
+    # themselves or by a recruiter/admin on their behalf.
     filters = [Application.consultant_id == consultant.id]
     if status:
         filters.append(Application.status == status)
@@ -1764,6 +1766,11 @@ async def get_recruiter_applications(
     if status:
         filters.append(Application.status == status)
 
+    # Recruiters see only the applications they sent themselves
+    # (recruiter_id = sender). Admins still see everything.
+    if current_user.role == "RECRUITER":
+        filters.append(Application.recruiter_id == current_user.id)
+
     # Search across the fields actually visible in the table — consultant
     # name, role, vendor, and client — so a recruiter can find an
     # application without knowing which specific field it's in.
@@ -1850,6 +1857,10 @@ async def get_recruiter_application_consultants(
     )
     if status:
         q = q.where(Application.status == status)
+
+    # Recruiter dropdown lists only candidates from applications they sent.
+    if current_user.role == "RECRUITER":
+        q = q.where(Application.recruiter_id == current_user.id)
 
     if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
         q = q.where(
