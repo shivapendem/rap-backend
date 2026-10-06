@@ -103,6 +103,10 @@ class NotificationResponse(BaseModel):
     body: str
     is_read: bool
     created_at: datetime
+    # Derived from the title (see notification_helper.resolve_notification_meta);
+    # no DB columns behind these.
+    type: Optional[str] = None
+    link: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -1583,7 +1587,36 @@ async def get_notifications(
         .order_by(Notification.created_at.desc())
         .limit(50)
     )
-    return result.scalars().all()
+    from notification_helper import resolve_notification_meta
+    out = []
+    for n in result.scalars().all():
+        ntype, link = resolve_notification_meta(n.title, current_user.role)
+        out.append(NotificationResponse(
+            id=n.id,
+            user_id=n.user_id,
+            title=n.title,
+            body=n.body,
+            is_read=n.is_read,
+            created_at=n.created_at,
+            type=ntype,
+            link=link,
+        ))
+    return out
+
+
+@app.get("/api/notifications/unread-count")
+async def get_unread_notification_count(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cheap count for the bell badge — avoids loading the whole list on every poll."""
+    count = (await db.execute(
+        select(func.count()).select_from(Notification).where(
+            Notification.user_id == current_user.id,
+            Notification.is_read == False,
+        )
+    )).scalar_one()
+    return {"unread_count": int(count or 0)}
 
 
 @app.patch("/api/notifications/{notification_id}/read")

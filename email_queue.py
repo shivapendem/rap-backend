@@ -1533,7 +1533,48 @@ def original_filename_from_ref(ref: str) -> str:
 # a staging pipeline test, without touching code.
 EMAIL_QUEUE_TEST_DOMAIN_SUFFIX = os.getenv("EMAIL_QUEUE_TEST_DOMAIN_SUFFIX", "")
 
+async def _notify_email_failure(session: AsyncSession, info: dict) -> None:
+    """Tell the sender (and the consultant's own login, if different) that a queued email failed."""
+    from models import Consultant
+    from notification_helper import notify_users
+    user_ids = {info.get("sent_by_user_id")}
+    if info.get("consultant_id"):
+        cons_user = (await session.execute(
+            select(Consultant.user_id).where(Consultant.id == info["consultant_id"])
+        )).scalar_one_or_none()
+        user_ids.add(cons_user)
+    reason = (info.get("status_text") or "see the Email Queue for details")[:160]
+    body = f"Email to {info.get('to_email') or 'recipient'} could not be sent (queue #{info.get('id')}): {reason}"
+    await notify_users(session, user_ids, "Email failed to send", body)
+
+
 async def process_single_email_queue_item(session: AsyncSession, item) -> None:
+    """
+    Thin wrapper: runs the original sender unchanged, then — only when the
+    item newly ended up FAILED — raises an in-app notification. Anything that
+    goes wrong while notifying is swallowed so it can never affect sending.
+    """
+    info = {
+        "id": getattr(item, "id", None),
+        "consultant_id": getattr(item, "consultant_id", None),
+        "sent_by_user_id": getattr(item, "sent_by_user_id", None),
+        "to_email": getattr(item, "to_email", None),
+    }
+    status_before = getattr(item, "status", None)
+    await _process_single_email_queue_item_impl(session, item)
+    try:
+        if getattr(item, "status", None) == "FAILED" and status_before != "FAILED":
+            info["status_text"] = getattr(item, "status_text", None)
+            await _notify_email_failure(session, info)
+    except Exception as _notify_err:
+        print(f"[email-queue] failure notification skipped: {_notify_err}")
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+
+
+async def _process_single_email_queue_item_impl(session: AsyncSession, item) -> None:
     """
     Send one QUEUED EmailQueue item via Gmail and update its status
     (SENT/FAILED), including creating/updating the matching Application row

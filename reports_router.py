@@ -17,6 +17,9 @@ class UserReportStat(BaseModel):
     user_role: str
     applications_sent: int
     emails_sent: int
+    # Most recent send (application or queued email) inside the selected
+    # date range. Optional so older clients/rows are unaffected.
+    last_sent_at: Optional[datetime.datetime] = None
 
 class AdminReportResponse(BaseModel):
     emails_processed: int
@@ -121,6 +124,7 @@ async def get_admin_reports(
                 User.full_name.label("user_name"),
                 User.role.label("user_role"),
                 func.count(Application.id).label("app_count"),
+                func.max(Application.sent_at).label("last_app_sent"),
             )
             .join(Application, Application.recruiter_id == User.id)
             .where(Application.status == "SENT")
@@ -140,6 +144,7 @@ async def get_admin_reports(
             select(
                 EmailQueue.sent_by_user_id.label("user_id"),
                 func.count(EmailQueue.id).label("email_count"),
+                func.max(EmailQueue.updated_at).label("last_email_sent"),
             )
             .where(EmailQueue.status == "SENT", EmailQueue.sent_by_user_id.is_not(None))
             .group_by(EmailQueue.sent_by_user_id)
@@ -148,7 +153,9 @@ async def get_admin_reports(
             emails_query = emails_query.where(EmailQueue.created_at >= start_dt)
         if end_dt:
             emails_query = emails_query.where(EmailQueue.created_at <= end_dt)
-        emails_by_user = {row.user_id: row.email_count for row in (await db.execute(emails_query)).all()}
+        _email_rows = (await db.execute(emails_query)).all()
+        emails_by_user = {row.user_id: row.email_count for row in _email_rows}
+        last_email_by_user = {row.user_id: row.last_email_sent for row in _email_rows}
 
         for row in user_stats:
             applications_per_user.append(UserReportStat(
@@ -156,7 +163,11 @@ async def get_admin_reports(
                 user_name=row.user_name or "Unknown User",
                 user_role=row.user_role or "",
                 applications_sent=row.app_count,
-                emails_sent=emails_by_user.get(row.user_id, 0)
+                emails_sent=emails_by_user.get(row.user_id, 0),
+                last_sent_at=max(
+                    (t for t in (row.last_app_sent, last_email_by_user.get(row.user_id)) if t is not None),
+                    default=None,
+                ),
             ))
 
     return AdminReportResponse(
