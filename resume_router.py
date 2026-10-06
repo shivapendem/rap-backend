@@ -3169,7 +3169,10 @@ async def get_consultants_for_resumes(
             "name": u.full_name or u.email,
             "email": u.email,
             "skills": consultant_skills or u.skills,
-            "experience_years": u.experience_years or (c.total_experience_years if c else 0)
+            "experience_years": u.experience_years or (c.total_experience_years if c else 0),
+            # For the message-template {current_location} / {visa} fills.
+            "current_location": (c.current_location if c else None) or "",
+            "work_authorization": (c.work_authorization if c else None) or "",
         }
 
     matched_consultant_ids = None
