@@ -457,6 +457,9 @@ from matching_router import router as matching_router  # noqa: E402
 app.include_router(reports_router)
 app.include_router(matching_router, prefix="/api/matching", tags=["matching"])
 
+from feedback_router import router as feedback_router  # noqa: E402
+app.include_router(feedback_router)
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------

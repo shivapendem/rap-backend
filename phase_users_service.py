@@ -369,7 +369,7 @@ class UserService:
             full_name=req.full_name.strip(),
             email=req.email,
             role=req.role,
-            password_hash=get_password_hash(req.password),
+            password_hash=get_password_hash(req.password) if req.password else None,
             is_authorized=True,
             experience_years=req.experience_years,
             resume_info=req.resume_info,

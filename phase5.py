@@ -62,6 +62,7 @@ from models import (
     Application,
 )
 from auth import get_current_user
+from permission_service import RECRUITER_CAN_TARGET_ANY_CONSULTANT
 
 logger = logging.getLogger(__name__)
 
@@ -1725,7 +1726,10 @@ async def get_recruiter_applications(
     # consultants". Scope to the recruiter's active assignments whenever
     # no explicit consultant_id is given, same as every other recruiter-
     # facing endpoint (e.g. _assert_recruiter_mapped) already does.
-    if current_user.role == "RECRUITER" and not consultant_id:
+    # Recruiter tracker shows applications sent for ANY consultant (same
+    # rule as Apply: RECRUITER_CAN_TARGET_ANY_CONSULTANT). Flag off → old
+    # assigned-only scope.
+    if current_user.role == "RECRUITER" and not consultant_id and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
         assigned_result = await db.execute(
             select(RecruiterConsultant.consultant_id).where(
                 RecruiterConsultant.recruiter_id == current_user.id,
@@ -1745,7 +1749,7 @@ async def get_recruiter_applications(
             raise HTTPException(status_code=400, detail="Invalid consultant_id format")
 
         if ids:
-            if current_user.role == "RECRUITER":
+            if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
                 rcs = (await db.execute(
                     select(RecruiterConsultant.consultant_id).where(
                         RecruiterConsultant.recruiter_id == current_user.id,
@@ -1820,6 +1824,51 @@ async def get_recruiter_applications(
 # ===========================================================================
 # Resume generation trigger
 # ===========================================================================
+
+@router.get(
+    "/api/recruiter/applications/consultants",
+    summary="Candidates that have applications (tracker dropdown)",
+    tags=["Phase5 - Recruiter Dashboard"],
+)
+async def get_recruiter_application_consultants(
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Applications Tracker candidate dropdown: every consultant with at least
+    one application (optionally of the given status, e.g. SENT) — not only
+    the recruiter's assigned roster. Shape matches /api/resume/consultants
+    rows the dropdown already reads (consultant_id, name, email).
+    """
+    _require_role(current_user, "RECRUITER", "ADMIN")
+
+    q = (
+        select(Consultant.id, Consultant.full_name, Consultant.email)
+        .join(Application, Application.consultant_id == Consultant.id)
+        .distinct()
+    )
+    if status:
+        q = q.where(Application.status == status)
+
+    if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
+        q = q.where(
+            Consultant.id.in_(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )
+        )
+
+    rows = (await db.execute(q)).all()
+    result = [
+        {"consultant_id": cid, "name": name or email, "email": email}
+        for cid, name, email in rows
+    ]
+    result.sort(key=lambda r: (r["name"] or "").lower())
+    return result
+
 
 @router.post(
     "/api/admin/resumes/generate",

@@ -963,3 +963,39 @@ def _rap_user_updated(mapper, connection, target):
             _sa_select(consultants.c.id).where(consultants.c.user_id == target.id)
         )]
         _rap_pause_gmail(connection, ids)
+
+
+# ---------------------------------------------------------------------------
+# Feedback — bug reports, improvements, general feedback from any role
+# (ADMIN / RECRUITER / CONSULTANT). Created by Base.metadata.create_all on
+# startup (new table, no migration needed).
+# ---------------------------------------------------------------------------
+class Feedback(Base):
+    __tablename__ = "feedback"
+
+    id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    # Snapshot of the reporter at submit time (survives user rename/delete).
+    reporter_name = Column(Text, nullable=True)
+    reporter_role = Column(Text, nullable=True)
+
+    type = Column(Text, nullable=False, default="BUG")            # BUG | IMPROVEMENT | FEEDBACK | OTHER
+    title = Column(Text, nullable=False)
+    location = Column(Text, nullable=True)                       # "Where did this happen?"
+    description = Column(Text, nullable=False)
+    impact = Column(Text, nullable=True)                         # BUG only: MINOR | SLOW | STUCK
+    steps = Column(Text, nullable=True)                          # BUG only, optional
+    expected = Column(Text, nullable=True)                       # BUG only, optional
+
+    image_key = Column(Text, nullable=True)                      # "s3:<key>" or "local:<path>"
+    image_name = Column(Text, nullable=True)
+    image_content_type = Column(Text, nullable=True)
+
+    # Captured automatically by the frontend.
+    page_url = Column(Text, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    screen = Column(Text, nullable=True)
+
+    status = Column(Text, nullable=False, default="OPEN", index=True)  # OPEN | PENDING | RESOLVED
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

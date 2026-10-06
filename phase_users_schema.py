@@ -82,7 +82,7 @@ class PaginatedUsersDTO(BaseModel):
 class CreateUserRequestDTO(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=100)
     email: EmailStr
-    password: str = Field(..., min_length=8)
+    password: Optional[str] = Field(None, min_length=8)
     role: str
     experience_years: Optional[float] = Field(None, ge=0, le=60)
     resume_info: Optional[Any] = None
@@ -125,8 +125,10 @@ class CreateUserRequestDTO(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def validate_password_strength(cls, v: str) -> str:
+    def validate_password_strength(cls, v: Optional[str]) -> Optional[str]:
         import re
+        if not v:
+            return None
         if not re.search(r"[A-Z]", v):
             raise ValueError("Password must contain at least one uppercase letter.")
         if not re.search(r"[0-9]", v):
