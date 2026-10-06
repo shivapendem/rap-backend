@@ -85,6 +85,7 @@ from auth import get_current_user, decode_access_token
 from s3_service import upload_file_to_s3, delete_file_from_s3
 # Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
 from contact_format import phone_for_storage, linkedin_for_storage
+from list_normalize import dedupe_csv, dedupe_list
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,17 @@ class ProfileUpdateRequest(BaseModel):
         allowed = {"FULL_TIME", "CONTRACT", "W2", "1099"}
         return list(dict.fromkeys(t for t in v if t in allowed))
 
+    # Collapse case-insensitive duplicate skills / roles (quietly).
+    @field_validator("primarySkills")
+    @classmethod
+    def _dedupe_primary_skills(cls, v):
+        return dedupe_list(v)
+
+    @field_validator("preferredRoles")
+    @classmethod
+    def _dedupe_preferred_roles(cls, v):
+        return dedupe_csv(v)
+
     @field_validator("preferredLocations")
     @classmethod
     def validate_preferred_locations(cls, v):
@@ -623,7 +635,12 @@ class _ProfilePartialBase(BaseModel):
         cleaned = [s.strip() for s in v if s and s.strip()]
         if not cleaned:
             raise ValueError("Add at least one skill")
-        return cleaned
+        return dedupe_list(cleaned)
+
+    @field_validator("preferredRoles")
+    @classmethod
+    def _dedupe_preferred_roles(cls, v):
+        return dedupe_csv(v)
 
     @field_validator("employmentTypes")
     @classmethod
@@ -752,6 +769,12 @@ class AdminConsultantCreateRequest(BaseModel):
     resume_rich_text: Optional[str] = None
     linkedin_url: Optional[str] = None
     education: List[EducationEntryRequest] = []
+
+    # Collapse case-insensitive duplicate skills / roles (quietly).
+    @field_validator("primary_skills", "preferred_roles")
+    @classmethod
+    def _dedupe_csv_fields(cls, v):
+        return dedupe_csv(v)
 
     # FIX (missed in the first pass): this create-path validator had no
     # normalization at all, unlike every other place preferred_locations is

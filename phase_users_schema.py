@@ -21,6 +21,7 @@ from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
 # Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
 from contact_format import phone_for_storage, linkedin_for_storage, extension_for_storage
+from list_normalize import dedupe_csv
 
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
 VALID_STATUSES = {"Active", "Inactive"}
@@ -213,6 +214,12 @@ class EditUserRequestDTO(BaseModel):
             raise ValueError(f"work_authorization must be one of {', '.join(sorted(valid))}")
         return v
 
+    # Collapse case-insensitive duplicate skills (quietly).
+    @field_validator("primary_skills")
+    @classmethod
+    def _dedupe_primary_skills(cls, v: Optional[str]) -> Optional[str]:
+        return dedupe_csv(v)
+
 
 # ---------------------------------------------------------------------------
 # Status management
@@ -354,6 +361,12 @@ class UpdateConsultantRequestDTO(BaseModel):
         if v is not None and not v.strip():
             raise ValueError(f"{info.field_name} is required and cannot be cleared")
         return v
+
+    # Collapse case-insensitive duplicate skills / roles (quietly).
+    @field_validator("primary_skills", "preferred_roles")
+    @classmethod
+    def _dedupe_csv_fields(cls, v: Optional[str]) -> Optional[str]:
+        return dedupe_csv(v)
 
     @field_validator("preferred_locations")
     @classmethod

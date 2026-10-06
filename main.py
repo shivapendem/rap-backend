@@ -93,6 +93,8 @@ class LoginResponse(BaseModel):
     role: str
     name: str
     access_token: str
+    # Google login only: True/False when Gmail send access is known, else None.
+    gmail_connected: Optional[bool] = None
 
 class NotificationResponse(BaseModel):
     id: int
@@ -590,12 +592,213 @@ async def logout(request: Request, db: AsyncSession = Depends(get_db)):
     return {"message": "Logged out successfully"}
 
 
+# ---------------------------------------------------------------------------
+# Google sign-in
+# ---------------------------------------------------------------------------
+# BUG FIX ("consultant Google login fails the first time, works after a few
+# tries" + "recruiter roster doesn't show Gmail Connected after the first
+# login"). Three problems in the old single-function version:
+#
+#  1. Google's `code` is single-use and was spent BEFORE the first DB call.
+#     database.py recycled every pooled connection after 60s, so almost every
+#     login had to open a brand-new TLS connection to the remote Postgres -
+#     which this codebase has already seen hang/fail intermittently (see
+#     _connect_with_retry). Any such flake became an unhandled 500, the user
+#     landed on /login?error=server_error, and the only way out was to start
+#     the whole Google flow again. The DB part is now retried with a fresh
+#     session on transient connection errors, so the spent code is never lost.
+#
+#  2. Saving the Gmail token ran AFTER the login was already committed, in the
+#     same request. If that second commit failed, the user got a 500 even
+#     though their login had succeeded - and nothing was saved, so the roster
+#     stayed "Not Connected". Token saving now runs in its own session, is
+#     retried, and can never fail the login itself.
+#
+#  3. Nothing told the consultant when Google did NOT grant gmail.send (the
+#     consent screen lets users untick it). The response now carries
+#     gmail_connected so the frontend can say so instead of silently leaving
+#     the roster at "Not Connected".
+# ---------------------------------------------------------------------------
+
+_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+_LOGIN_DB_ATTEMPTS = 3
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True for connection-level failures worth retrying with a new session."""
+    import sqlalchemy.exc as sa_exc
+    if isinstance(exc, HTTPException):
+        return False
+    if isinstance(exc, sa_exc.DBAPIError) and getattr(exc, "connection_invalidated", False):
+        return True
+    if isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError, sa_exc.TimeoutError,
+                        ConnectionError, asyncio.TimeoutError, OSError)):
+        return True
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "connection was closed", "connection does not exist", "connection reset",
+        "connection refused", "start_tls", "ssl", "timed out", "timeout",
+        "cannot perform operation: another operation is in progress",
+    ))
+
+
+async def _exchange_google_code(code: str, redirect_uri: str, client_id: str, client_secret: str) -> dict:
+    """Swap the auth code for tokens. Only retries when the request never
+    reached Google (connect errors) - a code Google has already accepted
+    can't be exchanged twice."""
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
+                token_res = await client.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "code": code,
+                        "grant_type": "authorization_code",
+                        "redirect_uri": redirect_uri,
+                    },
+                )
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+            print(f"[google-login] connect to Google failed (attempt {attempt}/3): {exc!r}")
+            await asyncio.sleep(0.5 * attempt)
+        except httpx.RequestError as exc:
+            print(f"[google-login] Google token request failed: {exc!r}")
+            raise HTTPException(status_code=502, detail=f"Failed to reach Google OAuth: {exc}")
+    else:
+        raise HTTPException(status_code=502, detail=f"Failed to reach Google OAuth: {last_exc}")
+
+    if token_res.status_code != 200:
+        # Log Google's real reason (invalid_grant / redirect_uri_mismatch / ...)
+        # - previously this was swallowed, which made first-login failures
+        # impossible to diagnose from the server logs.
+        print(f"[google-login] token exchange rejected: status={token_res.status_code} body={token_res.text[:300]}")
+        raise HTTPException(status_code=400, detail="Invalid or expired Google OAuth code")
+    return token_res.json()
+
+
+async def _finish_google_login_db(email: str, provider: str) -> dict:
+    """Look the user up, run the same checks as before, record the login.
+    Runs in its own session so it can be retried as a whole."""
+    async with AsyncSessionLocal() as db:
+        # Case-insensitive: users created via bulk import / older code paths
+        # may have mixed-case emails, while Google always returns lowercase.
+        result = await db.execute(select(User).where(func.lower(User.email) == email))
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User not registered. Please contact your administrator.",
+            )
+        if not user.is_authorized:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated.")
+        if user.role == "CONSULTANT":
+            consultant_status_result = await db.execute(
+                select(Consultant.status).where(Consultant.user_id == user.id)
+            )
+            if consultant_status_result.scalar_one_or_none() == "INACTIVE":
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated.")
+
+        user.last_login_at = datetime.now(timezone.utc)
+        db.add(Notification(
+            user_id=user.id,
+            title="New Login Accessed",
+            body=f"Successful {provider} login recorded at {datetime.now(_APP_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')}.",
+        ))
+        await db.commit()
+
+        return {"id": user.id, "email": user.email, "role": user.role, "name": user.full_name}
+
+
+async def _save_consultant_gmail_token(user_id: int, user_email: str, token_data: dict) -> Optional[bool]:
+    """Store/refresh the consultant's Gmail send token. Never raises.
+
+    Returns True when Gmail is connected now, False when it definitely is
+    not (no send permission and nothing saved), None when unknown (a saved
+    token is being refreshed in the background)."""
+    from models import ConsultantEmailToken
+    from gmail_send_service import encrypt_token
+
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+    expires_in = int(token_data.get("expires_in") or 3599)
+    granted_scopes = (token_data.get("scope") or "").split()
+    has_send_scope = _GMAIL_SEND_SCOPE in granted_scopes
+
+    for attempt in range(1, _LOGIN_DB_ATTEMPTS + 1):
+        try:
+            async with AsyncSessionLocal() as db:
+                consultant = (await db.execute(
+                    select(Consultant).where(Consultant.user_id == user_id)
+                )).scalars().first()
+                if not consultant:
+                    print(f"[google-login] user {user_id} is CONSULTANT but has no linked consultant row - Gmail not saved.")
+                    return False
+
+                email_token = (await db.execute(
+                    select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id)
+                )).scalars().first()
+
+                if not (access_token and has_send_scope):
+                    # Same rule as before: never overwrite a working token
+                    # with a login-only one. If there's a saved token, the
+                    # background refresh resumes it; if not, Gmail simply
+                    # isn't connected and the consultant must grant access.
+                    print(f"[google-login] consultant {consultant.id}: gmail.send NOT granted "
+                          f"(scopes={granted_scopes}); saved token present={bool(email_token)}")
+                    return None if email_token else False
+
+                expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                if not email_token:
+                    email_token = ConsultantEmailToken(
+                        consultant_id=consultant.id,
+                        email_address=user_email,
+                        access_token_encrypted=encrypt_token(access_token),
+                        refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
+                        token_expiry=expiry_dt,
+                        send_permission_granted=True,
+                        is_active=True,
+                    )
+                    db.add(email_token)
+                else:
+                    email_token.email_address = user_email
+                    email_token.access_token_encrypted = encrypt_token(access_token)
+                    if refresh_token:
+                        email_token.refresh_token_encrypted = encrypt_token(refresh_token)
+                    email_token.token_expiry = expiry_dt
+                    email_token.send_permission_granted = True
+                    email_token.is_active = True  # resume access paused by logout/inactive
+
+                consultant.gmail_connected = True
+                await db.commit()
+                print(f"[google-login] Gmail token saved for consultant {consultant.id}.")
+                return True
+        except Exception as exc:
+            import sqlalchemy.exc as sa_exc
+            # A parallel request inserted the row first (UNIQUE consultant_id):
+            # the next attempt takes the update path.
+            retryable = _is_transient_db_error(exc) or isinstance(exc, sa_exc.IntegrityError)
+            print(f"[google-login] saving Gmail token failed (attempt {attempt}/{_LOGIN_DB_ATTEMPTS}): {exc!r}")
+            if not retryable or attempt == _LOGIN_DB_ATTEMPTS:
+                try:
+                    from error_logger import log_db_error
+                    await log_db_error(stage="google_login_gmail_token", error=exc)
+                except Exception:
+                    pass
+                return False
+            await asyncio.sleep(0.5 * attempt)
+    return False
+
+
 @app.post("/auth/google/callback", response_model=LoginResponse)
 async def google_login(
     request: GoogleLoginRequest,
     response: Response,
     background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
 ):
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -606,25 +809,8 @@ async def google_login(
             detail="Google OAuth is not configured on this server.",
         )
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            token_res = await client.post(
-                "https://oauth2.googleapis.com/token",
-                data={
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "code": request.code,
-                    "grant_type": "authorization_code",
-                    "redirect_uri": request.redirect_uri,
-                },
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"Failed to reach Google OAuth: {exc}")
+    token_data = await _exchange_google_code(request.code, request.redirect_uri, client_id, client_secret)
 
-    if token_res.status_code != 200:
-        raise HTTPException(status_code=400, detail="Invalid or expired Google OAuth code")
-
-    token_data = token_res.json()
     id_token = token_data.get("id_token")
     if not id_token:
         raise HTTPException(status_code=400, detail="Missing id_token from Google response")
@@ -632,15 +818,10 @@ async def google_login(
     # BUG FIX: verify the signature with Google's public keys in production;
     # for simplicity we decode without verification here but add aud check.
     try:
-        decoded = jwt.decode(
-            id_token,
-            options={"verify_signature": False},
-            algorithms=["RS256"],
-        )
+        decoded = jwt.decode(id_token, options={"verify_signature": False}, algorithms=["RS256"])
     except jwt.DecodeError:
         raise HTTPException(status_code=400, detail="Malformed Google id_token")
 
-    # Validate audience to prevent token substitution attacks
     aud = decoded.get("aud")
     if IS_PRODUCTION and aud != client_id:
         raise HTTPException(status_code=400, detail="Token audience mismatch")
@@ -648,151 +829,46 @@ async def google_login(
     email: str = decoded.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="Google token is missing email claim")
-
     email = email.lower().strip()
 
-    result = await db.execute(select(User).where(User.email == email))
-    user = result.scalars().first()
+    # The Google code is spent at this point - retry the DB work instead of
+    # failing the login on a transient connection problem.
+    user_info = None
+    for attempt in range(1, _LOGIN_DB_ATTEMPTS + 1):
+        try:
+            user_info = await _finish_google_login_db(email, "Google")
+            break
+        except HTTPException:
+            raise
+        except Exception as exc:
+            print(f"[google-login] DB step failed for {email} (attempt {attempt}/{_LOGIN_DB_ATTEMPTS}): {exc!r}")
+            if not _is_transient_db_error(exc) or attempt == _LOGIN_DB_ATTEMPTS:
+                try:
+                    from error_logger import log_db_error
+                    await log_db_error(stage="google_login", error=exc)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail="Login failed due to a server error. Please try again.")
+            await asyncio.sleep(0.5 * attempt)
 
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User not registered. Please contact your administrator.",
-        )
-
-    if not user.is_authorized:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is deactivated.",
-        )
-    if user.role == "CONSULTANT":
-        consultant_status_result = await db.execute(
-            select(Consultant.status).where(Consultant.user_id == user.id)
-        )
-        if consultant_status_result.scalar_one_or_none() == "INACTIVE":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account is deactivated.",
-            )
-
-    token = create_access_token(data={"sub": user.email, "role": user.role})
+    token = create_access_token(data={"sub": user_info["email"], "role": user_info["role"]})
     set_session_cookies(response, token)
 
-    # Real last-login tracking — see matching note in /auth/login.
-    user.last_login_at = datetime.now(timezone.utc)
-
-    # Insert Login Notification
-    new_notif = Notification(
-        user_id=user.id,
-        title="New Login Accessed",
-        body=f"Successful Google login recorded at {datetime.now(_APP_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')}."
-    )
-    db.add(new_notif)
-    await db.commit()
-
-    # Gmail OAuth Token Capture (Role check commented for admin testing)
-    # if user.role == "CONSULTANT":
-    if True:
-        # BUG FIX ("localhost:3000/login?error=server_error" on every
-        # CONSULTANT Google login): `Consultant` is already imported at
-        # module level (see the `from models import ... Consultant ...`
-        # at the top of this file) — re-importing it locally here made
-        # Python treat `Consultant` as a local variable for this
-        # function's ENTIRE body. The CONSULTANT-only inactive-check a
-        # few lines above (`select(Consultant.status).where(...)`) runs
-        # BEFORE this local import executes, so it tried to read that
-        # local `Consultant` before it was ever assigned, raising
-        # `UnboundLocalError: cannot access local variable 'Consultant'
-        # where it is not associated with a value` — an unhandled 500,
-        # which is exactly why this only ever broke CONSULTANT logins
-        # (ADMIN/RECRUITER skip that earlier check and never hit it).
-        # `ConsultantEmailToken` isn't imported at module level, so it
-        # still needs importing here — just not `Consultant` again.
-        from models import ConsultantEmailToken
-        from gmail_send_service import encrypt_token
-        
-        access_token = token_data.get("access_token")
-        refresh_token = token_data.get("refresh_token")
-        expires_in = token_data.get("expires_in", 3599)
-
-        # BUG FIX ("login with Gmail auto-connects Gmail, then send fails
-        # with 403 insufficientPermissions"): "Sign in with Google"
-        # (LoginForm.tsx buildGoogleOAuthURL) only ever requests scope
-        # "openid email profile" — never "gmail.send". This block used to
-        # take that login token unconditionally and upsert it into
-        # ConsultantEmailToken as if Gmail were freshly connected, with no
-        # scope check at all. Two bugs from that: (1) it marked the
-        # account "connected" in the UI with a token that could never
-        # send, guaranteeing a 403 the first time a send was attempted;
-        # (2) if the consultant had already gone through the real Connect
-        # Gmail flow (OAuthRedirectButton / GmailStatusCard, which do
-        # request gmail.send) and then simply logged in again with
-        # Google, this silently overwrote that good, working token with
-        # the useless login-only one — breaking a connection that used to
-        # work. Only touch ConsultantEmailToken here when this specific
-        # token actually carries gmail.send, and never overwrite an
-        # existing token that already has send permission with one that
-        # doesn't.
-        granted_scopes = (token_data.get("scope") or "").split()
-        has_send_scope = "https://www.googleapis.com/auth/gmail.send" in granted_scopes
-
-        if access_token and has_send_scope:
-            # BUG FIX (recruiter/admin logins attached their Gmail token to an
-            # arbitrary consultant): for any role other than CONSULTANT this
-            # used select(Consultant) with no filter and took .first() -- an
-            # unordered "some consultant" -- so a staff member's token was saved
-            # under (and overwrote the Gmail connection of) whichever consultant
-            # Postgres returned, and the startup sync then marked that unrelated
-            # consultant "Connected". Only a CONSULTANT login has a consultant
-            # profile to attach a token to; @savantisintelli.com senders go
-            # through the service account in the cron's email_queue.py and never
-            # read this token.
-            consultant = None
-            if user.role == "CONSULTANT":
-                cons_result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
-                consultant = cons_result.scalars().first()
-            
-            if consultant:
-                # Find existing token or create new one
-                token_result = await db.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id))
-                email_token = token_result.scalars().first()
-                
-                expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                
-                if not email_token:
-                    email_token = ConsultantEmailToken(
-                        consultant_id=consultant.id,
-                        email_address=user.email,
-                        access_token_encrypted=encrypt_token(access_token),
-                        refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
-                        token_expiry=expiry_dt,
-                        send_permission_granted=True,
-                        is_active=True,
-                    )
-                    db.add(email_token)
-                else:
-                    email_token.email_address = user.email
-                    email_token.access_token_encrypted = encrypt_token(access_token)
-                    if refresh_token:
-                        email_token.refresh_token_encrypted = encrypt_token(refresh_token)
-                    email_token.token_expiry = expiry_dt
-                    email_token.send_permission_granted = True
-                    email_token.is_active = True  # resume access paused by logout/inactive
-                
-                # The roster reads consultants.gmail_connected, which was only ever
-                # recomputed at process startup - so a freshly connected consultant
-                # showed "Not Connected" until the next restart. Set it with the token.
-                consultant.gmail_connected = True
-                await db.commit()
-        elif user.role == "CONSULTANT":
-            # This Google login didn't grant gmail.send (e.g. the consultant
-            # unticked it on the consent screen), so the block above left any
-            # previously saved token alone. Still refresh that saved token so
-            # logging back in restores sending access where possible.
+    gmail_connected: Optional[bool] = None
+    if user_info["role"] == "CONSULTANT":
+        # Only CONSULTANT logins have a consultant profile to attach a Gmail
+        # token to (recruiter/admin tokens must never land on a consultant).
+        gmail_connected = await _save_consultant_gmail_token(user_info["id"], user_info["email"], token_data)
+        if gmail_connected is None:
             from gmail_status_sync import refresh_consultant_gmail_token_on_login
-            background_tasks.add_task(refresh_consultant_gmail_token_on_login, user.id)
+            background_tasks.add_task(refresh_consultant_gmail_token_on_login, user_info["id"])
 
-    return LoginResponse(role=user.role, name=user.full_name, access_token=token)
+    return LoginResponse(
+        role=user_info["role"],
+        name=user_info["name"],
+        access_token=token,
+        gmail_connected=gmail_connected,
+    )
 
 
 # BUG FIX: sentinel/junk values leaking into the Requirements list.
