@@ -523,8 +523,26 @@ def _normalize_resume_data(resume_data: dict, resume_info: dict) -> dict:
             "end": _clean_str(exp.get("end") or exp.get("end_date")) or "Present",
             "location": _clean_str(exp.get("location")),
             "description": _clean_str(exp.get("description")),
+            "project": _clean_str(exp.get("project") or exp.get("project_name")),
             "bullets": bullets,
         })
+
+    # The profile is the source of truth for each job's project and
+    # location — carry them over by client when the generated entry lacks them.
+    _profile_by_client = {}
+    for _pe in _as_list((resume_info or {}).get("experience")):
+        if isinstance(_pe, dict):
+            _key = _clean_str(_pe.get("company") or _pe.get("client")).lower()
+            if _key and _key not in _profile_by_client:
+                _profile_by_client[_key] = _pe
+    for _ne in normalized_experience:
+        _src = _profile_by_client.get(_ne["client"].lower())
+        if not _src:
+            continue
+        if not _ne["project"]:
+            _ne["project"] = _clean_str(_src.get("project"))
+        if not _ne["location"]:
+            _ne["location"] = _clean_str(_src.get("location"))
     normalized["experience"] = normalized_experience
 
     # 5. Everything else — pass through as-is. These sections are all
@@ -1222,6 +1240,7 @@ def generate_tailored_resume(
                     "start": exp.get("start_date", exp.get("start", "")),
                     "end": exp.get("end_date", exp.get("end", "Present")),
                     "location": exp.get("location", ""),
+                    "project": exp.get("project", ""),
                     "bullets": exp.get("bullets", [])
                 }
                 for exp in resume_info.get("experience", [])

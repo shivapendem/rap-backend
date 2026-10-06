@@ -300,6 +300,8 @@ async def _build_resume_info(
             "start": start_str,
             "end": end_str,
             "is_present": bool(exp.is_present),
+            "location": exp.location or "",
+            "project": exp.project_title or "",
             "bullets": bullets
         })
 
@@ -1398,7 +1400,7 @@ class BaseResumeContentUpdateRequest(BaseModel):
 
 
 _HEURISTIC_SECTION_HEADERS = [
-    ("career_objective", re.compile(r'^career\s+objective\s*:?$', re.I)),
+    ("career_objective", re.compile(r'^(?:career\s+objective|professional\s+summary)\s*:?$', re.I)),
     ("technical_proficiencies", re.compile(r'^technical\s+proficienc(?:y|ies)\s*:?$', re.I)),
     ("experience", re.compile(r'^(?:experience|work\s+experience|professional\s+experience)\s*:?$', re.I)),
     ("educational_background", re.compile(r'^educational\s+background\s*:?$|^education\s*:?$', re.I)),
@@ -1570,6 +1572,14 @@ def _heuristic_parse_resume_text(text: str) -> Optional[dict]:
             current["bullets"].append(line)
     if current:
         experience.append(current)
+
+    # Resumes generated in the newer layout ("Client – Location" / "Role
+    # <tab> dates" / "Project: ..." / "Roles & Responsibilities") have no
+    # "Associated with" lines. Rather than return a result with every job
+    # lost, hand those to the generic parser, which understands that
+    # layout (None from it still lets callers fall back to the AI parser).
+    if sections.get("experience") and not experience:
+        return _generic_parse_resume_text(text)
 
     # Whatever's left after the last recognized section's content is the
     # flattened technical-proficiencies table (see docstring above). When
@@ -2021,7 +2031,7 @@ def _flatten_base_resume_content_to_text(data: dict) -> str:
         parts.append(f"{label}: {value}" if label else value)
 
     add(None, data.get("name"))
-    add("Career Objective", data.get("career_objective") or data.get("summary"))
+    add("Professional Summary", data.get("career_objective") or data.get("summary"))
 
     # BUG FIX: skills can now be a list of {"name","isPrimary"} tag
     # objects, not just plain strings — the `add()` helper's
@@ -2231,6 +2241,7 @@ async def build_base_resume_content(
             "start": _format_month_year(exp.start_date),
             "end": "Present" if exp.is_present else _format_month_year(exp.end_date),
             "location": exp.location or "",
+            "project": exp.project_title or "",
             "bullets": bullets,
             "technologies": exp.technologies or [],
         })
@@ -2664,6 +2675,8 @@ async def update_base_resume_content(
             exp.client_name = item.get("client") or exp.client_name
             exp.role_title = item.get("role") or exp.role_title
             exp.location = item.get("location")
+            if "project" in item:
+                exp.project_title = (item.get("project") or "").strip() or None
             if start_date is not None:
                 exp.start_date = start_date
             # BUG FIX: is_present MUST be assigned before end_date —
@@ -2688,6 +2701,7 @@ async def update_base_resume_content(
                 end_date=end_date,
                 is_present=is_present,
                 location=item.get("location"),
+                project_title=(item.get("project") or "").strip() or None,
                 # BUG FIX ("Save Changes does nothing" when editing a role
                 # added from the Base Resume editor in the Work Experience
                 # drawer): this reconciler never set work_mode, leaving it

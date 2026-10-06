@@ -858,6 +858,8 @@ class ExperienceMonthYear(BaseModel):
 class ExperienceRequest(BaseModel):
     clientName: str = Field(..., min_length=1, max_length=200)
     implementationPartner: Optional[str] = Field(None, max_length=200)
+    # Resume "Project: ..." line. Optional; omitted by older clients.
+    projectTitle: Optional[str] = Field(None, max_length=300)
     roleTitle: str = Field(..., min_length=1, max_length=200)
     startDate: ExperienceMonthYear
     endDate: Optional[ExperienceMonthYear] = None
@@ -882,6 +884,7 @@ class ExperienceResponse(BaseModel):
     id: str
     clientName: str
     implementationPartner: Optional[str] = None
+    projectTitle: Optional[str] = None
     roleTitle: str
     startDate: Optional[ExperienceMonthYear] = None
     endDate: Optional[ExperienceMonthYear] = None
@@ -993,6 +996,7 @@ async def _sync_experience_into_resume_info(db: AsyncSession, consultant: Consul
             "end": "Present" if exp.is_present else (_format_month_year(exp.end_date) if exp.end_date else ""),
             "is_present": bool(exp.is_present),
             "location": exp.location or "",
+            "project": exp.project_title or "",
             "bullets": bullets,
             "technologies": exp.technologies or [],
         })
@@ -1180,6 +1184,7 @@ def _exp_to_response(e: ConsultantExperience) -> ExperienceResponse:
         id=str(e.id),
         clientName=e.client_name,
         implementationPartner=e.implementation_partner,
+        projectTitle=e.project_title,
         roleTitle=e.role_title,
         startDate=start_date,
         endDate=end_date,
@@ -2237,6 +2242,7 @@ async def create_experience(
         consultant_id=consultant.id,
         client_name=payload.clientName,
         implementation_partner=payload.implementationPartner,
+        project_title=(payload.projectTitle or "").strip() or None,
         role_title=payload.roleTitle,
         start_date=date(payload.startDate.year, payload.startDate.month, 1),
         end_date=date(payload.endDate.year, payload.endDate.month, 1) if payload.endDate else None,
@@ -2289,6 +2295,10 @@ async def update_experience(
 
     exp.client_name = payload.clientName
     exp.implementation_partner = payload.implementationPartner
+    # Only touch the project when the client actually sent it, so older
+    # clients that don't know the field can't wipe it.
+    if "projectTitle" in payload.model_fields_set:
+        exp.project_title = (payload.projectTitle or "").strip() or None
     exp.role_title = payload.roleTitle
     exp.start_date = date(payload.startDate.year, payload.startDate.month, 1)
     # BUG FIX ("edit 2025–Present to 2016–2017 saves as 2016 – —"):

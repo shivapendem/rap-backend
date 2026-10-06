@@ -167,6 +167,13 @@ async def create_feedback(
     if not desc_v:
         raise HTTPException(status_code=422, detail="Please tell us what happened.")
 
+    # Snapshot the reporter, then release the pooled DB connection before the
+    # (possibly slow) image upload so other requests aren't kept waiting.
+    reporter_id = current_user.id
+    reporter_name = current_user.full_name or current_user.email
+    reporter_role = current_user.role
+    await db.rollback()
+
     impact_v = None
     if ftype == "BUG":
         impact_v = (impact or "SLOW").strip().upper()
@@ -187,9 +194,9 @@ async def create_feedback(
             image_ct = ct
 
     f = Feedback(
-        user_id=current_user.id,
-        reporter_name=current_user.full_name or current_user.email,
-        reporter_role=current_user.role,
+        user_id=reporter_id,
+        reporter_name=reporter_name,
+        reporter_role=reporter_role,
         type=ftype,
         title=title_v,
         location=_clean(location, 300),
@@ -266,8 +273,9 @@ async def all_feedback(
     list_conds = list(conds)
     if status_filter and status_filter.upper() in STATUSES:
         list_conds.append(Feedback.status == status_filter.upper())
-
-    total = (await db.execute(select(func.count()).select_from(Feedback).where(*list_conds))).scalar_one()
+        total = counts[status_filter.upper()]
+    else:
+        total = sum(counts.values())
     rows = (await db.execute(
         select(Feedback).where(*list_conds)
         .order_by(Feedback.created_at.desc())
@@ -331,11 +339,14 @@ async def get_feedback_image(
     f = await _get_visible(db, feedback_id, current_user)
     if not f.image_key:
         raise HTTPException(status_code=404, detail="No image")
-    data = await run_in_threadpool(_load_image, f.image_key)
+    key, ctype = f.image_key, f.image_content_type
+    # Free the pooled DB connection before the storage download.
+    await db.rollback()
+    data = await run_in_threadpool(_load_image, key)
     if not data:
         raise HTTPException(status_code=404, detail="Image not found")
     return Response(
         content=data,
-        media_type=f.image_content_type or "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=300"},
+        media_type=ctype or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=86400"},
     )

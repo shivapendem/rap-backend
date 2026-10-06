@@ -257,6 +257,8 @@ def _build_profile_resume_info(
                 "end_date": "Present"
                 if exp.is_present
                 else (exp.end_date.strftime("%b %Y") if exp.end_date else ""),
+                "location": exp.location or "",
+                "project": exp.project_title or "",
                 "technologies": exp.technologies or [],
                 "bullets": bullets,
             }
@@ -448,6 +450,26 @@ def _validate_resume_output(resume_data: dict, consultant: Consultant) -> tuple[
 # Task 4 — DOCX Generation (verbatim from Phase 6 doc code example)
 # ---------------------------------------------------------------------------
 
+_PROJECT_LINE_RE = re.compile(r"^\s*project(?:\s+name)?\s*[:\-–]\s*(.+)$", re.I | re.S)
+
+
+def _split_project(exp: dict) -> tuple:
+    """(project_name, other_description) for one experience entry.
+
+    The project comes from an explicit "project"/"project_name" field, or
+    from a description written as "Project: <name>" (what the resume
+    parsers store). Any other description text is returned separately so
+    it is still shown, just not as the Project line.
+    """
+    project = str(exp.get("project") or exp.get("project_name") or "").strip()
+    desc = str(exp.get("description") or "").strip()
+    if not project and desc:
+        m = _PROJECT_LINE_RE.match(desc)
+        if m and "\n" not in m.group(1).strip():
+            return m.group(1).strip(), ""
+    return project, desc
+
+
 def _generate_docx(resume_data: dict, output_path: Path, template: str = "classic") -> None:
     """Master Resume DOCX Builder modeled after shivashankar.docx.pdf template.
 
@@ -472,7 +494,7 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     """
     from docx import Document
     from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     import re
@@ -681,10 +703,11 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     p_hr_border.append(bottom_border)
     p_hr._p.get_or_add_pPr().append(p_hr_border)
 
-    # 2. CAREER OBJECTIVE / SUMMARY
+    # 2. PROFESSIONAL SUMMARY (data key stays "career_objective"; only the
+    # visible heading changed — every reader of the data is untouched).
     career_obj = resume_data.get("career_objective") or resume_data.get("summary")
     if career_obj:
-        add_section_header("CAREER OBJECTIVE:", is_objective=True)
+        add_section_header("PROFESSIONAL SUMMARY:", is_objective=True)
         obj_p = add_formatted_paragraph(career_obj, space_after=6)
         if obj_p:
             if cfg["objective"] == "centered":
@@ -772,72 +795,104 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             r_cat.bold = True
             p_sk.add_run(", ".join(skills_list))
 
-    # 4. EXPERIENCE
+    # 4. EXPERIENCE — layout per job:
+    #     Client – Location                         (bold)
+    #     Role                         Start – End  (bold, dates right-aligned)
+    #     Project: <name>                           (bold, when known)
+    #     Roles & Responsibilities                  (bold)
+    #     • bullets
     experience = resume_data.get("experience", [])
     if experience:
         add_section_header("EXPERIENCE:")
+        _sec = doc.sections[0]
+        right_tab_pos = _sec.page_width - _sec.left_margin - _sec.right_margin
+
+        def _style_first_line(par):
+            """Template accents (accent-box / timeline) on a job's first line."""
+            if cfg["experience"] == "accent-box":
+                bdr = OxmlElement('w:pBdr')
+                edge = OxmlElement('w:left')
+                edge.set(qn('w:val'), 'single')
+                edge.set(qn('w:sz'), '18')
+                edge.set(qn('w:space'), '4')
+                edge.set(qn('w:color'), accent_hex or '6366F1')
+                bdr.append(edge)
+                par._p.get_or_add_pPr().append(bdr)
+            elif cfg["experience"] == "timeline":
+                bdr = OxmlElement('w:pBdr')
+                edge = OxmlElement('w:left')
+                edge.set(qn('w:val'), 'single')
+                edge.set(qn('w:sz'), '8')
+                edge.set(qn('w:space'), '4')
+                edge.set(qn('w:color'), accent_hex or '334155')
+                bdr.append(edge)
+                par._p.get_or_add_pPr().append(bdr)
+
+        def _bold_line(text: str, color_accent: bool = False):
+            par = doc.add_paragraph()
+            par.paragraph_format.space_after = Pt(0)
+            r = par.add_run(text)
+            r.bold = True
+            if color_accent and cfg["experience"] == "accent-box" and accent_hex:
+                r.font.color.rgb = RGBColor.from_string(accent_hex)
+            return par
+
         for exp in experience:
             company = exp.get("client") or exp.get("company") or ""
             role = exp.get("role") or exp.get("title") or ""
+            location = exp.get("location") or ""
             start = exp.get("start") or exp.get("start_date") or ""
             end = exp.get("end") or exp.get("end_date") or ""
             date_str = f"{start} – {end}".strip(" –")
+            project, other_desc = _split_project(exp)
 
-            company_text = f"Associated with {company}" if company else ""
-            if cfg["experience"] == "timeline" and company_text:
-                # BUG FIX ("experience have missed styles" — a small box/
-                # tofu glyph showing instead of a marker): "●" (BLACK
-                # CIRCLE, U+25CF) doesn't have reliable font support in
-                # Google's DOCX viewer and rendered as a missing-glyph
-                # placeholder box instead of a bullet. "•" (BULLET,
-                # U+2022) is the character actually used for bullets
-                # nearly everywhere and has far more universal support.
-                company_text = f"\u2022 {company_text}"
-            if company_text or date_str:
-                p_exp = doc.add_paragraph()
-                p_exp.paragraph_format.space_after = Pt(2)
-                if company_text:
-                    r_company = p_exp.add_run(company_text)
-                    r_company.bold = True
-                    if cfg["experience"] == "accent-box" and accent_hex:
-                        r_company.font.color.rgb = RGBColor.from_string(accent_hex)
+            first_par = None
+            # Line 1: Client – Location
+            company_line = " – ".join(v for v in (company, location) if v)
+            if company_line:
+                if cfg["experience"] == "timeline":
+                    company_line = f"\u2022 {company_line}"
+                first_par = _bold_line(company_line, color_accent=True)
+                first_par.paragraph_format.space_before = Pt(6)
+
+            # No role: put the dates on the client line instead of a line of
+            # their own.
+            if not role and date_str and first_par is not None:
+                first_par.paragraph_format.tab_stops.add_tab_stop(right_tab_pos, WD_TAB_ALIGNMENT.RIGHT)
+                r_d = first_par.add_run(f"\t{date_str}")
+                r_d.bold = True
+                date_str = ""
+
+            # Line 2: Role ........ dates (right-aligned via a right tab stop)
+            if role or date_str:
+                p_role = doc.add_paragraph()
+                p_role.paragraph_format.space_after = Pt(0)
+                p_role.paragraph_format.tab_stops.add_tab_stop(right_tab_pos, WD_TAB_ALIGNMENT.RIGHT)
+                if role:
+                    r_role = p_role.add_run(role)
+                    r_role.bold = True
                 if date_str:
-                    r_date = p_exp.add_run(f" ({date_str})" if company_text else date_str)
+                    r_date = p_role.add_run(f"\t{date_str}")
                     r_date.bold = True
-                if cfg["experience"] == "accent-box":
-                    left_border = OxmlElement('w:pBdr')
-                    edge = OxmlElement('w:left')
-                    edge.set(qn('w:val'), 'single')
-                    edge.set(qn('w:sz'), '18')
-                    edge.set(qn('w:space'), '4')
-                    edge.set(qn('w:color'), accent_hex or '6366F1')
-                    left_border.append(edge)
-                    p_exp._p.get_or_add_pPr().append(left_border)
-                elif cfg["experience"] == "timeline":
-                    # Approximates the frontend's vertical connecting
-                    # line down the left side of the timeline (a real
-                    # positioned line + dot isn't reproducible in DOCX,
-                    # but a thin left border reads the same way at a
-                    # glance). Falls back to the same slate color the
-                    # frontend's timeline dot uses when no accent is set.
-                    left_border = OxmlElement('w:pBdr')
-                    edge = OxmlElement('w:left')
-                    edge.set(qn('w:val'), 'single')
-                    edge.set(qn('w:sz'), '8')
-                    edge.set(qn('w:space'), '4')
-                    edge.set(qn('w:color'), accent_hex or '334155')
-                    left_border.append(edge)
-                    p_exp._p.get_or_add_pPr().append(left_border)
+                if first_par is None:
+                    first_par = p_role
+                    p_role.paragraph_format.space_before = Pt(6)
 
-            if role:
-                add_formatted_paragraph(f"Designation: {role}")
-            if exp.get("location"):
-                add_formatted_paragraph(f"Location: {exp['location']}")
-            if exp.get("description"):
-                add_formatted_paragraph(f"Job Description: {exp['description']}")
+            # Line 3: Project
+            if project:
+                _bold_line(f"Project: {project}")
 
-            for bullet in exp.get("bullets", []):
-                add_formatted_paragraph(bullet, style="List Bullet")
+            if first_par is not None:
+                _style_first_line(first_par)
+
+            if other_desc:
+                add_formatted_paragraph(other_desc, space_after=2)
+
+            bullets = [b for b in (exp.get("bullets") or []) if b]
+            if bullets:
+                _bold_line("Roles & Responsibilities")
+                for bullet in bullets:
+                    add_formatted_paragraph(bullet, style="List Bullet")
 
     # 5. KEY PROJECTS
     key_projects = resume_data.get("key_projects", [])

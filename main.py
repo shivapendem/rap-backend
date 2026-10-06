@@ -1000,6 +1000,9 @@ async def get_requirements(
     # consultant at all — mirrors the same comma-separated-ids pattern
     # already used by /api/matching/pending and the Applications Tracker.
     consultant_id: Optional[str] = None,
+    # Work mode filter (REMOTE | HYBRID | ONSITE) for the Requirements
+    # page's "Work mode" dropdown. Optional — omitted means no filter.
+    work_mode: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1103,6 +1106,13 @@ async def get_requirements(
     # type and clicking Apply returned the exact same unfiltered list.
     if confidence_filter == "low":
         query = query.where(Requirement.parse_confidence < 0.5)
+
+    if work_mode:
+        wm = work_mode.strip().upper().replace("-", "").replace(" ", "")
+        if wm in ("REMOTE", "HYBRID", "ONSITE"):
+            query = query.where(
+                func.upper(func.replace(func.replace(Requirement.work_mode, "-", ""), " ", "")) == wm
+            )
 
     if employment_type:
         raw_types = _normalize_employment_type_filter(employment_type)
