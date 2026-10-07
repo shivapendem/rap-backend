@@ -3,12 +3,13 @@
 # submit feedback and see their own; only ADMIN sees everything and changes
 # status.
 #
-#   POST   /api/feedback                 submit (multipart, optional image)
+#   POST   /api/feedback                 submit (multipart, up to 5 images)
 #   GET    /api/feedback/mine            my feedback
 #   GET    /api/feedback                 ADMIN: all feedback + counts
 #   GET    /api/feedback/{id}            owner or ADMIN
 #   PATCH  /api/feedback/{id}/status     ADMIN: OPEN | PENDING | RESOLVED
-#   GET    /api/feedback/{id}/image      owner or ADMIN (streams the image)
+#   GET    /api/feedback/{id}/image      owner or ADMIN (streams the first/legacy image)
+#   GET    /api/feedback/{id}/images/{image_id}  owner or ADMIN (streams one image; 0 = legacy)
 #
 # Images go to DO Spaces when configured, else uploads/feedback/ on disk.
 # ---------------------------------------------------------------------------
@@ -19,7 +20,7 @@ import io
 import os
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
@@ -30,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user
 from database import get_db
-from models import Feedback, User
+from models import Feedback, FeedbackImage, User
 
 router = APIRouter(prefix="/api/feedback", tags=["Feedback"])
 
@@ -39,6 +40,7 @@ IMPACTS = {"MINOR", "SLOW", "STUCK"}
 STATUSES = {"OPEN", "PENDING", "RESOLVED"}
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGES = 5
 
 LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads", "feedback")
 
@@ -108,6 +110,21 @@ async def _get_visible(db: AsyncSession, fid: int, user: User) -> Feedback:
     return f
 
 
+async def _image_list(db: AsyncSession, f: Feedback) -> list:
+    """All images of a feedback as [{id, name, content_type}]. Rows from
+    before multi-image support (single image in feedback.image_*) are
+    returned as one entry with id 0."""
+    rows = (await db.execute(
+        select(FeedbackImage).where(FeedbackImage.feedback_id == f.id)
+        .order_by(FeedbackImage.position, FeedbackImage.id)
+    )).scalars().all()
+    if rows:
+        return [{"id": r.id, "name": r.image_name, "content_type": r.image_content_type} for r in rows]
+    if f.image_key:
+        return [{"id": 0, "name": f.image_name, "content_type": f.image_content_type}]
+    return []
+
+
 def _store_image(data: bytes, ext: str, content_type: str) -> str:
     """Returns the stored key ('s3:...' or 'local:...'). Raises on failure."""
     name = f"{uuid.uuid4().hex}.{ext}"
@@ -153,7 +170,8 @@ async def create_feedback(
     page_url: Optional[str] = Form(None),
     user_agent: Optional[str] = Form(None),
     screen: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
+    images: List[UploadFile] = File(default=[]),
+    image: Optional[UploadFile] = File(None),  # legacy single-image field
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -180,18 +198,31 @@ async def create_feedback(
         if impact_v not in IMPACTS:
             impact_v = "SLOW"
 
-    image_key = image_name = image_ct = None
+    # Validate every image BEFORE storing any, so a bad 4th file doesn't
+    # leave 3 orphaned uploads behind.
+    uploads = [u for u in (images or []) if u is not None and u.filename]
     if image is not None and image.filename:
-        ct = (image.content_type or "").lower()
+        uploads.append(image)
+    if len(uploads) > MAX_IMAGES:
+        raise HTTPException(status_code=422, detail=f"You can attach up to {MAX_IMAGES} images.")
+    prepared = []  # (data, ext, content_type, name)
+    for u in uploads:
+        ct = (u.content_type or "").lower()
         if ct not in IMAGE_TYPES:
             raise HTTPException(status_code=422, detail="Only PNG, JPG, WEBP or GIF images are allowed.")
-        data = await image.read()
+        data = await u.read()
         if len(data) > MAX_IMAGE_BYTES:
-            raise HTTPException(status_code=422, detail="Image must be 10 MB or smaller.")
+            raise HTTPException(status_code=422, detail="Each image must be 10 MB or smaller.")
         if data:
-            image_key = await run_in_threadpool(_store_image, data, IMAGE_TYPES[ct], ct)
-            image_name = os.path.basename(image.filename)[:200]
-            image_ct = ct
+            prepared.append((data, IMAGE_TYPES[ct], ct, os.path.basename(u.filename)[:200]))
+
+    stored = []  # (key, name, content_type)
+    for data, ext, ct, name in prepared:
+        key = await run_in_threadpool(_store_image, data, ext, ct)
+        stored.append((key, name, ct))
+    # The first image is also kept in the legacy columns (cover image /
+    # has_image flag / older clients).
+    image_key, image_name, image_ct = stored[0] if stored else (None, None, None)
 
     f = Feedback(
         user_id=reporter_id,
@@ -213,9 +244,17 @@ async def create_feedback(
         status="OPEN",
     )
     db.add(f)
+    await db.flush()  # assigns f.id for the image rows
+    for pos, (key, name, ct) in enumerate(stored):
+        db.add(FeedbackImage(
+            feedback_id=f.id, image_key=key, image_name=name,
+            image_content_type=ct, position=pos,
+        ))
     await db.commit()
     await db.refresh(f)
-    return _to_dict(f, full=True)
+    out = _to_dict(f, full=True)
+    out["images"] = await _image_list(db, f)
+    return out
 
 
 @router.get("/mine")
@@ -303,7 +342,9 @@ async def get_feedback(
     current_user: User = Depends(get_current_user),
 ):
     f = await _get_visible(db, feedback_id, current_user)
-    return _to_dict(f, full=True)
+    out = _to_dict(f, full=True)
+    out["images"] = await _image_list(db, f)
+    return out
 
 
 class StatusUpdate(BaseModel):
@@ -340,6 +381,36 @@ async def get_feedback_image(
     if not f.image_key:
         raise HTTPException(status_code=404, detail="No image")
     key, ctype = f.image_key, f.image_content_type
+    # Free the pooled DB connection before the storage download.
+    await db.rollback()
+    data = await run_in_threadpool(_load_image, key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return Response(
+        content=data,
+        media_type=ctype or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@router.get("/{feedback_id}/images/{image_id}")
+async def get_feedback_image_by_id(
+    feedback_id: int,
+    image_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    f = await _get_visible(db, feedback_id, current_user)
+    if image_id == 0:
+        # Feedback submitted before multi-image support.
+        key, ctype = f.image_key, f.image_content_type
+    else:
+        row = await db.get(FeedbackImage, image_id)
+        if not row or row.feedback_id != f.id:
+            raise HTTPException(status_code=404, detail="No image")
+        key, ctype = row.image_key, row.image_content_type
+    if not key:
+        raise HTTPException(status_code=404, detail="No image")
     # Free the pooled DB connection before the storage download.
     await db.rollback()
     data = await run_in_threadpool(_load_image, key)

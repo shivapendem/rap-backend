@@ -979,8 +979,8 @@ def _find_best_matching_experience(experience: list, jd_skills_lower: set) -> Op
 def _build_factual_career_objective(
     resume_info: dict, real_skills: list, job_description: str, target_role: Optional[str] = None
 ) -> str:
-    """Constructs a single flowing paragraph career objective from only
-    real profile data — no AI call, pure deterministic templating — used
+    """Constructs the career objective / Professional Summary as a short
+    bulleted list (HTML <ul><li>) from only real profile data — no AI call, pure deterministic templating — used
     when there's no stored summary AND the real Claude call itself
     failed. Never invents a job title, employer, or achievement the
     profile doesn't actually have.
@@ -1096,8 +1096,19 @@ def _build_factual_career_objective(
     ]
     line_5 = closing_templates[_pick_index(seed + "5", len(closing_templates))]
 
-    paragraph = " ".join(p for p in (line_1, line_2, (line_3 + gap_clause).strip(), line_5) if p)
-    return paragraph
+    # Returned as a bulleted list (one <li> per part) — the Professional
+    # Summary editor, preview and DOCX/PDF export all render <ul><li>.
+    # Wording and JD matching are unchanged; only the layout is bullets.
+    def _plain(text: str) -> str:
+        # Any HTML that came in with profile data (e.g. a Quill-saved
+        # bullet) is flattened so it can't break the list markup.
+        return re.sub(r"<[^>]+>", "", text or "").strip()
+
+    parts = [_plain(p) for p in (line_1, line_2, (line_3 + gap_clause).strip(), line_5)]
+    items = [p for p in parts if p]
+    if not items:
+        return ""
+    return "<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>"
 
 
 def generate_tailored_resume(
