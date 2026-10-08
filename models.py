@@ -999,3 +999,20 @@ class Feedback(Base):
     status = Column(Text, nullable=False, default="OPEN", index=True)  # OPEN | PENDING | RESOLVED
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), index=True)
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# FeedbackImage — up to 5 screenshots per feedback. New table, created by
+# Base.metadata.create_all on startup (no migration needed). Feedback rows
+# submitted before this existed keep their single image in feedback.image_*.
+# ---------------------------------------------------------------------------
+class FeedbackImage(Base):
+    __tablename__ = "feedback_image"
+
+    id = Column(PK_TYPE, primary_key=True, index=True, autoincrement=True)
+    feedback_id = Column(FK_TYPE, ForeignKey("feedback.id", ondelete="CASCADE"), nullable=False, index=True)
+    image_key = Column(Text, nullable=False)                     # "s3:<key>" or "local:<name>"
+    image_name = Column(Text, nullable=True)
+    image_content_type = Column(Text, nullable=True)
+    position = Column(Integer, nullable=False, default=0)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())

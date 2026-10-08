@@ -2172,6 +2172,24 @@ def _build_base_career_objective(consultant: Consultant) -> str:
     return " ".join(p for p in (line_a, line_b, line_c) if p)
 
 
+def _split_bullets_for_save(bullets, existing_achievements):
+    """Map the editor's flat bullet list back onto the Responsibilities /
+    Achievements columns (each a newline-separated text block).
+
+    If the role's existing Achievements lines are still the tail of the
+    list, they stay in Achievements and the rest is Responsibilities.
+    Otherwise everything is stored as Responsibilities."""
+    lines = []
+    for b in bullets or []:
+        for line in str(b if b is not None else "").split("\n"):
+            if line.strip():
+                lines.append(line.strip())
+    ach = [l.strip() for l in str(existing_achievements or "").split("\n") if l.strip()]
+    if ach and len(lines) > len(ach) and lines[-len(ach):] == ach:
+        return "\n".join(lines[:-len(ach)]), "\n".join(ach)
+    return ("\n".join(lines) or None), None
+
+
 async def build_base_resume_content(
     db: AsyncSession,
     consultant: Consultant,
@@ -2233,7 +2251,15 @@ async def build_base_resume_content(
     experience_list = []
     # Chronological (current/most recent first) — see experience_order.py.
     for exp in sort_experiences_chronologically(exp_rows_result.scalars().all()):
-        bullets = [b for b in (exp.responsibilities, exp.achievements) if b]
+        # responsibilities / achievements are newline-separated text blocks;
+        # split them so each line is its own bullet (the editor and preview
+        # both expect one array item per bullet).
+        bullets = [
+            line.strip()
+            for block in (exp.responsibilities, exp.achievements) if block
+            for line in str(block).split("\n")
+            if line.strip()
+        ]
         experience_list.append({
             "id": str(exp.id),
             "role": exp.role_title or "",
@@ -2666,8 +2692,8 @@ async def update_base_resume_content(
 
         start_date, end_date, is_present = _parse_resume_editor_dates(item.get("start"), item.get("end"))
         bullets = item.get("bullets") or []
-        responsibilities = bullets[0] if len(bullets) > 0 else None
-        achievements = "\n".join(bullets[1:]) if len(bullets) > 1 else None
+        # New rows have no existing Achievements block to preserve.
+        responsibilities, achievements = _split_bullets_for_save(bullets, None)
         technologies = item.get("technologies") or []
 
         if exp_id is not None and exp_id in existing_by_id:
@@ -2687,8 +2713,12 @@ async def update_base_resume_content(
             exp.is_present = is_present
             exp.end_date = end_date
             exp.technologies = technologies
-            exp.responsibilities = responsibilities
-            exp.achievements = achievements
+            # Keep the role's existing Achievements block intact when its
+            # lines are still the tail of the bullet list; otherwise every
+            # line goes to Responsibilities (nothing is lost).
+            exp.responsibilities, exp.achievements = _split_bullets_for_save(
+                bullets, exp.achievements
+            )
             exp.sort_order = idx
             seen_ids.add(exp_id)
             reconciled_experience.append(item)
