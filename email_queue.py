@@ -132,16 +132,18 @@ class EmailQueueStatusUpdate(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-ANTI_SPAM_DELAY_MINUTES = 1
+# Minimum gap between two emails from the same sender (anti-spam).
+# Override with the ANTI_SPAM_DELAY_SECONDS env var.
+ANTI_SPAM_DELAY_SECONDS = int(__import__("os").getenv("ANTI_SPAM_DELAY_SECONDS", "10"))
 
 
 async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> datetime:
     """
     Calculates the next available scheduled_at timestamp for a given from_email.
-    Enforces a mandatory 5-minute anti-spam delay between consecutive emails sent from the same sender email.
+    Enforces a mandatory anti-spam delay (ANTI_SPAM_DELAY_SECONDS) between consecutive emails sent from the same sender email.
     Checks both EmailQueue and Application tables for any recent sends/schedules.
-    If no prior email was scheduled/sent for this from_email in the last 5 minutes, returns current UTC time.
-    Otherwise, returns max_previous_time + 5 minutes.
+    If no prior email was scheduled/sent for this from_email within the delay window, returns current UTC time.
+    Otherwise, returns max_previous_time + the delay.
     """
     from datetime import datetime, timezone, timedelta
     from models import EmailQueue, Application, Consultant
@@ -184,7 +186,7 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
     times = [t for t in (last_eq_time, last_app_time) if t is not None]
 
     # Base reference floor is (now - 5 minutes)
-    reference_time = now_utc - timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+    reference_time = now_utc - timedelta(seconds=ANTI_SPAM_DELAY_SECONDS)
 
     if times:
         last_time = max(times)
@@ -192,7 +194,7 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
             last_time = last_time.replace(tzinfo=timezone.utc)
         reference_time = max(reference_time, last_time)
 
-    return reference_time + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+    return reference_time + timedelta(seconds=ANTI_SPAM_DELAY_SECONDS)
 
 
 async def reschedule_remaining_queued_emails(db: AsyncSession, from_email: str, actual_sent_at: datetime) -> None:
@@ -219,7 +221,7 @@ async def reschedule_remaining_queued_emails(db: AsyncSession, from_email: str, 
     res = await db.execute(stmt)
     remaining_items = res.scalars().all()
 
-    current_slot = actual_sent_at + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+    current_slot = actual_sent_at + timedelta(seconds=ANTI_SPAM_DELAY_SECONDS)
     for item in remaining_items:
         item_sched = item.scheduled_at or item.created_at
         if item_sched and item_sched.tzinfo is None:
@@ -227,9 +229,9 @@ async def reschedule_remaining_queued_emails(db: AsyncSession, from_email: str, 
 
         if not item_sched or item_sched < current_slot:
             item.scheduled_at = current_slot
-            current_slot += timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+            current_slot += timedelta(seconds=ANTI_SPAM_DELAY_SECONDS)
         else:
-            current_slot = item_sched + timedelta(minutes=ANTI_SPAM_DELAY_MINUTES)
+            current_slot = item_sched + timedelta(seconds=ANTI_SPAM_DELAY_SECONDS)
 
 
 async def _assert_email_queue_access(db: AsyncSession, current_user: User, item) -> None:
@@ -1119,7 +1121,7 @@ async def send_email_now(
 
     # BUG FIX ("Failed to send application email." with literally nothing
     # else to go on): calculate_next_scheduled_at enforces a mandatory
-    # ANTI_SPAM_DELAY_MINUTES gap between sends from the same from_email —
+    # ANTI_SPAM_DELAY_SECONDS gap between sends from the same from_email —
     # correct and needed for the deferred/background-queue flow, but this
     # is send_email_now, which exists specifically to send RIGHT NOW and
     # give the caller a real result (see this function's own docstring
@@ -1136,13 +1138,13 @@ async def send_email_now(
     # same silent failure the moment it was written to the DB.
     if scheduled_at > now_utc:
         wait_seconds = (scheduled_at - now_utc).total_seconds()
-        wait_minutes = max(1, round(wait_seconds / 60))
+        wait_secs = max(1, int(round(wait_seconds)))
         raise HTTPException(
             status_code=429,
             detail=(
                 f"To prevent spam, only one email can be sent from {effective_from_email} "
-                f"every {ANTI_SPAM_DELAY_MINUTES} minutes. Please wait about "
-                f"{wait_minutes} more minute{'s' if wait_minutes != 1 else ''} and try again."
+                f"every {ANTI_SPAM_DELAY_SECONDS} seconds. Please wait about "
+                f"{wait_secs} more second{'s' if wait_secs != 1 else ''} and try again."
             ),
         )
 
