@@ -1781,7 +1781,7 @@ async def list_consultants(
     rows = (
         await db.execute(
             query
-            .order_by(Consultant.created_at.desc())
+            .order_by(func.lower(Consultant.full_name).asc(), Consultant.id.asc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
