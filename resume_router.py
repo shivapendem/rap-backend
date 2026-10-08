@@ -829,59 +829,6 @@ class FinalizeResumeRequest(BaseModel):
     # all 11 templates; only the actual attached PDF/DOCX never did.
     template: Optional[str] = None
 
-class SkillGapIntegrateRequest(BaseModel):
-    skill: str
-    # The CURRENT draft resume JSON from the review dialog (only
-    # career_objective/summary and experience are read).
-    resume_data: dict
-    job_description: Optional[str] = ""
-    target_role: Optional[str] = None
-
-
-# FEATURE ("Skills Gap + Add should also add points to the relevant
-# experience and the Professional Summary"): returns the text to insert —
-# it does NOT modify any stored resume. The frontend merges the result
-# into its draft state, and it's only persisted on Finalize, exactly like
-# every other edit in the review dialog. Always returns a usable result
-# (template wording when Claude is unavailable), never a 5xx for an AI
-# hiccup, so the "+ Add" click never leaves the resume half-updated.
-@router.post("/skill-gap/integrate")
-async def integrate_missing_skill(
-    request: SkillGapIntegrateRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    from claude_service import generate_skill_integration
-    skill = (request.skill or "").strip()
-    if not skill:
-        raise HTTPException(status_code=400, detail="Skill is required")
-
-    result, rate_limits, usage_info = await asyncio.to_thread(
-        generate_skill_integration,
-        skill,
-        request.resume_data or {},
-        request.job_description or "",
-        request.target_role,
-    )
-    try:
-        if rate_limits:
-            await save_openai_rate_limits(db, rate_limits)
-        if usage_info:
-            from phase8_ai_usage_service import log_ai_usage
-            await log_ai_usage(
-                db,
-                purpose="skill_gap_integration",
-                model="claude-sonnet-4-6",
-                input_tokens=usage_info["input_tokens"],
-                output_tokens=usage_info["output_tokens"],
-                entity_type="resume",
-            )
-    except Exception as e:
-        # Usage logging is bookkeeping only — never fail the request over it.
-        print(f"Skill-gap integration usage logging failed: {e}")
-    return {"skill": skill, **result}
-
-
 @router.post("/{resume_id}/finalize", response_model=ResumeResponse)
 async def finalize_resume(
     resume_id: int,
