@@ -654,6 +654,12 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             p.paragraph_format.space_after = Pt(space_after)
             return p
         normalized = str(text)
+        # BUG FIX (empty boxes / "?" before pasted or Enter-typed paragraphs in the
+        # DOCX/PDF): the rich-text editor leaves invisible characters in the saved
+        # HTML (its U+FEFF cursor placeholder, zero-width spaces, stray control
+        # characters). The browser preview hides them, but the document font has no
+        # glyph for them, so Word/PDF draw a box. Strip them before building.
+        normalized = re.sub(r'[\u200b-\u200d\u2060\ufeff\u00ad\x00-\x08\x0b\x0c\x0e-\x1f]', '', normalized)
         normalized = re.sub(r'</?(strong|b)>', '**', normalized)
         normalized = re.sub(r'</?(em|i)>', '*', normalized)
         normalized = re.sub(r'<br\s*/?>', '\n', normalized)
