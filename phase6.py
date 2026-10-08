@@ -380,7 +380,8 @@ MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
     # regardless of whether generation would have actually succeeded.
     try:
         resume_data, rate_limits, usage_info = await asyncio.to_thread(
-            generate_tailored_resume, resume_info, jd_context, requirement.role
+            generate_tailored_resume, resume_info, jd_context, requirement.role,
+            ((requirement.parsed_fields or {}).get("skills") if isinstance(requirement.parsed_fields, dict) else None),
         )
     except Exception as exc:  # noqa: BLE001 - surface any client/transport error
         logger.error("Claude resume generation failed: %s", exc)
@@ -477,6 +478,40 @@ def _split_project(exp: dict) -> tuple:
         if m and "\n" not in m.group(1).strip():
             return m.group(1).strip(), ""
     return project, desc
+
+
+_SUMMARY_BULLET_RE = re.compile(r"^\s*[\u2022\u25aa\u25cf\u25e6\-\*\u2013]\s+(.*)$")
+
+
+def _summary_blocks(text: str) -> list[tuple[str, bool]]:
+    """Splits a Professional Summary into (text, is_bullet) blocks so a
+    bulleted summary is written with the same Word "List Bullet" style as
+    the experience bullets (it used to come out as plain "\u2022 text" lines
+    with no hanging indent). A paragraph summary stays one paragraph."""
+    t = str(text or "")
+    if re.search(r"<li\b", t, re.I):
+        blocks: list[tuple[str, bool]] = []
+        pos = 0
+        for m in re.finditer(r"<(ul|ol)[^>]*>(.*?)</\1>", t, re.I | re.S):
+            head = t[pos:m.start()]
+            if re.sub(r"<[^>]+>", "", head).strip():
+                blocks.append((head, False))
+            for li in re.findall(r"<li[^>]*>(.*?)</li>", m.group(2), re.I | re.S):
+                if re.sub(r"<[^>]+>", "", li).strip():
+                    blocks.append((li, True))
+            pos = m.end()
+        tail = t[pos:]
+        if re.sub(r"<[^>]+>", "", tail).strip():
+            blocks.append((tail, False))
+        return blocks
+    lines = [ln for ln in t.split("\n") if ln.strip()]
+    if sum(1 for ln in lines if _SUMMARY_BULLET_RE.match(ln)) >= 2:
+        out = []
+        for ln in lines:
+            m = _SUMMARY_BULLET_RE.match(ln)
+            out.append((m.group(1), True) if m else (ln, False))
+        return out
+    return [(t, False)]
 
 
 def _generate_docx(resume_data: dict, output_path: Path, template: str = "classic") -> None:
@@ -630,6 +665,10 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
         # Final safety net — strips any remaining tag this editor
         # doesn't currently produce but could add in the future.
         normalized = re.sub(r'<[^>]+>', '', normalized)
+        # Decode entities left by HTML summaries / rich-text edits
+        # ("&amp;" -> "&", "&nbsp;" -> space) so they never print literally.
+        import html as _html
+        normalized = _html.unescape(normalized).replace("\u00a0", " ")
         para_lines = [ln for ln in normalized.split('\n') if ln.strip()] or [""]
         first_p = None
         for para_text in para_lines:
@@ -717,7 +756,11 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     career_obj = resume_data.get("career_objective") or resume_data.get("summary")
     if career_obj:
         add_section_header("PROFESSIONAL SUMMARY:", is_objective=True)
-        obj_p = add_formatted_paragraph(career_obj, space_after=6)
+        obj_p = None
+        for block_text, is_bullet in _summary_blocks(career_obj):
+            p_blk = (add_formatted_paragraph(block_text, style="List Bullet") if is_bullet
+                     else add_formatted_paragraph(block_text, space_after=6))
+            obj_p = obj_p or p_blk
         if obj_p:
             if cfg["objective"] == "centered":
                 obj_p.alignment = WD_ALIGN_PARAGRAPH.CENTER

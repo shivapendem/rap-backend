@@ -1112,7 +1112,8 @@ def _build_factual_career_objective(
 
 
 def generate_tailored_resume(
-    resume_info: dict, job_description: str, target_role: Optional[str] = None
+    resume_info: dict, job_description: str, target_role: Optional[str] = None,
+    jd_skills: Optional[list] = None,
 ) -> tuple[dict, dict, Optional[dict]]:
     """
     Builds a structured JSON resume from resume_info and job_description
@@ -1278,7 +1279,25 @@ def generate_tailored_resume(
     # missing_skills gap analysis — all from _build_factual_career_objective
     # and friends), never calling Anthropic. generation_notes left blank
     # since this is the normal path now, not a fallback-from-failure.
-    return _normalize_resume_data(mock_fallback, resume_info), {}, None
+    result = _normalize_resume_data(mock_fallback, resume_info)
+
+    # Add EVERY skill the requirement asks for (skill table + a bullet in
+    # one of the two most recent projects + summary points), recorded in
+    # result["jd_added"] for the review dialog's highlight / ✕ remove.
+    # Rules (certifications never claimed, release dates respected, no
+    # years claimed) live in skill_augment.py. Best-effort: a failure here
+    # must never block resume generation.
+    try:
+        from skill_augment import augment_resume_with_jd_skills, detect_jd_skills
+        skills_for_jd = [s for s in (jd_skills or []) if str(s or "").strip()]
+        if not skills_for_jd:
+            skills_for_jd = detect_jd_skills(job_description)
+        if skills_for_jd:
+            augment_resume_with_jd_skills(result, skills_for_jd, existing_categorizer=categorize_skills)
+    except Exception as exc:  # noqa: BLE001
+        print(f"skill_augment failed, returning resume without JD skill additions: {exc}")
+
+    return result, {}, None
 
 
 def generate_template_values(resume_info: dict, job_description: str) -> tuple[dict, dict, Optional[dict]]:

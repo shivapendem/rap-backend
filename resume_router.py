@@ -128,6 +128,11 @@ class ResumeCreateRequest(BaseModel):
     # Changes/regenerate reads resume.template right back out). Same class
     # of bug the finalize endpoint already had fixed for its own payload.
     template: Optional[str] = None
+    # The requirement's own parsed skill list (requirement.parsed_fields
+    # ["skills"]). Every one of these is added to the generated resume's
+    # skill table, recent-project bullets and summary (skill_augment.py).
+    # When omitted, skills are detected from job_description instead.
+    jd_skills: Optional[List[str]] = None
 
 async def _get_resume_for_user(db: AsyncSession, resume_id: int, current_user: User):
     if current_user.role == "ADMIN":
@@ -682,8 +687,17 @@ async def generate_resume(
         )
 
     try:
+        jd_skills = request.jd_skills
+        if not jd_skills and request.requirement_id:
+            from models import Requirement
+            req_row = (await db.execute(
+                select(Requirement).where(Requirement.id == request.requirement_id)
+            )).scalar_one_or_none()
+            if req_row is not None and isinstance(req_row.parsed_fields, dict):
+                jd_skills = req_row.parsed_fields.get("skills") or None
         generated_data, rate_limits, usage_info = generate_tailored_resume(
-            resume_info, request.job_description or "General Role", target_role=request.target_role
+            resume_info, request.job_description or "General Role", target_role=request.target_role,
+            jd_skills=jd_skills,
         )
         if rate_limits:
             await save_openai_rate_limits(db, rate_limits)
@@ -837,6 +851,9 @@ async def finalize_resume(
     # at the point the resume is actually being finalized.
     finalized_data = dict(request.data)
     finalized_data.pop("missing_skills", None)
+    # jd_added only drives the review dialog's highlight/✕ list; the
+    # added skills/bullets/summary points themselves stay in the resume.
+    finalized_data.pop("jd_added", None)
 
     resume.data = finalized_data
     resume.template = request.template or "classic"
