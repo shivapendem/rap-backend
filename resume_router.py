@@ -695,6 +695,15 @@ async def generate_resume(
             )).scalar_one_or_none()
             if req_row is not None and isinstance(req_row.parsed_fields, dict):
                 jd_skills = req_row.parsed_fields.get("skills") or None
+        # Also add the skills the ATS scorer below detects in the JD text, so
+        # the generated resume covers everything the score checks (whole-word
+        # matches only — see skill_augment.verify_detected_skills).
+        from phase3 import _detect_skills as _p3_detect, _SKILL_ALIASES as _p3_aliases
+        from skill_augment import verify_detected_skills
+        jd_text_skills = verify_detected_skills(
+            request.job_description or "", _p3_detect(request.job_description or ""), _p3_aliases
+        )
+        jd_skills = list(dict.fromkeys([*(jd_skills or []), *jd_text_skills]))
         generated_data, rate_limits, usage_info = generate_tailored_resume(
             resume_info, request.job_description or "General Role", target_role=request.target_role,
             jd_skills=jd_skills,
@@ -719,9 +728,13 @@ async def generate_resume(
     ats_value = None
     try:
         from phase6 import _ats_score
-        from phase3 import _detect_skills
+        from phase3 import _detect_skills, _SKILL_ALIASES as _p3_aliases
+        from skill_augment import verify_detected_skills
+        # Whole-word JD skills only: the raw detector also "found" Go in
+        # "good", Machine Learning in "HTML" etc., which then counted as
+        # missing and dragged the score down for skills the JD never asked for.
         jd_skills = list(dict.fromkeys(
-            _detect_skills(request.job_description or "")
+            verify_detected_skills(request.job_description or "", _detect_skills(request.job_description or ""), _p3_aliases)
             + (generated_data.get("missing_skills") or [])
         ))
         if jd_skills:
@@ -734,6 +747,12 @@ async def generate_resume(
                 text_parts.append(exp.get("role", ""))
                 text_parts.append(" ".join(exp.get("bullets", []) or []))
             resume_text = " ".join(text_parts)
+            # A skill written under another of its names ("Google Cloud" for
+            # GCP, "k8s" for Kubernetes) counts as present: append the
+            # canonical names whose aliases appear as whole words.
+            resume_text += " " + " ".join(
+                verify_detected_skills(resume_text, list(_p3_aliases.keys()), _p3_aliases)
+            )
             ats_total, *_ = _ats_score(jd_skills, resume_text, request.target_role or "")
             ats_value = int(round(ats_total))
     except Exception as e:

@@ -1021,6 +1021,20 @@ async def get_requirements(
     query = select(Requirement)
     if status:
         query = query.where(Requirement.status == status)
+    # Consultants only ever see requirements matched to THEM — all matches,
+    # no time window (the Date filter narrows by received date). Enforced
+    # here, not just hidden in the UI. MATCHING + APPLIED only (rejected /
+    # not-eligible matches stay hidden).
+    if current_user.role == "CONSULTANT":
+        own_consultant = (await db.execute(
+            select(Consultant).where(Consultant.user_id == current_user.id)
+        )).scalars().first()
+        own_matches = select(RequirementConsultantMatch.requirement_id).where(
+            RequirementConsultantMatch.consultant_id == (own_consultant.id if own_consultant else -1),
+            RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
+        )
+        query = query.where(Requirement.id.in_(own_matches))
+        matched_only = False  # already scoped above; ignore the old N-day window
     if matched_only:
         since = datetime.now(timezone.utc) - timedelta(days=matched_days)
         matched_subq = select(RequirementConsultantMatch.requirement_id).where(
