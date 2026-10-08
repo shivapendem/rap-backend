@@ -344,6 +344,15 @@ async def _call_ai_tailoring(
 
     resume_info = _build_profile_resume_info(consultant, experiences)
 
+    # Professional Summary = base resume's summary as-is (same source/
+    # fallback as the Base Resume pane in resume_router).
+    from resume_router import _build_base_career_objective  # lazy: avoid circular import
+    base_summary = ""
+    if db is not None and consultant.user_id:
+        info_res = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
+        base_summary = ((info_res.scalar_one_or_none() or {}).get("summary") or "")
+    resume_info["summary"] = base_summary or _build_base_career_objective(consultant)
+
     # ── Requirement context (preserves everything the old prompt carried) ──
     jd_context = f"""Role: {requirement.role}
 Client: {requirement.client or 'Not specified'}

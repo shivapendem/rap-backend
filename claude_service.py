@@ -1156,7 +1156,15 @@ def generate_tailored_resume(
     # stored summary exists. The stored summary is NOT discarded — it's
     # still shown as-is on the Base Resume pane elsewhere; this only
     # changes what the *Generated* (tailored) pane shows.
-    real_summary = _build_factual_career_objective(resume_info, real_skills, job_description, target_role)
+    # CHANGE ("Professional Summary should be the base resume's summary,
+    # not modified"): use the base resume's stored summary exactly as-is.
+    # Callers (resume_router._build_resume_info / phase6._call_ai_tailoring)
+    # put the same text the Base Resume pane shows into
+    # resume_info["summary"], so Generated == Base for this section.
+    real_summary = (
+        (resume_info.get("summary") or "").strip()
+        or (resume_info.get("career_objective") or "").strip()
+    )
     # TECHNICAL PROFICIENCIES table: prefer resume_info's own categorized
     # list if it has one, otherwise build one from the full tech_stack
     # (expert + exposure/intermediate + familiar tiers merged) so the

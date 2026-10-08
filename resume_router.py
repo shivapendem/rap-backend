@@ -376,6 +376,10 @@ async def _build_resume_info(
             resume_info["title"] = consultant.preferred_roles
         if not resume_info.get("skills") and not resume_info.get("tech_stack") and not resume_info.get("technical_proficiencies") and consultant.primary_skills:
             resume_info["skills"] = [s.strip() for s in consultant.primary_skills.split(",") if s.strip()]
+        # Same Professional Summary the Base Resume shows
+        # (build_base_resume_content) — generated resume reuses it as-is.
+        if not resume_info.get("summary"):
+            resume_info["summary"] = _build_base_career_objective(consultant)
 
     return resume_info
 
