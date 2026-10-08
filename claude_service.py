@@ -1501,3 +1501,257 @@ def evaluate_role_match_with_ai(requirement_role: str, consultant_roles: list[st
         else:
             logger.warning(f"Error calling Claude API for role matching: {e}")
         return None
+
+# ─────────────────────────────────────────────────────────────────────────
+# FEATURE ("Skills Gap + Add should also update the Professional Summary
+# and the relevant Experience, not just the Technical Proficiencies
+# table"): when a recruiter/consultant clicks "+ Add" on a Skills Gap
+# chip in the Review Generated Resume dialog, the frontend already files
+# the skill under its Technical Proficiencies category instantly. It then
+# calls /api/resume/skill-gap/integrate (resume_router.py), which uses
+# this function to write:
+#   - ONE new Professional Summary point that names the skill, and
+#   - ONE new bullet for each of the 1-2 MOST RELEVANT experience
+#     entries (picked by tech-stack overlap, then recency).
+# Claude writes the text when available (so it reads naturally next to
+# the candidate's existing bullets); if the API key is missing, the
+# circuit breaker is open, or the call fails, a deterministic
+# category-based template is used instead, so the click always produces
+# a result. Neither path invents employers, clients, metrics or numbers.
+# ─────────────────────────────────────────────────────────────────────────
+
+SKILL_INTEGRATION_SYSTEM_PROMPT = """You are a senior technical resume writer.
+A recruiter has decided to add ONE skill to a candidate's tailored resume. Your job is to
+weave that skill naturally into the resume so it is not just a bare keyword in the skills table.
+
+Return ONLY a valid JSON object, no prose, no markdown fences:
+{
+  "summary_point": "one sentence for the Professional Summary",
+  "experience_bullets": [
+    {"index": <integer index of the experience entry from the input list>, "bullet": "one bullet"}
+  ]
+}
+
+Rules:
+- Pick the 1 or 2 experience entries where this skill fits most plausibly, based on that entry's
+  role, project description, existing bullets and tech stack. Prefer recent entries when equally relevant.
+  Never pick more than 2 entries. Use the exact integer "index" given in the input.
+- Each bullet: 18-32 words, starts with a strong past-tense action verb (present tense only if the
+  role's end date is "Present"/"Current"), matches the tone of that entry's existing bullets, and
+  ties the skill to the technologies/work already described in that entry.
+- summary_point: one sentence, 15-30 words, connecting the skill to the candidate's existing strengths
+  and to the target role when given.
+- Mention the skill EXACTLY once in each piece of text, wrapped in **double asterisks** (e.g. **Docker**).
+- Do NOT invent company names, client names, product names, team sizes, percentages, dollar amounts
+  or any other numbers. Do NOT repeat a bullet that already exists.
+- Plain text only (no HTML)."""
+
+# Deterministic fallback wording, keyed by the same category names as
+# SKILL_CATEGORIES above (plus the "Other Tools & Technologies" catch-all
+# used by categorize_skills / the frontend's categorizeSkill).
+_SKILL_FALLBACK_BULLETS: dict[str, str] = {
+    "Programming Languages": "Developed and maintained application modules using **{skill}**, writing clean, reusable code and collaborating with the team through code reviews.",
+    "AI / ML & GenAI": "Applied **{skill}** to build and refine AI/ML components, validating model outputs and integrating them into the existing application workflow.",
+    "Vector Databases & Search": "Implemented search and retrieval features using **{skill}**, tuning indexing and query patterns to return relevant results efficiently.",
+    "Backend Frameworks & APIs": "Designed and developed backend services and APIs using **{skill}**, handling request validation, error handling and integration with downstream systems.",
+    "Cloud Platforms": "Deployed and managed application components on **{skill}**, configuring environments, access and monitoring to support reliable releases.",
+    "Big Data & Streaming": "Built data pipelines and event-driven processing using **{skill}**, ensuring reliable data flow between upstream and downstream services.",
+    "Databases & Data Stores": "Designed schemas and wrote optimized queries using **{skill}**, supporting application data storage, reporting and performance tuning.",
+    "DevOps & CI/CD": "Automated build, test and deployment workflows using **{skill}**, improving release consistency across development and production environments.",
+    "Data Processing & Visualization": "Processed, analyzed and visualized application data using **{skill}**, producing insights that supported technical and business decisions.",
+    "Testing & Monitoring": "Strengthened quality and observability using **{skill}**, adding tests and monitoring that helped detect and resolve issues early.",
+    "Version Control & Collaboration": "Used **{skill}** for day-to-day version control and team collaboration, following branching, review and documentation best practices.",
+    "Web Technologies": "Built responsive, user-friendly interfaces using **{skill}**, integrating front-end components with backend APIs.",
+}
+_SKILL_FALLBACK_BULLET_DEFAULT = "Utilized **{skill}** as part of the project's technology stack, contributing to design, development and delivery of application features."
+
+_SKILL_FALLBACK_SUMMARY: dict[str, str] = {
+    "Cloud Platforms": "Experienced in deploying and managing applications on **{skill}** cloud services alongside core development responsibilities.",
+    "DevOps & CI/CD": "Skilled in streamlining build and deployment pipelines with **{skill}** to deliver reliable, repeatable releases.",
+    "Big Data & Streaming": "Hands-on experience building event-driven and data-streaming solutions with **{skill}**.",
+    "Databases & Data Stores": "Proficient in data modeling and query optimization with **{skill}**.",
+    "Backend Frameworks & APIs": "Strong background designing and building scalable services and APIs with **{skill}**.",
+    "Web Technologies": "Experienced in building responsive web interfaces with **{skill}**.",
+    "AI / ML & GenAI": "Hands-on experience applying **{skill}** to build intelligent, data-driven features.",
+}
+_SKILL_FALLBACK_SUMMARY_DEFAULT = "Hands-on experience with **{skill}**, applying it alongside the core technology stack to deliver quality solutions."
+
+
+def _strip_html_for_prompt(text: str) -> str:
+    """Turns ReactQuill HTML (<ul><li>..</li></ul>, <p>..</p>) into plain
+    lines so the prompt shows Claude readable text, not markup."""
+    if not text:
+        return ""
+    text = re.sub(r"(?i)<\s*(br|/p|/li)\s*/?>", "\n", str(text))
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _skill_category(skill: str) -> str:
+    """Same word-boundary, first-match-wins rule as categorize_skills()."""
+    lower = (skill or "").lower()
+    for category, keywords in SKILL_CATEGORIES:
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", lower):
+                return category
+    return "Other Tools & Technologies"
+
+
+def _experience_text(exp: dict) -> str:
+    return " ".join([
+        str(exp.get("role") or exp.get("title") or ""),
+        str(exp.get("description") or ""),
+        str(exp.get("project") or exp.get("project_name") or ""),
+        " ".join(str(b) for b in (exp.get("bullets") or [])),
+    ]).lower()
+
+
+def _rank_experiences_for_skill(experience: list, skill: str) -> list[int]:
+    """Returns experience indexes ordered best-fit first: entries whose
+    text mentions keywords from the SAME category as the new skill (e.g.
+    'aws'/'lambda' for Azure, 'jenkins' for Docker) rank highest; ties go
+    to the more recent entry (lower index — experience is stored newest
+    first, see experience_order.py)."""
+    category = _skill_category(skill)
+    keywords = []
+    for cat, kws in SKILL_CATEGORIES:
+        if cat == category:
+            keywords = kws
+            break
+    scored = []
+    for i, exp in enumerate(experience or []):
+        if not isinstance(exp, dict):
+            continue
+        text = _experience_text(exp)
+        score = sum(1 for kw in keywords if re.search(r"\b" + re.escape(kw) + r"\b", text))
+        scored.append((score, -i, i))
+    scored.sort(reverse=True)
+    return [i for _, _, i in scored]
+
+
+def _fallback_skill_integration(skill: str, experience: list) -> dict:
+    category = _skill_category(skill)
+    summary_point = _SKILL_FALLBACK_SUMMARY.get(category, _SKILL_FALLBACK_SUMMARY_DEFAULT).format(skill=skill)
+    bullet = _SKILL_FALLBACK_BULLETS.get(category, _SKILL_FALLBACK_BULLET_DEFAULT).format(skill=skill)
+    ranked = _rank_experiences_for_skill(experience, skill)
+    bullets = [{"index": ranked[0], "bullet": bullet}] if ranked else []
+    return {"summary_point": summary_point, "experience_bullets": bullets, "source": "template"}
+
+
+def _ensure_skill_bolded(text: str, skill: str) -> str:
+    """Guarantees the skill is mentioned and **bolded** once, so the new
+    text stands out the same way the generator's own bolded JD terms do."""
+    text = (text or "").strip()
+    if not text:
+        return text
+    if re.search(r"\*\*[^*]*" + re.escape(skill) + r"[^*]*\*\*", text, re.IGNORECASE):
+        return text
+    if re.search(r"\b" + re.escape(skill) + r"\b", text, re.IGNORECASE):
+        return _bold_terms(text, [skill])
+    return text.rstrip(".") + f" using **{skill}**."
+
+
+def generate_skill_integration(
+    skill: str,
+    resume_data: dict,
+    job_description: str = "",
+    target_role: Optional[str] = None,
+) -> tuple[dict, dict, Optional[dict]]:
+    """Returns ({"summary_point", "experience_bullets": [{"index", "bullet"}],
+    "source": "ai"|"template"}, rate_limits, usage_info) — same three-tuple
+    shape as the other Claude helpers here so the router can log usage."""
+    skill = (skill or "").strip()
+    resume_data = resume_data or {}
+    experience = resume_data.get("experience") or []
+    if not isinstance(experience, list):
+        experience = []
+    fallback = _fallback_skill_integration(skill, experience)
+    if not skill:
+        return fallback, {}, None
+
+    if _claude_circuit_is_open():
+        return fallback, {}, None
+
+    client, _key = get_working_anthropic_client()
+    if client is None:
+        return fallback, {}, None
+
+    exp_lines = []
+    for i, exp in enumerate(experience[:8]):
+        if not isinstance(exp, dict):
+            continue
+        bullets = [str(b).strip() for b in (exp.get("bullets") or []) if str(b).strip()][:6]
+        exp_lines.append(
+            f"[index {i}] Role: {exp.get('role') or exp.get('title') or ''} | "
+            f"Client/Company: {exp.get('client') or exp.get('company') or ''} | "
+            f"Dates: {exp.get('start') or ''} - {exp.get('end') or ''}\n"
+            f"Project/Description: {_strip_html_for_prompt(exp.get('description') or exp.get('project') or '')[:400]}\n"
+            "Existing bullets:\n" + "\n".join(f"- {b}" for b in bullets)
+        )
+    summary_text = _strip_html_for_prompt(resume_data.get("career_objective") or resume_data.get("summary") or "")
+    user_prompt = f"""SKILL TO ADD: {skill}
+TARGET ROLE: {target_role or 'Not specified'}
+
+JOB DESCRIPTION (excerpt):
+{(job_description or '')[:2500]}
+
+CURRENT PROFESSIONAL SUMMARY:
+{summary_text[:1500] or '(empty)'}
+
+EXPERIENCE ENTRIES:
+{chr(10).join(exp_lines) or '(none)'}
+
+Return the JSON now."""
+
+    try:
+        response = client.messages.with_raw_response.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            system=SKILL_INTEGRATION_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        headers = response.headers
+        rate_limits = {
+            "tokens-limit": headers.get("anthropic-ratelimit-tokens-limit"),
+            "tokens-remaining": headers.get("anthropic-ratelimit-tokens-remaining"),
+            "tokens-reset": headers.get("anthropic-ratelimit-tokens-reset"),
+            "requests-limit": headers.get("anthropic-ratelimit-requests-limit"),
+            "requests-remaining": headers.get("anthropic-ratelimit-requests-remaining"),
+            "requests-reset": headers.get("anthropic-ratelimit-requests-reset"),
+        }
+        parsed = response.parse()
+        usage_info = {
+            "input_tokens": parsed.usage.input_tokens,
+            "output_tokens": parsed.usage.output_tokens,
+        }
+        content = parsed.content[0].text.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        result, _ = json.JSONDecoder().raw_decode(content.strip())
+
+        summary_point = _ensure_skill_bolded(str(result.get("summary_point") or ""), skill) \
+            or fallback["summary_point"]
+        bullets_out, used = [], set()
+        for item in (result.get("experience_bullets") or [])[:2]:
+            try:
+                idx = int(item.get("index"))
+            except Exception:
+                continue
+            text = _ensure_skill_bolded(str(item.get("bullet") or ""), skill)
+            if 0 <= idx < len(experience) and idx not in used and text:
+                used.add(idx)
+                bullets_out.append({"index": idx, "bullet": text})
+        if not bullets_out:
+            bullets_out = fallback["experience_bullets"]
+        return {"summary_point": summary_point, "experience_bullets": bullets_out, "source": "ai"}, rate_limits, usage_info
+    except Exception as e:
+        if _is_hard_claude_failure(e):
+            _trip_claude_circuit(f"skill integration: {e}")
+        else:
+            logger.warning(f"Error calling Claude API for skill integration: {e}")
+        return fallback, {}, None
