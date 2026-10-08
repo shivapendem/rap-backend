@@ -575,24 +575,8 @@ async def login(
 
 @app.post("/auth/logout")
 async def logout(request: Request, db: AsyncSession = Depends(get_db)):
-    # Consultant logout pauses their Gmail access: sending stops and the
-    # recruiter roster shows "Not Connected" until they log in again. The
-    # token is kept (not deleted) so the next login can refresh it. Logout
-    # itself must never fail, so any problem here is only logged.
-    try:
-        auth_header = request.headers.get("authorization") or ""
-        if auth_header.lower().startswith("bearer "):
-            payload = decode_access_token(auth_header[7:].strip())
-            email = payload.get("sub")
-            if email:
-                from gmail_status_sync import pause_consultant_gmail
-                await pause_consultant_gmail(db, email)
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-        print(f"[logout] Gmail pause skipped: {exc!r}")
+    # Simply return success; the client handles clearing the JWT for the session.
+    # We no longer pause Gmail access so that emails can continue sending in the background.
     return {"message": "Logged out successfully"}
 
 
