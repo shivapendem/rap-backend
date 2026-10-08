@@ -20,6 +20,41 @@ class UserReportStat(BaseModel):
     # Most recent send (application or queued email) inside the selected
     # date range. Optional so older clients/rows are unaffected.
     last_sent_at: Optional[datetime.datetime] = None
+    # Earliest SENT application inside the selected date range. This is the
+    # primary sort key of the User Activity table (see _sort_user_activity).
+    first_sent_at: Optional[datetime.datetime] = None
+
+
+# User Activity ordering: staff are grouped by role first
+# (Admin, then Recruiter, then Consultant), and inside each role the user whose
+# FIRST application in the selected period went out earliest comes first.
+# Not by count, not by name, not by Last Sent.
+_ROLE_PRIORITY = {"ADMIN": 0, "RECRUITER": 1, "CONSULTANT": 2}
+
+
+def _sort_user_activity(rows: List["UserReportStat"]) -> List["UserReportStat"]:
+    """Deterministic order: role priority -> earliest first_sent_at -> user_id.
+
+    Users with no first_sent_at (no application activity) go after those with
+    activity inside their own role; unknown roles go after the three known
+    ones. user_id is the final tie-breaker so the order never flips between
+    refreshes.
+    """
+    _no_time = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+    def _key(u: "UserReportStat"):
+        ts = u.first_sent_at
+        if ts is not None and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return (
+            _ROLE_PRIORITY.get((u.user_role or "").upper(), len(_ROLE_PRIORITY)),
+            ts is None,
+            ts or _no_time,
+            u.user_id,
+        )
+
+    return sorted(rows, key=_key)
+
 
 class AdminReportResponse(BaseModel):
     emails_processed: int
@@ -125,6 +160,7 @@ async def get_admin_reports(
                 User.role.label("user_role"),
                 func.count(Application.id).label("app_count"),
                 func.max(Application.sent_at).label("last_app_sent"),
+                func.min(Application.sent_at).label("first_app_sent"),
             )
             .join(Application, Application.recruiter_id == User.id)
             .where(Application.status == "SENT")
@@ -168,7 +204,11 @@ async def get_admin_reports(
                     (t for t in (row.last_app_sent, last_email_by_user.get(row.user_id)) if t is not None),
                     default=None,
                 ),
+                first_sent_at=row.first_app_sent,
             ))
+
+        # Role group first, then earliest first application in the period.
+        applications_per_user = _sort_user_activity(applications_per_user)
 
     return AdminReportResponse(
         emails_processed=emails_processed,
