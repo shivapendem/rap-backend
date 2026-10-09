@@ -886,3 +886,20 @@ def detect_jd_skills(job_description: str) -> list[str]:
             seen.add(canon)
             out.append(shown)
     return out
+
+
+# Short aliases that hit inside ordinary words ("go" in "good/Google",
+# "ml" in "HTML", "ts" in "its") — never trusted on their own.
+_AMBIGUOUS_ALIASES = {"go", "ts", "js", "ml", "es6"}
+
+
+def verify_detected_skills(text: str, canonicals: list[str], alias_table: dict[str, list[str]]) -> list[str]:
+    """Keeps only the skills from a plain-substring detector (phase3._detect_skills)
+    that really appear in the text as whole words, via a non-ambiguous alias."""
+    low = (text or "").lower()
+    out = []
+    for c in canonicals or []:
+        aliases = [a.lower() for a in alias_table.get(c, [c])] + [c.lower()]
+        if any(a not in _AMBIGUOUS_ALIASES and a in low and _word_re(a).search(low) for a in aliases):
+            out.append(c)
+    return out

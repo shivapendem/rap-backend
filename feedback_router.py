@@ -260,14 +260,22 @@ async def create_feedback(
 @router.get("/mine")
 async def my_feedback(
     status_filter: Optional[str] = Query(None, alias="status"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = select(Feedback).where(Feedback.user_id == current_user.id)
+    """The signed-in user's own feedback, newest first, 50 per page."""
+    conds = [Feedback.user_id == current_user.id]
     if status_filter and status_filter.upper() in STATUSES:
-        q = q.where(Feedback.status == status_filter.upper())
-    rows = (await db.execute(q.order_by(Feedback.created_at.desc()).limit(200))).scalars().all()
-    return [_to_dict(r) for r in rows]
+        conds.append(Feedback.status == status_filter.upper())
+    total = (await db.execute(select(func.count()).select_from(Feedback).where(*conds))).scalar_one()
+    rows = (await db.execute(
+        select(Feedback).where(*conds)
+        .order_by(Feedback.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+    return {"items": [_to_dict(r) for r in rows], "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("")
@@ -277,7 +285,7 @@ async def all_feedback(
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
