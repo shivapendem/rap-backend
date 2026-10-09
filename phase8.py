@@ -47,6 +47,13 @@ router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
 # daylight-saving transitions are handled correctly.
 _CST_ZONE = ZoneInfo("America/Chicago")
 
+# The Error Queue groups messages in SQL with split_part, which Postgres has
+# and the SQLite dev fallback does not — see errors_grouped.
+try:
+    from models import _is_postgres as _IS_POSTGRES
+except Exception:  # pragma: no cover - defensive, models always defines it
+    _IS_POSTGRES = False
+
 
 # ---------------------------------------------------------------------------
 # Auth dependency — built on your existing auth.py, Bearer-token style
@@ -116,6 +123,54 @@ class ProcessingErrorRowDTO(BaseModel):
     error_message: str
     occurred_at: str
     resolved_at: Optional[str] = None
+    # Exposed so the Error Queue can show state, the real stack trace and how
+    # many times a row has already been retried. All are existing columns on
+    # processing_errors that this endpoint simply never returned.
+    status: Optional[str] = None
+    stack_trace: Optional[str] = None
+    retry_count: int = 0
+    category: Optional[str] = None
+
+
+class ErrorGroupDTO(BaseModel):
+    """One cause, with every occurrence of it folded into a single row."""
+    signature: str
+    error_stage: str
+    category: str
+    count: int
+    last_occurred: str
+    sample_message: str
+    sample_id: str
+    source_type: Optional[str] = None
+
+
+class ErrorGroupsDTO(BaseModel):
+    data: List[ErrorGroupDTO]
+    total_groups: int
+    total_errors: int
+    # True when the grouping was computed over a capped sample instead of the
+    # whole table (the SQLite dev path, which has no split_part).
+    approximate: bool = False
+
+
+class ErrorSummaryDTO(BaseModel):
+    total: int
+    by_category: dict
+
+
+class ErrorActionResultDTO(BaseModel):
+    success: bool
+    affected: int = 0
+    requeued: int = 0
+    message: str = ""
+
+
+class ErrorBulkBody(BaseModel):
+    action: str                       # "retry" | "dismiss"
+    ids: Optional[List[str]] = None
+    signature: Optional[str] = None   # with error_stage, acts on a whole group
+    error_stage: Optional[str] = None
+    date_filter: Optional[str] = None
 
 
 class PaginatedErrorsDTO(BaseModel):
@@ -596,10 +651,35 @@ async def list_errors(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
     date_filter: Optional[str] = None,
+    status: Optional[str] = Query("OPEN", description="OPEN | CLOSED | ALL"),
+    category: Optional[str] = None,
+    error_stage: Optional[str] = None,
+    signature: Optional[str] = None,
+    search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
     filters = []
+    # Only unresolved errors by default. The queue used to return dismissed
+    # and resolved rows too, which is most of why the count ran to tens of
+    # thousands; "ALL" keeps the old behaviour for anyone who wants it.
+    if status and status.upper() != "ALL":
+        filters.append(ProcessingError.status == status.upper())
+    if error_stage:
+        filters.append(ProcessingError.error_stage == error_stage)
+    if category:
+        stages = _stages_for_category(category)
+        if stages is not None:
+            filters.append(ProcessingError.error_stage.in_(stages))
+    if signature:
+        filters.append(ProcessingError.error_message.like(signature.rstrip() + "%"))
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        filters.append(or_(
+            ProcessingError.error_message.ilike(term),
+            ProcessingError.error_stage.ilike(term),
+            ProcessingError.source_id.ilike(term),
+        ))
     if date_filter:
         try:
             d = date.fromisoformat(date_filter)
@@ -636,6 +716,8 @@ async def list_errors(
             error_stage=r.error_stage, error_message=r.error_message,
             occurred_at=r.occurred_at.isoformat() if r.occurred_at else "",
             resolved_at=r.resolved_at.isoformat() if r.resolved_at else None,
+            status=r.status, stack_trace=r.stack_trace, retry_count=r.retry_count or 0,
+            category=_category_for_stage(r.error_stage),
         )
         for r in rows
     ]
@@ -644,6 +726,320 @@ async def list_errors(
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Error Queue: grouping, summary and actions
+# ---------------------------------------------------------------------------
+
+# Every error_stage the pipeline writes, bucketed into the handful of
+# categories the Error Queue screen filters by.
+_CATEGORY_RULES = [
+    ("Email", ("email", "send", "gmail")),
+    ("Parsing", ("parse", "parser", "extract", "ingest")),
+    ("Matching", ("match",)),
+    ("Resume", ("resume", "generate")),
+    ("Database", ("db", "database", "migration", "sql")),
+]
+
+
+def _category_for_stage(stage: Optional[str]) -> str:
+    st = (stage or "").lower()
+    for name, needles in _CATEGORY_RULES:
+        if any(n in st for n in needles):
+            return name
+    return "Other"
+
+
+def _stages_for_category(category: str):
+    """None = do not filter (unknown category)."""
+    wanted = (category or "").strip().lower()
+    if not wanted or wanted == "all":
+        return None
+    for name, _ in _CATEGORY_RULES:
+        if name.lower() == wanted:
+            return None if name == "Other" else _STAGE_CACHE.get(name)
+    return None
+
+
+# Filled lazily per request from the stages actually present in the table, so
+# a new stage name starts being categorised without a code change.
+_STAGE_CACHE: dict = {}
+
+
+async def _refresh_stage_cache(db: AsyncSession) -> None:
+    rows = (await db.execute(select(ProcessingError.error_stage).distinct())).scalars().all()
+    buckets: dict = {}
+    for st in rows:
+        buckets.setdefault(_category_for_stage(st), []).append(st)
+    _STAGE_CACHE.clear()
+    _STAGE_CACHE.update(buckets)
+
+
+def _date_filters(date_filter: Optional[str]):
+    out = []
+    if date_filter:
+        try:
+            d = date.fromisoformat(date_filter)
+            start_local = datetime.combine(d, datetime.min.time(), tzinfo=_CST_ZONE)
+            out.append(ProcessingError.occurred_at >= start_local.astimezone(timezone.utc))
+            out.append(ProcessingError.occurred_at < (start_local + timedelta(days=1)).astimezone(timezone.utc))
+        except ValueError:
+            pass
+    return out
+
+
+def _signature_of(message: str) -> str:
+    """The part of a message before its first bracket, which is where the
+    per-row detail (an address, an id) lives. 'Email not enabled for this
+    user (a@b.com)' and the next 41,229 like it collapse to one signature."""
+    return (message or "").split("(")[0].strip()
+
+
+@router.get("/errors/summary", response_model=ErrorSummaryDTO)
+async def errors_summary(
+    date_filter: Optional[str] = None,
+    status: Optional[str] = Query("OPEN"),
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> ErrorSummaryDTO:
+    """Counts per category, for the chips above the list."""
+    filters = _date_filters(date_filter)
+    if status and status.upper() != "ALL":
+        filters.append(ProcessingError.status == status.upper())
+    base = and_(*filters) if filters else True
+
+    rows = (await db.execute(
+        select(ProcessingError.error_stage, func.count().label("n"))
+        .where(base).group_by(ProcessingError.error_stage)
+    )).all()
+
+    by_cat: dict = {}
+    total = 0
+    for stage, n in rows:
+        by_cat[_category_for_stage(stage)] = by_cat.get(_category_for_stage(stage), 0) + int(n)
+        total += int(n)
+    return ErrorSummaryDTO(total=total, by_category=by_cat)
+
+
+@router.get("/errors/groups", response_model=ErrorGroupsDTO)
+async def errors_grouped(
+    date_filter: Optional[str] = None,
+    status: Optional[str] = Query("OPEN"),
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> ErrorGroupsDTO:
+    """
+    The Error Queue's default view: one row per cause instead of one row per
+    occurrence. Tens of thousands of identical "Email not enabled for this
+    user (...)" rows are a single group with a count, so the screen shows
+    what is actually wrong rather than a wall of repeats.
+
+    The grouping runs in SQL on Postgres (split_part on the first bracket).
+    On the SQLite dev path there is no split_part, so it groups in Python
+    over the most recent 5,000 rows and reports approximate = true.
+    """
+    await _refresh_stage_cache(db)
+
+    filters = _date_filters(date_filter)
+    if status and status.upper() != "ALL":
+        filters.append(ProcessingError.status == status.upper())
+    if category and category.lower() != "all":
+        stages = _stages_for_category(category)
+        if stages is not None:
+            filters.append(ProcessingError.error_stage.in_(stages))
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        filters.append(or_(
+            ProcessingError.error_message.ilike(term),
+            ProcessingError.error_stage.ilike(term),
+        ))
+    base = and_(*filters) if filters else True
+
+    total_errors = (await db.execute(
+        select(func.count()).select_from(ProcessingError).where(base)
+    )).scalar_one()
+
+    groups = []
+    approximate = False
+
+    if _IS_POSTGRES:
+        sig = func.btrim(func.split_part(ProcessingError.error_message, "(", 1))
+        rows = (await db.execute(
+            select(
+                sig.label("sig"),
+                ProcessingError.error_stage,
+                func.count().label("n"),
+                func.max(ProcessingError.occurred_at).label("last_at"),
+                func.min(ProcessingError.error_message).label("sample"),
+                func.min(ProcessingError.id).label("sample_id"),
+                func.min(ProcessingError.source_type).label("source_type"),
+            )
+            .where(base)
+            .group_by(sig, ProcessingError.error_stage)
+            .order_by(func.count().desc())
+            .limit(limit)
+        )).all()
+        for sg, stage, n, last_at, sample, sample_id, src in rows:
+            groups.append(ErrorGroupDTO(
+                signature=sg or (sample or "")[:120], error_stage=stage,
+                category=_category_for_stage(stage), count=int(n),
+                last_occurred=last_at.isoformat() if last_at else "",
+                sample_message=sample or "", sample_id=str(sample_id), source_type=src,
+            ))
+    else:
+        approximate = True
+        recent = (await db.execute(
+            select(ProcessingError).where(base)
+            .order_by(ProcessingError.occurred_at.desc()).limit(5000)
+        )).scalars().all()
+        acc: dict = {}
+        for r in recent:
+            key = (_signature_of(r.error_message), r.error_stage)
+            cur = acc.get(key)
+            if cur is None:
+                acc[key] = {"n": 1, "last": r.occurred_at, "sample": r.error_message,
+                            "id": r.id, "src": r.source_type}
+            else:
+                cur["n"] += 1
+                if r.occurred_at and (cur["last"] is None or r.occurred_at > cur["last"]):
+                    cur["last"] = r.occurred_at
+        for (sg, stage), v in sorted(acc.items(), key=lambda kv: -kv[1]["n"])[:limit]:
+            groups.append(ErrorGroupDTO(
+                signature=sg, error_stage=stage, category=_category_for_stage(stage),
+                count=v["n"], last_occurred=v["last"].isoformat() if v["last"] else "",
+                sample_message=v["sample"], sample_id=str(v["id"]), source_type=v["src"],
+            ))
+
+    return ErrorGroupsDTO(data=groups, total_groups=len(groups),
+                          total_errors=int(total_errors), approximate=approximate)
+
+
+async def _requeue_email_for(db: AsyncSession, err) -> bool:
+    """A failed send is the one stage that can genuinely be run again: put its
+    email back in the queue and let the existing worker send it. Returns True
+    only when a queue item was actually re-queued."""
+    if _category_for_stage(err.error_stage) != "Email":
+        return False
+    from models import EmailQueue
+    ident = err.source_id
+    if not ident or not str(ident).isdigit():
+        return False
+    item = (await db.execute(
+        select(EmailQueue).where(EmailQueue.id == int(ident))
+    )).scalars().first()
+    if not item or item.status != "FAILED":
+        return False
+    item.status = "QUEUED"
+    item.status_text = None
+    item.scheduled_at = datetime.now(timezone.utc)
+    return True
+
+
+@router.post("/errors/{error_id}/retry", response_model=ErrorActionResultDTO)
+async def retry_error(
+    error_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> ErrorActionResultDTO:
+    """
+    Records a retry attempt and, for a failed send, actually re-queues the
+    email. Other stages have no automatic re-run yet, so the response says so
+    rather than pretending the work was redone.
+    """
+    err = (await db.execute(select(ProcessingError).where(ProcessingError.id == error_id))).scalars().first()
+    if not err:
+        raise HTTPException(status_code=404, detail="Error not found")
+
+    requeued = await _requeue_email_for(db, err)
+    err.retry_count = (err.retry_count or 0) + 1
+    err.last_retry_at = datetime.now(timezone.utc)
+    if requeued:
+        err.status = "CLOSED"
+        err.resolved_at = datetime.now(timezone.utc)
+    await db.commit()
+    return ErrorActionResultDTO(
+        success=True, affected=1, requeued=1 if requeued else 0,
+        message="Email put back in the send queue." if requeued
+        else "Attempt recorded. This stage has no automatic re-run, so fix the cause and the next run will pick it up.",
+    )
+
+
+@router.post("/errors/{error_id}/close", response_model=ErrorActionResultDTO)
+async def close_error(
+    error_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> ErrorActionResultDTO:
+    """Dismiss one error: it leaves the queue, nothing is reprocessed."""
+    err = (await db.execute(select(ProcessingError).where(ProcessingError.id == error_id))).scalars().first()
+    if not err:
+        raise HTTPException(status_code=404, detail="Error not found")
+    err.status = "CLOSED"
+    err.resolved_at = datetime.now(timezone.utc)
+    await db.commit()
+    return ErrorActionResultDTO(success=True, affected=1, message="Error dismissed.")
+
+
+@router.post("/errors/bulk", response_model=ErrorActionResultDTO)
+async def bulk_error_action(
+    body: ErrorBulkBody,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+) -> ErrorActionResultDTO:
+    """
+    Retry or dismiss many errors at once: either an explicit list of ids, or
+    a whole group (its signature plus stage), which is what "Retry all" on a
+    group card sends.
+    """
+    action = (body.action or "").lower()
+    if action not in ("retry", "dismiss"):
+        raise HTTPException(status_code=422, detail="action must be 'retry' or 'dismiss'")
+
+    filters = [ProcessingError.status == "OPEN"]
+    if body.ids:
+        ids = [int(i) for i in body.ids if str(i).isdigit()][:5000]
+        if not ids:
+            raise HTTPException(status_code=422, detail="No valid error ids")
+        filters.append(ProcessingError.id.in_(ids))
+    elif body.signature is not None:
+        filters.append(ProcessingError.error_message.like(body.signature.rstrip() + "%"))
+        if body.error_stage:
+            filters.append(ProcessingError.error_stage == body.error_stage)
+        filters += _date_filters(body.date_filter)
+    else:
+        raise HTTPException(status_code=422, detail="Pass ids, or a signature")
+
+    # Capped so one click can never run away with the whole table.
+    rows = (await db.execute(
+        select(ProcessingError).where(and_(*filters)).limit(5000)
+    )).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    requeued = 0
+    for err in rows:
+        if action == "retry":
+            if await _requeue_email_for(db, err):
+                requeued += 1
+                err.status = "CLOSED"
+                err.resolved_at = now
+            err.retry_count = (err.retry_count or 0) + 1
+            err.last_retry_at = now
+        else:
+            err.status = "CLOSED"
+            err.resolved_at = now
+    await db.commit()
+
+    if action == "dismiss":
+        msg = f"Dismissed {len(rows)} errors."
+    elif requeued:
+        msg = f"Re-queued {requeued} of {len(rows)} emails. The rest have no automatic re-run."
+    else:
+        msg = f"Recorded a retry on {len(rows)} errors. This stage has no automatic re-run."
+    return ErrorActionResultDTO(success=True, affected=len(rows), requeued=requeued, message=msg)
 
 
 # ---------------------------------------------------------------------------
