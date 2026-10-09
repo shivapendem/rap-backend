@@ -23,6 +23,9 @@ class UserReportStat(BaseModel):
     # Earliest SENT application inside the selected date range. This is the
     # primary sort key of the User Activity table (see _sort_user_activity).
     first_sent_at: Optional[datetime.datetime] = None
+    # True for the logged-in caller's own row — the frontend tags it "You"
+    # and the table lists it first.
+    is_current_user: bool = False
 
 
 # User Activity ordering: staff are grouped by role first
@@ -53,7 +56,9 @@ def _sort_user_activity(rows: List["UserReportStat"]) -> List["UserReportStat"]:
             u.user_id,
         )
 
-    return sorted(rows, key=_key)
+    # Logged-in user's own row always first, then the role/time order above.
+    rows = sorted(rows, key=_key)
+    return [u for u in rows if u.is_current_user] + [u for u in rows if not u.is_current_user]
 
 
 class AdminReportResponse(BaseModel):
@@ -141,12 +146,17 @@ async def get_admin_reports(
         queue_query = queue_query.where(EmailQueue.consultant_id == (own_consultant_id or -1))
     emails_sent = (await db.execute(queue_query)).scalar_one()
 
-    # 4. User Stats (Applications per user) — ADMIN only. Recruiters and
-    # consultants already get their own scoped totals in the two cards
-    # above; a one-row "you vs. nobody else" breakdown table adds nothing
-    # for them, so the frontend hides this section entirely when scoped.
+    # 4. User Stats (Applications per user).
+    # ADMIN: every sender. RECRUITER / CONSULTANT: only their own row
+    # ("Your Activity") — counted by applications/emails THEY sent
+    # (Application.recruiter_id / EmailQueue.sent_by_user_id hold the sender
+    # for every role), so a consultant's row excludes recruiter-sent ones.
+    # BUG FIX: this block used to run for ADMIN only, so the recruiter and
+    # consultant Reporting pages always showed an empty "Your Activity".
+    # Users with 0 sent applications in the period stay hidden (inner join).
+    is_admin = current_user.role == "ADMIN"
     applications_per_user: List[UserReportStat] = []
-    if current_user.role == "ADMIN":
+    if current_user.role in ("ADMIN", "RECRUITER", "CONSULTANT"):
         # BUG FIX: was joining Application -> Consultant -> User via
         # Consultant.user_id == User.id — that attributes every application
         # to the CONSULTANT it was sent on behalf of, not to the staff
@@ -166,6 +176,8 @@ async def get_admin_reports(
             .where(Application.status == "SENT")
             .group_by(User.id, User.full_name, User.role)
         )
+        if not is_admin:
+            stats_query = stats_query.where(User.id == current_user.id)
         if start_dt:
             stats_query = stats_query.where(Application.sent_at >= start_dt)
         if end_dt:
@@ -185,6 +197,8 @@ async def get_admin_reports(
             .where(EmailQueue.status == "SENT", EmailQueue.sent_by_user_id.is_not(None))
             .group_by(EmailQueue.sent_by_user_id)
         )
+        if not is_admin:
+            emails_query = emails_query.where(EmailQueue.sent_by_user_id == current_user.id)
         if start_dt:
             emails_query = emails_query.where(EmailQueue.created_at >= start_dt)
         if end_dt:
@@ -205,6 +219,7 @@ async def get_admin_reports(
                     default=None,
                 ),
                 first_sent_at=row.first_app_sent,
+                is_current_user=(row.user_id == current_user.id),
             ))
 
         # Role group first, then earliest first application in the period.
