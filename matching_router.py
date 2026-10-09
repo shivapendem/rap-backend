@@ -38,6 +38,8 @@ _matching_run_state: dict = {
     "processed_requirements": 0,
     "new_matches": 0,
     "error": None,
+    # Set by POST /run/cancel; the loop below checks it between requirements.
+    "cancel_requested": False,
 }
 
 
@@ -69,7 +71,11 @@ async def _run_matching_engine_background():
 
             total_matching = 0
             processed = 0
+            cancelled = False
             for req_id in requirement_ids:
+                if _matching_run_state.get("cancel_requested"):
+                    cancelled = True
+                    break
                 try:
                     total_matching += await match_requirement(db, req_id)
                 except Exception as req_err:
@@ -94,7 +100,7 @@ async def _run_matching_engine_background():
                     _matching_run_state["new_matches"] = total_matching
 
             _matching_run_state.update({
-                "status": "completed",
+                "status": "cancelled" if cancelled else "completed",
                 "new_matches": total_matching,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
@@ -133,9 +139,24 @@ async def trigger_matching_run(
         "processed_requirements": 0,
         "new_matches": 0,
         "error": None,
+        "cancel_requested": False,
     })
     background_tasks.add_task(_run_matching_engine_background)
     return {"success": True, "started": True, **_matching_run_state}
+
+
+@router.post("/run/cancel")
+async def cancel_matching_run(
+    current_user: User = Depends(get_current_user)
+):
+    """Stops a running engine after the requirement it is on. Matches already
+    found are kept."""
+    if current_user.role not in ["ADMIN", "RECRUITER"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if _matching_run_state["status"] != "running":
+        return {"success": True, "cancelled": False}
+    _matching_run_state["cancel_requested"] = True
+    return {"success": True, "cancelled": True}
 
 
 @router.get("/run/status")

@@ -544,6 +544,9 @@ class RecruiterApplicationRow(BaseModel):
     resume_available: bool = False
     sent_by_name: Optional[str] = None
     sent_by_role: Optional[str] = None
+    # Shown in the tracker row and its email popup.
+    consultant_email: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 class PaginatedRecruiterApplications(BaseModel):
@@ -1815,6 +1818,8 @@ async def get_recruiter_applications(
             resume_available=bool(app.generated_resume_id or app.resume_attachment_path),
             sent_by_name=sender.full_name if sender else cons.full_name,
             sent_by_role=sender.role if sender else "CONSULTANT",
+            consultant_email=cons.email,
+            error_message=app.error_message if app.status == "FAILED" else None,
         )
         for app, req, cons, sender in results
     ]
@@ -1826,6 +1831,68 @@ async def get_recruiter_applications(
         page_size=page_size,
         total_pages=math.ceil(total / page_size) if total else 1,
     )
+
+
+@router.post(
+    "/api/recruiter/applications/{application_id}/retry",
+    summary="Retry a failed application email",
+    tags=["Phase5 - Recruiter Dashboard"],
+)
+async def retry_failed_application(
+    application_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Puts a FAILED application's email back in the send queue (Retry send
+    in the tracker popup). The existing queue worker sends it again, so
+    the normal send gap, attachments and status updates all apply.
+    Recruiters can retry only applications they sent; admins any.
+    """
+    from models import EmailQueue
+
+    _require_role(current_user, "RECRUITER", "ADMIN")
+
+    app = (await db.execute(select(Application).where(Application.id == application_id))).scalars().first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if current_user.role == "RECRUITER" and app.recruiter_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app.status != "FAILED":
+        raise HTTPException(status_code=400, detail="Only failed applications can be retried")
+
+    item = (await db.execute(
+        select(EmailQueue)
+        .where(
+            EmailQueue.consultant_id == app.consultant_id,
+            EmailQueue.requirement_id == app.requirement_id,
+            EmailQueue.status == "FAILED",
+        )
+        .order_by(EmailQueue.id.desc())
+    )).scalars().first()
+    if not item:
+        raise HTTPException(status_code=404, detail="The original email is no longer in the queue, so it can't be retried")
+
+    item.status = "QUEUED"
+    item.status_text = None
+    item.scheduled_at = datetime.now(timezone.utc)
+    app.status = "PENDING"
+    app.error_message = None
+
+    # The failed send had put the match back to MATCHING; it is being
+    # applied again, so mark it APPLIED like the normal queue flow does.
+    match = (await db.execute(
+        select(RequirementConsultantMatch).where(
+            RequirementConsultantMatch.consultant_id == app.consultant_id,
+            RequirementConsultantMatch.requirement_id == app.requirement_id,
+            RequirementConsultantMatch.status == "MATCHING",
+        )
+    )).scalars().first()
+    if match:
+        match.status = "APPLIED"
+
+    await db.commit()
+    return {"success": True, "message": "Queued again. It will be sent shortly."}
 
 
 # ===========================================================================

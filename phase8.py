@@ -296,6 +296,9 @@ class ApplicationSentRowDTO(BaseModel):
     # reflects either source so the Resume column shows correctly for all
     # of them, not just the ATS-gated recruiter confirm-send flow.
     resume_available: bool = False
+    # Shown in the tracker row and its email popup.
+    consultant_email: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 class PaginatedApplicationsDTO(BaseModel):
@@ -479,8 +482,24 @@ async def list_applications(
         .limit(page_size)
     )).scalars().all()
 
+    # consultant email + failure reason come straight from their own tables
+    # (one extra query for this page) so the v_applications_detail view
+    # doesn't need a migration.
+    _ids = [r.application_id for r in results]
+    _extra = {}
+    if _ids:
+        from models import Application as _App, Consultant as _Cons
+        _rows = (await db.execute(
+            select(_App.id, _App.error_message, _Cons.email)
+            .join(_Cons, _Cons.id == _App.consultant_id)
+            .where(_App.id.in_(_ids))
+        )).all()
+        _extra = {r[0]: (r[1], r[2]) for r in _rows}
+
     data = [
         ApplicationSentRowDTO(
+            consultant_email=(_extra.get(row.application_id) or (None, None))[1],
+            error_message=((_extra.get(row.application_id) or (None, None))[0] if row.status == "FAILED" else None),
             id=str(row.application_id),
             timestamp=row.created_at.isoformat() if row.created_at else "",
             consultant_name=row.consultant_name if row.consultant_name else str(row.consultant_id),
