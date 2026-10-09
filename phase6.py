@@ -379,9 +379,15 @@ MISSING SKILLS (in JD, not in profile): {', '.join(missing_skills) or 'None'}"""
     # except block below and surfaced as a generic "AI service error"
     # regardless of whether generation would have actually succeeded.
     try:
+        from phase3 import _detect_skills as _p3_detect, _SKILL_ALIASES as _p3_aliases
+        from skill_augment import verify_detected_skills
+        _parsed_skills = ((requirement.parsed_fields or {}).get("skills") if isinstance(requirement.parsed_fields, dict) else None) or []
+        _jd_all_skills = list(dict.fromkeys([
+            *_parsed_skills,
+            *verify_detected_skills(requirement.job_description or "", _p3_detect(requirement.job_description or ""), _p3_aliases),
+        ]))
         resume_data, rate_limits, usage_info = await asyncio.to_thread(
-            generate_tailored_resume, resume_info, jd_context, requirement.role,
-            ((requirement.parsed_fields or {}).get("skills") if isinstance(requirement.parsed_fields, dict) else None),
+            generate_tailored_resume, resume_info, jd_context, requirement.role, _jd_all_skills or None,
         )
     except Exception as exc:  # noqa: BLE001 - surface any client/transport error
         logger.error("Claude resume generation failed: %s", exc)
@@ -433,12 +439,21 @@ def _validate_resume_output(resume_data: dict, consultant: Consultant) -> tuple[
         if s.strip()
     )
 
+    # Skills skill_augment.py added on purpose for this requirement (shown
+    # highlighted with a ✕ in review) are kept — only stray skills that
+    # are neither in the profile nor in jd_added are rejected.
+    jd_added_lower = {
+        str(a.get("name", "")).strip().lower()
+        for a in ((resume_data.get("jd_added") or {}).get("skills") or [])
+        if isinstance(a, dict)
+    }
+
     original_skills = resume_data.get("skills", [])
     validated_skills = []
     rejected_skills = []
 
     for skill in original_skills:
-        if skill.strip().lower() in profile_skills_lower:
+        if skill.strip().lower() in profile_skills_lower or skill.strip().lower() in jd_added_lower:
             validated_skills.append(skill)
         else:
             rejected_skills.append(skill)
@@ -637,7 +652,7 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
         run.font.color.rgb = RGBColor.from_string(accent_hex) if accent_hex else RGBColor(0, 0, 0)
         return p
 
-    def add_formatted_paragraph(text: str, style: Optional[str] = None, space_after: int = 4):
+    def add_formatted_paragraph(text: str, style: Optional[str] = None, space_after: int = 4, justify: bool = False):
         # BUG FIX: this only ever converted <b>/<strong> to a bold
         # marker — every OTHER tag ReactQuill's toolbar can emit (<p>,
         # </p>, <em>/<i>, <u>, <br>, <ul>/<ol>/<li>) passed straight
@@ -654,12 +669,6 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
             p.paragraph_format.space_after = Pt(space_after)
             return p
         normalized = str(text)
-        # BUG FIX (empty boxes / "?" before pasted or Enter-typed paragraphs in the
-        # DOCX/PDF): the rich-text editor leaves invisible characters in the saved
-        # HTML (its U+FEFF cursor placeholder, zero-width spaces, stray control
-        # characters). The browser preview hides them, but the document font has no
-        # glyph for them, so Word/PDF draw a box. Strip them before building.
-        normalized = re.sub(r'[\u200b-\u200d\u2060\ufeff\u00ad\x00-\x08\x0b\x0c\x0e-\x1f]', '', normalized)
         normalized = re.sub(r'</?(strong|b)>', '**', normalized)
         normalized = re.sub(r'</?(em|i)>', '*', normalized)
         normalized = re.sub(r'<br\s*/?>', '\n', normalized)
@@ -680,6 +689,10 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
         for para_text in para_lines:
             p = doc.add_paragraph(style=style)
             p.paragraph_format.space_after = Pt(space_after)
+            # Body text (summary + every bullet) is justified like Word's
+            # Ctrl+J; headings, role/date lines and the skill table are not.
+            if justify or style == "List Bullet":
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             if first_p is None:
                 first_p = p
             parts = re.split(r'(\*\*.*?\*\*|\*.*?\*)', para_text)
@@ -765,7 +778,7 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
         obj_p = None
         for block_text, is_bullet in _summary_blocks(career_obj):
             p_blk = (add_formatted_paragraph(block_text, style="List Bullet") if is_bullet
-                     else add_formatted_paragraph(block_text, space_after=6))
+                     else add_formatted_paragraph(block_text, space_after=6, justify=True))
             obj_p = obj_p or p_blk
         if obj_p:
             if cfg["objective"] == "centered":
