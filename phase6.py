@@ -542,6 +542,7 @@ def _apply_resume_font(doc) -> None:
 def is_current_resume_docx(data: bytes) -> bool:
     """True when `data` is a DOCX built by _generate_docx with the
     current font (carries RESUME_STYLE_MARKER)."""
+    import io
     import zipfile
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
