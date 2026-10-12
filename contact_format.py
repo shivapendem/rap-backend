@@ -19,7 +19,6 @@ import re
 from typing import Optional
 from urllib.parse import urlsplit
 
-US_PHONE_EXAMPLE = "+1 (469) 392-4030"
 
 _PHONE_CHARS = re.compile(r"^\+?[\d\s\-().]+$")
 _US_TEN_DIGITS = re.compile(r"^[2-9]\d{2}[2-9]\d{6}$")

@@ -81,23 +81,6 @@ def decode_access_token(token: str) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
-def _request_is_https(request: Request | None) -> bool:
-    """Best-effort detection of whether this request actually arrived over TLS.
-
-    request.url.scheme reflects what Starlette/uvicorn sees directly, which
-    is "http" unless TLS terminates at uvicorn itself. If a reverse proxy
-    (nginx, ALB, Cloudflare, etc.) terminates TLS in front of this process,
-    that proxy MUST forward `X-Forwarded-Proto: https` or this will keep
-    reporting False even in production — check the proxy config if so.
-    """
-    if request is None:
-        return False
-    forwarded_proto = request.headers.get("x-forwarded-proto", "")
-    if forwarded_proto:
-        return forwarded_proto.split(",")[0].strip().lower() == "https"
-    return request.url.scheme == "https"
-
-
 def set_session_cookies(response, token: str, request: Request | None = None) -> None:
     """No-op: Authentication is handled entirely via Authorization headers on the frontend."""
     pass

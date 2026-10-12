@@ -1,4 +1,3 @@
-import os
 from sqlalchemy import Column, BigInteger, Integer, Text, Boolean, Numeric, ForeignKey, Date, UniqueConstraint, String
 from sqlalchemy.sql import func
 from sqlalchemy.sql.expression import true as _sa_true

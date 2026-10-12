@@ -86,12 +86,6 @@ def _require_role(user: User, *roles: str) -> None:
 # their own VALID_* sets, so these mirror what phase4.py / models.py already
 # accept elsewhere in the codebase, kept here for query-param validation).
 _VALID_WORK_MODES = {"REMOTE", "HYBRID", "ONSITE", "TRAVEL_REQUIRED"}
-_VALID_EMPLOYMENT_TYPES = {"C2C", "W2", "FULLTIME", "FULL_TIME"}
-_VALID_REQUIREMENT_STATUSES = getattr(
-    Requirement, "VALID_STATUSES",
-    {"NEW", "REVIEWING", "SUBMITTED", "INTERVIEWING", "CLOSED", "REJECTED"},
-)
-_MAX_SEARCH_LENGTH = 200
 _MAX_FILTER_LENGTH = 100
 
 
@@ -105,44 +99,6 @@ def _validate_work_mode(value: Optional[str]) -> Optional[str]:
             detail=f"work_mode must be one of {sorted(_VALID_WORK_MODES)}, got '{value}'",
         )
     return upper
-
-
-def _validate_employment_type(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    upper = value.upper()
-    if upper not in _VALID_EMPLOYMENT_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"employment_type must be one of {sorted(_VALID_EMPLOYMENT_TYPES)}, got '{value}'",
-        )
-    return upper
-
-
-def _validate_status(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    upper = value.upper()
-    if upper not in _VALID_REQUIREMENT_STATUSES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"status must be one of {sorted(_VALID_REQUIREMENT_STATUSES)}, got '{value}'",
-        )
-    return upper
-
-
-def _validate_search_text(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    stripped = value.strip()
-    if not stripped:
-        return None
-    if len(stripped) > _MAX_SEARCH_LENGTH:
-        raise HTTPException(
-            status_code=422,
-            detail=f"search must be at most {_MAX_SEARCH_LENGTH} characters",
-        )
-    return stripped
 
 
 def _validate_filter_text(value: Optional[str], field_name: str) -> Optional[str]:
@@ -409,80 +365,6 @@ class RequirementDetailResponse(BaseModel):
     received_date: Optional[str] = None
     parse_confidence: Optional[float] = None
     skills: Optional[List[str]] = None
-
-
-class GeneratedResumeDTO(BaseModel):
-    id: str
-    pdf_url: Optional[str] = None
-    ats_score: Optional[float] = None
-    is_final: bool
-    generation_status: str
-
-
-class ConsultantDashboardRow(BaseModel):
-    """One row in the consultant dashboard table."""
-    requirement_id: str
-    role: str
-    vendor: Optional[str] = None
-    client: Optional[str] = None
-    location: Optional[str] = None
-    work_mode: Optional[str] = None
-    employment_types: Optional[List[str]] = None
-    rate: Optional[str] = None
-    status: str
-    match_score: float
-    match_status: str
-    matched_skills: List[str] = []
-    missing_skills: List[str] = []
-    received_date: Optional[str] = None
-    # Resume column
-    generated_resume: Optional[GeneratedResumeDTO] = None
-    # Apply button
-    can_apply: bool = False
-    apply_reason: str = ""
-
-
-class PaginatedConsultantDashboard(BaseModel):
-    data: List[ConsultantDashboardRow]
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
-
-
-class RecruiterDashboardRow(BaseModel):
-    """One row in the recruiter dashboard table."""
-    requirement_id: str
-    role: str
-    vendor: Optional[str] = None
-    client: Optional[str] = None
-    location: Optional[str] = None
-    work_mode: Optional[str] = None
-    employment_types: Optional[List[str]] = None
-    rate: Optional[str] = None
-    status: str
-    received_date: Optional[str] = None
-    # Only present when consultant_id filter is active
-    match_score: Optional[float] = None
-    match_status: Optional[str] = None
-    generated_resume: Optional[GeneratedResumeDTO] = None
-    can_apply: bool = False
-    apply_reason: str = ""
-
-
-class PaginatedRecruiterDashboard(BaseModel):
-    data: List[RecruiterDashboardRow]
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
-
-
-class ConsultantDropdownItem(BaseModel):
-    id: str
-    full_name: Optional[str] = None
-    email: Optional[str] = None
-    status: Optional[str] = None
 
 
 class ApplicationHistoryRow(BaseModel):
@@ -834,19 +716,7 @@ async def get_consultant_requirements(
         )
     ).all()
 
-    # Batch-load: which requirement_ids has this consultant already SENT an
-    # application for? One query for the whole page instead of one per row.
     page_requirement_ids = [req.id for _, req, _ in results]
-    sent_application_req_ids: set[int] = set()
-    if page_requirement_ids:
-        sent_rows = (await db.execute(
-            select(Application.requirement_id).where(
-                Application.consultant_id == consultant.id,
-                Application.requirement_id.in_(page_requirement_ids),
-                Application.status == "SENT",
-            )
-        )).scalars().all()
-        sent_application_req_ids = set(sent_rows)
 
     # Batch-load sent_at for appliedAt field
     sent_at_by_req: dict[int, str] = {}
@@ -884,7 +754,6 @@ async def get_consultant_requirements(
         # status filtering now happens in SQL, above — every row that
         # reaches this loop already passed the filter.
 
-        already_applied = req.id in sent_application_req_ids
         resume_generated = bool(resume and resume.generation_status == "COMPLETED")
         has_job_description = bool(req.job_description and req.job_description.strip())
         # BUG FIX: this used to hide an already-created manual resume the

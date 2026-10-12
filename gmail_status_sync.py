@@ -183,32 +183,6 @@ async def prepare_gmail_status_sync(engine) -> None:
     await pause_tokens_of_inactive_consultants(engine)
 
 # ---------------------------------------------------------------------------
-# Logout: pause access
-# ---------------------------------------------------------------------------
-
-async def pause_consultant_gmail(db, user_email: str) -> None:
-    """Called on logout. Pauses (does not delete) the consultant's Gmail token."""
-    from sqlalchemy.future import select
-    from models import User, Consultant, ConsultantEmailToken
-
-    user = (await db.execute(select(User).where(User.email == user_email))).scalars().first()
-    if not user or user.role != "CONSULTANT":
-        return
-    consultant = (await db.execute(
-        select(Consultant).where(Consultant.user_id == user.id)
-    )).scalars().first()
-    if not consultant:
-        return
-    token = (await db.execute(
-        select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id)
-    )).scalars().first()
-    if token and token.is_active:
-        token.is_active = False
-    consultant.gmail_connected = False
-    await db.commit()
-    print(f"[gmail-sync] Gmail access paused on logout for consultant {consultant.id}.")
-
-# ---------------------------------------------------------------------------
 # Re-login: refresh and resume access
 # ---------------------------------------------------------------------------
 

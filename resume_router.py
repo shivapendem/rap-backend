@@ -8,7 +8,7 @@ import asyncio
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime, timezone, date
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Body, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +26,6 @@ from resume_validation import get_missing_resume_fields, missing_fields_message
 from phase3 import _extract_text_from_docx
 # Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
 from contact_format import format_us_phone, normalize_linkedin_url
-
-# You can import openai and use it if an API key is provided
-# import openai
 
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
@@ -430,10 +427,8 @@ async def generate_resume_from_template(
     db: AsyncSession = Depends(get_db)
 ):
     import tempfile
-    import subprocess
     import traceback
     import logging
-    from pathlib import Path
     
     logger = logging.getLogger(__name__)
 
@@ -795,7 +790,6 @@ async def generate_resume(
     # is now the one file every screen (Edit preview, View, Download)
     # reads from.
     from phase6 import _generate_docx
-    from pathlib import Path
 
     resume_dir = Path("/tmp/resumes") / str(target_user_id) / str(new_resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
@@ -892,7 +886,6 @@ async def finalize_resume(
     # the PDF step entirely and storing the DOCX itself as resume.s3_key
     # means every screen reads the one same rendering.
     from phase6 import _generate_docx
-    from pathlib import Path
 
     resume_dir = Path("/tmp/resumes") / str(resume.user_id) / str(resume.id)
     resume_dir.mkdir(parents=True, exist_ok=True)
@@ -1206,7 +1199,6 @@ async def get_base_resume_text(
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
         
-    from pathlib import Path
     filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
     
     return BaseResumeTextDTO(
@@ -1252,7 +1244,6 @@ async def update_base_resume_text(
     # place that already stores or serves base_resume_file_path keeps
     # working unchanged.
     import io
-    from pathlib import Path
     from docx import Document
     try:
         doc = Document()
@@ -2337,7 +2328,6 @@ async def _regenerate_base_resume_docx_file(db: AsyncSession, consultant: Consul
     already wrapping this same logic at its original call site."""
     import io
     import tempfile
-    from pathlib import Path
     from phase6 import _generate_docx
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2530,7 +2520,6 @@ async def get_base_resume_content(
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
 
-    from pathlib import Path
     filename = Path(consultant.base_resume_file_path).name if consultant.base_resume_file_path else None
 
     # BACKFILL: consultants whose base resume predates this structured

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -32,10 +31,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,13 +60,10 @@ router = APIRouter()
 # Config
 # ---------------------------------------------------------------------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")   # legacy - unused since Claude migration
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # legacy - unused since Claude migration
 # Kept in sync with claude_service.generate_tailored_resume()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ATS_PASS_THRESHOLD = 80          # per Phase 6 doc — NOT configurable
 MAX_GENERATION_ATTEMPTS = 3      # per frontend RegenerateDialog MAX_ATTEMPTS = 3
-RESUME_UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
 BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 
@@ -181,40 +176,6 @@ def _ats_score(
         matched,
         missing,
     )
-
-
-# ---------------------------------------------------------------------------
-# Task 2 — AI Resume Tailoring System Prompt (verbatim from Phase 6 doc)
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """You are a resume tailoring assistant. Your goal is to tailor the candidate's resume to the provided job description, targeting approximately an 80% match rate by optimizing terminology, emphasizing relevant experience, and reordering skills. 
-You MUST use only the consultant base resume and structured experience provided.
-Do not invent clients, projects, skills, certifications, titles, dates, or years of experience.
-If the job description includes a skill not present in the consultant profile, mark it as missing instead of adding it.
-Rephrase and improve wording to closely mirror the JD's terminology where truthful, reorder relevant skills to the top, and add 4-6 truthful bullets based on existing experience only. Do NOT hallucinate metrics.
-CRITICAL: Do NOT add false or unsupported experience simply to force a higher match percentage.
-Return structured JSON.
-
-Return exactly this JSON structure with no markdown, no code fences, no extra text:
-{
-  "name": "string",
-  "email": "string",
-  "phone": "string",
-  "summary": "string",
-  "skills": ["skill1", "skill2"],
-  "missing_skills": ["skill_not_in_profile"],
-  "experience": [
-    {
-      "client": "string",
-      "role": "string",
-      "start": "string",
-      "end": "string",
-      "location": "string",
-      "bullets": ["bullet1", "bullet2", "bullet3", "bullet4"]
-    }
-  ],
-  "generation_notes": "string"
-}"""
 
 
 def _build_profile_resume_info(

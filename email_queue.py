@@ -11,7 +11,7 @@ from fastapi import UploadFile, File
 
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
@@ -21,15 +21,6 @@ from auth import get_current_user
 from models import User
 
 router = APIRouter()
-
-# How long send_email_now waits for the actual send (token refresh +
-# attachment download + Gmail API call) before giving up and returning
-# "queued" instead — see the BUG FIX comment at its call site below for
-# why this exists. Kept comfortably under common reverse-proxy/Cloudflare
-# timeout windows (usually 30-100s) so THIS server is always the one that
-# gives up first and returns a clean response, rather than an intermediary
-# silently killing the connection with none at all.
-SEND_NOW_TIMEOUT_SECONDS = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +136,7 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
     If no prior email was scheduled/sent for this from_email within the delay window, returns current UTC time.
     Otherwise, returns max_previous_time + the delay.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime
     from models import EmailQueue, Application, Consultant
     from sqlalchemy import text
     import hashlib
@@ -203,7 +194,6 @@ async def reschedule_remaining_queued_emails(db: AsyncSession, from_email: str, 
     Pushes any remaining QUEUED emails for the same from_email to ensure they are at least
     5 minutes after actual_sent_at and spaced 5 minutes apart.
     """
-    from datetime import datetime, timezone, timedelta
     from models import EmailQueue
 
     norm_from = from_email.strip().lower()
@@ -1332,7 +1322,7 @@ async def download_queue_attachment(
     every attachment, local or not, gets a real presigned URL and goes
     through the same in-browser preview path.
     """
-    from s3_service import generate_presigned_url, download_file_from_s3, upload_file_to_s3
+    from s3_service import generate_presigned_url, upload_file_to_s3
     import io
 
     clean_ref = ref.strip()
