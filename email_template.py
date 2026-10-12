@@ -71,15 +71,7 @@ Please let me know if you need any additional details.
 # attachment, so it renders inline in the signature like the sample.
 # ---------------------------------------------------------------------------
 
-COMPANY_NAME = "Savantis Intelli Solutions"
-COMPANY_TAGLINE = "Quality is not an act, it is a habit."
-COMPANY_ADDRESS = "Dallas, Texas, USA"
 COMPANY_LINE_NUMBER = "+1 469-392-4030"
-# Static, same for every recruiter — like COMPANY_ADDRESS/COMPANY_LINE_NUMBER
-# above, not a per-consultant profile field, so it's added here rather than
-# as a new database column. Shown as a link under the Employer Details
-# block's LinkedIn line, matching the reference signature layout.
-COMPANY_WEBSITE = "www.savantisintelli.com"
 # Referenced as <img src="cid:{COMPANY_BANNER_CID}"> in build_signature_html
 # below, and attached inline (Content-ID header, not a regular attachment)
 # by gmail_send_service.build_mime_message — see BANNER_IMAGE_PATH there.
@@ -390,19 +382,6 @@ def extract_top_skills(primary_skills: Optional[str], max_skills: int = 3) -> st
     if len(top) == 2:
         return f"{top[0]} and {top[1]}"
     return f"{', '.join(top[:-1])}, and {top[-1]}"
-
-
-# ---------------------------------------------------------------------------
-# Shared signature/sender resolution — phase7.py (older preview/confirm-send
-# endpoints) and this module both need it, so it lives here in
-# email_template.py rather than either of theirs, avoiding a circular
-# import between the two (phase7.py already imports from email_queue.py,
-# and email_queue.py needs this too — see send_email_now there, the ACTUAL
-# live endpoint the Apply buttons on Pending Applications/Requirements hit;
-# phase7.py's confirm_send/get_email_preview turned out not to be wired to
-# those buttons at all, just an earlier/alternate implementation).
-# ---------------------------------------------------------------------------
-ROLE_TITLE = {"ADMIN": "Administrator", "RECRUITER": "Recruiter"}
 
 
 # ---------------------------------------------------------------------------

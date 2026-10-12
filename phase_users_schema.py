@@ -14,8 +14,6 @@
 
 from typing import Optional, List, Any
 
-# Preferred Location is a fixed single-select on the frontend.
-PREFERRED_LOCATION_OPTIONS = ("Onsite", "Hybrid", "Remote")  # "All" retired — see validate_preferred_locations_value
 import re
 from pydantic import BaseModel, EmailStr, field_validator, Field, ConfigDict
 
@@ -24,7 +22,6 @@ from contact_format import phone_for_storage, linkedin_for_storage, extension_fo
 from list_normalize import dedupe_csv
 
 VALID_ROLES = {"ADMIN", "RECRUITER", "CONSULTANT"}
-VALID_STATUSES = {"Active", "Inactive"}
 VALID_CONSULTANT_STATUSES = {"ACTIVE", "INACTIVE", "BENCH", "ON_PROJECT"}  # matches your Consultant.VALID_STATUSES
 
 

@@ -43,19 +43,6 @@ async def get_budget_threshold(db: AsyncSession) -> float:
             pass
     return DEFAULT_BUDGET_USD
 
-async def set_budget_threshold(db: AsyncSession, budget_usd: float, updated_by: str | None = None) -> float:
-    """Create or update the ai_budget_usd row in app_settings."""
-    result = await db.execute(select(AppSetting).where(AppSetting.key == "ai_budget_usd"))
-    setting = result.scalars().first()
-    if setting:
-        setting.value = str(budget_usd)
-        setting.updated_by = updated_by
-    else:
-        db.add(AppSetting(key="ai_budget_usd", value=str(budget_usd), updated_by=updated_by))
-    await db.commit()
-    return budget_usd
-
-
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate USD cost for an AI call based on model + token counts."""
@@ -110,28 +97,3 @@ async def save_openai_rate_limits(db: AsyncSession, limits: dict):
             else:
                 db.add(AppSetting(key=full_key, value=val))
     await db.commit()
-
-async def get_openai_rate_limits(db: AsyncSession) -> dict:
-    """Retrieve OpenAI rate limit headers from AppSettings."""
-    keys_to_load = [
-        "openai_ratelimit_tokens-limit", 
-        "openai_ratelimit_tokens-remaining", 
-        "openai_ratelimit_tokens-reset"
-    ]
-    result = await db.execute(select(AppSetting).where(AppSetting.key.in_(keys_to_load)))
-    settings = result.scalars().all()
-    
-    limits = {
-        "tokens_limit": 0,
-        "tokens_remaining": 0,
-        "tokens_reset": ""
-    }
-    for s in settings:
-        if s.key == "openai_ratelimit_tokens-limit":
-            limits["tokens_limit"] = int(s.value) if s.value.isdigit() else 0
-        elif s.key == "openai_ratelimit_tokens-remaining":
-            limits["tokens_remaining"] = int(s.value) if s.value.isdigit() else 0
-        elif s.key == "openai_ratelimit_tokens-reset":
-            limits["tokens_reset"] = s.value
-            
-    return limits

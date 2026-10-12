@@ -349,7 +349,6 @@ SINGLE_TEMPLATES = {
     "Methodologies & Practices": "Applied {skills} throughout project delivery.",
     "Domain Knowledge": "Supported business processes related to {skills}.",
 }
-NON_TECH_CATEGORIES = {"Methodologies & Practices", "Domain Knowledge"}
 
 MAX_NEW_BULLETS = 3            # new work-experience points per generated resume
 MAX_BULLETS_PER_PROJECT = 2    # ... in either of the two most recent projects
@@ -847,12 +846,6 @@ def append_summary(summary: str, sentences: list[str]) -> str:
         return s + " " + escape(joined, quote=False)
     sep = "" if s.endswith((".", "!", "?")) else "."
     return s + sep + " " + joined
-
-
-def strip_jd_added(resume_data: dict) -> dict:
-    if isinstance(resume_data, dict):
-        resume_data.pop("jd_added", None)
-    return resume_data
 
 
 # Aliases too ambiguous to trust in free JD text ("go-live", "the rest of", "spring release").

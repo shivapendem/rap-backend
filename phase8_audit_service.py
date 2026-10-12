@@ -15,14 +15,6 @@ from models import AuditLog
 
 logger = logging.getLogger("rap.audit")
 
-VALID_ACTIONS = {
-    "USER_LOGIN", "USER_LOGOUT", "RESUME_GENERATED", "APPLICATION_CREATED",
-    "APPLICATION_SENT", "GMAIL_CONNECTED", "PERMISSION_DENIED", "ADMIN_ACTION",
-    "ERROR_RETRY", "REVIEW_APPROVED", "REVIEW_REJECTED",
-    "LOGIN", "LOGOUT", "GENERATE", "SEND", "CONNECT", "DISCONNECT",
-    "MATCH", "ERROR", "PARSE", "ARCHIVE", "BUDGET_ALERT",
-}
-
 
 async def log_action(
     db: AsyncSession,

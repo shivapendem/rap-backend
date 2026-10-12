@@ -230,7 +230,6 @@ async def confirm_send(
     """
     from permission_service import (
         resolve_apply_consultant,
-        assert_gmail_connected,
         check_duplicate_application,
         get_sales_recruiter_email,
     )

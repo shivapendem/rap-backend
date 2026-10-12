@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import asyncio
 from datetime import date, datetime, timedelta, timezone
@@ -38,14 +37,13 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, AsyncSessionLocal
 from models import (
     User,
     Consultant,
-    RecruiterConsultant,
     ConsultantExperience,
     Requirement,
     RequirementConsultantMatch,
@@ -60,7 +58,6 @@ router = APIRouter()
 # Config
 # ---------------------------------------------------------------------------
 
-MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "60"))
 
 # BUG FIX (Run Engine timing out at 300s): making the matching engine
 # re-validate every EXISTING row on every run — not just skip it via
@@ -2055,32 +2052,10 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
 # Response schemas
 # ---------------------------------------------------------------------------
 
-class MatchedRequirementResponse(BaseModel):
-    id: str
-    role: str
-    vendor: Optional[str] = None
-    client: Optional[str] = None
-    location: Optional[str] = None
-    work_mode: Optional[str] = None
-    employment_types: Optional[List[str]] = None
-    rate: Optional[str] = None
-    status: str
-    match_score: float
-    match_status: str
-    matched_skills: List[str] = []
-    missing_skills: List[str] = []
-    match_reason: Optional[str] = None
-    received_date: Optional[str] = None
-
 
 class RematchResponse(BaseModel):
     requirement_id: str
     assignments_created_or_updated: int
-
-
-class MatchAllResponse(BaseModel):
-    requirements_processed: int
-    total_assignments: int
 
 
 class NewMatchesCountResponse(BaseModel):
@@ -2098,46 +2073,6 @@ def _require_role(user: User, *roles: str) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Requires role: {list(roles)}",
         )
-
-
-async def _get_consultant_for_user(db: AsyncSession, user: User) -> Consultant:
-    result = await db.execute(select(Consultant).where(Consultant.user_id == user.id))
-    consultant = result.scalars().first()
-    if not consultant:
-        raise HTTPException(status_code=404, detail="Consultant profile not found for this user")
-    return consultant
-
-
-async def _assert_recruiter_mapped(db: AsyncSession, recruiter_id: int, consultant_id: int) -> None:
-    result = await db.execute(
-        select(RecruiterConsultant).where(
-            RecruiterConsultant.recruiter_id == recruiter_id,
-            RecruiterConsultant.consultant_id == consultant_id,
-            RecruiterConsultant.is_active == True,
-        )
-    )
-    if not result.scalars().first():
-        raise HTTPException(status_code=403, detail="Consultant not assigned to this recruiter")
-
-
-def _match_to_response(match: RequirementConsultantMatch, requirement: Requirement) -> MatchedRequirementResponse:
-    return MatchedRequirementResponse(
-        id=str(requirement.id),
-        role=requirement.role,
-        vendor=requirement.vendor,
-        client=requirement.client,
-        location=requirement.location,
-        work_mode=requirement.work_mode,
-        employment_types=requirement.employment_types,
-        rate=requirement.rate,
-        status=requirement.status,
-        match_score=float(match.match_score),
-        match_status=match.status,
-        matched_skills=match.matched_skills or [],
-        missing_skills=match.missing_skills or [],
-        match_reason=match.match_reason,
-        received_date=requirement.received_date.isoformat() if requirement.received_date else None,
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@
 # Validates who can apply for which consultant/requirement
 # ---------------------------------------------------------------------------
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -90,41 +90,6 @@ async def resolve_apply_consultant(
         return consultant
 
     raise HTTPException(status_code=403, detail="Insufficient permissions to apply.")
-
-
-async def assert_gmail_connected(db: AsyncSession, consultant_id: int):
-    """
-    Check consultant has Gmail connected with send permission.
-    Returns token record if valid.
-    """
-    from models import ConsultantEmailToken
-
-    result = await db.execute(
-        select(ConsultantEmailToken).where(
-            ConsultantEmailToken.consultant_id == consultant_id
-        )
-    )
-    token = result.scalars().first()
-
-    if not token:
-        raise HTTPException(
-            status_code=400,
-            detail="Consultant Gmail not connected. Please connect Gmail first.",
-        )
-    if getattr(token, "is_active", True) is False:
-        from gmail_status_sync import GMAIL_PAUSED_MESSAGE
-        raise HTTPException(status_code=403, detail=GMAIL_PAUSED_MESSAGE)
-    if not token.send_permission_granted:
-        raise HTTPException(
-            status_code=403,
-            detail="Gmail send permission not granted.",
-        )
-    if not token.email_address:
-        raise HTTPException(
-            status_code=400,
-            detail="Consultant Gmail email address not found.",
-        )
-    return token
 
 
 async def check_duplicate_application(

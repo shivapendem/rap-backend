@@ -15,16 +15,14 @@ if sys.platform.startswith("win"):
     _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 # ---------------------------------------------------------------------------
 
-from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Cookie, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, func, update
-from pydantic import BaseModel, EmailStr, field_validator, model_validator, Field
+from pydantic import BaseModel, EmailStr, field_validator, Field
 # Direct Number / Extension -> "+1 (469) 392-4030"; see contact_format.py
 from contact_format import phone_for_storage, extension_for_storage
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import or_
-from passlib.context import CryptContext
 import jwt
 import os
 import time
@@ -41,18 +39,12 @@ _APP_TZ = ZoneInfo("America/Chicago")
 from database import engine, Base, get_db, AsyncSessionLocal, DATABASE_URL
 from models import User, Requirement, Consultant, Notification, RequirementConsultantMatch, RecruiterConsultant, Application
 import asyncio
-from requirements_sync import sync_pending_emails
 from parser import is_email_body
 from auth import (
-    pwd_context,
-    SECRET_KEY,
-    ALGORITHM,
-    ACCESS_TOKEN_EXPIRE_HOURS,
     IS_PRODUCTION,
     verify_password,
     get_password_hash,
     create_access_token,
-    decode_access_token,
     set_session_cookies,
     get_current_user,
 )
@@ -176,7 +168,6 @@ class PaginatedRequirements(BaseModel):
 class ConsultantResponse(BaseModel):
     model_config = {"from_attributes": True}
 
-    # id: int  # BUG FIX: BigInteger PK → int, not str
     id: str
     full_name: Optional[str] = None
     email: Optional[str] = None
@@ -323,15 +314,6 @@ app = FastAPI(lifespan=lifespan)
 from fastapi.staticfiles import StaticFiles
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
 
 # PERF: no compression middleware existed anywhere — every JSON response
 # (the Applications Tracker's paginated lists, Email Queue, dashboards)
@@ -1641,7 +1623,6 @@ async def mark_all_notifications_read(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from sqlalchemy import update
     await db.execute(
         update(Notification)
         .where(Notification.user_id == current_user.id, Notification.is_read == False)

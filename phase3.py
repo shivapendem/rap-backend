@@ -45,7 +45,6 @@ import asyncio
 import io
 import logging
 import math
-import os
 import re
 import secrets
 import string
@@ -54,7 +53,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status, BackgroundTasks
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status, BackgroundTasks
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,8 +71,6 @@ from models import (
     ConsultantExperience,
     Application,
     Resume,
-    PK_TYPE,
-    FK_TYPE,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,8 +78,8 @@ from models import (
 # Imported here at module level — no circular dependency because phase3.py
 # does NOT import the FastAPI app instance, only the utility functions.
 # ---------------------------------------------------------------------------
-from auth import get_current_user, decode_access_token
-from s3_service import upload_file_to_s3, delete_file_from_s3
+from auth import get_current_user
+from s3_service import upload_file_to_s3
 # Consultant phone -> "+1 (469) 392-4030", LinkedIn -> https://...; see contact_format.py
 from contact_format import phone_for_storage, linkedin_for_storage
 from list_normalize import dedupe_csv, dedupe_list
@@ -181,7 +178,6 @@ ALLOWED_RESUME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads/resumes"))
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas — matching frontend DTO contracts exactly
@@ -1201,7 +1197,6 @@ def _exp_to_response(e: ConsultantExperience) -> ExperienceResponse:
 def _save_resume_file(file_bytes: bytes, consultant_id: int, original_filename: str, content_type: str) -> str:
     """Upload file to S3, return the S3 key."""
     import io
-    from s3_service import upload_file_to_s3
     ext_map = {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
         "application/pdf": ".pdf",
@@ -1499,44 +1494,6 @@ async def get_consultant_profile_version(
     consultant = await _get_consultant_or_404(db, consultant_id)
     return {"version": await _profile_version(db, consultant)}
 
-async def _profile_version(db: AsyncSession, consultant: Consultant) -> str:
-    """Cheap change marker: newest updated_at of Consultant, linked User and
-    experience rows (+count for deletes). Clients refetch only on change."""
-    parts = [consultant.updated_at]
-    if consultant.user_id:
-        parts.append((await db.execute(
-            select(User.updated_at).where(User.id == consultant.user_id)
-        )).scalar_one_or_none())
-    exp_max, exp_count = (await db.execute(
-        select(func.max(ConsultantExperience.updated_at), func.count())
-        .where(ConsultantExperience.consultant_id == consultant.id)
-    )).one()
-    parts.append(exp_max)
-    newest = max((p for p in parts if p is not None), default=None)
-    return f"{newest.isoformat() if newest else '0'}|{exp_count}"
-
-
-@router.get("/api/consultant/profile/version", summary="Change marker for own profile")
-async def get_own_profile_version(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
-    return {"version": await _profile_version(db, consultant)}
-
-
-@router.get("/api/consultants/{consultant_id}/version", summary="Change marker for a consultant profile")
-async def get_consultant_profile_version(
-    consultant_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_role(current_user, "ADMIN", "RECRUITER")
-    if current_user.role == "RECRUITER":
-        await _assert_recruiter_mapped(db, current_user.id, consultant_id)
-    consultant = await _get_consultant_or_404(db, consultant_id)
-    return {"version": await _profile_version(db, consultant)}
 
 @router.get(
     "/api/consultant/profile",

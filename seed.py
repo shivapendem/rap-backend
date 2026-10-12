@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 from passlib.context import CryptContext
 from sqlalchemy.future import select
-from sqlalchemy.exc import IntegrityError
 
 from database import engine, Base, AsyncSessionLocal
 from models import User, Consultant, Requirement
