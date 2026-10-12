@@ -1476,6 +1476,9 @@ async def apply_to_requirement(
         base_name = resume.filename or f"Resume_{resume.id}.pdf"
         resume_filename = Path(base_name).stem + ".docx"
     elif consultant.base_resume_file_path:
+        # SAME FONT FIX: rebuild an old-font base file before attaching.
+        from resume_router import _ensure_base_resume_style
+        await _ensure_base_resume_style(db, consultant)
         resume_source_path = consultant.base_resume_file_path
         resume_filename = Path(consultant.base_resume_file_path).name
 
