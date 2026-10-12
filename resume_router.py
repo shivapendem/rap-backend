@@ -2919,6 +2919,55 @@ async def update_resume_text(
     await db.commit()
     return {"success": True, "message": "Resume text updated successfully"}
 
+# SAME FONT FIX: the base resume file is only rebuilt by
+# _regenerate_base_resume_docx_file on a profile/editor save, so a base
+# file saved before the font change (or still the consultant's original
+# upload) kept a different font from the generated resumes. Before the
+# base file is downloaded or attached to an email, rebuild it once if it
+# doesn't carry phase6.RESUME_STYLE_MARKER. Skipped when the profile has
+# nothing to rebuild from, so an uploaded original is never replaced by
+# an empty resume. Best-effort: never blocks the download/send.
+_BASE_STYLE_OK: set = set()
+
+
+async def _ensure_base_resume_style(db: AsyncSession, consultant: Consultant) -> None:
+    stored = consultant.base_resume_file_path if consultant else None
+    if not stored or (consultant.id, stored) in _BASE_STYLE_OK:
+        return
+    try:
+        from phase6 import is_current_resume_docx
+        if os.path.isfile(stored):
+            with open(stored, "rb") as fh:
+                body = fh.read()
+        else:
+            body, _ = await asyncio.to_thread(download_file_from_s3, stored)
+        if not body:
+            return  # mid-upload or missing; let the normal path handle it
+        if is_current_resume_docx(body):
+            _BASE_STYLE_OK.add((consultant.id, stored))
+            return
+        # Own session: _regenerate_base_resume_docx_file commits, and the
+        # caller (apply / confirm-send) may have uncommitted work pending.
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as own_db:
+            own = (await own_db.execute(
+                select(Consultant).where(Consultant.id == consultant.id)
+            )).scalars().first()
+            if not own:
+                return
+            content = await build_base_resume_content(own_db, own)
+            if not (content.get("experience") or content.get("technical_proficiencies")):
+                return
+            await _regenerate_base_resume_docx_file(own_db, own, content)
+            new_path = own.base_resume_file_path
+        if new_path:
+            if new_path != consultant.base_resume_file_path:
+                consultant.base_resume_file_path = new_path
+            _BASE_STYLE_OK.add((consultant.id, new_path))
+    except Exception as e:
+        print(f"[base-resume-style] rebuild skipped for consultant {getattr(consultant, 'id', None)}: {e}")
+
+
 @router.get("/base/download")
 async def download_base_resume(
     user_id: Optional[int] = None,
@@ -2988,6 +3037,7 @@ async def download_base_resume(
     if not consultant or not consultant.base_resume_file_path:
         raise HTTPException(status_code=404, detail="No base resume uploaded yet.")
 
+    await _ensure_base_resume_style(db, consultant)
     stored = consultant.base_resume_file_path
     print(f"[base-resume-view-debug] stored={stored!r} isfile={os.path.isfile(stored) if stored else 'N/A'}")
     ext = os.path.splitext(stored)[1].lower()

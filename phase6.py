@@ -529,6 +529,67 @@ def _summary_blocks(text: str) -> list[tuple[str, bool]]:
     return [(t, False)]
 
 
+# SAME FONT FIX ("base resume and generated resume should use the same
+# font, and the attachments too"): every resume DOCX, base and generated,
+# is built by _generate_docx below, but it never named a font. It only
+# inherited Word's THEME font, which different viewers (Gmail preview,
+# Google Docs, LibreOffice PDF) resolve differently. And a base resume
+# that was never rebuilt was still the consultant's own uploaded file, in
+# whatever font they used. Now every run, style and the document
+# defaults carry one explicit font, and the file is stamped with
+# RESUME_STYLE_MARKER so a base file that predates this can be detected
+# and rebuilt once (see resume_router._ensure_base_resume_style).
+RESUME_FONT_NAME = "Calibri"
+RESUME_STYLE_MARKER = "rap-resume-style:calibri-v1"
+
+
+def _apply_resume_font(doc) -> None:
+    """Pin RESUME_FONT_NAME on the document defaults, every style and
+    every run (body, tables, headers/footers), replacing theme fonts."""
+    from docx.oxml.ns import qn
+
+    def _pin(rpr) -> None:
+        rfonts = rpr.get_or_add_rFonts()
+        for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+            rfonts.attrib.pop(qn(attr), None)
+        for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+            rfonts.set(qn(attr), RESUME_FONT_NAME)
+
+    defaults = doc.styles.element.find(qn("w:docDefaults"))
+    if defaults is not None:
+        rpr_default = defaults.find(qn("w:rPrDefault"))
+        if rpr_default is not None and rpr_default.find(qn("w:rPr")) is not None:
+            _pin(rpr_default.find(qn("w:rPr")))
+    for style in doc.styles:
+        try:
+            _pin(style.element.get_or_add_rPr())
+        except Exception:
+            pass
+    parts = [doc.element.body]
+    for section in doc.sections:
+        for hf in (section.header, section.footer):
+            try:
+                parts.append(hf._element)
+            except Exception:
+                pass
+    for part in parts:
+        for r in part.iter(qn("w:r")):
+            _pin(r.get_or_add_rPr())
+    doc.core_properties.comments = RESUME_STYLE_MARKER
+
+
+def is_current_resume_docx(data: bytes) -> bool:
+    """True when `data` is a DOCX built by _generate_docx with the
+    current font (carries RESUME_STYLE_MARKER)."""
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return RESUME_STYLE_MARKER in z.read("docProps/core.xml").decode("utf-8", "ignore")
+    except Exception:
+        return False
+
+
 def _generate_docx(resume_data: dict, output_path: Path, template: str = "classic") -> None:
     """Master Resume DOCX Builder modeled after shivashankar.docx.pdf template.
 
@@ -1161,6 +1222,7 @@ def _generate_docx(resume_data: dict, output_path: Path, template: str = "classi
     # also now strips missing_skills from resume.data at finalize time,
     # so this is belt-and-suspenders for any other caller.
 
+    _apply_resume_font(doc)
     doc.save(str(output_path))
 
 

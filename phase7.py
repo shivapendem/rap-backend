@@ -372,6 +372,9 @@ async def confirm_send(
                     source_id=request.generated_resume_id,
                 )
         if resume_source_path is None and consultant.base_resume_file_path:
+            # SAME FONT FIX: rebuild an old-font base file before attaching.
+            from resume_router import _ensure_base_resume_style
+            await _ensure_base_resume_style(db, consultant)
             resume_source_path = consultant.base_resume_file_path
             resume_display_name = Path(consultant.base_resume_file_path).name
 
