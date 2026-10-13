@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy import func, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import aliased
 
 from models import User, Consultant, Requirement, RequirementConsultantMatch, RecruiterConsultant, Application
 from database import get_db, AsyncSessionLocal
@@ -321,6 +322,7 @@ async def get_pending_matches(
     count_stmt = _base_stmt(select(func.count()).select_from(RequirementConsultantMatch))
     total_count = (await db.execute(count_stmt)).scalar_one()
 
+    _RCM_ALL = aliased(RequirementConsultantMatch)
     stmt = _base_stmt(select(
         RequirementConsultantMatch.id,
         RequirementConsultantMatch.requirement_id,
@@ -337,6 +339,21 @@ async def get_pending_matches(
         RequirementConsultantMatch.status,
         RequirementConsultantMatch.resume_status,
         RequirementConsultantMatch.created_at,
+        RequirementConsultantMatch.updated_at,
+        # Counts for the "N matched" chip and the "N more rejected" footer.
+        select(func.count(_RCM_ALL.id))
+        .where(_RCM_ALL.requirement_id == RequirementConsultantMatch.requirement_id)
+        .correlate(RequirementConsultantMatch)
+        .scalar_subquery()
+        .label("requirement_match_total"),
+        select(func.count(_RCM_ALL.id))
+        .where(
+            _RCM_ALL.requirement_id == RequirementConsultantMatch.requirement_id,
+            _RCM_ALL.status == "REJECTED",
+        )
+        .correlate(RequirementConsultantMatch)
+        .scalar_subquery()
+        .label("requirement_rejected_total"),
         applied_exists.label("has_sent_application"),
     ))
     # Same reasoning as before: order by match quality first, not by when
@@ -379,6 +396,9 @@ async def get_pending_matches(
             ),
             "resume_status": row["resume_status"],
             "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "requirement_match_total": row["requirement_match_total"],
+            "requirement_rejected_total": row["requirement_rejected_total"],
         }
         for row in rows
     ]
@@ -460,3 +480,20 @@ async def reject_match(
     match.status = "REJECTED"
     await db.commit()
     return {"success": True, "message": "Match rejected successfully"}
+
+
+@router.patch("/{match_id}/restore")
+async def restore_match(
+    match_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Undo a reject: move a REJECTED match back to MATCHING."""
+    match = await _load_match_for_action(db, match_id, current_user)
+
+    if match.status != "REJECTED":
+        raise HTTPException(status_code=400, detail="Only rejected rows can be restored")
+
+    match.status = "MATCHING"
+    await db.commit()
+    return {"success": True, "message": "Match restored successfully"}
