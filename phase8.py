@@ -1009,6 +1009,80 @@ async def _requeue_email_for(db: AsyncSession, err) -> bool:
     return True
 
 
+@router.get("/errors/{error_id}")
+async def get_error_detail(
+    error_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    """One error with its Entity Context filled in. The error rows rarely carry
+    raw_email_id / requirement_id / consultant_id themselves, so they are
+    followed from the thing that failed: an email-queue item leads to its
+    requirement, consultant and the raw email the requirement came from."""
+    err = (await db.execute(
+        select(ProcessingError).where(ProcessingError.id == error_id)
+    )).scalars().first()
+    if not err:
+        raise HTTPException(status_code=404, detail="Error not found")
+
+    raw_email_id = err.raw_email_id
+    requirement_id = err.requirement_id
+    consultant_id = err.consultant_id
+    extra: dict = {}
+    if isinstance(err.additional_context, dict):
+        extra.update({str(k): str(v) for k, v in err.additional_context.items() if v is not None})
+
+    try:
+        ident = err.source_id
+        if (err.source_type or "").lower() == "email_queue" and ident and str(ident).isdigit():
+            from models import EmailQueue
+            item = (await db.execute(select(EmailQueue).where(EmailQueue.id == int(ident)))).scalars().first()
+            if item:
+                extra.setdefault("Queue item", str(item.id))
+                if item.from_email:
+                    extra.setdefault("From email", item.from_email)
+                if item.to_email:
+                    extra.setdefault("To email", item.to_email)
+                if item.subject:
+                    extra.setdefault("Subject", item.subject)
+                consultant_id = consultant_id or (str(item.consultant_id) if item.consultant_id is not None else None)
+                requirement_id = requirement_id or (str(item.requirement_id) if item.requirement_id is not None else None)
+        if consultant_id and str(consultant_id).isdigit():
+            from models import Consultant as _Cons
+            c = (await db.execute(select(_Cons).where(_Cons.id == int(consultant_id)))).scalars().first()
+            if c and c.full_name:
+                extra.setdefault("Consultant", c.full_name)
+        if requirement_id and str(requirement_id).isdigit():
+            from models import Requirement as _Req
+            rq = (await db.execute(select(_Req).where(_Req.id == int(requirement_id)))).scalars().first()
+            if rq:
+                raw_email_id = raw_email_id or (str(getattr(rq, "raw_email_id", None)) if getattr(rq, "raw_email_id", None) is not None else None)
+                title = getattr(rq, "title", None) or getattr(rq, "job_title", None)
+                if title:
+                    extra.setdefault("Requirement", str(title))
+    except Exception:
+        # Context is a convenience: never let a lookup hide the error itself.
+        pass
+
+    return {
+        "id": str(err.id),
+        "source_type": err.source_type,
+        "source_id": err.source_id,
+        "error_stage": err.error_stage,
+        "error_message": err.error_message,
+        "occurred_at": err.occurred_at.isoformat() if err.occurred_at else "",
+        "resolved_at": err.resolved_at.isoformat() if err.resolved_at else None,
+        "status": err.status,
+        "stack_trace": err.stack_trace,
+        "retry_count": err.retry_count or 0,
+        "category": _category_for_stage(err.error_stage),
+        "raw_email_id": str(raw_email_id) if raw_email_id else None,
+        "requirement_id": str(requirement_id) if requirement_id else None,
+        "consultant_id": str(consultant_id) if consultant_id else None,
+        "additional": extra,
+    }
+
+
 @router.post("/errors/{error_id}/retry", response_model=ErrorActionResultDTO)
 async def retry_error(
     error_id: int,
