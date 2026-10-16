@@ -409,6 +409,9 @@ class RequirementDetailResponse(BaseModel):
     received_date: Optional[str] = None
     parse_confidence: Optional[float] = None
     skills: Optional[List[str]] = None
+    # gmail_emails.id of the vendor email this requirement was parsed from
+    # (Apply screen "Original email" tab).
+    raw_email_id: Optional[str] = None
 
 
 class GeneratedResumeDTO(BaseModel):
@@ -1358,6 +1361,7 @@ async def get_requirement_detail(
         # frontend had no requirement-side skills to compare a candidate's
         # primary skills against for the application-template {skills} fill.
         skills=(req.parsed_fields or {}).get("skills") if req.parsed_fields else None,
+        raw_email_id=str(req.raw_email_id) if getattr(req, "raw_email_id", None) else None,
     )
 
 
