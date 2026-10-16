@@ -3,11 +3,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import func
 from database import get_db
-from models import Email, Application, EmailQueue, User, Consultant
+from models import Email, Application, EmailQueue, User, Consultant, Requirement
 from auth import get_current_user
 from pydantic import BaseModel
 from typing import List, Optional
 import datetime
+from collections import Counter
+from zoneinfo import ZoneInfo
 
 router = APIRouter(prefix="/api/reports", tags=["Reports"])
 
@@ -61,11 +63,39 @@ def _sort_user_activity(rows: List["UserReportStat"]) -> List["UserReportStat"]:
     return [u for u in rows if u.is_current_user] + [u for u in rows if not u.is_current_user]
 
 
+class DailyActivity(BaseModel):
+    # CST calendar day (YYYY-MM-DD) and SENT applications on that day, scoped
+    # to the caller exactly like jobs_applied. Days with 0 are omitted; the
+    # frontend fills the gaps.
+    date: str
+    applications: int
+
+
+class VendorCount(BaseModel):
+    vendor: str
+    applications: int
+
+
+class StatusCounts(BaseModel):
+    sent: int = 0
+    pending: int = 0
+    failed: int = 0
+
+
 class AdminReportResponse(BaseModel):
     emails_processed: int
     jobs_applied: int
     emails_sent: int
     applications_per_user: List[UserReportStat]
+    daily_activity: List[DailyActivity] = []
+    # Same-length window immediately before the selected range (only when both
+    # dates are given) so the dashboard can show a trend. None = no comparison.
+    prev_jobs_applied: Optional[int] = None
+    prev_emails_sent: Optional[int] = None
+    # Applications by status for the caller's scope inside the range.
+    status_counts: StatusCounts = StatusCounts()
+    # Vendors with the most SENT applications inside the range (top 5).
+    top_vendors: List[VendorCount] = []
 
 @router.get("/", response_model=AdminReportResponse)
 async def get_admin_reports(
@@ -133,6 +163,90 @@ async def get_admin_reports(
         # — force zero rows rather than accidentally returning org-wide.
         app_query = app_query.where(Application.consultant_id == (own_consultant_id or -1))
     jobs_applied = (await db.execute(app_query)).scalar_one()
+
+    # 2b. Daily activity — same scope/filters as jobs_applied, bucketed per
+    # CST day in Python (portable across Postgres/SQLite).
+    _cst = ZoneInfo("America/Chicago")
+    day_query = select(Application.sent_at).where(
+        Application.status == "SENT", Application.sent_at.is_not(None)
+    )
+    if start_dt:
+        day_query = day_query.where(Application.sent_at >= start_dt)
+    if end_dt:
+        day_query = day_query.where(Application.sent_at <= end_dt)
+    if current_user.role == "RECRUITER":
+        day_query = day_query.where(Application.recruiter_id == current_user.id)
+    elif current_user.role == "CONSULTANT":
+        day_query = day_query.where(Application.consultant_id == (own_consultant_id or -1))
+    _day_counts: Counter = Counter()
+    for (ts,) in (await db.execute(day_query)).all():
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        _day_counts[ts.astimezone(_cst).date().isoformat()] += 1
+    daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_day_counts.items())]
+
+    def _scope_apps(q):
+        if current_user.role == "RECRUITER":
+            return q.where(Application.recruiter_id == current_user.id)
+        if current_user.role == "CONSULTANT":
+            return q.where(Application.consultant_id == (own_consultant_id or -1))
+        return q
+
+    # 2c. Trend: the window of the same length right before the range.
+    prev_jobs_applied = None
+    prev_emails_sent = None
+    if start_dt and end_dt and end_dt > start_dt:
+        _span = end_dt - start_dt
+        _p_start, _p_end = start_dt - _span, start_dt
+        prev_jobs_applied = (await db.execute(_scope_apps(
+            select(func.count()).select_from(Application).where(
+                Application.status == "SENT",
+                Application.sent_at >= _p_start,
+                Application.sent_at < _p_end,
+            )
+        ))).scalar_one()
+        _pq = select(func.count()).select_from(EmailQueue).where(
+            EmailQueue.status == "SENT",
+            EmailQueue.created_at >= _p_start,
+            EmailQueue.created_at < _p_end,
+        )
+        if current_user.role == "RECRUITER":
+            _pq = _pq.where(EmailQueue.sent_by_user_id == current_user.id)
+        elif current_user.role == "CONSULTANT":
+            _pq = _pq.where(EmailQueue.consultant_id == (own_consultant_id or -1))
+        prev_emails_sent = (await db.execute(_pq)).scalar_one()
+
+    # 2d. Status breakdown (created_at because PENDING/FAILED have no sent_at).
+    _sq = select(Application.status, func.count()).select_from(Application).group_by(Application.status)
+    if start_dt:
+        _sq = _sq.where(Application.created_at >= start_dt)
+    if end_dt:
+        _sq = _sq.where(Application.created_at <= end_dt)
+    _by_status = {(st or "").upper(): n for st, n in (await db.execute(_scope_apps(_sq))).all()}
+    status_counts = StatusCounts(
+        sent=_by_status.get("SENT", 0),
+        pending=_by_status.get("PENDING", 0),
+        failed=_by_status.get("FAILED", 0),
+    )
+
+    # 2e. Top vendors by SENT applications.
+    _vq = (
+        select(Requirement.vendor, func.count(Application.id).label("n"))
+        .join(Requirement, Requirement.id == Application.requirement_id)
+        .where(Application.status == "SENT", Requirement.vendor.is_not(None))
+        .group_by(Requirement.vendor)
+        .order_by(func.count(Application.id).desc())
+        .limit(5)
+    )
+    if start_dt:
+        _vq = _vq.where(Application.sent_at >= start_dt)
+    if end_dt:
+        _vq = _vq.where(Application.sent_at <= end_dt)
+    top_vendors = [
+        VendorCount(vendor=v, applications=n)
+        for v, n in (await db.execute(_scope_apps(_vq))).all()
+        if (v or "").strip()
+    ]
 
     # 3. Emails Sent (EmailQueue)
     queue_query = select(func.count()).select_from(EmailQueue).where(EmailQueue.status == 'SENT')
@@ -229,5 +343,10 @@ async def get_admin_reports(
         emails_processed=emails_processed,
         jobs_applied=jobs_applied,
         emails_sent=emails_sent,
-        applications_per_user=applications_per_user
+        applications_per_user=applications_per_user,
+        daily_activity=daily_activity,
+        prev_jobs_applied=prev_jobs_applied,
+        prev_emails_sent=prev_emails_sent,
+        status_counts=status_counts,
+        top_vendors=top_vendors,
     )
