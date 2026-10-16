@@ -38,7 +38,7 @@ from models import (
 )
 from phase8_audit_service import log_action, build_metadata_preview
 from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost
-from phase8_cache import cache_get, cache_set, check_redis_health
+from phase8_cache import check_redis_health
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
 
