@@ -720,6 +720,9 @@ class ProfileResponse(BaseModel):
     summary: Optional[str] = None
     education: List[EducationEntryResponse] = []
     resumeRichText: Optional[str] = None
+    # Linked login (User) id — lets the recruiter detail page load this
+    # consultant's Work experience via GET /api/consultant/experience?user_id=.
+    userId: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1123,6 +1126,7 @@ async def _consultant_to_profile_response(
 
     return ProfileResponse(
         id=str(c.id),
+        userId=c.user_id,
         fullName=c.full_name,
         email=c.email,
         location=c.current_location,
