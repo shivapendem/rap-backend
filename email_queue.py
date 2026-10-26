@@ -1242,6 +1242,8 @@ async def send_email_now(
         "fallback_sender_used": False,
     }
 
+ALLOWED_ATTACHMENT_EXTENSIONS = {".pdf", ".doc", ".docx"}
+
 @router.post("/api/consultant/email-queue/upload-attachment")
 async def upload_attachment(
     file: UploadFile = File(...),
@@ -1261,6 +1263,12 @@ async def upload_attachment(
     survives restarts) and the returned reference points there; the
     /tmp copy is kept only as a same-process fast path.
     """
+    # Only PDF and Word files may be attached to queued emails.
+    if os.path.splitext(file.filename or "")[1].lower() not in ALLOWED_ATTACHMENT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="File type not allowed. Only PDF, DOC and DOCX files can be attached.",
+        )
     safe_original = sanitize_attachment_filename(file.filename)
     unique_name = f"{uuid.uuid4()}__{safe_original}"
     contents = await file.read()
