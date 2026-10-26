@@ -9,7 +9,7 @@ import re
 from typing import Optional, List, Any
 
 from fastapi import HTTPException
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import User, Consultant, Application, Resume, ConsultantExperience, RecruiterConsultant
@@ -48,6 +48,32 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
         linkedin_url=u.linkedin_url,
         designation=u.designation,
     )
+
+
+def _matching_snapshot(c: Optional[Consultant]):
+    """The consultant fields the matching engine reads. A re-match only runs
+    when one of these actually changed (not for phone / LinkedIn / education)."""
+    if c is None:
+        return None
+    return (
+        c.primary_skills, c.work_authorization, tuple(c.preferred_employment_types or []),
+        c.preferred_roles, c.preferred_locations, c.current_location,
+        float(c.total_experience_years) if c.total_experience_years is not None else None,
+        c.status,
+    )
+
+
+def _after_consultant_save(consultant_id: int, rematch: bool) -> None:
+    """PERF: base resume rebuild (always) and re-match (only when matching
+    fields changed) run in the background after commit — the save replies
+    immediately. Never fails the save."""
+    try:
+        from phase3 import _trigger_base_resume_sync, _trigger_consultant_rematch
+        _trigger_base_resume_sync(consultant_id)
+        if rematch:
+            _trigger_consultant_rematch(consultant_id)
+    except Exception:
+        pass
 
 
 async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdminRowDTO:
@@ -335,6 +361,44 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
 class UserService:
 
     @staticmethod
+    async def user_counts(
+        db: AsyncSession, *, search: Optional[str], role: Optional[str], status: Optional[str],
+    ) -> dict:
+        """PERF: every tab + status count for User Management in 2 small
+        GROUP BY queries (was 7 separate list requests). Same filters as
+        UserRepository.list_paginated: role tabs follow search + status,
+        status options follow search + role."""
+        search_filter = None
+        if search:
+            kw = f"%{search.lower()}%"
+            search_filter = or_(func.lower(User.full_name).like(kw), func.lower(User.email).like(kw))
+
+        role_filters = [f for f in (search_filter,) if f is not None]
+        if status:
+            role_filters.append(User.is_authorized == (status == "Active"))
+        role_rows = (await db.execute(
+            select(User.role, func.count()).where(and_(*role_filters) if role_filters else True).group_by(User.role)
+        )).all()
+        roles = {"": 0, "ADMIN": 0, "RECRUITER": 0, "CONSULTANT": 0}
+        for r, n in role_rows:
+            roles[""] += n
+            if r in roles:
+                roles[r] = n
+
+        status_filters = [f for f in (search_filter,) if f is not None]
+        if role:
+            status_filters.append(User.role == role)
+        status_rows = (await db.execute(
+            select(User.is_authorized, func.count()).where(and_(*status_filters) if status_filters else True).group_by(User.is_authorized)
+        )).all()
+        statuses = {"": 0, "Active": 0, "Inactive": 0}
+        for authorized, n in status_rows:
+            statuses[""] += n
+            statuses["Active" if authorized else "Inactive"] += n
+
+        return {"roles": roles, "statuses": statuses}
+
+    @staticmethod
     async def list_users(
         db: AsyncSession,
         *, page: int, page_size: int, sort_by: str, sort_dir: str,
@@ -441,9 +505,12 @@ class UserService:
             user.designation = req.designation
         user = await UserRepository.update(db, user)
 
+        _bg_consultant_id = None
+        _bg_rematch = False
         # Apply consultant-only fields if this user has a linked consultant profile
         if req.role == "CONSULTANT":
             consultant = await ConsultantRepository.get_by_user_id(db, user.id)
+            _match_before = _matching_snapshot(consultant)
             # BUG FIX: this only ever UPDATED an existing Consultant row —
             # if someone's role was CHANGED to CONSULTANT (as opposed to
             # being created as one from the start, which already
@@ -499,8 +566,9 @@ class UserService:
             elif consultant.status in (None, "", "INACTIVE"):
                 consultant.status = "ACTIVE"
             await ConsultantRepository.update(db, consultant)
-            from resume_router import sync_base_resume_text
-            await sync_base_resume_text(db, consultant)
+            # PERF: base resume rebuild + re-match moved to the background after commit.
+            _bg_consultant_id = consultant.id
+            _bg_rematch = _matching_snapshot(consultant) != _match_before
             if req.recruiter_id:
                 rid = int(req.recruiter_id)
                 already = await RecruiterConsultantRepository.exists(db, rid, consultant.id)
@@ -517,6 +585,8 @@ class UserService:
             }},
         )
         await db.commit()
+        if _bg_consultant_id is not None:
+            _after_consultant_save(_bg_consultant_id, _bg_rematch)
         return _user_to_dto(user)
 
     @staticmethod
@@ -694,6 +764,22 @@ class ConsultantAssignmentService:
         return await _consultants_to_dtos_bulk(db, consultants)
 
     @staticmethod
+    async def get_consultant_by_user(db: AsyncSession, user_id: int) -> ConsultantAdminRowDTO:
+        """PERF: one consultant by its login user id — the Edit User drawer and
+        user detail page used to download the whole consultant list for this."""
+        consultant = await ConsultantRepository.get_by_user_id(db, user_id)
+        if not consultant:
+            # Same fallback the old frontend lookup had: match by the user's email.
+            user = await UserRepository.get_by_id(db, user_id)
+            if user and user.email:
+                consultant = (await db.execute(
+                    select(Consultant).where(func.lower(Consultant.email) == user.email.lower())
+                )).scalars().first()
+        if not consultant:
+            raise HTTPException(status_code=404, detail="Consultant not found")
+        return await _consultant_to_dto(db, consultant)
+
+    @staticmethod
     async def get_consultant(db: AsyncSession, consultant_id: int) -> ConsultantAdminRowDTO:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
@@ -720,6 +806,7 @@ class ConsultantAssignmentService:
         consultant = await ConsultantRepository.get_by_id(db, consultant_id)
         if not consultant:
             raise HTTPException(status_code=404, detail="Consultant not found")
+        _match_before = _matching_snapshot(consultant)
 
         if primary_skills is not None:
             consultant.primary_skills = primary_skills
@@ -833,8 +920,9 @@ class ConsultantAssignmentService:
         # all, so an admin's edit updated the Consultant row correctly but
         # left the consultant's Base Resume showing stale content until
         # the consultant happened to save their own profile again.
-        from resume_router import sync_base_resume_text
-        await sync_base_resume_text(db, consultant)
+        # PERF: base resume rebuild moved to the background after commit
+        # (see _after_consultant_save) — the save no longer waits on it.
+        _rematch_needed = _matching_snapshot(consultant) != _match_before
 
         await log_action(
             db, "USER_UPDATED",
@@ -844,13 +932,9 @@ class ConsultantAssignmentService:
         )
         await db.commit()
 
-        # FIX: admin edits now re-run matching the same way the consultant's
-        # own profile save does, so both sides see the same match results.
-        try:
-            from phase3 import _trigger_consultant_rematch
-            _trigger_consultant_rematch(consultant.id)
-        except Exception:  # never fail the save because of the rematch trigger
-            pass
+        # Admin edits re-run matching like the consultant's own profile save,
+        # but only when a field the matching engine reads actually changed.
+        _after_consultant_save(consultant.id, _rematch_needed)
 
         return await _consultant_to_dto(db, consultant)
 

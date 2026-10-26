@@ -29,6 +29,9 @@ class EducationEntryDTO(BaseModel):
     degree: Optional[str] = None
     institution: Optional[str] = None
     year: Optional[str] = None
+    # Same 4 fields as the consultant's My Profile — without this, an admin
+    # save silently dropped the consultant's "Details".
+    details: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

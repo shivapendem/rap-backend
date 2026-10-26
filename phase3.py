@@ -168,6 +168,58 @@ def _trigger_consultant_rematch(consultant_id: int) -> None:
         _rematch_in_progress.add(consultant_id)
         asyncio.create_task(_rematch_in_background(consultant_id))
 
+
+_base_sync_in_progress: set[int] = set()
+_base_sync_dirty: set[int] = set()
+_base_sync_with_experience: set[int] = set()
+
+
+def _trigger_base_resume_sync(consultant_id: int, include_experience: bool = False) -> None:
+    """PERF: rebuild the consultant's base resume (and, for experience edits,
+    resume_info["experience"]) in the background AFTER the save is committed,
+    so saves reply immediately. Same coalescing as _trigger_consultant_rematch:
+    several saves in a row (e.g. Edit User's two calls) cost at most 2 runs.
+    Call only after db.commit() — the background session reads committed data."""
+    if include_experience:
+        _base_sync_with_experience.add(consultant_id)
+
+    async def _sync_in_background(cid: int):
+        from database import AsyncSessionLocal
+        from resume_router import sync_base_resume_text
+        try:
+            while True:
+                _base_sync_dirty.discard(cid)
+                with_exp = cid in _base_sync_with_experience
+                _base_sync_with_experience.discard(cid)
+                async with AsyncSessionLocal() as bg_session:
+                    c = (await bg_session.execute(
+                        select(Consultant).where(Consultant.id == cid)
+                    )).scalars().first()
+                    if c:
+                        await sync_base_resume_text(bg_session, c)
+                        if with_exp:
+                            await _sync_experience_into_resume_info(bg_session, c)
+                        await bg_session.commit()
+                if cid not in _base_sync_dirty:
+                    break
+        except Exception as e:
+            logger.error("Background base resume sync failed for consultant_id=%s: %s", cid, e)
+            from error_logger import log_db_error
+            await log_db_error(
+                stage="background_base_resume_sync",
+                error=e,
+                source_type="consultant",
+                source_id=str(cid),
+            )
+        finally:
+            _base_sync_in_progress.discard(cid)
+
+    if consultant_id in _base_sync_in_progress:
+        _base_sync_dirty.add(consultant_id)
+    else:
+        _base_sync_in_progress.add(consultant_id)
+        asyncio.create_task(_sync_in_background(consultant_id))
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1168,6 +1220,16 @@ async def _consultant_to_profile_response(
         profileCompleteness=completeness,
         activeApplicationsCount=active_applications_count,
     )
+
+
+async def _sync_experience_side_effects(db, consultant, background_tasks) -> None:
+    """After an experience add/edit/delete is COMMITTED: rebuild the base
+    resume + resume_info in the background (the save replies immediately)
+    and re-match this consultant, since experience titles feed role
+    matching. The re-match only scores the last REMATCH_WINDOW_DAYS days
+    of requirements (phase4.match_consultant)."""
+    _trigger_base_resume_sync(consultant.id, include_experience=True)
+    _trigger_consultant_rematch(consultant.id)
 
 
 def _exp_to_response(e: ConsultantExperience) -> ExperienceResponse:
@@ -2220,13 +2282,16 @@ async def create_experience(
     await db.flush()
     await renumber_experiences_chronologically(db, consultant.id)
 
-    from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant, None, background_tasks)
-    await _sync_experience_into_resume_info(db, consultant)
-
+    # BUG FIX ("experience saved but popup still shows Add experience"):
+    # commit the row FIRST and build the response, then run the base-resume /
+    # resume_info sync. Before, a slow or failing sync made the request time
+    # out or 500 AFTER the row was effectively saved, so the popup never
+    # closed and the new role only appeared after a page refresh.
     await db.commit()
     await db.refresh(exp)
-    return _exp_to_response(exp)
+    response = _exp_to_response(exp)
+    await _sync_experience_side_effects(db, consultant, background_tasks)
+    return response
 
 
 @router.put(
@@ -2283,13 +2348,12 @@ async def update_experience(
     # move this entry.
     await renumber_experiences_chronologically(db, consultant.id)
 
-    from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant, None, background_tasks)
-    await _sync_experience_into_resume_info(db, consultant)
-
+    # Same fix as create_experience: save first, sync after.
     await db.commit()
     await db.refresh(exp)
-    return _exp_to_response(exp)
+    response = _exp_to_response(exp)
+    await _sync_experience_side_effects(db, consultant, background_tasks)
+    return response
 
 
 @router.delete(
@@ -2326,11 +2390,9 @@ async def delete_experience(
     await db.flush()
     await renumber_experiences_chronologically(db, consultant.id)
 
-    from resume_router import sync_base_resume_text
-    await sync_base_resume_text(db, consultant, None, background_tasks)
-    await _sync_experience_into_resume_info(db, consultant)
-
+    # PERF: commit the delete first; resume rebuild + re-match run in the background.
     await db.commit()
+    await _sync_experience_side_effects(db, consultant, background_tasks)
 
 
 @router.patch(

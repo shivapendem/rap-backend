@@ -521,70 +521,8 @@ def _parse_admin_date_filter(value: str, end_of_day: bool) -> datetime:
     return cst_aware.astimezone(timezone.utc)
 
 
-@router.get(
-    "/api/admin/gmail-emails",
-    summary="Get all emails from gmail_emails table — all columns included",
-)
-async def get_gmail_emails(
-    page: int = 1,
-    page_size: int = 20,
-    account_email: Optional[str] = None,
-    category: Optional[str] = None,
-    processed: Optional[bool] = None,
-    search: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    # light=true: list view only — skip the heavy body/header/address columns
-    # (the View modal fetches the full email via /api/admin/raw-emails/{id}).
-    light: bool = False,
-    # search_body=true also searches the email body (slow on a large table).
-    # Default: subject / from name / from address only — fast.
-    search_body: bool = False,
-    # Status Desc dropdown: Parsed | Parsed - Dup | Parsed - NR | Pending | Failed
-    status_desc: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_role(current_user, "ADMIN", "RECRUITER")
-
-    page = max(1, page)
-    page_size = max(1, min(page_size, 200))
-
-    _ALLOWED_STATUS_DESC = {"Parsed", "Parsed - Dup", "Parsed - NR", "Pending", "Failed"}
-    if status_desc and status_desc not in _ALLOWED_STATUS_DESC:
-        raise HTTPException(
-            status_code=422,
-            detail=f"status_desc must be one of: {sorted(_ALLOWED_STATUS_DESC)}",
-        )
-
-    # Build WHERE clause
-    where_clauses = []
-    params = {"limit": page_size, "offset": (page - 1) * page_size}
-
-    if account_email:
-        where_clauses.append("account_email = :account_email")
-        params["account_email"] = account_email
-    if category:
-        where_clauses.append("category = :category")
-        params["category"] = category
-    if processed is not None:
-        where_clauses.append("processed = :processed")
-        params["processed"] = processed
-    if status_desc:
-        # Mirrors the page's emailStatusLabel(): a Pending/NULL row whose
-        # email is already processed or has a Requirement displays as Parsed.
-        _done = (
-            "(COALESCE(ge.processed, false) = true"
-            " OR EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id))"
-        )
-        _open = "(ge.status_desc IS NULL OR ge.status_desc = 'Pending')"
-        if status_desc == "Parsed":
-            where_clauses.append(f"(ge.status_desc = 'Parsed' OR ({_open} AND {_done}))")
-        elif status_desc == "Pending":
-            where_clauses.append(f"({_open} AND NOT {_done})")
-        else:
-            where_clauses.append("ge.status_desc = :status_desc")
-            params["status_desc"] = status_desc
+def _apply_gmail_search(where_clauses: list, params: dict, search: Optional[str], search_body: bool) -> None:
+    """Search filter shared by the Gmail emails list and its status counts."""
     if search:
         # BUG FIX ("search shows 'no results' for a requirement that
         # genuinely exists" -- confirmed real case): only subject,
@@ -715,6 +653,115 @@ async def get_gmail_emails(
             # "BI with Alteryx Developer - Charlotte, NC".
             _ws_opt = _ws_class[:-1] + "*"
             params["search"] = "^" + _ws_opt + _ws_class.join(_words) + _ws_opt + "$"
+
+
+# PERF: the status dropdown used to send one list request per status (6
+# COUNT queries + 6 ordered row queries). One query now counts them all.
+@router.get("/api/admin/gmail-emails/status-counts", summary="Gmail emails count per status")
+async def get_gmail_email_status_counts(
+    search: Optional[str] = None,
+    search_body: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+    where_clauses: list = []
+    params: dict = {}
+    _apply_gmail_search(where_clauses, params, search, search_body)
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    row = (await db.execute(text(f"""
+        SELECT
+            COUNT(*) AS all_count,
+            COUNT(*) FILTER (WHERE t.status_desc = 'Parsed' OR (t.is_open AND t.is_done)) AS parsed,
+            COUNT(*) FILTER (WHERE t.status_desc = 'Parsed - Dup') AS parsed_dup,
+            COUNT(*) FILTER (WHERE t.status_desc = 'Parsed - NR') AS parsed_nr,
+            COUNT(*) FILTER (WHERE t.is_open AND NOT t.is_done) AS pending,
+            COUNT(*) FILTER (WHERE t.status_desc = 'Failed') AS failed
+        FROM (
+            SELECT ge.status_desc,
+                   (ge.status_desc IS NULL OR ge.status_desc = 'Pending') AS is_open,
+                   (COALESCE(ge.processed, false) = true
+                    OR EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id)) AS is_done
+            FROM gmail_emails ge
+            {where_sql}
+        ) t
+    """), params)).mappings().one()
+    return {
+        "": int(row["all_count"]),
+        "Parsed": int(row["parsed"]),
+        "Parsed - Dup": int(row["parsed_dup"]),
+        "Parsed - NR": int(row["parsed_nr"]),
+        "Pending": int(row["pending"]),
+        "Failed": int(row["failed"]),
+    }
+
+
+@router.get(
+    "/api/admin/gmail-emails",
+    summary="Get all emails from gmail_emails table — all columns included",
+)
+async def get_gmail_emails(
+    page: int = 1,
+    page_size: int = 20,
+    account_email: Optional[str] = None,
+    category: Optional[str] = None,
+    processed: Optional[bool] = None,
+    search: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    # light=true: list view only — skip the heavy body/header/address columns
+    # (the View modal fetches the full email via /api/admin/raw-emails/{id}).
+    light: bool = False,
+    # search_body=true also searches the email body (slow on a large table).
+    # Default: subject / from name / from address only — fast.
+    search_body: bool = False,
+    # Status Desc dropdown: Parsed | Parsed - Dup | Parsed - NR | Pending | Failed
+    status_desc: Optional[str] = None,
+    count_only: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN", "RECRUITER")
+
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+
+    _ALLOWED_STATUS_DESC = {"Parsed", "Parsed - Dup", "Parsed - NR", "Pending", "Failed"}
+    if status_desc and status_desc not in _ALLOWED_STATUS_DESC:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status_desc must be one of: {sorted(_ALLOWED_STATUS_DESC)}",
+        )
+
+    # Build WHERE clause
+    where_clauses = []
+    params = {"limit": page_size, "offset": (page - 1) * page_size}
+
+    if account_email:
+        where_clauses.append("account_email = :account_email")
+        params["account_email"] = account_email
+    if category:
+        where_clauses.append("category = :category")
+        params["category"] = category
+    if processed is not None:
+        where_clauses.append("processed = :processed")
+        params["processed"] = processed
+    if status_desc:
+        # Mirrors the page's emailStatusLabel(): a Pending/NULL row whose
+        # email is already processed or has a Requirement displays as Parsed.
+        _done = (
+            "(COALESCE(ge.processed, false) = true"
+            " OR EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id))"
+        )
+        _open = "(ge.status_desc IS NULL OR ge.status_desc = 'Pending')"
+        if status_desc == "Parsed":
+            where_clauses.append(f"(ge.status_desc = 'Parsed' OR ({_open} AND {_done}))")
+        elif status_desc == "Pending":
+            where_clauses.append(f"({_open} AND NOT {_done})")
+        else:
+            where_clauses.append("ge.status_desc = :status_desc")
+            params["status_desc"] = status_desc
+    _apply_gmail_search(where_clauses, params, search, search_body)
     if date_from:
         where_clauses.append("date >= :date_from")
         try:
@@ -736,6 +783,12 @@ async def get_gmail_emails(
         params
     )
     total = count_result.scalar_one()
+
+    # PERF: callers that only need the number (dashboard / "Ingested Today")
+    # skip the ordered row query entirely.
+    if count_only:
+        return {"data": [], "total": total, "page": page, "page_size": page_size,
+                "total_pages": math.ceil(total / page_size) if total else 0}
 
     # BUG FIX ("new mail not showing immediately"): this sorted by ge.date
     # — the sender's own "Date:" header, copied through as-is from the

@@ -62,6 +62,23 @@ async def list_users(
     )
 
 
+# PERF: all User Management tab + status counts in one request. Declared
+# before /users/{user_id} so "counts" is not read as a user id.
+@router.get("/users/counts")
+async def user_counts(
+    search: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    if role and role not in {"ADMIN", "RECRUITER", "CONSULTANT"}:
+        raise HTTPException(status_code=422, detail="Invalid role filter")
+    if status and status not in {"Active", "Inactive"}:
+        raise HTTPException(status_code=422, detail="Invalid status filter")
+    return await UserService.user_counts(db, search=search, role=role, status=status)
+
+
 @router.post("/users", response_model=CreateUserResponseDTO, status_code=201)
 async def create_user(
     body: CreateUserRequestDTO,
@@ -243,6 +260,15 @@ async def update_recruiter_consultants(
 # ===========================================================================
 # MANAGE CONSULTANTS
 # ===========================================================================
+
+@router.get("/consultants/by-user/{user_id}", response_model=ConsultantAdminRowDTO)
+async def get_consultant_by_user(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    return await ConsultantAssignmentService.get_consultant_by_user(db, user_id)
+
 
 @router.get("/consultants/{consultant_id}", response_model=ConsultantAdminRowDTO)
 async def get_consultant(
