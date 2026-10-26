@@ -3674,7 +3674,7 @@ async def delete_resume(
         raise HTTPException(status_code=404, detail="Resume not found")
 
     if resume.s3_key:
-        delete_file_from_s3(resume.s3_key)
+        await asyncio.to_thread(delete_file_from_s3, resume.s3_key)
 
     await db.delete(resume)
     await db.commit()

@@ -385,7 +385,7 @@ async def confirm_send(
                         body_bytes = f.read()
                 else:
                     from s3_service import download_file_from_s3
-                    body_bytes, _ = download_file_from_s3(resume_source_path)
+                    body_bytes, _ = await asyncio.to_thread(download_file_from_s3, resume_source_path)
                 if body_bytes:
                     import tempfile
                     safe_title = "".join(
@@ -696,7 +696,7 @@ async def get_application_email_preview(
         size_bytes, content_type = None, None
         local_path = os.path.join("/tmp/email_attachments", ref)
         if ref.startswith(EMAIL_ATTACHMENT_S3_PREFIX):
-            size_bytes, content_type = get_s3_file_metadata(ref)
+            size_bytes, content_type = await asyncio.to_thread(get_s3_file_metadata, ref)
         elif os.path.exists(local_path):
             size_bytes = os.path.getsize(local_path)
             content_type = mimetypes.guess_type(local_path)[0]

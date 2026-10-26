@@ -499,7 +499,13 @@ async def login(
     user = result.scalars().first()
 
     # BUG FIX: avoid user enumeration — same error for bad user or bad password
-    if not user or not user.password_hash or not verify_password(request.password, user.password_hash):
+    # PERF: bcrypt is deliberately slow (~0.25s of CPU). Run it in a worker thread
+    # so it doesn't freeze the event loop for every other request. Same
+    # short-circuit as before: no user / no stored hash -> bcrypt never runs.
+    password_ok = bool(user and user.password_hash) and await asyncio.to_thread(
+        verify_password, request.password, user.password_hash
+    )
+    if not password_ok:
         _record_failed_login(request.email)
         try:
             from notification_helper import notify_by_role
@@ -1392,7 +1398,7 @@ async def get_company_banner():
     from gmail_send_service import _resolve_banner_bytes
     import mimetypes
 
-    body, filename = _resolve_banner_bytes()
+    body, filename = await asyncio.to_thread(_resolve_banner_bytes)
     if body is None:
         raise HTTPException(status_code=404, detail="No company banner is set.")
 
@@ -1463,7 +1469,9 @@ async def upload_company_banner(
     from email_template import COMPANY_BANNER_S3_KEY
     from s3_service import upload_file_to_s3
 
-    success = upload_file_to_s3(file.file, COMPANY_BANNER_S3_KEY, content_type=detected_content_type)
+    success = await asyncio.to_thread(
+        upload_file_to_s3, file.file, COMPANY_BANNER_S3_KEY, content_type=detected_content_type
+    )
     if not success:
         raise HTTPException(
             status_code=502,
@@ -1512,7 +1520,9 @@ async def upload_signature_image(
     ext = _IMAGE_EXT_BY_CONTENT_TYPE.get(detected_content_type, ".png")
     s3_key = f"{SIGNATURE_IMAGE_S3_PREFIX}{current_user.id}/{_uuid.uuid4()}{ext}"
 
-    success = upload_file_to_s3(file.file, s3_key, content_type=detected_content_type)
+    success = await asyncio.to_thread(
+        upload_file_to_s3, file.file, s3_key, content_type=detected_content_type
+    )
     if not success:
         raise HTTPException(
             status_code=502,
@@ -1540,7 +1550,7 @@ async def get_signature_image(s3_key: str):
     from s3_service import download_file_from_s3
     import mimetypes
 
-    body, content_type = download_file_from_s3(s3_key)
+    body, content_type = await asyncio.to_thread(download_file_from_s3, s3_key)
     if body is None:
         raise HTTPException(status_code=404, detail="Image not found.")
 

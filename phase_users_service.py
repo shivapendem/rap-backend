@@ -4,6 +4,7 @@
 # Business logic + audit logging via your existing Phase 8 audit_logs table.
 # ---------------------------------------------------------------------------
 
+import asyncio
 import math
 import re
 from typing import Optional, List, Any
@@ -73,7 +74,13 @@ def _after_consultant_save(consultant_id: int, rematch: bool) -> None:
         if rematch:
             _trigger_consultant_rematch(consultant_id)
     except Exception:
-        pass
+        # Still never fails the save (it is already committed) -- but no longer
+        # silent: a failure here means the base resume / re-match was NOT queued.
+        import logging
+        logging.getLogger(__name__).exception(
+            "Could not queue background base-resume sync / re-match for consultant_id=%s",
+            consultant_id,
+        )
 
 
 async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdminRowDTO:
@@ -433,7 +440,8 @@ class UserService:
             full_name=req.full_name.strip(),
             email=req.email,
             role=req.role,
-            password_hash=get_password_hash(req.password) if req.password else None,
+            # PERF: bcrypt hashing runs in a worker thread (see auth.py / login).
+            password_hash=(await asyncio.to_thread(get_password_hash, req.password)) if req.password else None,
             is_authorized=True,
             experience_years=req.experience_years,
             resume_info=req.resume_info,

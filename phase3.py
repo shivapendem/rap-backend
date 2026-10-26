@@ -191,15 +191,26 @@ def _trigger_base_resume_sync(consultant_id: int, include_experience: bool = Fal
                 _base_sync_dirty.discard(cid)
                 with_exp = cid in _base_sync_with_experience
                 _base_sync_with_experience.discard(cid)
+                # sync_base_resume_text() stages the new text and then schedules
+                # the DOCX rebuild/upload through a BackgroundTasks object. We are
+                # already in a background job (no request, so no FastAPI-provided
+                # one), so hand it our own and run it ourselves AFTER the commit
+                # below. Without this it took its "no BackgroundTasks" fallback:
+                # a warning on every save plus a second, separate task that was
+                # not ordered after this commit.
+                post_commit_tasks = BackgroundTasks()
                 async with AsyncSessionLocal() as bg_session:
                     c = (await bg_session.execute(
                         select(Consultant).where(Consultant.id == cid)
                     )).scalars().first()
                     if c:
-                        await sync_base_resume_text(bg_session, c)
+                        await sync_base_resume_text(bg_session, c, None, post_commit_tasks)
                         if with_exp:
                             await _sync_experience_into_resume_info(bg_session, c)
                         await bg_session.commit()
+                # DB session is released first so the (slow) DOCX build / S3 upload
+                # doesn't hold a pooled connection.
+                await post_commit_tasks()
                 if cid not in _base_sync_dirty:
                     break
         except Exception as e:
@@ -1538,14 +1549,49 @@ async def _profile_version(db: AsyncSession, consultant: Consultant) -> str:
     return f"{newest.isoformat() if newest else '0'}|{exp_count}"
 
 
+async def _profile_version_fast(db: AsyncSession, consultant_filter) -> Optional[str]:
+    """Same marker string as _profile_version(), computed in ONE narrow query
+    (no full Consultant row load, no separate User / experience round-trips).
+    Returns None when no consultant matches the filter (caller raises 404)."""
+    exp_max_sq = (
+        select(func.max(ConsultantExperience.updated_at))
+        .where(ConsultantExperience.consultant_id == Consultant.id)
+        .correlate(Consultant)
+        .scalar_subquery()
+    )
+    exp_count_sq = (
+        select(func.count())
+        .select_from(ConsultantExperience)
+        .where(ConsultantExperience.consultant_id == Consultant.id)
+        .correlate(Consultant)
+        .scalar_subquery()
+    )
+    row = (await db.execute(
+        select(Consultant.updated_at, User.updated_at, exp_max_sq, exp_count_sq)
+        .select_from(Consultant)
+        .outerjoin(User, User.id == Consultant.user_id)
+        .where(consultant_filter)
+        .limit(1)
+    )).first()
+    if row is None:
+        return None
+    cons_updated, user_updated, exp_max, exp_count = row
+    newest = max((p for p in (cons_updated, user_updated, exp_max) if p is not None), default=None)
+    return f"{newest.isoformat() if newest else '0'}|{exp_count}"
+
+
 @router.get("/api/consultant/profile/version", summary="Change marker for own profile")
 async def get_own_profile_version(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "CONSULTANT")
-    consultant = await _get_consultant_for_user(db, current_user)
-    return {"version": await _profile_version(db, consultant)}
+    # PERF: one narrow query instead of loading the full Consultant row
+    # (incl. large text columns) + 2 more queries on every 3s poll.
+    version = await _profile_version_fast(db, Consultant.user_id == current_user.id)
+    if version is None:
+        raise HTTPException(status_code=404, detail="Consultant profile not found for this user")
+    return {"version": version}
 
 
 @router.get("/api/consultants/{consultant_id}/version", summary="Change marker for a consultant profile")
@@ -1557,8 +1603,10 @@ async def get_consultant_profile_version(
     _require_role(current_user, "ADMIN", "RECRUITER")
     if current_user.role == "RECRUITER":
         await _assert_recruiter_mapped(db, current_user.id, consultant_id)
-    consultant = await _get_consultant_or_404(db, consultant_id)
-    return {"version": await _profile_version(db, consultant)}
+    version = await _profile_version_fast(db, Consultant.id == consultant_id)
+    if version is None:
+        raise HTTPException(status_code=404, detail="Consultant not found")
+    return {"version": version}
 
 
 @router.get(
@@ -1983,7 +2031,8 @@ async def admin_create_consultant(
             **(payload.resume_info or {}),
         },
     )
-    _set_password_on_user(user, _hash_password(temp_password))
+    # PERF: bcrypt hashing in a worker thread so it doesn't block the event loop.
+    _set_password_on_user(user, await asyncio.to_thread(_hash_password, temp_password))
     db.add(user)
     await db.flush()  # populate user.id before creating the linked Consultant row
 
@@ -2126,7 +2175,9 @@ async def upload_resume(
         _delete_file_if_exists(consultant.base_resume_file_path)
 
     # Store file
-    file_path = _save_resume_file(file_bytes, consultant.id, file.filename or "resume", content_type)
+    file_path = await asyncio.to_thread(
+        _save_resume_file, file_bytes, consultant.id, file.filename or "resume", content_type
+    )
 
     # Extract text (best-effort — never fail the upload)
     extracted_text = _extract_resume_text(file_bytes, content_type)

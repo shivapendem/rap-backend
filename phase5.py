@@ -1493,7 +1493,7 @@ async def apply_to_requirement(
                 body_bytes = f.read()
         else:
             from s3_service import download_file_from_s3
-            body_bytes, _ = download_file_from_s3(resume_source_path)
+            body_bytes, _ = await asyncio.to_thread(download_file_from_s3, resume_source_path)
 
         if body_bytes:
             safe_name = "".join(

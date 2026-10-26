@@ -1970,7 +1970,7 @@ async def download_resume(
 
     if file_path and not Path(file_path).exists():
         from s3_service import download_file_from_s3
-        body, content_type = download_file_from_s3(file_path)
+        body, content_type = await asyncio.to_thread(download_file_from_s3, file_path)
         if body:
             from fastapi.responses import Response
             return Response(
