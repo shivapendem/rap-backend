@@ -208,6 +208,10 @@ def _normalize_ws_col(col):
     )
 
 
+# Pending / Rejected / Not Eligible tabs only list matches from the last N days.
+PENDING_WINDOW_DAYS = 4
+
+
 @router.get("/pending")
 async def get_pending_matches(
     db: AsyncSession = Depends(get_db),
@@ -275,6 +279,8 @@ async def get_pending_matches(
         Application.status == "SENT",
     )
 
+    pending_cutoff = datetime.now(timezone.utc) - timedelta(days=PENDING_WINDOW_DAYS)
+
     def _base_stmt(select_clause):
         stmt = (
             select_clause
@@ -289,6 +295,9 @@ async def get_pending_matches(
         if not show_all_statuses:
             if target_status in ("MATCHING", "NOT_ELIGIBLE"):
                 stmt = stmt.where(RequirementConsultantMatch.status == target_status, ~applied_exists)
+                # Pending and Not Eligible show only matches from the last
+                # PENDING_WINDOW_DAYS days (older ones are hidden, not deleted).
+                stmt = stmt.where(RequirementConsultantMatch.created_at >= pending_cutoff)
             elif target_status == "APPLIED":
                 stmt = stmt.where(or_(
                     RequirementConsultantMatch.status == "APPLIED",
@@ -296,6 +305,10 @@ async def get_pending_matches(
                 ))
             else:
                 stmt = stmt.where(RequirementConsultantMatch.status == target_status)
+                # Rejected: last PENDING_WINDOW_DAYS days by the date shown on the
+                # card ("Rejected on" = updated_at, falling back to created_at).
+                if target_status == "REJECTED":
+                    stmt = stmt.where(func.coalesce(RequirementConsultantMatch.updated_at, RequirementConsultantMatch.created_at) >= pending_cutoff)
         if consultant_id:
             c_ids = [int(cid.strip()) for cid in consultant_id.split(',') if cid.strip().isdigit()][:100]
             if c_ids:

@@ -1857,6 +1857,13 @@ async def match_requirement(db: AsyncSession, requirement_id: int) -> int:
     return match_count
 
 
+# PERF: a consultant re-match (profile / experience / admin edit) only scores
+# requirements received in the last N days — same window Pending Applications
+# shows. Was every open requirement (44,000+), which took several seconds and
+# slowed the whole backend while it ran.
+REMATCH_WINDOW_DAYS = 4
+
+
 async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
     """
     Inverse of match_requirement: score ONE consultant against all
@@ -1900,7 +1907,10 @@ async def match_consultant(db: AsyncSession, consultant_id: int) -> int:
             (RequirementConsultantMatch.requirement_id == Requirement.id)
             & (RequirementConsultantMatch.consultant_id == consultant_id),
         )
-        .where(Requirement.status.notin_(Requirement.TERMINAL_STATUSES))
+        .where(
+            Requirement.status.notin_(Requirement.TERMINAL_STATUSES),
+            Requirement.received_date >= datetime.now(timezone.utc) - timedelta(days=REMATCH_WINDOW_DAYS),
+        )
     )
     lightweight_rows = lightweight_result.all()
     if not lightweight_rows:
