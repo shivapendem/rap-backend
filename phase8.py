@@ -383,10 +383,13 @@ async def list_audit_logs(
     _: dict = Depends(require_admin),
 ):
     filters = []
-    if action:
-        filters.append(AuditLog.action == action)
-    if entity_type:
-        filters.append(AuditLog.entity_type == entity_type)
+    # Multi-select: comma-separated, e.g. action=USER_UPDATED,USER_CREATED
+    action_list = [a.strip() for a in (action or "").split(",") if a.strip()]
+    entity_list = [e.strip() for e in (entity_type or "").split(",") if e.strip()]
+    if action_list:
+        filters.append(AuditLog.action.in_(action_list))
+    if entity_list:
+        filters.append(AuditLog.entity_type.in_(entity_list))
     if date_from:
         # BUG FIX: date_to below appends "T23:59:59+00:00" so the compared
         # value is tz-aware, matching AuditLog.created_at's tz-aware

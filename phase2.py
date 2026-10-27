@@ -727,7 +727,10 @@ async def get_gmail_emails(
     page_size = max(1, min(page_size, 200))
 
     _ALLOWED_STATUS_DESC = {"Parsed", "Parsed - Dup", "Parsed - NR", "Pending", "Failed"}
-    if status_desc and status_desc not in _ALLOWED_STATUS_DESC:
+    # Multi-select: comma-separated, e.g. "Parsed,Pending"
+    status_list = [s.strip() for s in (status_desc or "").split(",") if s.strip()]
+    bad = [s for s in status_list if s not in _ALLOWED_STATUS_DESC]
+    if bad:
         raise HTTPException(
             status_code=422,
             detail=f"status_desc must be one of: {sorted(_ALLOWED_STATUS_DESC)}",
@@ -746,7 +749,7 @@ async def get_gmail_emails(
     if processed is not None:
         where_clauses.append("processed = :processed")
         params["processed"] = processed
-    if status_desc:
+    if status_list:
         # Mirrors the page's emailStatusLabel(): a Pending/NULL row whose
         # email is already processed or has a Requirement displays as Parsed.
         _done = (
@@ -754,13 +757,16 @@ async def get_gmail_emails(
             " OR EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id))"
         )
         _open = "(ge.status_desc IS NULL OR ge.status_desc = 'Pending')"
-        if status_desc == "Parsed":
-            where_clauses.append(f"(ge.status_desc = 'Parsed' OR ({_open} AND {_done}))")
-        elif status_desc == "Pending":
-            where_clauses.append(f"({_open} AND NOT {_done})")
-        else:
-            where_clauses.append("ge.status_desc = :status_desc")
-            params["status_desc"] = status_desc
+        status_parts = []
+        for i, st in enumerate(status_list):
+            if st == "Parsed":
+                status_parts.append(f"(ge.status_desc = 'Parsed' OR ({_open} AND {_done}))")
+            elif st == "Pending":
+                status_parts.append(f"({_open} AND NOT {_done})")
+            else:
+                status_parts.append(f"ge.status_desc = :status_desc_{i}")
+                params[f"status_desc_{i}"] = st
+        where_clauses.append("(" + " OR ".join(status_parts) + ")")
     _apply_gmail_search(where_clauses, params, search, search_body)
     if date_from:
         where_clauses.append("date >= :date_from")
