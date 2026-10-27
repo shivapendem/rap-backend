@@ -593,6 +593,13 @@ class UserService:
             }},
         )
         await db.commit()
+        # BUG FIX ("Failed to update user" toast although the edit WAS saved):
+        # the commit's flush runs an UPDATE whose updated_at is set by the
+        # database (onupdate=func.now()), which expires that attribute on
+        # `user`. _user_to_dto then read it lazily outside the async greenlet
+        # -> MissingGreenlet -> 500, even though the data was already saved.
+        # Reload the row here, inside the async session, before building the DTO.
+        await db.refresh(user)
         if _bg_consultant_id is not None:
             _after_consultant_save(_bg_consultant_id, _bg_rematch)
         return _user_to_dto(user)
