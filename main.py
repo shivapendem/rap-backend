@@ -17,7 +17,7 @@ if sys.platform.startswith("win"):
 
 from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import or_, func, update
+from sqlalchemy import or_, and_, func, update
 from pydantic import BaseModel, EmailStr, field_validator, Field
 # Direct Number / Extension -> "+1 (469) 392-4030"; see contact_format.py
 from contact_format import phone_for_storage, extension_for_storage
@@ -120,6 +120,23 @@ class GoogleLoginRequest(BaseModel):
         return v
 
 
+class MatchedConsultantDetail(BaseModel):
+    """One consultant matched to a requirement — powers the Matched card
+    and side panel on the admin/recruiter Requirements page."""
+    consultant_id: int
+    name: str
+    role: Optional[str] = None
+    location: Optional[str] = None
+    experience: Optional[str] = None
+    work_mode: Optional[str] = None
+    availability: Optional[str] = None
+    # JD skills the consultant has ÷ total JD skills, 0-100.
+    percent: int = 0
+    matching_skills: List[str] = []
+    missing_skills: List[str] = []
+    applied: bool = False
+
+
 class RequirementResponse(BaseModel):
     model_config = {"from_attributes": True}
     id: int
@@ -145,6 +162,9 @@ class RequirementResponse(BaseModel):
     # left empty for CONSULTANT (not relevant/exposed on this shared
     # admin-style endpoint for that role).
     matched_consultants: List[str] = []
+    # Same consultants with match percentage + matching/missing JD skills
+    # (best match first).
+    matched_details: List[MatchedConsultantDetail] = []
     # Names of matched consultants who ALSO have a real SENT application
     # for this requirement — the frontend highlights these within
     # matched_consultants. Previously never populated by this endpoint at
@@ -999,16 +1019,21 @@ async def get_requirements(
     if sort_dir not in ("asc", "desc"):
         raise HTTPException(status_code=422, detail="sort_dir must be 'asc' or 'desc'")
 
-    # Validate status value
-    if status and status not in Requirement.VALID_STATUSES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"status must be one of: {sorted(Requirement.VALID_STATUSES)}",
-        )
+    # Validate status value. Accepts one status or a comma-separated list
+    # (the Requirements page's Status filter is multi-select).
+    status_list = [x.strip() for x in status.split(",") if x.strip()] if status else []
+    for _st in status_list:
+        if _st not in Requirement.VALID_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status must be one of: {sorted(Requirement.VALID_STATUSES)}",
+            )
 
     query = select(Requirement)
-    if status:
-        query = query.where(Requirement.status == status)
+    if len(status_list) == 1:
+        query = query.where(Requirement.status == status_list[0])
+    elif status_list:
+        query = query.where(Requirement.status.in_(status_list))
     # Consultants only ever see requirements matched to THEM — all matches,
     # no time window (the Date filter narrows by received date). Enforced
     # here, not just hidden in the UI. MATCHING + APPLIED only (rejected /
@@ -1094,19 +1119,41 @@ async def get_requirements(
     # unrecognized query params rather than erroring, so both filters were
     # completely non-functional: picking "Low confidence" or an employment
     # type and clicking Apply returned the exact same unfiltered list.
-    if confidence_filter == "low":
-        query = query.where(Requirement.parse_confidence < 0.5)
+    # confidence_filter: "low" (< 0.5, the original value) or a comma-separated
+    # mix of low / medium (0.5 to < 0.8) / high (>= 0.8) — multi-select.
+    if confidence_filter:
+        _conf = {x.strip().lower() for x in confidence_filter.split(",") if x.strip()}
+        _conf_clauses = []
+        if "low" in _conf:
+            _conf_clauses.append(Requirement.parse_confidence < 0.5)
+        if "medium" in _conf:
+            _conf_clauses.append(and_(Requirement.parse_confidence >= 0.5, Requirement.parse_confidence < 0.8))
+        if "high" in _conf:
+            _conf_clauses.append(Requirement.parse_confidence >= 0.8)
+        if _conf_clauses:
+            query = query.where(or_(*_conf_clauses))
 
+    # work_mode: one value or a comma-separated list (multi-select).
     if work_mode:
-        wm = work_mode.strip().upper().replace("-", "").replace(" ", "")
-        if wm in ("REMOTE", "HYBRID", "ONSITE"):
+        _wms = []
+        for _w in work_mode.split(","):
+            _n = _w.strip().upper().replace("-", "").replace(" ", "")
+            if _n in ("REMOTE", "HYBRID", "ONSITE"):
+                _wms.append(_n)
+        if _wms:
             query = query.where(
-                func.upper(func.replace(func.replace(Requirement.work_mode, "-", ""), " ", "")) == wm
+                func.upper(func.replace(func.replace(Requirement.work_mode, "-", ""), " ", "")).in_(_wms)
             )
 
+    # employment_type: one value or a comma-separated list (multi-select).
     if employment_type:
-        raw_types = _normalize_employment_type_filter(employment_type)
-        if DATABASE_URL.startswith("postgresql"):
+        raw_types = []
+        for _e in employment_type.split(","):
+            if _e.strip():
+                for _t in _normalize_employment_type_filter(_e.strip()):
+                    if _t not in raw_types:
+                        raw_types.append(_t)
+        if raw_types and DATABASE_URL.startswith("postgresql"):
             if len(raw_types) == 1:
                 query = query.where(Requirement.employment_types.any(raw_types[0]))
             else:
@@ -1185,7 +1232,7 @@ async def get_requirements(
     if current_user.role in ("RECRUITER", "ADMIN") and reqs:
         req_ids = [r.id for r in reqs]
         matches_q = (
-            select(RequirementConsultantMatch.requirement_id, Consultant.full_name)
+            select(RequirementConsultantMatch.requirement_id, Consultant.full_name, RequirementConsultantMatch, Consultant)
             .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
             .where(
                 RequirementConsultantMatch.requirement_id.in_(req_ids),
@@ -1217,8 +1264,29 @@ async def get_requirements(
             matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids))
 
         matches_by_req: dict[int, list[str]] = {}
-        for req_id, name in (await db.execute(matches_q)).all():
+        details_by_req: dict[int, list[dict]] = {}
+        for req_id, name, m, c in (await db.execute(matches_q)).all():
             matches_by_req.setdefault(req_id, []).append(name)
+            have = [x for x in (m.matched_skills or []) if x]
+            lack = [x for x in (m.missing_skills or []) if x]
+            total_jd = len(have) + len(lack)
+            percent = round(len(have) * 100 / total_jd) if total_jd else int(round(float(m.match_score or 0)))
+            first_role = (c.preferred_roles or "").split(",")[0].strip() or None
+            exp = c.total_experience_years
+            details_by_req.setdefault(req_id, []).append({
+                "consultant_id": c.id,
+                "name": name or "Unknown",
+                "role": first_role,
+                "location": c.current_location,
+                "experience": (f"{float(exp):g} yrs" if exp is not None else None),
+                "work_mode": c.preferred_locations,
+                "availability": c.availability_status,
+                "percent": max(0, min(100, percent)),
+                "matching_skills": have,
+                "missing_skills": lack,
+            })
+        for lst in details_by_req.values():
+            lst.sort(key=lambda d: -d["percent"])
 
         for r in reqs:
             # matched_consultants is what's actually shown (the "Matched
@@ -1226,6 +1294,7 @@ async def get_requirements(
             # column that got removed as redundant; nothing reads it
             # anymore.
             r.matched_consultants = matches_by_req.get(r.id, [])
+            r.matched_details = details_by_req.get(r.id, [])
 
         # Which of those matched consultants already have a real SENT
         # application for this requirement — powers the "highlight
@@ -1249,6 +1318,10 @@ async def get_requirements(
 
         for r in reqs:
             r.submitted_consultants = submitted_by_req.get(r.id, [])
+            applied_names = set(r.submitted_consultants)
+            r.matched_details = [
+                {**d, "applied": d["name"] in applied_names} for d in (r.matched_details or [])
+            ]
 
     # For a CONSULTANT viewing their own Requirements page, tell them
     # which of these requirements they've already sent an application
