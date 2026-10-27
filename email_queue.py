@@ -1450,6 +1450,18 @@ async def update_email_queue_status(
             detail=f"status must be one of: {sorted(valid_statuses)}"
         )
 
+    # BUG FIX: a consultant could PATCH their own queued email straight to
+    # SENT, which made the requirement show APPLIED (and the application
+    # count go up) although nothing was ever sent. SENT / FAILED are results
+    # of an actual send attempt, so only the send worker (which writes them
+    # directly) and admin/recruiter accounts may set them; a consultant may
+    # still put an item back to QUEUED.
+    if current_user.role == "CONSULTANT" and body.status in ("SENT", "FAILED"):
+        raise HTTPException(
+            status_code=403,
+            detail="Consultants cannot set an email to SENT or FAILED; status is set automatically when the email is sent.",
+        )
+
     item.status = body.status
     await db.commit()
     return {"success": True, "id": str(item.id), "status": item.status}
