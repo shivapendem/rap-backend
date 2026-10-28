@@ -27,7 +27,7 @@ from sqlalchemy import select, func, and_, or_, text
 from sqlalchemy.future import select as fselect
 
 from database import get_db
-from auth import decode_access_token
+from auth import decode_access_token, get_current_user
 from models import (
     Application,
     AuditLog,
@@ -66,24 +66,31 @@ from fastapi.security import OAuth2PasswordBearer
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 
-async def require_admin(request: Request, token: Optional[str] = Depends(oauth2_scheme)) -> dict:
+async def require_admin(
+    request: Request,
+    token: Optional[str] = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """
-    Accepts only Bearer token from the Authorization header.
-    Returns the decoded JWT payload as a dict: {"sub": email, "role": ...}.
+    Accepts only a Bearer token from the Authorization header.
+
+    SECURITY FIX: this used to trust the "role" claim inside the JWT alone,
+    so a demoted, deactivated or even deleted admin kept full admin access
+    until their token expired (24h) — and could create new admins with it.
+    The role is now re-read from the database on every request through
+    get_current_user (the same check every other router uses), which also
+    rejects deactivated users and inactive consultants.
+
+    Still returns {"sub": email, "role": ...} so every endpoint that reads
+    current_user.get("sub") / .get("role") keeps working unchanged.
     """
-    if not token:
-        # Fallback to check header manually in case Swagger/OAuth2PasswordBearer doesn't catch it
-        auth_header = request.headers.get("authorization")
-        if auth_header and auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    payload = decode_access_token(token)
-    if payload.get("role") != "ADMIN":
+    # get_current_user reads the Authorization header itself and raises 401
+    # ("Not authenticated" / "Invalid token" / "Session expired" /
+    # "User not found or inactive") exactly like the rest of the API.
+    user = await get_current_user(request, db)
+    if user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Admin access required")
-    return payload
+    return {"sub": user.email, "role": user.role}
 
 
 # ---------------------------------------------------------------------------
@@ -383,10 +390,13 @@ async def list_audit_logs(
     _: dict = Depends(require_admin),
 ):
     filters = []
-    if action:
-        filters.append(AuditLog.action == action)
-    if entity_type:
-        filters.append(AuditLog.entity_type == entity_type)
+    # Multi-select: comma-separated, e.g. action=USER_UPDATED,USER_CREATED
+    action_list = [a.strip() for a in (action or "").split(",") if a.strip()]
+    entity_list = [e.strip() for e in (entity_type or "").split(",") if e.strip()]
+    if action_list:
+        filters.append(AuditLog.action.in_(action_list))
+    if entity_list:
+        filters.append(AuditLog.entity_type.in_(entity_list))
     if date_from:
         # BUG FIX: date_to below appends "T23:59:59+00:00" so the compared
         # value is tz-aware, matching AuditLog.created_at's tz-aware
