@@ -2226,6 +2226,36 @@ async def _process_single_email_queue_item_impl(session: AsyncSession, item) -> 
                 if requirement and requirement.status == "NEW":
                     requirement.status = "SUBMITTED"
 
+                # Log APPLICATION_SENT in audit logs for live activity feed
+                try:
+                    from phase8_audit_service import log_action
+                    from models import Consultant, User
+                    cons = (await session.execute(select(Consultant).where(Consultant.id == item.consultant_id))).scalars().first()
+                    cons_name = cons.full_name if cons else "Consultant"
+                    rec_user = (await session.execute(select(User).where(User.id == item.sent_by_user_id))).scalars().first() if item.sent_by_user_id else None
+                    rec_name = rec_user.full_name if rec_user else (rec_user.email if rec_user else "Recruiter")
+                    comp_name = requirement.client or requirement.vendor or "Client" if requirement else "Client"
+                    summary_text = f"{rec_name} submitted {cons_name} profile to {comp_name}"
+                    await log_action(
+                        session,
+                        "APPLICATION_SENT",
+                        actor_user_id=str(item.sent_by_user_id) if item.sent_by_user_id else None,
+                        actor_name=rec_user.email if rec_user else "System Queue",
+                        actor_role="RECRUITER",
+                        entity_type="Application",
+                        entity_id=str(existing_app.id if existing_app else item.id),
+                        metadata={
+                            "consultant_name": cons_name,
+                            "company": comp_name,
+                            "role": requirement.role if requirement else "",
+                            "requirement_id": item.requirement_id,
+                            "consultant_id": item.consultant_id,
+                            "summary": summary_text,
+                        },
+                    )
+                except Exception as audit_e:
+                    logger.warning(f"[email_queue] Could not log audit action: {audit_e}")
+
             await reschedule_remaining_queued_emails(session, item.from_email, now)
             await session.commit()
         finally:

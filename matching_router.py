@@ -335,7 +335,6 @@ async def get_pending_matches(
     count_stmt = _base_stmt(select(func.count()).select_from(RequirementConsultantMatch))
     total_count = (await db.execute(count_stmt)).scalar_one()
 
-    _RCM_ALL = aliased(RequirementConsultantMatch)
     stmt = _base_stmt(select(
         RequirementConsultantMatch.id,
         RequirementConsultantMatch.requirement_id,
@@ -353,20 +352,6 @@ async def get_pending_matches(
         RequirementConsultantMatch.resume_status,
         RequirementConsultantMatch.created_at,
         RequirementConsultantMatch.updated_at,
-        # Counts for the "N matched" chip and the "N more rejected" footer.
-        select(func.count(_RCM_ALL.id))
-        .where(_RCM_ALL.requirement_id == RequirementConsultantMatch.requirement_id)
-        .correlate(RequirementConsultantMatch)
-        .scalar_subquery()
-        .label("requirement_match_total"),
-        select(func.count(_RCM_ALL.id))
-        .where(
-            _RCM_ALL.requirement_id == RequirementConsultantMatch.requirement_id,
-            _RCM_ALL.status == "REJECTED",
-        )
-        .correlate(RequirementConsultantMatch)
-        .scalar_subquery()
-        .label("requirement_rejected_total"),
         applied_exists.label("has_sent_application"),
     ))
     # Same reasoning as before: order by match quality first, not by when
@@ -387,6 +372,29 @@ async def get_pending_matches(
 
     result = await db.execute(stmt)
     rows = result.mappings().all()
+
+    # PERF: Batch-load the "N matched" and "N more rejected" counts for the
+    # current page's unique requirements in one quick grouped query, rather
+    # than running 2 correlated subqueries per row.
+    req_ids = list({row["requirement_id"] for row in rows if row["requirement_id"]})
+    match_totals: dict[int, int] = {}
+    rejected_totals: dict[int, int] = {}
+    if req_ids:
+        counts_stmt = (
+            select(
+                RequirementConsultantMatch.requirement_id,
+                func.count(RequirementConsultantMatch.id).label("match_total"),
+                func.count(RequirementConsultantMatch.id)
+                .filter(RequirementConsultantMatch.status == "REJECTED")
+                .label("rejected_total"),
+            )
+            .where(RequirementConsultantMatch.requirement_id.in_(req_ids))
+            .group_by(RequirementConsultantMatch.requirement_id)
+        )
+        counts_res = await db.execute(counts_stmt)
+        for c_row in counts_res.all():
+            match_totals[c_row.requirement_id] = c_row.match_total
+            rejected_totals[c_row.requirement_id] = c_row.rejected_total
 
     output = [
         {
@@ -410,8 +418,8 @@ async def get_pending_matches(
             "resume_status": row["resume_status"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
-            "requirement_match_total": row["requirement_match_total"],
-            "requirement_rejected_total": row["requirement_rejected_total"],
+            "requirement_match_total": match_totals.get(row["requirement_id"], 0),
+            "requirement_rejected_total": rejected_totals.get(row["requirement_id"], 0),
         }
         for row in rows
     ]

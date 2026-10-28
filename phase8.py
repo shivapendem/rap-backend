@@ -1507,9 +1507,22 @@ async def email_intake_chart(
     # 7 days including today (today and 6 previous days)
     start_date = today - timedelta(days=6)
     
-    # Fetch rows using raw SQL since the model might not map completely
+    # Aggregate directly in SQL by CST day instead of transferring tens of thousands of rows
     res = await db.execute(
-        text("SELECT status_desc, processed, EXISTS(SELECT 1 FROM requirements r WHERE r.raw_email_id = gmail_emails.id) AS has_requirement, fetched_at, date FROM gmail_emails WHERE COALESCE(fetched_at, date) >= :start"),
+        text("""
+            SELECT 
+                to_char(COALESCE(fetched_at, date) AT TIME ZONE 'America/Chicago', 'YYYY-MM-DD') AS day_key,
+                COUNT(*) FILTER (WHERE status_desc = 'Parsed') AS parsed,
+                COUNT(*) FILTER (WHERE status_desc = 'Parsed - NR') AS parsed_nr,
+                COUNT(*) FILTER (WHERE status_desc = 'Parsed - Dup') AS parsed_dup,
+                COUNT(*) FILTER (WHERE status_desc = 'Failed') AS failed,
+                COUNT(*) FILTER (WHERE status_desc = 'Pending') AS pending,
+                COUNT(*) FILTER (WHERE status_desc IS NULL AND processed = true) AS fallback_parsed,
+                COUNT(*) FILTER (WHERE status_desc IS NULL AND (processed IS NULL OR processed = false)) AS fallback_pending
+            FROM gmail_emails
+            WHERE COALESCE(fetched_at, date) >= :start
+            GROUP BY 1
+        """),
         {"start": start_date.astimezone(zoneinfo.ZoneInfo("UTC"))}
     )
     rows = res.mappings().all()
@@ -1522,32 +1535,16 @@ async def email_intake_chart(
         )
     
     for row in rows:
-        dt = row.get("fetched_at") or row.get("date")
-        if not dt:
-            continue
-            
-        cst_dt = dt.astimezone(tz)
-        day_key = cst_dt.strftime("%Y-%m-%d")
+        day_key = row.get("day_key")
         if day_key not in days:
             continue
             
         bucket = days[day_key]
-        
-        status_desc = row.get("status_desc")
-        if status_desc == "Parsed":
-            bucket.Parsed += 1
-        elif status_desc == "Parsed - NR":
-            bucket.Parsed_NR += 1
-        elif status_desc == "Parsed - Dup":
-            bucket.Parsed_Dup += 1
-        elif status_desc == "Failed":
-            bucket.Failed += 1
-        elif status_desc == "Pending":
-            bucket.Pending += 1
-        elif row.get("processed") is True or row.get("has_requirement") is True:
-            bucket.Parsed += 1
-        else:
-            bucket.Pending += 1
+        bucket.Parsed = int(row.get("parsed") or 0) + int(row.get("fallback_parsed") or 0)
+        bucket.Parsed_NR = int(row.get("parsed_nr") or 0)
+        bucket.Parsed_Dup = int(row.get("parsed_dup") or 0)
+        bucket.Failed = int(row.get("failed") or 0)
+        bucket.Pending = int(row.get("pending") or 0) + int(row.get("fallback_pending") or 0)
 
     return list(days.values())
 

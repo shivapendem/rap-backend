@@ -61,5 +61,15 @@ async def log_action(
 
 
 def build_metadata_preview(metadata: dict) -> str:
-    raw = json.dumps(metadata or {})
-    return raw[:60] + "..." if len(raw) > 60 else raw
+    if not metadata or not isinstance(metadata, dict):
+        return ""
+    if "summary" in metadata:
+        return str(metadata["summary"])
+    if "description" in metadata:
+        return str(metadata["description"])
+    if "new_status" in metadata:
+        return f"Status changed to {metadata.get('new_status')}"
+    if "role" in metadata and "email" in metadata:
+        return f"Role: {metadata.get('role')}, Email: {metadata.get('email')}"
+    raw = json.dumps(metadata)
+    return raw[:100] + "..." if len(raw) > 100 else raw

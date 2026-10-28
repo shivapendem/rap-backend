@@ -119,24 +119,31 @@ async def get_requirement_stats(
 
     result = await db.execute(
         select(
-            func.count(Requirement.id).label("total"),
-            func.sum(case((Requirement.status == "NEW", 1), else_=0)).label("new"),
-            func.sum(case((Requirement.status == "REVIEWING", 1), else_=0)).label("reviewing"),
-            func.sum(case((Requirement.status == "SUBMITTED", 1), else_=0)).label("submitted"),
-            func.sum(case((Requirement.status == "INTERVIEWING", 1), else_=0)).label("interviewing"),
-            func.sum(case((Requirement.status == "CLOSED", 1), else_=0)).label("closed"),
-            func.sum(case((Requirement.status == "REJECTED", 1), else_=0)).label("rejected"),
+            func.sum(text("c")).label("total"),
+            func.sum(text("c")).filter(text("status = 'NEW'")).label("new"),
+            func.sum(text("c")).filter(text("status = 'REVIEWING'")).label("reviewing"),
+            func.sum(text("c")).filter(text("status = 'SUBMITTED'")).label("submitted"),
+            func.sum(text("c")).filter(text("status = 'INTERVIEWING'")).label("interviewing"),
+            func.sum(text("c")).filter(text("status = 'CLOSED'")).label("closed"),
+            func.sum(text("c")).filter(text("status = 'REJECTED'")).label("rejected"),
+        ).select_from(
+            select(
+                Requirement.status,
+                func.count(Requirement.id).label("c"),
+            )
+            .group_by(Requirement.status)
+            .subquery()
         )
     )
     row = result.first()
     return RequirementStatsResponse(
-        total=row.total or 0,
-        new=row.new or 0,
-        reviewing=row.reviewing or 0,
-        submitted=row.submitted or 0,
-        interviewing=row.interviewing or 0,
-        closed=row.closed or 0,
-        rejected=row.rejected or 0,
+        total=int(row.total or 0),
+        new=int(row.new or 0),
+        reviewing=int(row.reviewing or 0),
+        submitted=int(row.submitted or 0),
+        interviewing=int(row.interviewing or 0),
+        closed=int(row.closed or 0),
+        rejected=int(row.rejected or 0),
     )
 
 
@@ -669,6 +676,24 @@ async def get_gmail_email_status_counts(
     params: dict = {}
     _apply_gmail_search(where_clauses, params, search, search_body)
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    if not where_sql:
+        # Fast path using the ix_gmail_emails_status_desc B-tree index
+        rows = (await db.execute(text("""
+            SELECT status_desc, COUNT(*) AS cnt
+            FROM gmail_emails
+            GROUP BY status_desc
+        """))).mappings().all()
+        counts = {r["status_desc"]: int(r["cnt"]) for r in rows}
+        total = sum(counts.values())
+        return {
+            "": total,
+            "Parsed": counts.get("Parsed", 0),
+            "Parsed - Dup": counts.get("Parsed - Dup", 0),
+            "Parsed - NR": counts.get("Parsed - NR", 0),
+            "Pending": counts.get("Pending", 0),
+            "Failed": counts.get("Failed", 0),
+        }
+
     row = (await db.execute(text(f"""
         SELECT
             COUNT(*) AS all_count,

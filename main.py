@@ -569,6 +569,23 @@ async def login(
         body=f"Successful login recorded at {datetime.now(_APP_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')}."
     )
     db.add(new_notif)
+
+    # Log USER_LOGIN in audit logs for live activity feed
+    try:
+        from phase8_audit_service import log_action
+        await log_action(
+            db,
+            "USER_LOGIN",
+            actor_user_id=str(user.id),
+            actor_name=user.email,
+            actor_role=user.role or "USER",
+            entity_type="User",
+            entity_id=str(user.id),
+            metadata={"full_name": user.full_name, "email": user.email, "role": user.role},
+        )
+    except Exception as e:
+        logger.warning(f"[login-audit] FAILED: {e}")
+
     await db.commit()
 
     # Consultant logged back in: refresh their saved Gmail token (if any) so

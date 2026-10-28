@@ -30,7 +30,7 @@ from phase_users_schema import (
 # Mapping helpers
 # ---------------------------------------------------------------------------
 
-def _user_to_dto(u: User) -> UserAdminRowDTO:
+def _user_to_dto(u: User, *, include_resume_info: bool = True) -> UserAdminRowDTO:
     return UserAdminRowDTO(
         id=str(u.id),
         full_name=u.full_name,
@@ -43,7 +43,7 @@ def _user_to_dto(u: User) -> UserAdminRowDTO:
         skills=u.skills if isinstance(u.skills, list) else None,
         needsto_fetch_mail=bool(u.needsto_fetch_mail),
         experience_years=float(u.experience_years) if u.experience_years is not None else None,
-        resume_info=u.resume_info,
+        resume_info=u.resume_info if include_resume_info else None,
         mobile_number=u.mobile_number,
         extension=u.extension,
         linkedin_url=u.linkedin_url,
@@ -410,13 +410,14 @@ class UserService:
         db: AsyncSession,
         *, page: int, page_size: int, sort_by: str, sort_dir: str,
         search: Optional[str], role: Optional[str], status: Optional[str],
+        include_resume_info: bool = False,
     ) -> PaginatedUsersDTO:
         rows, total = await UserRepository.list_paginated(
             db, page=page, page_size=page_size, sort_by=sort_by, sort_dir=sort_dir,
             search=search, role=role, status=status,
         )
         return PaginatedUsersDTO(
-            data=[_user_to_dto(u) for u in rows],
+            data=[_user_to_dto(u, include_resume_info=include_resume_info) for u in rows],
             total=total, page=page, page_size=page_size,
             total_pages=math.ceil(total / page_size) if total else 1,
         )

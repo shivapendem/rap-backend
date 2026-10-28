@@ -46,6 +46,7 @@ async def list_users(
     status: Optional[str] = Query(None),
     sort_by: str = Query("full_name"),
     sort_dir: str = Query("asc"),
+    include_resume_info: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin),
 ):
@@ -59,6 +60,7 @@ async def list_users(
     return await UserService.list_users(
         db, page=page, page_size=page_size, sort_by=sort_by, sort_dir=sort_dir,
         search=search, role=role, status=status,
+        include_resume_info=include_resume_info,
     )
 
 

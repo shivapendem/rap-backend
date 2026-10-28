@@ -112,7 +112,18 @@ class ConsultantRepository:
 
     @staticmethod
     async def list_all(db: AsyncSession, limit: int = 200) -> List[Consultant]:
-        result = await db.execute(select(Consultant).order_by(Consultant.full_name.asc()).limit(limit))
+        from sqlalchemy.orm import defer
+        result = await db.execute(
+            select(Consultant)
+            .options(
+                defer(Consultant.base_resume_text),
+                defer(Consultant.resume_rich_text),
+                defer(Consultant.base_resume_content),
+                defer(Consultant.base_resume_file_path),
+            )
+            .order_by(Consultant.full_name.asc())
+            .limit(limit)
+        )
         return list(result.scalars().all())
 
     @staticmethod

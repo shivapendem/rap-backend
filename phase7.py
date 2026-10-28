@@ -504,6 +504,33 @@ async def confirm_send(
         await db.commit()
         await db.refresh(application)
 
+        # Log APPLICATION_SENT in audit trail so Recent Activity shows real submissions
+        try:
+            from phase8_audit_service import log_action
+            actor_name = current_user.full_name or current_user.email or "Recruiter"
+            company_name = requirement.client or requirement.vendor or "Client"
+            summary_text = f"{actor_name} submitted {consultant.full_name} profile to {company_name}"
+            await log_action(
+                db,
+                "APPLICATION_SENT",
+                actor_user_id=str(current_user.id),
+                actor_name=current_user.email,
+                actor_role=current_user.role or "RECRUITER",
+                entity_type="Application",
+                entity_id=str(application.id),
+                metadata={
+                    "consultant_name": consultant.full_name,
+                    "company": company_name,
+                    "role": requirement.role,
+                    "requirement_id": requirement.id,
+                    "consultant_id": consultant.id,
+                    "summary": summary_text,
+                },
+            )
+            await db.commit()
+        except Exception as audit_err:
+            logger.warning(f"[phase7] Failed to write audit log for application send: {audit_err}")
+
         return ConfirmSendResponse(
             success=True,
             application_id=application.id,

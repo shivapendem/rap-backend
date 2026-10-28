@@ -1119,3 +1119,785 @@ DELETE FROM requirement_consultant_matches WHERE requirement_id IN (SELECT id FR
 DELETE FROM requirements WHERE raw_email_id IN (SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100);
 UPDATE gmail_emails SET status_desc = 'Pending', category = NULL, reason = NULL, processed = false WHERE id IN (SELECT id FROM gmail_emails ORDER BY id DESC LIMIT 100);
 COMMIT;
+
+-- database_views_and_optimizations.sql
+-- =========================================================================================
+-- RAP Platform Database Views and Performance Optimizations
+-- =========================================================================================
+-- This script contains:
+--   1. Reusable SQL Views replacing complex multi-table joins across endpoints.
+--   2. Targeted B-tree and composite indexes to eliminate full-table scans.
+--
+-- Safe to run multiple times: all view creations use CREATE OR REPLACE VIEW / DROP VIEW IF EXISTS,
+-- and all indexes use CREATE INDEX IF NOT EXISTS.
+-- =========================================================================================
+
+-- -----------------------------------------------------------------------------------------
+-- VIEW 1: v_pending_matches_active
+-- -----------------------------------------------------------------------------------------
+-- Purpose: Consolidates the 4-table join (RequirementConsultantMatch + Requirement +
+--          Consultant + User) and authorization gating used on the Pending Applications page,
+--          Consultant Matched view, and Recruiter Roster matching views.
+--          Includes `has_sent_application` subquery check.
+-- -----------------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_pending_matches_active AS
+SELECT
+    rcm.id,
+    rcm.requirement_id,
+    r.role AS requirement_title,
+    COALESCE(r.client, r.vendor) AS requirement_company,
+    r.vendor_email AS requirement_vendor_email,
+    r.raw_email_id,
+    rcm.consultant_id,
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    rcm.match_score,
+    rcm.score_breakdown,
+    rcm.match_reason,
+    rcm.status,
+    rcm.resume_status,
+    rcm.created_at,
+    rcm.updated_at,
+    c.user_id,
+    EXISTS (
+        SELECT 1 FROM applications a
+        WHERE a.requirement_id = rcm.requirement_id
+          AND a.consultant_id = rcm.consultant_id
+          AND a.status = 'SENT'
+    ) AS has_sent_application
+FROM requirement_consultant_matches rcm
+JOIN requirements r ON rcm.requirement_id = r.id
+JOIN consultants c ON rcm.consultant_id = c.id
+JOIN users u ON u.id = c.user_id
+WHERE c.status = 'ACTIVE'
+  AND u.is_authorized = true;
+
+
+-- -----------------------------------------------------------------------------------------
+-- VIEW 2: v_application_tracker_details
+-- -----------------------------------------------------------------------------------------
+-- Purpose: Consolidates Application, Consultant, Requirement, and Recruiter (User) tables
+--          for recruiter and consultant application tracker pages.
+-- -----------------------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_application_tracker_details;
+CREATE VIEW v_application_tracker_details AS
+SELECT
+    a.id,
+    a.consultant_id,
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    a.requirement_id,
+    r.role AS requirement_title,
+    COALESCE(r.client, r.vendor) AS company_name,
+    r.client,
+    r.vendor,
+    a.recruiter_id,
+    u.full_name AS recruiter_name,
+    u.role AS recruiter_role,
+    a.status,
+    a.vendor_email,
+    a.cc_email,
+    a.email_subject,
+    a.gmail_message_id,
+    a.generated_resume_id,
+    a.resume_attachment_path,
+    (a.generated_resume_id IS NOT NULL OR a.resume_attachment_path IS NOT NULL) AS resume_available,
+    a.sent_at,
+    a.applied_at,
+    a.created_at,
+    a.updated_at,
+    a.error_message
+FROM applications a
+JOIN consultants c ON a.consultant_id = c.id
+JOIN requirements r ON a.requirement_id = r.id
+LEFT JOIN users u ON a.recruiter_id = u.id;
+
+
+-- -----------------------------------------------------------------------------------------
+-- VIEW 3: v_email_queue_details
+-- -----------------------------------------------------------------------------------------
+-- Purpose: Pre-joins EmailQueue with Consultant, Requirement, and Sender User details
+--          to eliminate repetitive outer joins across email queue listings and searches.
+-- -----------------------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_email_queue_details;
+CREATE VIEW v_email_queue_details AS
+SELECT
+    eq.id,
+    eq.consultant_id,
+    c.full_name AS consultant_name,
+    c.email AS consultant_email,
+    eq.requirement_id,
+    r.role AS requirement_title,
+    r.client AS requirement_client,
+    r.vendor AS requirement_vendor,
+    eq.from_email,
+    eq.to_email,
+    eq.cc_email,
+    eq.subject,
+    eq.content,
+    eq.html_content,
+    eq.attachments,
+    eq.status,
+    eq.status_text,
+    eq.sent_by_user_id,
+    u.full_name AS sent_by_name,
+    u.role AS sent_by_role,
+    eq.scheduled_at,
+    eq.created_at,
+    eq.updated_at
+FROM email_queue eq
+LEFT JOIN consultants c ON eq.consultant_id = c.id
+LEFT JOIN requirements r ON eq.requirement_id = r.id
+LEFT JOIN users u ON eq.sent_by_user_id = u.id;
+
+
+-- -----------------------------------------------------------------------------------------
+-- VIEW 4: v_user_reporting_stats
+-- -----------------------------------------------------------------------------------------
+-- Purpose: Aggregates sent applications and email queue submissions grouped per user
+--          for the reporting and admin dashboard overview.
+-- -----------------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_user_reporting_stats AS
+SELECT
+    u.id AS user_id,
+    u.full_name AS user_name,
+    u.role AS user_role,
+    COALESCE(app_counts.applications_sent, 0::bigint) AS applications_sent,
+    COALESCE(eq_counts.emails_sent, 0::bigint) AS emails_sent
+FROM users u
+LEFT JOIN (
+    SELECT applications.recruiter_id, count(*) AS applications_sent
+    FROM applications
+    WHERE applications.status = 'SENT' AND applications.recruiter_id IS NOT NULL
+    GROUP BY applications.recruiter_id
+) app_counts ON u.id = app_counts.recruiter_id
+LEFT JOIN (
+    SELECT email_queue.sent_by_user_id, count(*) AS emails_sent
+    FROM email_queue
+    WHERE email_queue.status = 'SENT' AND email_queue.sent_by_user_id IS NOT NULL
+    GROUP BY email_queue.sent_by_user_id
+) eq_counts ON u.id = eq_counts.sent_by_user_id;
+
+
+-- -----------------------------------------------------------------------------------------
+-- Performance Indexes Supporting the Views and High-Traffic Queries
+-- -----------------------------------------------------------------------------------------
+
+-- 1. Covering composite index on requirement_consultant_matches for requirement lookups
+CREATE INDEX IF NOT EXISTS ix_rcm_req_status_id
+ON requirement_consultant_matches (requirement_id, status, id);
+
+-- 2. Partial index for fast MATCHING lookups per consultant & requirement ordered by creation
+CREATE INDEX IF NOT EXISTS ix_rcm_matching_cons_req_created
+ON requirement_consultant_matches (consultant_id, requirement_id, created_at DESC)
+WHERE status = 'MATCHING';
+
+-- 3. Composite and sorted indexes on applications for instant sent_at pagination
+CREATE INDEX IF NOT EXISTS ix_applications_sent_at_desc
+ON applications (sent_at DESC NULLS LAST);
+
+CREATE INDEX IF NOT EXISTS ix_applications_sent_status
+ON applications (status, sent_at DESC NULLS LAST);
+
+-- 4. Status and ID index on requirements for quick index-only group counts
+CREATE INDEX IF NOT EXISTS ix_requirements_status_id
+ON requirements (status, id);
+
+
+-- 5. Full name index for fast user list ordering
+CREATE INDEX IF NOT EXISTS ix_users_full_name_asc ON users (full_name ASC);
+
+
+-- 6. Reporting time-window indexes
+CREATE INDEX IF NOT EXISTS ix_emails_parse_received ON emails (parse_status, received_at);
+CREATE INDEX IF NOT EXISTS ix_applications_sent_range ON applications (sent_at) WHERE status = 'SENT';
+CREATE INDEX IF NOT EXISTS ix_applications_created_range ON applications (created_at);
+CREATE INDEX IF NOT EXISTS ix_email_queue_created_range ON email_queue (created_at) WHERE status = 'SENT';
+
+-- 7. Notification unread count index
+CREATE INDEX IF NOT EXISTS ix_notifications_user_unread ON notifications (user_id, is_read);
+
+
+
+
+-- Remove all old data
+TRUNCATE TABLE message_templates;
+
+-- Insert 50 generalized templates
+INSERT INTO message_templates (name, content) VALUES
+('Template Variant 1', 'Dear Hiring Manager,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+I have included my resume for your review and would welcome an interview to discuss how my skills can benefit {client}.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 2', 'To the Recruiting Team at {client},
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. My proficiency in {skills} allows me to adapt to new toolsets rapidly, ensuring that I can contribute to your team''s success with minimal ramp-up time. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 3', 'Hi team,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I pride myself on my ability to understand core business requirements and translate them into effective, scalable deliverables.
+
+I have attached my resume for your detailed review. I would welcome the opportunity to discuss how my diverse background and expertise align with your organization’s long-term goals.
+
+Thank you for your time and consideration.
+
+Best regards,
+{name}'),
+('Template Variant 4', 'Hello,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 5', 'Hello {client} Hiring Team,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 6', 'Hi team,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+I am {name}, currently a {working_title} residing in {current_location} (Visa status: {visa}), with a {exp_years}-year background in driving projects from conception to successful deployment. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. I bring a proactive mindset and a dedication to continuous improvement, which I believe are essential for success in this role.
+
+My attached resume provides further details on my background and accomplishments. I would appreciate the chance to discuss this opportunity further.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 7', 'Dear Hiring Manager,
+
+With a strong background in my field, I am eager to apply for the {role} position at {client}.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+I have attached my resume for your detailed review. I would welcome the opportunity to discuss how my diverse background and expertise align with your organization’s long-term goals.
+
+Respectfully,
+{name}'),
+('Template Variant 8', 'To the Recruiting Team at {client},
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Respectfully,
+{name}'),
+('Template Variant 9', 'To the Recruiting Team at {client},
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I bring a proactive mindset and a dedication to continuous improvement, which I believe are essential for success in this role.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Respectfully,
+{name}'),
+('Template Variant 10', 'Dear {client} Team,
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+My attached resume provides further details on my background and accomplishments. I would appreciate the chance to discuss this opportunity further.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 11', 'Hello,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. I leverage my extensive knowledge of {skills} to design and implement innovative solutions that align with organizational strategies. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 12', 'Hi team,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+I have attached my resume for your detailed review. I would welcome the opportunity to discuss how my diverse background and expertise align with your organization’s long-term goals.
+
+Respectfully,
+{name}'),
+('Template Variant 13', 'Hello {client} Hiring Team,
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. I possess comprehensive expertise in {skills}, which has been instrumental in helping previous organizations streamline operations, optimize workflows, and achieve critical project milestones. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+My attached resume provides further details on my background and accomplishments. I would appreciate the chance to discuss this opportunity further.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 14', 'Dear {client} Team,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+Over my {exp_years}-year career as a {working_title}, I have successfully collaborated with diverse teams to overcome hurdles and meet aggressive project goals. I am located in {current_location} and am authorized to work on a {visa}. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I bring a proactive mindset and a dedication to continuous improvement, which I believe are essential for success in this role.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 15', 'Dear {client} Team,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I am confident that my adaptable skill set, strategic mindset, and proactive approach make me a strong fit for your team.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+Thank you for your time and consideration.
+
+Best regards,
+{name}'),
+('Template Variant 16', 'Greetings,
+
+I am submitting my application for the {role} opportunity at {client}.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 17', 'Greetings,
+
+With a strong background in my field, I am eager to apply for the {role} position at {client}.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. I leverage my extensive knowledge of {skills} to design and implement innovative solutions that align with organizational strategies. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thank you for your time and consideration.
+
+Best regards,
+{name}'),
+('Template Variant 18', 'Hello,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. I am confident that my adaptable skill set, strategic mindset, and proactive approach make me a strong fit for your team.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 19', 'Hi team,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. I leverage my extensive knowledge of {skills} to design and implement innovative solutions that align with organizational strategies. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Respectfully,
+{name}'),
+('Template Variant 20', 'Dear {client} Team,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+I have included my resume for your review and would welcome an interview to discuss how my skills can benefit {client}.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 21', 'Greetings,
+
+With a strong background in my field, I am eager to apply for the {role} position at {client}.
+
+I am {name}, currently a {working_title} residing in {current_location} (Visa status: {visa}), with a {exp_years}-year background in driving projects from conception to successful deployment. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+Thank you for your time and consideration.
+
+Best regards,
+{name}'),
+('Template Variant 22', 'Hello {client} Hiring Team,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. My proficiency in {skills} allows me to adapt to new toolsets rapidly, ensuring that I can contribute to your team''s success with minimal ramp-up time. I am confident that my adaptable skill set, strategic mindset, and proactive approach make me a strong fit for your team.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 23', 'Hi team,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. I possess comprehensive expertise in {skills}, which has been instrumental in helping previous organizations streamline operations, optimize workflows, and achieve critical project milestones. I am confident that my adaptable skill set, strategic mindset, and proactive approach make me a strong fit for your team.
+
+I have attached my most up-to-date resume for your consideration. I am excited about the prospect of bringing my unique perspective and extensive industry experience to your organization.
+
+Respectfully,
+{name}'),
+('Template Variant 24', 'Hi team,
+
+With a strong background in my field, I am eager to apply for the {role} position at {client}.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+Respectfully,
+{name}'),
+('Template Variant 25', 'To the Recruiting Team at {client},
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Respectfully,
+{name}'),
+('Template Variant 26', 'Hello,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+I am {name}, currently a {working_title} residing in {current_location} (Visa status: {visa}), with a {exp_years}-year background in driving projects from conception to successful deployment. I possess comprehensive expertise in {skills}, which has been instrumental in helping previous organizations streamline operations, optimize workflows, and achieve critical project milestones. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Respectfully,
+{name}'),
+('Template Variant 27', 'Greetings,
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+Over my {exp_years}-year career as a {working_title}, I have successfully collaborated with diverse teams to overcome hurdles and meet aggressive project goals. I am located in {current_location} and am authorized to work on a {visa}. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 28', 'Hello,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+Over my {exp_years}-year career as a {working_title}, I have successfully collaborated with diverse teams to overcome hurdles and meet aggressive project goals. I am located in {current_location} and am authorized to work on a {visa}. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 29', 'Hi team,
+
+With a strong background in my field, I am eager to apply for the {role} position at {client}.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Respectfully,
+{name}'),
+('Template Variant 30', 'Hello,
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+My attached resume provides further details on my background and accomplishments. I would appreciate the chance to discuss this opportunity further.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 31', 'To the Recruiting Team at {client},
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. I bring a proactive mindset and a dedication to continuous improvement, which I believe are essential for success in this role.
+
+I have attached my resume for your detailed review. I would welcome the opportunity to discuss how my diverse background and expertise align with your organization’s long-term goals.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 32', 'To the Recruiting Team at {client},
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. My proficiency in {skills} allows me to adapt to new toolsets rapidly, ensuring that I can contribute to your team''s success with minimal ramp-up time. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+I have attached my most up-to-date resume for your consideration. I am excited about the prospect of bringing my unique perspective and extensive industry experience to your organization.
+
+Respectfully,
+{name}'),
+('Template Variant 33', 'Dear {client} Team,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. My proficiency in {skills} allows me to adapt to new toolsets rapidly, ensuring that I can contribute to your team''s success with minimal ramp-up time. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+My attached resume provides further details on my background and accomplishments. I would appreciate the chance to discuss this opportunity further.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 34', 'Greetings,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. I leverage my extensive knowledge of {skills} to design and implement innovative solutions that align with organizational strategies. I am confident that my adaptable skill set, strategic mindset, and proactive approach make me a strong fit for your team.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+Thank you for your time and consideration.
+
+Best regards,
+{name}'),
+('Template Variant 35', 'Hi team,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+Over my {exp_years}-year career as a {working_title}, I have successfully collaborated with diverse teams to overcome hurdles and meet aggressive project goals. I am located in {current_location} and am authorized to work on a {visa}. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I am confident that my adaptable skill set, strategic mindset, and proactive approach make me a strong fit for your team.
+
+I have attached my resume for your detailed review. I would welcome the opportunity to discuss how my diverse background and expertise align with your organization’s long-term goals.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 36', 'Hello {client} Hiring Team,
+
+I am writing to express my strong interest in the {role} position at {client}.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. I bring a proactive mindset and a dedication to continuous improvement, which I believe are essential for success in this role.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 37', 'Dear {client} Team,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 38', 'Dear Hiring Manager,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 39', 'Hi team,
+
+Please accept this letter and the attached resume as an expression of my interest in the {role} position.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. I possess comprehensive expertise in {skills}, which has been instrumental in helping previous organizations streamline operations, optimize workflows, and achieve critical project milestones. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+I have attached my most up-to-date resume for your consideration. I am excited about the prospect of bringing my unique perspective and extensive industry experience to your organization.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 40', 'Hi team,
+
+I am reaching out to express my enthusiasm for the {role} role currently available at {client}.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+I have attached my resume for your detailed review. I would welcome the opportunity to discuss how my diverse background and expertise align with your organization’s long-term goals.
+
+Thank you for your time and consideration.
+
+Best regards,
+{name}'),
+('Template Variant 41', 'Hi team,
+
+With a strong background in my field, I am eager to apply for the {role} position at {client}.
+
+My name is {name} and I am currently based in {current_location}, working as a {working_title}. I am fully authorized to work on a {visa} visa. Throughout my {exp_years} years of professional experience, I have consistently focused on delivering high-quality results, adapting quickly to complex project environments, and driving impactful solutions. I leverage my extensive knowledge of {skills} to design and implement innovative solutions that align with organizational strategies. I bring a proactive mindset and a dedication to continuous improvement, which I believe are essential for success in this role.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 42', 'Dear {client} Team,
+
+I am submitting my application for the {role} opportunity at {client}.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. My robust foundation in {skills} has enabled me to successfully collaborate with cross-functional teams, navigate challenging assignments, and continuously exceed performance expectations. I thrive in dynamic, fast-paced settings and am always eager to leverage my diverse skill set to drive innovation and support core objectives.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 43', 'Hi team,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+In my {exp_years} years working as a {working_title}, I have consistently demonstrated a commitment to excellence, clear communication, and a strong analytical mindset. I currently live in {current_location} and my visa status is {visa}. Through my strong command of {skills}, I have been able to bridge the gap between technical requirements and business objectives effectively. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 44', 'Dear Hiring Manager,
+
+I am submitting my application for the {role} opportunity at {client}.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I pride myself on my ability to understand core business requirements and translate them into effective, scalable deliverables.
+
+I have included my resume for your review and would welcome an interview to discuss how my skills can benefit {client}.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 45', 'Hi team,
+
+I am submitting my application for the {role} opportunity at {client}.
+
+As a {working_title} based out of {current_location} with {exp_years} years of hands-on experience, I have developed a strong aptitude for navigating complex challenges. My current work authorization is {visa}. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. My approach to work is characterized by dedication, adaptability, and a relentless focus on delivering value.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Respectfully,
+{name}'),
+('Template Variant 46', 'Dear Hiring Manager,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+Over my {exp_years}-year career as a {working_title}, I have successfully collaborated with diverse teams to overcome hurdles and meet aggressive project goals. I am located in {current_location} and am authorized to work on a {visa}. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I pride myself on my ability to understand core business requirements and translate them into effective, scalable deliverables.
+
+My attached resume provides further details on my background and accomplishments. I would appreciate the chance to discuss this opportunity further.
+
+I look forward to hearing from you.
+
+Sincerely,
+{name}'),
+('Template Variant 47', 'Dear Hiring Manager,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+With over {exp_years} years of progressive experience working as a {working_title}, I have built a solid track record of tackling intricate problems and providing sustainable, efficient solutions. I am currently located in {current_location} and am on a {visa} visa. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thanks for your time.
+
+Best,
+{name}'),
+('Template Variant 48', 'Hello,
+
+I was excited to see the opening for a {role} at {client} and would like to formally apply.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. Equipped with a diverse skill set centered around {skills}, I am well-prepared to tackle the unique challenges associated with this role. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Thank you for considering my application. My resume is attached, and I hope to have the opportunity to speak with you about this role.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 49', 'Dear {client} Team,
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+Over my {exp_years}-year career as a {working_title}, I have successfully collaborated with diverse teams to overcome hurdles and meet aggressive project goals. I am located in {current_location} and am authorized to work on a {visa}. My background heavily utilizes {skills}, enabling me to provide forward-thinking solutions and maintain high standards of quality. I am highly motivated, detail-oriented, and possess a strong passion for continuous learning and professional growth.
+
+Please find my resume attached. I look forward to the possibility of speaking with you soon to discuss my qualifications in greater detail.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}'),
+('Template Variant 50', 'Hello,
+
+I am thrilled to submit my resume for consideration for the {role} opening.
+
+Having spent the past {exp_years} years as a {working_title}, I have honed my ability to analyze requirements and translate them into robust, scalable deliverables. For context, I am based in {current_location} and hold {visa} work authorization. I leverage my extensive knowledge of {skills} to design and implement innovative solutions that align with organizational strategies. I am a strong advocate for best practices and collaborative problem-solving, always ensuring that the solutions provided are both effective and forward-thinking.
+
+I invite you to review my attached resume and would be thrilled to discuss how I can contribute to the continued success of your team.
+
+Thank you for reviewing my application.
+
+Kind regards,
+{name}');
