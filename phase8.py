@@ -1444,34 +1444,6 @@ def format_large_number(num: int) -> str:
         return f"{num / 1_000:.1f}k".replace(".0k", "k")
     return str(num)
 
-@router.get("/ai-usage/openai", response_model=OpenAIUsageDTO)
-async def get_openai_usage(
-    db: AsyncSession = Depends(get_db),
-    _: dict = Depends(require_admin)
-):
-    import os
-    import openai_usage_client as ouc
-
-    if not os.getenv("OPENAI_ADMIN_API_KEY"):
-        return OpenAIUsageDTO(tokens_limit="0", tokens_remaining="0", tokens_used_pct=0.0, tokens_reset="End of Month")
-
-    total_tokens = 0
-    try:
-        usage_buckets = await ouc.fetch_usage_buckets(ouc.month_start_ts())
-        total_tokens = ouc.summarize(usage_buckets or [])["tokens"]
-    except Exception:
-        pass
-
-    limit = int(os.getenv("OPENAI_MONTHLY_TOKEN_LIMIT", "300000000"))
-    remaining = max(0, limit - total_tokens)
-    used_pct = (total_tokens / limit) * 100.0 if limit > 0 else 0.0
-
-    return OpenAIUsageDTO(
-        tokens_limit=format_large_number(limit),
-        tokens_remaining=format_large_number(remaining),
-        tokens_used_pct=round(used_pct, 2),
-        tokens_reset="End of Month"
-    )
 
 @router.get("/ai-usage/daily")
 async def ai_usage_daily(
@@ -1623,76 +1595,6 @@ async def error_rate(
         prev_pct=prev_pct
     )
 
-@router.get("/stats", response_model=AdminStatsDTO)
-async def admin_stats(
-    db: AsyncSession = Depends(get_db),
-    _: dict = Depends(require_admin),
-):
-    total_audit = (await db.execute(select(func.count()).select_from(AuditLog))).scalar_one()
-    open_errors = (await db.execute(
-        select(func.count()).select_from(ProcessingError).where(ProcessingError.status == "OPEN")
-    )).scalar_one()
-    pending_reviews = (await db.execute(
-        select(func.count()).select_from(ManualReviewQueue).where(ManualReviewQueue.status == "OPEN")
-    )).scalar_one()
-    # DASHBOARD FIX: was a LIFETIME sum shown as "AI Cost This Month".
-    # Now current calendar month, Claude/resume usage only -- the frontend
-    # adds the OpenAI month-to-date cost from /ai-usage/stats, so
-    # 'email_parsing' rows are excluded here to avoid counting them twice.
-    _month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    total_ai_cost = (await db.execute(
-        select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
-        .where(AIUsageLog.created_at >= _month_start, AIUsageLog.purpose != "email_parsing")
-    )).scalar_one()
-
-    return AdminStatsDTO(
-        total_audit_events=total_audit,
-        open_errors=open_errors,
-        pending_reviews=pending_reviews,
-        total_ai_cost_usd=round(float(total_ai_cost), 4),
-    )
-
-
-@router.get("/classifier-health", response_model=ClassifierHealthDTO)
-async def classifier_health(
-    db: AsyncSession = Depends(get_db),
-    _: dict = Depends(require_admin),
-):
-    unclassified_count = (await db.execute(
-        # DASHBOARD FIX: the sync itself sets category='unclassified' on
-        # every "not a requirement" email, so the old count only ever grew.
-        # Now: unclassified emails that are still waiting to be processed.
-        text("SELECT COUNT(*) FROM gmail_emails WHERE (category IS NULL OR category = 'unclassified') AND (status_desc IS NULL OR status_desc = 'Pending')")
-    )).scalar_one()
-
-    processed_last_5_min = (await db.execute(
-        text("SELECT COUNT(*) FROM gmail_emails WHERE classified_at > now() - interval '5 minutes'")
-    )).scalar_one()
-
-    last_classified_at = (await db.execute(
-        text("SELECT MAX(classified_at) FROM gmail_emails WHERE classified_at IS NOT NULL")
-    )).scalar_one()
-
-    minutes_since_last_cycle = None
-    if last_classified_at:
-        if last_classified_at.tzinfo is None:
-            last_classified_at = last_classified_at.replace(tzinfo=timezone.utc)
-        minutes_since_last_cycle = (datetime.now(timezone.utc) - last_classified_at).total_seconds() / 60
-
-    if minutes_since_last_cycle is not None and minutes_since_last_cycle > 5:
-        status = "no_recent_activity"
-    elif processed_last_5_min == 0 and unclassified_count > 100:
-        status = "stuck"
-    else:
-        status = "healthy"
-
-    return ClassifierHealthDTO(
-        unclassified_count=unclassified_count,
-        processed_last_5_min=processed_last_5_min,
-        last_classified_at=last_classified_at,
-        minutes_since_last_cycle=minutes_since_last_cycle,
-        status=status,
-    )
 
 
 @router.get("/system-health", response_model=SystemHealthDTO)
@@ -1910,13 +1812,29 @@ async def get_dashboard_summary(
         status=classifier_status,
     )
 
-    # 8. Pending Applications count (total active matches awaiting review)
-    # Fast count from requirement_consultant_matches table
+    # 8. Pending Applications count (total active matches awaiting review in the pending window)
+    from models import Consultant, User
+    from sqlalchemy.sql import exists
+    from matching_router import PENDING_WINDOW_DAYS
+
+    pending_cutoff = now_utc - timedelta(days=PENDING_WINDOW_DAYS)
+    applied_exists = exists().where(
+        Application.requirement_id == RequirementConsultantMatch.requirement_id,
+        Application.consultant_id == RequirementConsultantMatch.consultant_id,
+        Application.status == "SENT",
+    )
+
     pending_apps_count = (await db.execute(
         select(func.count()).select_from(RequirementConsultantMatch)
+        .join(Requirement, RequirementConsultantMatch.requirement_id == Requirement.id)
+        .join(Consultant, RequirementConsultantMatch.consultant_id == Consultant.id)
+        .join(User, User.id == Consultant.user_id)
         .where(
+            Consultant.status == "ACTIVE",
+            User.is_authorized == True,
             RequirementConsultantMatch.status == "MATCHING",
-            RequirementConsultantMatch.candidate_status.in_(["PROPOSED", "MATCHED"]),
+            ~applied_exists,
+            RequirementConsultantMatch.created_at >= pending_cutoff,
         )
     )).scalar_one()
 
