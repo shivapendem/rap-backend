@@ -51,6 +51,56 @@ def _user_to_dto(u: User, *, include_resume_info: bool = True) -> UserAdminRowDT
     )
 
 
+def _gmail_status_of(is_active, send_ok, has_refresh) -> str:
+    """Token row -> Gmail status. No row = NOT_CONNECTED (handled by caller)."""
+    if not is_active:
+        return "PAUSED"
+    if not send_ok or not has_refresh:
+        return "RECONNECT"
+    return "CONNECTED"
+
+
+async def _gmail_info_for_users(db: AsyncSession, users: List[User]) -> dict:
+    """{user_id: {gmail_status, gmail_email, gmail_connected_at, gmail_updated_at}}
+    for the CONSULTANT users given — ONE query for the whole page. Never
+    loads the encrypted token text itself."""
+    from models import ConsultantEmailToken as T
+    ids = [u.id for u in users if u.role == "CONSULTANT"]
+    if not ids:
+        return {}
+    out = {uid: {"gmail_status": "NOT_CONNECTED"} for uid in ids}
+    try:
+        rows = (await db.execute(
+            select(
+                Consultant.user_id, T.is_active, T.send_permission_granted,
+                T.refresh_token_encrypted.isnot(None), T.email_address,
+                T.created_at, T.updated_at,
+            )
+            .select_from(Consultant)
+            .join(T, T.consultant_id == Consultant.id)
+            .where(Consultant.user_id.in_(ids))
+        )).all()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("[users] Gmail status lookup failed")
+        return {}
+    for uid, is_active, send_ok, has_refresh, email, created, updated in rows:
+        out[uid] = {
+            "gmail_status": _gmail_status_of(is_active, send_ok, has_refresh),
+            "gmail_email": email,
+            "gmail_connected_at": created.isoformat() if created else None,
+            "gmail_updated_at": updated.isoformat() if updated else None,
+        }
+    return out
+
+
+def _with_gmail(dto: UserAdminRowDTO, info: dict) -> UserAdminRowDTO:
+    if info:
+        for k, v in info.items():
+            setattr(dto, k, v)
+    return dto
+
+
 def _matching_snapshot(c: Optional[Consultant]):
     """The consultant fields the matching engine reads. A re-match only runs
     when one of these actually changed (not for phone / LinkedIn / education)."""
@@ -370,6 +420,7 @@ class UserService:
     @staticmethod
     async def user_counts(
         db: AsyncSession, *, search: Optional[str], role: Optional[str], status: Optional[str],
+        gmail_status: Optional[List[str]] = None,
     ) -> dict:
         """PERF: every tab + status count for User Management in 2 small
         GROUP BY queries (was 7 separate list requests). Same filters as
@@ -379,6 +430,11 @@ class UserService:
         if search:
             kw = f"%{search.lower()}%"
             search_filter = or_(func.lower(User.full_name).like(kw), func.lower(User.email).like(kw))
+
+        from phase_users_repository import gmail_status_filter
+        gmail_filter = gmail_status_filter(gmail_status)
+        if gmail_filter is not None:
+            search_filter = and_(search_filter, gmail_filter) if search_filter is not None else gmail_filter
 
         role_filters = [f for f in (search_filter,) if f is not None]
         if status:
@@ -411,13 +467,15 @@ class UserService:
         *, page: int, page_size: int, sort_by: str, sort_dir: str,
         search: Optional[str], role: Optional[str], status: Optional[str],
         include_resume_info: bool = False,
+        gmail_status: Optional[List[str]] = None,
     ) -> PaginatedUsersDTO:
         rows, total = await UserRepository.list_paginated(
             db, page=page, page_size=page_size, sort_by=sort_by, sort_dir=sort_dir,
-            search=search, role=role, status=status,
+            search=search, role=role, status=status, gmail_status=gmail_status,
         )
+        gmail = await _gmail_info_for_users(db, rows)
         return PaginatedUsersDTO(
-            data=[_user_to_dto(u, include_resume_info=include_resume_info) for u in rows],
+            data=[_with_gmail(_user_to_dto(u, include_resume_info=include_resume_info), gmail.get(u.id)) for u in rows],
             total=total, page=page, page_size=page_size,
             total_pages=math.ceil(total / page_size) if total else 1,
         )
@@ -427,7 +485,8 @@ class UserService:
         user = await UserRepository.get_by_id(db, user_id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        return _user_to_dto(user)
+        gmail = await _gmail_info_for_users(db, [user])
+        return _with_gmail(_user_to_dto(user), gmail.get(user.id))
 
     @staticmethod
     async def create_user(

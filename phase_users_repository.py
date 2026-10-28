@@ -10,7 +10,41 @@ from typing import Optional, List, Tuple
 from sqlalchemy import select, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import User, Consultant, RecruiterConsultant
+from models import User, Consultant, RecruiterConsultant, ConsultantEmailToken
+
+
+GMAIL_STATUSES = {"CONNECTED", "PAUSED", "RECONNECT", "NOT_CONNECTED"}
+
+
+def gmail_status_filter(gmail_status: Optional[List[str]]):
+    """SQL filter for the User Management "Gmail" dropdown (multi-select, OR).
+    Same rules as phase_users_service._gmail_status_of:
+      CONNECTED     token active + send permission + refresh token
+      PAUSED        token kept but is_active = FALSE (logged out / inactive)
+      RECONNECT     token active but send permission or refresh token missing
+      NOT_CONNECTED no token row (Google rejected refresh -> row deleted)
+    Only consultants have Gmail, so any Gmail filter limits to CONSULTANT."""
+    wanted = [s for s in (gmail_status or []) if s in GMAIL_STATUSES]
+    if not wanted:
+        return None
+    T = ConsultantEmailToken
+    def has_token(*conds):
+        return (
+            select(T.id)
+            .join(Consultant, Consultant.id == T.consultant_id)
+            .where(Consultant.user_id == User.id, *conds)
+            .exists()
+        )
+    parts = []
+    if "CONNECTED" in wanted:
+        parts.append(has_token(T.is_active == True, T.send_permission_granted == True, T.refresh_token_encrypted.isnot(None)))
+    if "PAUSED" in wanted:
+        parts.append(has_token(T.is_active == False))
+    if "RECONNECT" in wanted:
+        parts.append(has_token(T.is_active == True, or_(T.send_permission_granted == False, T.refresh_token_encrypted.is_(None))))
+    if "NOT_CONNECTED" in wanted:
+        parts.append(~has_token())
+    return and_(User.role == "CONSULTANT", or_(*parts))
 
 
 class UserRepository:
@@ -36,8 +70,12 @@ class UserRepository:
         search: Optional[str] = None,
         role: Optional[str] = None,
         status: Optional[str] = None,
+        gmail_status: Optional[List[str]] = None,
     ) -> Tuple[List[User], int]:
         filters = []
+        gmail_filter = gmail_status_filter(gmail_status)
+        if gmail_filter is not None:
+            filters.append(gmail_filter)
         if role:
             filters.append(User.role == role)
         if status:

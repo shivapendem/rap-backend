@@ -57,6 +57,13 @@ class UserAdminRowDTO(BaseModel):
     extension: Optional[str] = None
     linkedin_url: Optional[str] = None
     designation: Optional[str] = None
+    # Gmail connection (CONSULTANT rows only; None for Admin/Recruiter).
+    # "CONNECTED" | "PAUSED" | "RECONNECT" | "NOT_CONNECTED" — derived from
+    # consultant_email_tokens in phase_users_service._gmail_info_for_users.
+    gmail_status: Optional[str] = None
+    gmail_email: Optional[str] = None
+    gmail_connected_at: Optional[str] = None
+    gmail_updated_at: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

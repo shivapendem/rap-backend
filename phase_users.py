@@ -47,6 +47,7 @@ async def list_users(
     sort_by: str = Query("full_name"),
     sort_dir: str = Query("asc"),
     include_resume_info: bool = Query(False),
+    gmail_status: Optional[str] = Query(None, description="Comma-separated: CONNECTED,PAUSED,RECONNECT,NOT_CONNECTED"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin),
 ):
@@ -61,7 +62,19 @@ async def list_users(
         db, page=page, page_size=page_size, sort_by=sort_by, sort_dir=sort_dir,
         search=search, role=role, status=status,
         include_resume_info=include_resume_info,
+        gmail_status=_parse_gmail_status(gmail_status),
     )
+
+
+def _parse_gmail_status(raw: Optional[str]) -> Optional[List[str]]:
+    if not raw:
+        return None
+    from phase_users_repository import GMAIL_STATUSES
+    vals = [v.strip().upper() for v in raw.split(",") if v.strip()]
+    bad = [v for v in vals if v not in GMAIL_STATUSES]
+    if bad:
+        raise HTTPException(status_code=422, detail=f"Invalid gmail_status: {', '.join(bad)}")
+    return vals or None
 
 
 # PERF: all User Management tab + status counts in one request. Declared
@@ -71,6 +84,7 @@ async def user_counts(
     search: Optional[str] = Query(None),
     role: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    gmail_status: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin),
 ):
@@ -78,7 +92,10 @@ async def user_counts(
         raise HTTPException(status_code=422, detail="Invalid role filter")
     if status and status not in {"Active", "Inactive"}:
         raise HTTPException(status_code=422, detail="Invalid status filter")
-    return await UserService.user_counts(db, search=search, role=role, status=status)
+    return await UserService.user_counts(
+        db, search=search, role=role, status=status,
+        gmail_status=_parse_gmail_status(gmail_status),
+    )
 
 
 @router.post("/users", response_model=CreateUserResponseDTO, status_code=201)
