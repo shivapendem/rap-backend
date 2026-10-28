@@ -1862,7 +1862,7 @@ async def get_dashboard_summary(
 
     rep_emails_sent = (await db.execute(
         select(func.count()).select_from(EmailQueue)
-        .where(EmailQueue.status == "SENT", EmailQueue.sent_at >= seven_days_ago)
+        .where(EmailQueue.status == "SENT", EmailQueue.created_at >= seven_days_ago)
     )).scalar_one()
 
     reports_summary_dto = DashboardReportSummaryDTO(
