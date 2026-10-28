@@ -226,7 +226,7 @@ async def confirm_send(
     """
     Main confirm-send endpoint.
     Validates permissions → checks ATS → prevents duplicates
-    → builds email → sends via Gmail → records application.
+    → builds email → queues in EmailQueue → records PENDING application.
     """
     from permission_service import (
         resolve_apply_consultant,
@@ -234,7 +234,11 @@ async def confirm_send(
         get_sales_recruiter_email,
     )
     from email_template import build_application_email
-    from gmail_send_service import send_application_email_async, decrypt_token
+    from email_queue import EMAIL_ATTACHMENT_S3_PREFIX, calculate_next_scheduled_at
+    from models import EmailQueue, RequirementConsultantMatch
+    import asyncio
+    import io as _io
+    import uuid as _uuid
 
     try:
         consultant = await resolve_apply_consultant(db, current_user, request.consultant_id)
@@ -261,18 +265,6 @@ async def confirm_send(
 
         await check_duplicate_application(db, request.requirement_id, consultant.id)
 
-        # BUG FIX ("Gmail API error 403: insufficientPermissions /
-        # ACCESS_TOKEN_SCOPE_INSUFFICIENT" at send time): patch8.py had
-        # replaced the assert_gmail_connected(db, consultant.id) call that
-        # used to sit here with this raw query, in order to add the
-        # service-account fallback below for consultants with no Gmail
-        # token at all. That swap dropped the send_permission_granted
-        # check entirely — a token missing the gmail.send scope (consent
-        # checkbox unchecked, or silently stripped by Google for an
-        # unverified app) was still passed straight to the Gmail API,
-        # which only surfaces the problem downstream as this raw 403.
-        # Re-added the scope check here, keeping the fallback intact for
-        # consultants who have no token on file yet.
         token_res = await db.execute(select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant.id))
         token = token_res.scalars().first()
         if token and getattr(token, "is_active", True) is False:
@@ -311,40 +303,9 @@ async def confirm_send(
             **_sender_fields(current_user, consultant),
         )
 
-        if token and token.access_token_encrypted:
-            access_token = decrypt_token(token.access_token_encrypted)
-            from_email = token.email_address
-        else:
-            from gmail_send_service import get_service_account_access_token
-            import os
-            import asyncio
-            sa_path = os.path.join(os.path.dirname(__file__), "service-account-key.json")
-            from_email = consultant.email
-            # Run the blocking JWT-signing/HTTP call off the event loop so
-            # this async route doesn't stall other requests while it waits.
-            access_token = await asyncio.to_thread(get_service_account_access_token, sa_path, from_email)
+        from_email = (token.email_address if token and token.email_address else consultant.email) or ""
 
-        # BUG FIX: was querying the `Resume` table (self-service consultant
-        # resume builder) by generated_resume_id — but Application.generated_resume_id's
-        # actual foreign key points at `generated_resumes` (GeneratedResume),
-        # the per-requirement tailored resume this screen is previewing/
-        # sending. Querying the wrong table meant `selected_resume` was
-        # always None here, so no resume was ever attached even when
-        # request.generated_resume_id was populated. Also handles pdf_path
-        # holding a Spaces object key instead of a local path — same
-        # pattern phase6.py's download endpoint uses, since the local file
-        # is deleted after upload.
-        #
-        # BUG FIX (same root cause as apply_to_requirement in phase5.py):
-        # generated_resume_id is Optional and independent of ats_score —
-        # when it isn't populated (consultant applying with their base
-        # resume, no tailored resume generated for this match), this whole
-        # block was skipped and attachment_path stayed None the entire
-        # way through, sending the email with no attachment and no error.
-        # Fall back to the consultant's base resume in that case, same
-        # source resume_router.py's download_base_resume already reads.
-        attachment_path = None
-        tmp_resume_path = None
+        attachment_refs = None
         resume_source_path = None
         resume_display_name = None
         if request.generated_resume_id:
@@ -355,10 +316,6 @@ async def confirm_send(
                 selected_resume = resume_result.scalars().first()
                 if selected_resume and selected_resume.docx_path:
                     resume_source_path = selected_resume.docx_path
-                    # See phase5.py's identical fix: GeneratedResume.filename
-                    # is always built with a .pdf extension regardless of
-                    # which file is actually attached — swap to .docx here
-                    # since we're now sending the DOCX, not the PDF.
                     base_name = selected_resume.filename or f"Resume_{selected_resume.id}.pdf"
                     resume_display_name = Path(base_name).stem + ".docx"
             except Exception as attach_err:
@@ -371,7 +328,6 @@ async def confirm_send(
                     source_id=request.generated_resume_id,
                 )
         if resume_source_path is None and consultant.base_resume_file_path:
-            # SAME FONT FIX: rebuild an old-font base file before attaching.
             from resume_router import _ensure_base_resume_style
             await _ensure_base_resume_style(db, consultant)
             resume_source_path = consultant.base_resume_file_path
@@ -387,16 +343,15 @@ async def confirm_send(
                     from s3_service import download_file_from_s3
                     body_bytes, _ = await asyncio.to_thread(download_file_from_s3, resume_source_path)
                 if body_bytes:
-                    import tempfile
                     safe_title = "".join(
                         c for c in (resume_display_name or "Resume.pdf")
                         if c.isalnum() or c in " -_."
                     ).strip() or "Resume.pdf"
-                    tmp_dir = tempfile.mkdtemp(prefix="rap_apply_")
-                    tmp_resume_path = os.path.join(tmp_dir, safe_title)
-                    with open(tmp_resume_path, "wb") as f:
-                        f.write(body_bytes)
-                    attachment_path = tmp_resume_path
+                    unique_name = f"{_uuid.uuid4()}__{safe_title}"
+                    from s3_service import upload_file_to_s3
+                    s3_ref = f"{EMAIL_ATTACHMENT_S3_PREFIX}{unique_name}"
+                    if await asyncio.to_thread(upload_file_to_s3, _io.BytesIO(body_bytes), s3_ref, "application/octet-stream"):
+                        attachment_refs = [s3_ref]
             except Exception as attach_err:
                 print(f"[confirm_send] resume attach FAILED for path={resume_source_path}: {attach_err}")
                 from error_logger import log_db_error
@@ -407,135 +362,79 @@ async def confirm_send(
                     source_id=request.generated_resume_id,
                 )
 
-        # Resume filename on the sent mail: <CandidateName>_<Role>_<N>Yrs.<ext>
-        # (Role = the requirement being applied to). Display name only --
-        # falls back to the existing filename if anything is missing.
-        attachment_names = {}
-        if attachment_path:
-            try:
-                from gmail_send_service import build_resume_attachment_name
-                _name_exp = getattr(consultant, "total_experience_years", None)
-                if _name_exp is None and getattr(consultant, "user_id", None):
-                    from models import User as _NameUser
-                    _name_user = (await db.execute(
-                        select(_NameUser).where(_NameUser.id == consultant.user_id)
-                    )).scalars().first()
-                    _name_exp = getattr(_name_user, "experience_years", None)
-                _new_name = build_resume_attachment_name(
-                    consultant.full_name,
-                    requirement.role,
-                    _name_exp,
-                    os.path.splitext(attachment_path)[1],
-                )
-                if _new_name:
-                    attachment_names[attachment_path] = _new_name
-            except Exception as _name_err:
-                print(f"[confirm_send] resume filename build skipped: {_name_err!r}")
-
-        try:
-            send_result = await send_application_email_async(
-                access_token=access_token,
-                from_email=from_email,
-                to_email=requirement.vendor_email or "",
-                cc_email=cc_email,
-                subject=email_content["subject"],
-                body=email_content["body"],
-                attachment_paths=[attachment_path] if attachment_path else [],
-                attachment_names=attachment_names,
-                html_body=email_content["html_body"],
-                inline_images=email_content.get("inline_images"),
-                from_name=((consultant.full_name or "").strip() or None) if consultant else None,
-            )
-        except Exception as send_exc:
-            # BUG FIX ("Gmail API error 403: {raw JSON}" shown verbatim to
-            # the user): the send_permission_granted pre-check earlier in
-            # this function only protects against a token that was
-            # CORRECTLY recorded as scope-less — it does nothing when
-            # that flag is stale/wrong (e.g. a row created by the old
-            # "Sign in with Google" auto-connect bug before that was
-            # fixed, or a token whose scope was revoked after being
-            # granted), so Gmail's own real rejection could still reach
-            # this point and, uncaught here, get wrapped by the generic
-            # except Exception below into an HTTPException whose detail
-            # is literally Gmail's raw error JSON. Catch the specific
-            # marker send_via_gmail_api now raises for this case, give a
-            # clean actionable message instead, AND self-heal the token
-            # so it stops passing the earlier pre-check and every future
-            # attempt fails fast with the clean message instead of
-            # hitting Gmail directly again.
-            if "GMAIL_SCOPE_INSUFFICIENT" in str(send_exc):
-                if token:
-                    token.send_permission_granted = False
-                    await db.commit()
-                raise HTTPException(
-                    status_code=403,
-                    detail="Gmail send permission not granted. Please reconnect Gmail and "
-                           "make sure to allow the 'Send email on your behalf' permission.",
-                )
-            raise
-        finally:
-            if tmp_resume_path:
-                try:
-                    os.remove(tmp_resume_path)
-                    os.rmdir(os.path.dirname(tmp_resume_path))
-                except OSError:
-                    pass
-
-        # NOTE: status="SENT" (existing VALID_STATUSES), not "APPLIED"
-        application = Application(
-            requirement_id=request.requirement_id,
+        scheduled_at = await calculate_next_scheduled_at(db, from_email)
+        queue_item = EmailQueue(
             consultant_id=consultant.id,
-            # BUG FIX: was restricted to RECRUITER role only — admin-sent
-            # confirm-sends got no sender attribution at all. recruiter_id
-            # is used as a general "who sent this" field now.
-            recruiter_id=current_user.id,
-            generated_resume_id=request.generated_resume_id,
-            ats_score_at_send=ats_score,
-            vendor_email=requirement.vendor_email,
+            requirement_id=request.requirement_id,
+            from_email=from_email,
+            to_email=requirement.vendor_email or "",
             cc_email=cc_email or None,
-            gmail_message_id=send_result.get("gmail_message_id"),
-            email_subject=email_content["subject"],
-            email_body_preview=email_content["preview"],
-            status="SENT",
-            sent_at=datetime.now(timezone.utc),
-            applied_at=datetime.now(timezone.utc),
+            subject=email_content["subject"],
+            content=email_content["body"],
+            html_content=email_content["html_body"],
+            attachments=attachment_refs,
+            status="QUEUED",
+            sent_by_user_id=current_user.id,
+            scheduled_at=scheduled_at,
         )
-        db.add(application)
+        db.add(queue_item)
+
+        existing_app_res = await db.execute(
+            select(Application).where(
+                Application.consultant_id == consultant.id,
+                Application.requirement_id == request.requirement_id,
+            )
+        )
+        application = existing_app_res.scalars().first()
+        if application:
+            application.recruiter_id = current_user.id
+            application.generated_resume_id = request.generated_resume_id
+            application.ats_score_at_send = ats_score
+            application.vendor_email = requirement.vendor_email
+            application.cc_email = cc_email or None
+            application.email_subject = email_content["subject"]
+            application.email_body_preview = email_content["preview"]
+            application.status = "PENDING"
+            application.applied_at = datetime.now(timezone.utc)
+            if attachment_refs:
+                application.resume_attachment_path = attachment_refs[0]
+                application.attachments_sent = attachment_refs
+        else:
+            application = Application(
+                requirement_id=request.requirement_id,
+                consultant_id=consultant.id,
+                recruiter_id=current_user.id,
+                generated_resume_id=request.generated_resume_id,
+                ats_score_at_send=ats_score,
+                vendor_email=requirement.vendor_email,
+                cc_email=cc_email or None,
+                email_subject=email_content["subject"],
+                email_body_preview=email_content["preview"],
+                status="PENDING",
+                applied_at=datetime.now(timezone.utc),
+                resume_attachment_path=attachment_refs[0] if attachment_refs else None,
+                attachments_sent=attachment_refs,
+            )
+            db.add(application)
+
+        match_res = await db.execute(
+            select(RequirementConsultantMatch).where(
+                RequirementConsultantMatch.requirement_id == request.requirement_id,
+                RequirementConsultantMatch.consultant_id == consultant.id,
+            )
+        )
+        match = match_res.scalars().first()
+        if match:
+            match.status = "APPLIED"
+
         await db.commit()
         await db.refresh(application)
-
-        # Log APPLICATION_SENT in audit trail so Recent Activity shows real submissions
-        try:
-            from phase8_audit_service import log_action
-            actor_name = current_user.full_name or current_user.email or "Recruiter"
-            company_name = requirement.client or requirement.vendor or "Client"
-            summary_text = f"{actor_name} submitted {consultant.full_name} profile to {company_name}"
-            await log_action(
-                db,
-                "APPLICATION_SENT",
-                actor_user_id=str(current_user.id),
-                actor_name=current_user.email,
-                actor_role=current_user.role or "RECRUITER",
-                entity_type="Application",
-                entity_id=str(application.id),
-                metadata={
-                    "consultant_name": consultant.full_name,
-                    "company": company_name,
-                    "role": requirement.role,
-                    "requirement_id": requirement.id,
-                    "consultant_id": consultant.id,
-                    "summary": summary_text,
-                },
-            )
-            await db.commit()
-        except Exception as audit_err:
-            logger.warning(f"[phase7] Failed to write audit log for application send: {audit_err}")
 
         return ConfirmSendResponse(
             success=True,
             application_id=application.id,
-            gmail_message_id=send_result.get("gmail_message_id"),
-            message="Application sent successfully!",
+            gmail_message_id=None,
+            message="Application queued successfully!",
         )
 
     except HTTPException:

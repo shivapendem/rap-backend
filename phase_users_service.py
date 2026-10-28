@@ -114,21 +114,18 @@ def _matching_snapshot(c: Optional[Consultant]):
     )
 
 
-def _after_consultant_save(consultant_id: int, rematch: bool) -> None:
-    """PERF: base resume rebuild (always) and re-match (only when matching
-    fields changed) run in the background after commit — the save replies
-    immediately. Never fails the save."""
+def _after_consultant_save(consultant_id: int, rematch: bool = False) -> None:
+    """PERF: base resume rebuild runs in the background after commit — the save
+    replies immediately. Matching is NOT triggered here. Never fails the save."""
     try:
-        from phase3 import _trigger_base_resume_sync, _trigger_consultant_rematch
+        from phase3 import _trigger_base_resume_sync
         _trigger_base_resume_sync(consultant_id)
-        if rematch:
-            _trigger_consultant_rematch(consultant_id)
     except Exception:
         # Still never fails the save (it is already committed) -- but no longer
-        # silent: a failure here means the base resume / re-match was NOT queued.
+        # silent: a failure here means the base resume sync was NOT queued.
         import logging
         logging.getLogger(__name__).exception(
-            "Could not queue background base-resume sync / re-match for consultant_id=%s",
+            "Could not queue background base-resume sync for consultant_id=%s",
             consultant_id,
         )
 

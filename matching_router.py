@@ -4,169 +4,110 @@ import logging
 import math
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
-from sqlalchemy import func, or_, exists
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, or_, exists, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import aliased
 
 from models import User, Consultant, Requirement, RequirementConsultantMatch, RecruiterConsultant, Application
-from database import get_db, AsyncSessionLocal
+from database import get_db
 from auth import get_current_user
-from phase4 import match_requirement
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Single engine now — this router no longer scores anything itself. Every
 # endpoint here either reads RequirementConsultantMatch (the one table the
-# matching engine writes) or triggers phase4.match_requirement() per
-# requirement. There is no second table, no second pass, no TF-IDF/sklearn
-# fallback path — that all lived in the deleted Pipeline B
-# (matching_router_engine.py / JobMatch), which this file used to mirror.
-
-# Bulk "Run Engine" still runs as a background task with polling rather
-# than one long HTTP request — same reasoning as before: scoring every
-# open requirement against every active consultant only gets larger as
-# the dataset grows, so a fixed request timeout eventually gets crossed
-# again regardless of the number chosen. In-memory state is fine for this
-# single-process, admin-triggered, non-critical-path operation.
-_matching_run_state: dict = {
-    "status": "idle",  # idle | running | completed | failed
-    "started_at": None,
-    "finished_at": None,
-    "total_requirements": 0,
-    "processed_requirements": 0,
-    "new_matches": 0,
-    "error": None,
-    # Set by POST /run/cancel; the loop below checks it between requirements.
-    "cancel_requested": False,
-}
-
-
-async def _run_matching_engine_background():
-    """
-    Loops open (non-terminal) requirements received in the last 24 hours
-    and calls match_requirement() for each — the same single engine used
-    by auto-sync, reparse, and the per-requirement admin "Rematch"
-    button. New requirements are already auto-matched the moment they're
-    synced; this exists to catch anything auto-sync missed, not to redo
-    the whole backlog. Keeping it scoped to 24h means it always finishes
-    in one run and can't be caught mid-pass by a redeploy/restart.
-
-    Per-requirement isolation: one bad requirement is logged and skipped
-    rather than aborting the whole run.
-    """
-    global _matching_run_state
-    try:
-        async with AsyncSessionLocal() as db:
-            since = datetime.now(timezone.utc) - timedelta(hours=24)
-            reqs_res = await db.execute(
-                select(Requirement.id).where(
-                    Requirement.status.notin_(Requirement.TERMINAL_STATUSES),
-                    Requirement.received_date >= since,
-                )
-            )
-            requirement_ids = [row[0] for row in reqs_res.all()]
-            _matching_run_state["total_requirements"] = len(requirement_ids)
-
-            total_matching = 0
-            processed = 0
-            cancelled = False
-            for req_id in requirement_ids:
-                if _matching_run_state.get("cancel_requested"):
-                    cancelled = True
-                    break
-                try:
-                    total_matching += await match_requirement(db, req_id)
-                except Exception as req_err:
-                    await db.rollback()
-                    logger.error(
-                        "[RequirementConsultantMatch] Skipping requirement_id=%s (failed): %s",
-                        req_id, req_err,
-                    )
-                    try:
-                        from error_logger import log_db_error
-                        await log_db_error(
-                            stage="matching_batch_requirement",
-                            error=req_err,
-                            source_type="requirement",
-                            source_id=req_id,
-                        )
-                    except Exception:
-                        pass
-                finally:
-                    processed += 1
-                    _matching_run_state["processed_requirements"] = processed
-                    _matching_run_state["new_matches"] = total_matching
-
-            _matching_run_state.update({
-                "status": "cancelled" if cancelled else "completed",
-                "new_matches": total_matching,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            })
-    except Exception as exc:
-        logger.error("[RequirementConsultantMatch] Bulk run failed: %s", exc)
-        _matching_run_state.update({
-            "status": "failed",
-            "error": str(exc),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        })
+# matching engine writes) or marks requirements/emails for the cron worker
+# to match. No background task runs in the backend.
 
 
 @router.post("/run")
 async def trigger_matching_run(
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Triggers the matching engine and returns immediately — the actual
-    work happens in the background. Poll GET /run/status for progress.
-    Scoped to requirements received in the last 24 hours — new
-    requirements are already auto-matched on sync, so this just catches
-    anything that slipped through.
+    Queues open requirements received in the last 24 hours for matching
+    by updating their status in the requirements table. Actual matching is
+    handled exclusively by the cron worker without touching gmail_emails.status_desc.
     """
     if current_user.role not in ["ADMIN", "RECRUITER"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    if _matching_run_state["status"] == "running":
-        return {"success": True, "already_running": True, **_matching_run_state}
+    result = await db.execute(
+        text("""
+            UPDATE requirements
+            SET status = 'REMATCH_REQUESTED'
+            WHERE status NOT IN ('CLOSED', 'REJECTED', 'REMATCH_REQUESTED', 'REMATCHING')
+              AND received_date >= NOW() - INTERVAL '24 hours'
+            RETURNING id
+        """)
+    )
+    queued_count = len(result.all())
+    await db.commit()
 
-    _matching_run_state.update({
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "finished_at": None,
-        "total_requirements": 0,
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "success": True,
+        "started": True,
+        "status": "running" if queued_count > 0 else "completed",
+        "started_at": now_iso,
+        "finished_at": None if queued_count > 0 else now_iso,
+        "total_requirements": queued_count,
         "processed_requirements": 0,
         "new_matches": 0,
         "error": None,
         "cancel_requested": False,
-    })
-    background_tasks.add_task(_run_matching_engine_background)
-    return {"success": True, "started": True, **_matching_run_state}
+    }
 
 
 @router.post("/run/cancel")
 async def cancel_matching_run(
-    current_user: User = Depends(get_current_user)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Stops a running engine after the requirement it is on. Matches already
-    found are kept."""
+    """Cancels pending 'REMATCH_REQUESTED' requirements by restoring their status to 'NEW'."""
     if current_user.role not in ["ADMIN", "RECRUITER"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if _matching_run_state["status"] != "running":
-        return {"success": True, "cancelled": False}
-    _matching_run_state["cancel_requested"] = True
-    return {"success": True, "cancelled": True}
+    result = await db.execute(
+        text(
+            "UPDATE requirements SET status = 'NEW' "
+            "WHERE status = 'REMATCH_REQUESTED' RETURNING id"
+        )
+    )
+    cancelled_count = len(result.all())
+    await db.commit()
+    return {"success": True, "cancelled": cancelled_count > 0}
 
 
 @router.get("/run/status")
 async def get_matching_run_status(
-    current_user: User = Depends(get_current_user)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     if current_user.role not in ["ADMIN", "RECRUITER"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    return _matching_run_state
+
+    pending_res = await db.execute(
+        text(
+            "SELECT COUNT(*) FROM requirements "
+            "WHERE status IN ('REMATCH_REQUESTED', 'REMATCHING')"
+        )
+    )
+    pending = pending_res.scalar() or 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "status": "running" if pending > 0 else "completed",
+        "started_at": None,
+        "finished_at": None if pending > 0 else now_iso,
+        "total_requirements": pending,
+        "processed_requirements": 0,
+        "new_matches": 0,
+        "error": None,
+        "cancel_requested": False,
+    }
 
 
 def _safe_float(val):

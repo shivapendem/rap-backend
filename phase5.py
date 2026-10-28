@@ -1431,7 +1431,7 @@ async def apply_to_requirement(
     # resolution, real filename), instead of maintaining a second,
     # diverging "apply" implementation that only pretends to send.
     from models import EmailQueue
-    from email_queue import process_single_email_queue_item, EMAIL_ATTACHMENT_S3_PREFIX
+    from email_queue import EMAIL_ATTACHMENT_S3_PREFIX, calculate_next_scheduled_at
     from email_template import build_application_email, resolve_sender_fields
     from pathlib import Path
     import uuid as _uuid
@@ -1516,6 +1516,7 @@ async def apply_to_requirement(
                 detail="Could not retrieve the resume file to attach. Please check your resume and try again.",
             )
 
+    scheduled_at = await calculate_next_scheduled_at(db, consultant.email or "")
     queue_item = EmailQueue(
         consultant_id=consultant.id,
         requirement_id=requirement_id,
@@ -1528,53 +1529,42 @@ async def apply_to_requirement(
         attachments=attachment_refs,
         status="QUEUED",
         sent_by_user_id=current_user.id,
-        scheduled_at=datetime.now(timezone.utc),
+        scheduled_at=scheduled_at,
     )
     db.add(queue_item)
-    await db.commit()
-    await db.refresh(queue_item)
 
-    await process_single_email_queue_item(db, queue_item)
-    await db.refresh(queue_item)
-
-    if queue_item.status != "SENT":
-        # BUG FIX: was status_code=502. This can fail for ordinary,
-        # user-actionable reasons (e.g. no Gmail OAuth token connected
-        # yet) — not a proxy/gateway malfunction. 502 gets specially
-        # intercepted by Cloudflare, which replaces this response's real
-        # detail with its own generic "origin returned an invalid or
-        # incomplete response" page, so the actual reason never reaches
-        # the consultant. 422 passes through untouched. Same fix as
-        # email_queue.py's send_email_now for the admin/recruiter path.
-        raise HTTPException(
-            status_code=422,
-            detail=queue_item.status_text or "Failed to send application email.",
-        )
-
-    # NOTE: process_single_email_queue_item above already creates/updates
-    # the Application row itself (it upserts on consultant_id +
-    # requirement_id whenever item.requirement_id is set — see the
-    # "revised" BUG FIX block in that function). Do NOT create a second
-    # Application row here — Application has a unique constraint on
-    # (consultant_id, requirement_id), so doing so would raise an
-    # IntegrityError on every successful send. Just fetch what it already
-    # wrote (with the real gmail_message_id, resume attachment, sent_at,
-    # etc. — all more accurate than anything this endpoint could set
-    # itself) to build the response below.
     app = (await db.execute(
         select(Application).where(
             Application.consultant_id == consultant.id,
             Application.requirement_id == requirement_id,
         )
     )).scalars().first()
-    if not app:
-        # Shouldn't happen given queue_item.status == "SENT" above, but
-        # don't silently 500 with an AttributeError on app.id below if it
-        # somehow does.
-        raise HTTPException(
-            status_code=500,
-            detail="Email sent, but the application record could not be found afterward. Please check the Applications tab.",
+    if app:
+        app.status = "PENDING"
+        app.vendor_email = req.vendor_email
+        app.cc_email = None
+        app.email_subject = email_content["subject"]
+        app.email_body_preview = (email_content["body"] or "")[:500]
+        app.applied_at = datetime.now(timezone.utc)
+        app.recruiter_id = current_user.id
+        if attachment_refs:
+            app.resume_attachment_path = attachment_refs[0]
+            app.attachments_sent = attachment_refs
+    else:
+        app = Application(
+            consultant_id=consultant.id,
+            requirement_id=requirement_id,
+            status="PENDING",
+            vendor_email=req.vendor_email,
+            cc_email=None,
+            email_subject=email_content["subject"],
+            email_body_preview=(email_content["body"] or "")[:500],
+            applied_at=datetime.now(timezone.utc),
+            recruiter_id=current_user.id,
+            resume_attachment_path=attachment_refs[0] if attachment_refs else None,
+            attachments_sent=attachment_refs,
         )
+        db.add(app)
 
     # Update match status — reuses the match object already fetched above,
     # no second lookup needed.
@@ -1589,12 +1579,12 @@ async def apply_to_requirement(
         "application_id": str(app.id),
         "requirement_id": str(requirement_id),
         "consultant_id": str(consultant.id),
-        "status": "SENT",
+        "status": "PENDING",
     })
 
     return ApplyResponse(
         success=True,
-        message=f"Application submitted to {req.vendor_email}",
+        message=f"Application queued for {req.vendor_email}",
         application_id=str(app.id),
     )
 
