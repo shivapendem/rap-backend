@@ -280,6 +280,25 @@ class AdminStatsDTO(BaseModel):
     pending_reviews: int
     total_ai_cost_usd: float
 
+class DashboardReportSummaryDTO(BaseModel):
+    emails_processed: int = 0
+    jobs_applied: int = 0
+    emails_sent: int = 0
+
+class AdminDashboardSummaryDTO(BaseModel):
+    # Top 6 stat cards
+    emails_ingested_today: int
+    unique_requirements_7d: int
+    new_matches_7d: int
+    applications_sent_7d: int
+    open_errors: int
+    ai_cost_month_usd: float
+    # 4 sub-row stat cards
+    classifier_health: "ClassifierHealthDTO"
+    pending_applications_count: int
+    openai_usage: "OpenAIUsageDTO"
+    reports_summary: DashboardReportSummaryDTO
+
 class ClassifierHealthDTO(BaseModel):
     unclassified_count: int
     processed_last_5_min: int
@@ -1785,3 +1804,164 @@ async def list_applications_feed(
         ))
     return PaginatedApplicationsDTO(data=data, total=total, page=page,
         page_size=page_size, total_pages=math.ceil(total / page_size) or 1)
+
+
+@router.get("/dashboard-summary", response_model=AdminDashboardSummaryDTO)
+async def get_dashboard_summary(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Consolidated single endpoint for the Admin Dashboard.
+    Groups the 6 top-row cards, Classifier Status, Pending Applications,
+    OpenAI Usage Limits, and 7-Day Reporting Summary into a single request,
+    eliminating 10+ separate round-trips and OPTIONS pre-flights on dashboard mount.
+    """
+    import os
+    import openai_usage_client as ouc
+    from models import Requirement, RequirementConsultantMatch, EmailQueue
+
+    now_utc = datetime.now(timezone.utc)
+    seven_days_ago = now_utc - timedelta(days=7)
+    now_cst = now_utc.astimezone(_CST_ZONE)
+    today_start_cst = now_cst.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_cst.astimezone(timezone.utc)
+    month_start_utc = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # 1. Emails Ingested Today
+    emails_ingested_today = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE date >= :date_from"),
+        {"date_from": today_start_utc}
+    )).scalar_one()
+
+    # 2. Unique Requirements (7d)
+    unique_req_7d = (await db.execute(
+        select(func.count()).select_from(Requirement).where(Requirement.received_date >= seven_days_ago)
+    )).scalar_one()
+
+    # 3. New Matches (7d)
+    new_matches_7d = (await db.execute(
+        select(func.count(func.distinct(RequirementConsultantMatch.requirement_id)))
+        .where(RequirementConsultantMatch.created_at >= seven_days_ago)
+    )).scalar_one()
+
+    # 4. Applications Sent (7d)
+    apps_sent_7d = (await db.execute(
+        select(func.count()).select_from(Application)
+        .where(Application.status == "SENT", Application.sent_at >= seven_days_ago)
+    )).scalar_one()
+
+    # 5. Open Errors
+    open_errors = (await db.execute(
+        select(func.count()).select_from(ProcessingError).where(ProcessingError.status == "OPEN")
+    )).scalar_one()
+
+    # 6. AI Cost this month (Claude from DB + OpenAI from client)
+    claude_cost = (await db.execute(
+        select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
+        .where(AIUsageLog.created_at >= month_start_utc, AIUsageLog.purpose != "email_parsing")
+    )).scalar_one()
+
+    openai_cost = 0.0
+    openai_total_tokens = 0
+    try:
+        month_ts = ouc.month_start_ts()
+        cost_buckets = await ouc.fetch_costs_buckets(month_ts)
+        usage_buckets = await ouc.fetch_usage_buckets(month_ts)
+        summary = ouc.summarize(usage_buckets or [], cost_buckets=cost_buckets)
+        openai_cost = summary["cost_usd"]
+        openai_total_tokens = summary["tokens"]
+    except Exception:
+        pass
+
+    ai_cost_month_usd = round(float(claude_cost or 0) + float(openai_cost or 0), 2)
+
+    # 7. Classifier Health
+    unclassified_count = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE (category IS NULL OR category = 'unclassified') AND (status_desc IS NULL OR status_desc = 'Pending')")
+    )).scalar_one()
+
+    processed_last_5_min = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE classified_at > now() - interval '5 minutes'")
+    )).scalar_one()
+
+    last_classified_at = (await db.execute(
+        text("SELECT MAX(classified_at) FROM gmail_emails WHERE classified_at IS NOT NULL")
+    )).scalar_one()
+
+    minutes_since_last_cycle = None
+    if last_classified_at:
+        if last_classified_at.tzinfo is None:
+            last_classified_at = last_classified_at.replace(tzinfo=timezone.utc)
+        minutes_since_last_cycle = (now_utc - last_classified_at).total_seconds() / 60
+
+    if minutes_since_last_cycle is not None and minutes_since_last_cycle > 5:
+        classifier_status = "no_recent_activity"
+    elif processed_last_5_min == 0 and unclassified_count > 100:
+        classifier_status = "stuck"
+    else:
+        classifier_status = "healthy"
+
+    classifier_health_dto = ClassifierHealthDTO(
+        unclassified_count=unclassified_count,
+        processed_last_5_min=processed_last_5_min,
+        last_classified_at=last_classified_at,
+        minutes_since_last_cycle=minutes_since_last_cycle,
+        status=classifier_status,
+    )
+
+    # 8. Pending Applications count (total active matches awaiting review)
+    # Fast count from requirement_consultant_matches table
+    pending_apps_count = (await db.execute(
+        select(func.count()).select_from(RequirementConsultantMatch)
+        .where(
+            RequirementConsultantMatch.status == "MATCHING",
+            RequirementConsultantMatch.candidate_status.in_(["PROPOSED", "MATCHED"]),
+        )
+    )).scalar_one()
+
+    # 9. OpenAI Limits
+    openai_limit = int(os.getenv("OPENAI_MONTHLY_TOKEN_LIMIT", "300000000"))
+    remaining_tokens = max(0, openai_limit - openai_total_tokens)
+    used_pct = (openai_total_tokens / openai_limit) * 100.0 if openai_limit > 0 else 0.0
+    openai_usage_dto = OpenAIUsageDTO(
+        tokens_limit=format_large_number(openai_limit),
+        tokens_remaining=format_large_number(remaining_tokens),
+        tokens_used_pct=round(used_pct, 2),
+        tokens_reset="End of Month"
+    )
+
+    # 10. Reporting Summary (7 days)
+    rep_emails_processed = (await db.execute(
+        text("SELECT COUNT(*) FROM emails WHERE parse_status = 'PARSED' AND received_at >= :start_dt"),
+        {"start_dt": seven_days_ago}
+    )).scalar_one()
+
+    rep_jobs_applied = (await db.execute(
+        select(func.count()).select_from(Application)
+        .where(Application.status == "SENT", Application.sent_at >= seven_days_ago)
+    )).scalar_one()
+
+    rep_emails_sent = (await db.execute(
+        select(func.count()).select_from(EmailQueue)
+        .where(EmailQueue.status == "SENT", EmailQueue.sent_at >= seven_days_ago)
+    )).scalar_one()
+
+    reports_summary_dto = DashboardReportSummaryDTO(
+        emails_processed=rep_emails_processed,
+        jobs_applied=rep_jobs_applied,
+        emails_sent=rep_emails_sent,
+    )
+
+    return AdminDashboardSummaryDTO(
+        emails_ingested_today=emails_ingested_today,
+        unique_requirements_7d=unique_req_7d,
+        new_matches_7d=new_matches_7d,
+        applications_sent_7d=apps_sent_7d,
+        open_errors=open_errors,
+        ai_cost_month_usd=ai_cost_month_usd,
+        classifier_health=classifier_health_dto,
+        pending_applications_count=pending_apps_count,
+        openai_usage=openai_usage_dto,
+        reports_summary=reports_summary_dto,
+    )
