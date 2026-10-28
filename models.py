@@ -319,7 +319,7 @@ class Requirement(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
-    VALID_STATUSES = {"NEW", "REVIEWING", "SUBMITTED", "INTERVIEWING", "CLOSED", "REJECTED"}
+    VALID_STATUSES = {"NEW", "REVIEWING", "SUBMITTED", "INTERVIEWING", "CLOSED", "REJECTED", "REMATCH_REQUESTED", "REMATCHING"}
 
     # BUG FIX (ported from rap_python_cron's identical fix — "Match All"
     # rematching closed/rejected requirements): this project's own
