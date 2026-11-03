@@ -99,7 +99,11 @@ class NotificationResponse(BaseModel):
     # no DB columns behind these.
     type: Optional[str] = None
     link: Optional[str] = None
-    
+    # Extra, computed detail for grouped cards (new matches): totals, the
+    # per-consultant counts and the "since" used to highlight rows on the
+    # page the card opens. None for ordinary notifications.
+    meta: Optional[dict] = None
+
     class Config:
         from_attributes = True
 
@@ -176,6 +180,9 @@ class RequirementResponse(BaseModel):
     # on this shared endpoint — "did I personally apply" only makes sense
     # for the consultant viewing their own Requirements page.
     already_applied: bool = False
+    # Only meaningful when the list was opened with matched_since (from a
+    # new-matches notification): True when this requirement got a match since.
+    new_match: bool = False
 
 class PaginatedRequirements(BaseModel):
     data: List[RequirementResponse]
@@ -183,6 +190,9 @@ class PaginatedRequirements(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    # Number of new matches since matched_since for this caller (None when
+    # matched_since was not sent).
+    new_match_count: Optional[int] = None
 
 
 class ConsultantResponse(BaseModel):
@@ -243,6 +253,11 @@ async def lifespan(app: FastAPI):
     # sync below reads it (create_all doesn't add columns to existing tables).
     from gmail_status_sync import ensure_gmail_token_schema
     await ensure_gmail_token_schema(engine)
+
+    # notifications.consultant_id (nullable) — same reason: create_all() never
+    # adds a column to an existing table.
+    from notification_helper import ensure_notification_schema
+    await ensure_notification_schema(engine)
 
     # Insert-if-not-exists keyed by email — never touches rows that already exist.
     # SECURITY FIX: this used to unconditionally create admin@rap.io /
@@ -995,10 +1010,16 @@ async def get_requirements(
     # Work mode filter (REMOTE | HYBRID | ONSITE) for the Requirements
     # page's "Work mode" dropdown. Optional — omitted means no filter.
     work_mode: Optional[str] = None,
+    # Opened from a "new matches" notification: ISO timestamp (start of the
+    # alert's day). Requirements that got a match at/after it are flagged
+    # new_match=true and listed first; matched_since_only=true hides the rest.
+    # Scoped to the caller (own matches / own roster / everyone for admin).
+    matched_since: Optional[str] = None,
+    matched_since_only: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from sqlalchemy import func
+    from sqlalchemy import func, case
 
     # Validate pagination params
     if page < 1:
@@ -1109,6 +1130,42 @@ async def get_requirements(
                 )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
 
+    # New-match highlight (see matched_since above). new_match_subq is the
+    # requirement ids with a match created since that time, for THIS caller.
+    new_match_subq = None
+    new_match_count = None
+    if matched_since:
+        try:
+            since_dt = datetime.fromisoformat(matched_since.strip().replace("Z", "+00:00"))
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid matched_since format")
+        _nm_where = [
+            RequirementConsultantMatch.created_at >= since_dt,
+            RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
+        ]
+        if current_user.role == "CONSULTANT":
+            _own = (await db.execute(
+                select(Consultant.id).where(Consultant.user_id == current_user.id)
+            )).scalar_one_or_none()
+            _nm_where.append(RequirementConsultantMatch.consultant_id == (_own if _own else -1))
+        elif current_user.role == "RECRUITER":
+            _nm_where.append(RequirementConsultantMatch.consultant_id.in_(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            ))
+        if filter_consultant_ids:
+            _nm_where.append(RequirementConsultantMatch.consultant_id.in_(filter_consultant_ids))
+        new_match_subq = select(RequirementConsultantMatch.requirement_id).where(*_nm_where)
+        new_match_count = int((await db.execute(
+            select(func.count()).select_from(RequirementConsultantMatch).where(*_nm_where)
+        )).scalar_one() or 0)
+        if matched_since_only:
+            query = query.where(Requirement.id.in_(new_match_subq))
+
     # BUG FIX: the FilterBar (admin Requirements page) has always sent
     # confidence_filter and employment_type as real query params, but this
     # endpoint never declared or read either one — FastAPI silently drops
@@ -1173,7 +1230,7 @@ async def get_requirements(
             )
         )
 
-    if not date_from:
+    if not date_from and not matched_since:
         date_from = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
 
     if date_from:
@@ -1212,13 +1269,23 @@ async def get_requirements(
     # Tie-breaker on id: many rows share received_date/status, and without a
     # unique secondary key Postgres may order ties differently per query, so
     # rows repeated or went missing across pages.
-    query = query.order_by(
+    order_cols = [
         sort_col.desc() if sort_dir == "desc" else sort_col.asc(),
         Requirement.id.desc() if sort_dir == "desc" else Requirement.id.asc(),
-    )
+    ]
+    if new_match_subq is not None:
+        # New matches first, then the caller's chosen order.
+        order_cols.insert(0, case((Requirement.id.in_(new_match_subq), 0), else_=1))
+    query = query.order_by(*order_cols)
     query = query.offset((page - 1) * page_size).limit(page_size)
 
     reqs = (await db.execute(query)).scalars().all()
+    if new_match_subq is not None and reqs:
+        _flag_ids = {row[0] for row in (await db.execute(
+            new_match_subq.where(RequirementConsultantMatch.requirement_id.in_([r.id for r in reqs]))
+        )).all()}
+        for r in reqs:
+            r.new_match = r.id in _flag_ids
     total_pages = math.ceil(total / page_size) if page_size > 0 else 0
 
     # Batch-load matched consultant names for this page in one query
@@ -1348,6 +1415,7 @@ async def get_requirements(
         page=page,
         page_size=page_size,
         total_pages=total_pages,
+        new_match_count=new_match_count,
     )
 
 
@@ -1640,27 +1708,8 @@ async def get_notifications(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Notification)
-        .where(Notification.user_id == current_user.id)
-        .order_by(Notification.created_at.desc())
-        .limit(50)
-    )
-    from notification_helper import resolve_notification_meta
-    out = []
-    for n in result.scalars().all():
-        ntype, link = resolve_notification_meta(n.title, current_user.role)
-        out.append(NotificationResponse(
-            id=n.id,
-            user_id=n.user_id,
-            title=n.title,
-            body=n.body,
-            is_read=n.is_read,
-            created_at=n.created_at,
-            type=ntype,
-            link=link,
-        ))
-    return out
+    from notification_helper import list_for_user
+    return [NotificationResponse(**d) for d in await list_for_user(db, current_user, 50)]
 
 
 @app.get("/api/notifications/unread-count")
@@ -1669,13 +1718,13 @@ async def get_unread_notification_count(
     db: AsyncSession = Depends(get_db),
 ):
     """Cheap count for the bell badge — avoids loading the whole list on every poll."""
-    count = (await db.execute(
-        select(func.count()).select_from(Notification).where(
-            Notification.user_id == current_user.id,
-            Notification.is_read == False,
-        )
-    )).scalar_one()
-    return {"unread_count": int(count or 0)}
+    # Counted from the same composed list the bell shows, so the badge never
+    # disagrees with the cards (a day's new matches are ONE card).
+    from notification_helper import count_unread_for_user
+    # A just-created "consultant removed" notice rides along so the bell can
+    # toast it without opening the list (only for ~15 minutes).
+    count, notice = await count_unread_for_user(db, current_user)
+    return {"unread_count": count, "notice": notice}
 
 
 @app.patch("/api/notifications/{notification_id}/read")
@@ -1684,16 +1733,9 @@ async def mark_notification_read(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Notification)
-        .where(Notification.id == notification_id, Notification.user_id == current_user.id)
-    )
-    notif = result.scalars().first()
-    if not notif:
+    from notification_helper import mark_read
+    if not await mark_read(db, current_user, notification_id):
         raise HTTPException(status_code=404, detail="Notification not found")
-    
-    notif.is_read = True
-    await db.commit()
     return {"success": True}
 
 

@@ -225,8 +225,15 @@ class RecruiterConsultantRepository:
         )
         mapping = result.scalars().first()
         if mapping:
+            was_active = bool(mapping.is_active)
             mapping.is_active = False
             await db.flush()
+            if was_active:
+                # Retract this recruiter's unread alerts about the consultant
+                # (exact, by notifications.consultant_id) and leave a short
+                # notice. Runs in the caller's transaction; never raises.
+                from notification_helper import retract_for_removed_consultant
+                await retract_for_removed_consultant(db, recruiter_id, consultant_id)
 
     @staticmethod
     async def exists(db: AsyncSession, recruiter_id: int, consultant_id: int) -> bool:

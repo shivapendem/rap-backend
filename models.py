@@ -796,6 +796,12 @@ class Notification(Base):
     title = Column(Text, nullable=False)
     body = Column(Text, nullable=False)
     is_read = Column(Boolean, nullable=False, default=False)
+    # Optional link to the consultant this alert is about (new matches, failed
+    # email for a consultant). NULL for everything else, including all rows
+    # created before this column existed. Lets us retract exactly the right
+    # unread alerts when a consultant is removed from a recruiter. The column
+    # is added to existing databases by notification_helper.ensure_notification_schema().
+    consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 
 class Resume(Base):
