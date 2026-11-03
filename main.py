@@ -87,6 +87,9 @@ class LoginResponse(BaseModel):
     access_token: str
     # Google login only: True/False when Gmail send access is known, else None.
     gmail_connected: Optional[bool] = None
+    # Google login only: lets the frontend re-open Google for the SAME account
+    # (login_hint) when a consultant's first consent didn't grant gmail.send.
+    email: Optional[str] = None
 
 class NotificationResponse(BaseModel):
     id: int
@@ -875,6 +878,7 @@ async def google_login(
         name=user_info["name"],
         access_token=token,
         gmail_connected=gmail_connected,
+        email=user_info["email"],
     )
 
 
