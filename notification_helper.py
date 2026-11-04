@@ -274,12 +274,31 @@ async def _purge_old_match_rows(db) -> None:
 
 
 # --- consultant removed from a recruiter ------------------------------------
-async def retract_for_removed_consultant(db, recruiter_id: int, consultant_id: int) -> None:
+REMOVED_SUFFIX = "was removed from your consultants"
+ASSIGNED_SUFFIX = "was assigned to you"
+
+
+async def _clear_removal_notices(db, recruiter_id: int, consultant_id: int, name: str) -> None:
+    """Delete this recruiter's 'X was removed from your consultants' notices
+    for the consultant, read or unread: exact by consultant_id, plus the older
+    ones saved before the id was stored (matched by the exact title)."""
+    await db.execute(
+        delete(Notification).where(
+            Notification.user_id == recruiter_id,
+            func.lower(Notification.title).like("%" + REMOVED_SUFFIX),
+            (Notification.consultant_id == consultant_id)
+            | (Notification.title == f"{name} {REMOVED_SUFFIX}"),
+        )
+    )
+
+
+async def retract_for_removed_consultant(db, recruiter_id: int, consultant_id: int, notice: bool = True) -> None:
     """Called when a consultant is un-assigned from a recruiter. Deletes that
     recruiter's UNREAD alerts about this consultant (exact, by consultant_id)
-    and leaves a short notice. Read ones stay as history; match cards of a
-    removed consultant are hidden when the list is read. Does not commit (runs
-    inside the caller's transaction) and never raises."""
+    and, when `notice` is True, leaves a short notice (replacing any older
+    removal notice for the same consultant). Read ones stay as history; match
+    cards of a removed consultant are hidden when the list is read. Does not
+    commit (runs inside the caller's transaction) and never raises."""
     try:
         if not await ensure_notification_schema():
             return
@@ -296,19 +315,49 @@ async def retract_for_removed_consultant(db, recruiter_id: int, consultant_id: i
                     Notification.is_read == False,
                 )
             )
-            title = f"{name} was removed from your consultants"
-            body = "You will no longer get matches or alerts for this consultant."
-            dup = (await db.execute(
-                select(Notification.id).where(
-                    Notification.user_id == recruiter_id,
-                    Notification.title == title,
-                    Notification.is_read == False,
-                ).limit(1)
-            )).first()
-            if dup is None:
-                db.add(Notification(user_id=recruiter_id, title=title, body=body))
+            if notice:
+                await _clear_removal_notices(db, recruiter_id, consultant_id, name)
+                db.add(Notification(
+                    user_id=recruiter_id, consultant_id=consultant_id,
+                    title=f"{name} {REMOVED_SUFFIX}",
+                    body="You will no longer get matches or alerts for this consultant.",
+                ))
     except Exception as e:
         print(f"[notification_helper] FAILED to retract notifications: {e}")
+
+
+# --- consultant assigned to a recruiter -------------------------------------
+async def notify_consultant_assigned(db, recruiter_id: int, consultant_id: int, notice: bool = True) -> None:
+    """Called when a consultant is assigned (or re-assigned) to a recruiter.
+    Always clears the recruiter's stale 'was removed' notice for this
+    consultant; when `notice` is True also tells the recruiter about the new
+    assignment (replacing an older unread one). Pass notice=False when the
+    recruiter made the assignment themselves. Does not commit (runs inside the
+    caller's transaction) and never raises."""
+    try:
+        if not await ensure_notification_schema():
+            return
+        async with db.begin_nested():
+            name = (await db.execute(
+                select(Consultant.full_name).where(Consultant.id == consultant_id)
+            )).scalar_one_or_none() or "A consultant"
+            await _clear_removal_notices(db, recruiter_id, consultant_id, name)
+            if notice:
+                await db.execute(
+                    delete(Notification).where(
+                        Notification.user_id == recruiter_id,
+                        Notification.consultant_id == consultant_id,
+                        Notification.is_read == False,
+                        func.lower(Notification.title).like("%" + ASSIGNED_SUFFIX),
+                    )
+                )
+                db.add(Notification(
+                    user_id=recruiter_id, consultant_id=consultant_id,
+                    title=f"{name} {ASSIGNED_SUFFIX}",
+                    body="You will now get matches and alerts for this consultant.",
+                ))
+    except Exception as e:
+        print(f"[notification_helper] FAILED to notify assignment: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -337,8 +386,10 @@ def resolve_notification_meta(title: str, role: str, body: str = None):
     """Return (type, link) for a notification as seen by `role`."""
     t = (title or "").strip().lower()
     r = (role or "").upper()
-    if t.endswith("was removed from your consultants"):
+    if t.endswith(REMOVED_SUFFIX):
         return "consultant_removed", ("/recruiter/consultants" if r == "RECRUITER" else None)
+    if t.endswith(ASSIGNED_SUFFIX):
+        return "consultant_assigned", ("/recruiter/consultants" if r == "RECRUITER" else None)
     for prefix, ntype, links in _NOTIFICATION_RULES:
         if t.startswith(prefix):
             link = links.get(r)
