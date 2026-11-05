@@ -1017,6 +1017,21 @@ async def _resolve_experience_consultant(
     return await _get_consultant_for_user(db, target_user)
 
 
+def has_professional_summary(resume_info) -> bool:
+    """Profile completeness: True when the consultant has written a Professional
+    Summary (User.resume_info "summary" or "career_objective"; the editor may
+    store HTML, so tags / &nbsp; are stripped before checking for real text)."""
+    if not isinstance(resume_info, dict):
+        return False
+    for key in ("summary", "career_objective"):
+        val = resume_info.get(key)
+        if isinstance(val, str):
+            text = re.sub(r"<[^>]*>", " ", val).replace("&nbsp;", " ")
+            if text.strip():
+                return True
+    return False
+
+
 async def _consultant_to_profile_response(
     db: AsyncSession, c: Consultant, experience_count: int = 0, *, include_resume_size: bool = True
 ) -> ProfileResponse:
@@ -1089,7 +1104,9 @@ async def _consultant_to_profile_response(
      
     completeness = 0
     if (c.primary_skills or "").strip():
-        completeness += 30  # Skills
+        completeness += 25  # Skills
+    if has_professional_summary(resume_info):
+        completeness += 5  # Professional Summary
     if experience_count > 0:
         completeness += 25  # Experience
     if c.preferred_employment_types:
