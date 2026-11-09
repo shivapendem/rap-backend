@@ -315,6 +315,19 @@ class HealthIndicator(BaseModel):
 class SystemHealthDTO(BaseModel):
     status: str
     indicators: List[HealthIndicator]
+    # Real measurements for the dashboard's "System health" widget. All
+    # optional/defaulted so anything that only reads status/indicators is
+    # unaffected. *_status are traffic lights: "green" | "amber" | "red".
+    api_latency_ms: Optional[float] = None       # 5-minute average
+    api_latency_samples: int = 0                 # requests behind that average
+    api_latency_status: Optional[str] = None
+    queue_depth: Optional[int] = None            # jobs waiting for a cron worker
+    queue_breakdown: Optional[dict] = None
+    queue_status: Optional[str] = None
+    db_connections_used: Optional[int] = None
+    db_connections_max: Optional[int] = None
+    db_pool_usage_pct: Optional[float] = None
+    db_pool_status: Optional[str] = None
 
 
 class DuplicateGroupDTO(BaseModel):
@@ -1597,6 +1610,142 @@ async def error_rate(
 
 
 
+# ---------------------------------------------------------------------------
+# System health — real numbers for the admin dashboard widget
+#
+#   * API latency  : average duration of the HTTP requests this process served
+#                    in the last 5 minutes (sampled by the timing middleware
+#                    in main.py via record_api_latency()). In-memory and
+#                    per-process, like the other counters in this app (the
+#                    backend is run as a single uvicorn worker); it starts
+#                    empty after a restart.
+#   * Queue depth  : work waiting for the PM2 cron workers (this app has no
+#                    Celery) -- reparse requests, re-match requests, queued
+#                    outgoing application emails, emails the Gmail sync has
+#                    not parsed yet, and emails waiting in the OpenAI batch
+#                    pipeline.
+#   * DB pool      : Postgres connections currently open to this database as
+#                    a share of the server's max_connections (so it includes
+#                    the cron workers too). Falls back to this process's own
+#                    SQLAlchemy pool when pg_stat_activity isn't available.
+# ---------------------------------------------------------------------------
+import logging as _logging
+import time as _time
+from collections import deque as _deque
+
+_health_log = _logging.getLogger("rap.health")
+
+_API_LATENCY_WINDOW_SECONDS = 300
+_api_latency_samples = _deque(maxlen=20000)  # (monotonic_seconds, duration_ms)
+
+
+def record_api_latency(duration_ms: float) -> None:
+    """Called by the timing middleware in main.py for each HTTP request."""
+    _api_latency_samples.append((_time.monotonic(), float(duration_ms)))
+
+
+def get_api_latency_5m():
+    """(average_ms, sample_count) over the last 5 minutes, or (None, 0)."""
+    cutoff = _time.monotonic() - _API_LATENCY_WINDOW_SECONDS
+    while _api_latency_samples and _api_latency_samples[0][0] < cutoff:
+        _api_latency_samples.popleft()
+    snapshot = list(_api_latency_samples)
+    if not snapshot:
+        return None, 0
+    return sum(ms for _, ms in snapshot) / len(snapshot), len(snapshot)
+
+
+def _traffic_light(value, amber_at, red_at) -> str:
+    if value is None:
+        return "green"
+    if value >= red_at:
+        return "red"
+    if value >= amber_at:
+        return "amber"
+    return "green"
+
+
+async def _safe_count(db: AsyncSession, name: str, sql: str):
+    try:
+        return int((await db.execute(text(sql))).scalar() or 0)
+    except Exception as e:
+        await db.rollback()  # a failed statement poisons the Postgres transaction
+        _health_log.warning("system-health: %s count failed: %s", name, e)
+        return None
+
+
+# The queue counts scan a few tables, so cache them briefly: several admins
+# with the dashboard open still cost one set of queries per interval.
+_QUEUE_CACHE: dict = {"at": 0.0, "value": None}
+_QUEUE_CACHE_TTL_SECONDS = 10
+
+
+async def _queue_depth(db: AsyncSession):
+    """(total_or_None, breakdown) of jobs waiting for the cron workers."""
+    now = _time.monotonic()
+    if _QUEUE_CACHE["value"] is not None and now - _QUEUE_CACHE["at"] < _QUEUE_CACHE_TTL_SECONDS:
+        return _QUEUE_CACHE["value"]
+
+    breakdown = {
+        # cron_reparse.py: "Reparse Requested" / "Reparsing"
+        "reparse": await _safe_count(
+            db, "reparse",
+            "SELECT COUNT(*) FROM gmail_emails WHERE status_desc IN ('Reparse Requested', 'Reparsing')"),
+        # cron_reparse.py: REMATCH_REQUESTED / REMATCHING
+        "rematch": await _safe_count(
+            db, "rematch",
+            "SELECT COUNT(*) FROM requirements WHERE status IN ('REMATCH_REQUESTED', 'REMATCHING')"),
+        # cron_email_queue.py: outgoing application emails
+        "email_send": await _safe_count(
+            db, "email_send",
+            "SELECT COUNT(*) FROM email_queue WHERE status IN ('QUEUED', 'PROCESSING')"),
+        # cron_gmail_sync.py -> requirements_sync.py: same selection rule the
+        # sync uses (unparsed or auto-retryable failed emails inside the 14-day
+        # window, no requirement yet, fewer than 3 recorded failures).
+        "email_parse": await _safe_count(
+            db, "email_parse",
+            "SELECT COUNT(*) FROM gmail_emails ge "
+            "WHERE (ge.status_desc IS NULL OR ge.status_desc = 'Pending' OR ge.status_desc = 'Failed') "
+            "AND ge.date >= NOW() - INTERVAL '14 days' "
+            "AND NOT EXISTS (SELECT 1 FROM requirements r WHERE r.raw_email_id = ge.id) "
+            "AND (SELECT COUNT(*) FROM processing_errors pe "
+            "     WHERE pe.source_type = 'gmail_emails' AND pe.source_id = CAST(ge.id AS TEXT)) < 3"),
+        # cron_batch_submit.py / cron_batch_retrieve.py: OpenAI batch pipeline
+        "batch_parse": await _safe_count(
+            db, "batch_parse",
+            "SELECT COUNT(*) FROM gmail_emails WHERE status_desc IN ('Batch Queued', 'Batch Submitted')"),
+    }
+    known = [v for v in breakdown.values() if v is not None]
+    total = sum(known) if known else None
+    _QUEUE_CACHE["at"], _QUEUE_CACHE["value"] = now, (total, breakdown)
+    return total, breakdown
+
+
+async def _db_connection_usage(db: AsyncSession):
+    """(used, max, pct) -- or (None, None, None) if it can't be measured."""
+    try:
+        row = (await db.execute(text(
+            "SELECT (SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database()), "
+            "current_setting('max_connections')::int"
+        ))).first()
+        used, limit = int(row[0]), int(row[1])
+        if limit > 0:
+            return used, limit, round(used * 100.0 / limit, 1)
+    except Exception as e:
+        await db.rollback()
+        _health_log.info("system-health: pg_stat_activity unavailable (%s); using engine pool", e)
+    try:
+        from database import engine
+        pool = engine.sync_engine.pool
+        capacity = pool.size() + max(getattr(pool, "_max_overflow", 0), 0)
+        if capacity > 0:
+            used = pool.checkedout()
+            return used, capacity, round(used * 100.0 / capacity, 1)
+    except Exception as e:
+        _health_log.info("system-health: engine pool usage unavailable: %s", e)
+    return None, None, None
+
+
 @router.get("/system-health", response_model=SystemHealthDTO)
 async def system_health(
     db: AsyncSession = Depends(get_db),
@@ -1614,7 +1763,25 @@ async def system_health(
     indicators.append(HealthIndicator(name="redis", status="ok" if redis_ok else "unavailable"))
 
     overall = "ok" if all(i.status == "ok" for i in indicators if i.name == "database") else "degraded"
-    return SystemHealthDTO(status=overall, indicators=indicators)
+
+    latency_ms, latency_samples = get_api_latency_5m()
+    queue_total, queue_breakdown = await _queue_depth(db)
+    db_used, db_max, db_pct = await _db_connection_usage(db)
+
+    return SystemHealthDTO(
+        status=overall,
+        indicators=indicators,
+        api_latency_ms=round(latency_ms, 1) if latency_ms is not None else None,
+        api_latency_samples=latency_samples,
+        api_latency_status=_traffic_light(latency_ms, 500, 1000),   # normal under 500 ms
+        queue_depth=queue_total,
+        queue_breakdown=queue_breakdown,
+        queue_status=_traffic_light(queue_total, 50, 200),          # normal under 50 jobs
+        db_connections_used=db_used,
+        db_connections_max=db_max,
+        db_pool_usage_pct=db_pct,
+        db_pool_status=_traffic_light(db_pct, 80, 90),              # normal under 80%
+    )
 
 
 # ---------------------------------------------------------------------------

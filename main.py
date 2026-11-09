@@ -410,6 +410,25 @@ async def no_cache_api_responses(request, call_next):
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     return response
+
+
+# Feeds the admin dashboard's "System health -> API Latency" figure: records
+# how long each HTTP request took (until the response is ready) so
+# phase8.get_api_latency_5m() can report a real 5-minute average. Skips CORS
+# preflights and the health endpoints themselves, and can never break a
+# request -- any failure while recording is ignored.
+@app.middleware("http")
+async def record_api_latency_middleware(request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if request.method != "OPTIONS" and path != "/health" and not path.endswith("/system-health"):
+            from phase8 import record_api_latency
+            record_api_latency((time.perf_counter() - started) * 1000.0)
+    except Exception:
+        pass
+    return response
 # ---------------------------------------------------------------------------
 # Phase 2 router — requirement detail/status/stats, pipeline endpoints
 # ---------------------------------------------------------------------------
