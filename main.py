@@ -164,6 +164,8 @@ class RequirementResponse(BaseModel):
     skills: Optional[str] = None
     parse_confidence: Optional[float] = None
     raw_email_id: Optional[int] = None
+    account_email: Optional[str] = None
+    mode: Optional[str] = "public"
     # Names of consultants matched to this requirement — scoped to the
     # caller's own roster for RECRUITER, all consultants for ADMIN, and
     # left empty for CONSULTANT (not relevant/exposed on this shared
@@ -1078,6 +1080,8 @@ async def get_requirements(
     # no time window (the Date filter narrows by received date). Enforced
     # here, not just hidden in the UI. MATCHING + APPLIED only (rejected /
     # not-eligible matches stay hidden).
+    # Also enforce mode scoping: public requirements + private requirements from
+    # their assigned recruiter(s) or their own email.
     if current_user.role == "CONSULTANT":
         own_consultant = (await db.execute(
             select(Consultant).where(Consultant.user_id == current_user.id)
@@ -1087,7 +1091,52 @@ async def get_requirements(
             RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
         )
         query = query.where(Requirement.id.in_(own_matches))
+
+        # Mode scoping for consultant:
+        if own_consultant:
+            rec_assigned_q = select(User.email).join(
+                RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id
+            ).where(
+                RecruiterConsultant.consultant_id == own_consultant.id,
+                RecruiterConsultant.is_active == True,
+            )
+            rec_emails = [r[0].lower().strip() for r in (await db.execute(rec_assigned_q)).all() if r[0]]
+            if own_consultant.sales_recruiter_user_id:
+                sr_res = await db.execute(select(User.email).where(User.id == own_consultant.sales_recruiter_user_id))
+                sr_email = sr_res.scalar_one_or_none()
+                if sr_email:
+                    rec_emails.append(sr_email.lower().strip())
+            user_email = (current_user.email or "").lower().strip()
+            if user_email:
+                rec_emails.append(user_email)
+            rec_emails = list(set(rec_emails))
+
+            if rec_emails:
+                query = query.where(
+                    or_(
+                        Requirement.mode == "public",
+                        Requirement.mode.is_(None),
+                        func.lower(func.trim(Requirement.account_email)).in_(rec_emails),
+                    )
+                )
+            else:
+                query = query.where(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+        else:
+            query = query.where(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+
         matched_only = False  # already scoped above; ignore the old N-day window
+
+    elif current_user.role == "RECRUITER":
+        # Mode scoping for recruiter:
+        # Recruiter sees all public requirements + private requirements received on their own email
+        user_email = (current_user.email or "").lower().strip()
+        query = query.where(
+            or_(
+                Requirement.mode == "public",
+                Requirement.mode.is_(None),
+                func.lower(func.trim(Requirement.account_email)) == user_email,
+            )
+        )
     if matched_only:
         since = datetime.now(timezone.utc) - timedelta(days=matched_days)
         matched_subq = select(RequirementConsultantMatch.requirement_id).where(

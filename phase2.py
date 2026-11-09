@@ -86,6 +86,8 @@ class RequirementDetailResponse(BaseModel):
     parse_confidence: Optional[float] = None
     status: str
     received_date: Optional[str] = None
+    account_email: Optional[str] = None
+    mode: Optional[str] = "public"
 
 
 class UpdateStatusRequest(BaseModel):
@@ -117,6 +119,26 @@ async def get_requirement_stats(
 ):
     _require_role(current_user, "ADMIN", "RECRUITER")
 
+    # Scope to current_user: RECRUITER only counts public + their own private requirements
+    where_req = []
+    if current_user.role == "RECRUITER":
+        user_email = (current_user.email or "").lower().strip()
+        where_req.append(
+            or_(
+                Requirement.mode == "public",
+                Requirement.mode.is_(None),
+                func.lower(func.trim(Requirement.account_email)) == user_email,
+            )
+        )
+
+    subq = select(
+        Requirement.status,
+        func.count(Requirement.id).label("c"),
+    )
+    if where_req:
+        subq = subq.where(*where_req)
+    subq = subq.group_by(Requirement.status).subquery()
+
     result = await db.execute(
         select(
             func.sum(text("c")).label("total"),
@@ -126,14 +148,7 @@ async def get_requirement_stats(
             func.sum(text("c")).filter(text("status = 'INTERVIEWING'")).label("interviewing"),
             func.sum(text("c")).filter(text("status = 'CLOSED'")).label("closed"),
             func.sum(text("c")).filter(text("status = 'REJECTED'")).label("rejected"),
-        ).select_from(
-            select(
-                Requirement.status,
-                func.count(Requirement.id).label("c"),
-            )
-            .group_by(Requirement.status)
-            .subquery()
-        )
+        ).select_from(subq)
     )
     row = result.first()
     return RequirementStatsResponse(
@@ -164,6 +179,47 @@ async def get_requirement_detail(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    # Visibility checks for private requirements:
+    # ADMIN: full access.
+    # RECRUITER: public requirements + private requirements received on their own email.
+    # CONSULTANT: public requirements + private requirements from their assigned recruiter(s) or their own email.
+    req_mode = (getattr(requirement, "mode", None) or "public").lower()
+    req_acc = (getattr(requirement, "account_email", None) or "").lower().strip()
+
+    if req_mode == "private":
+        if current_user.role == "RECRUITER":
+            user_email = (current_user.email or "").lower().strip()
+            if req_acc != user_email:
+                raise HTTPException(status_code=403, detail="Not authorized to view this private requirement")
+        elif current_user.role == "CONSULTANT":
+            # Check if requirement matches their assigned recruiter or themselves
+            user_email = (current_user.email or "").lower().strip()
+            if req_acc != user_email:
+                from models import Consultant, RecruiterConsultant
+                cons_res = await db.execute(select(Consultant).where(Consultant.user_id == current_user.id))
+                cons = cons_res.scalars().first()
+                if not cons:
+                    raise HTTPException(status_code=403, detail="Not authorized to view this private requirement")
+
+                # Fetch assigned recruiters
+                assigned_q = (
+                    select(User.email)
+                    .join(RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id)
+                    .where(
+                        RecruiterConsultant.consultant_id == cons.id,
+                        RecruiterConsultant.is_active == True,
+                    )
+                )
+                recruiter_emails = {r[0].lower().strip() for r in (await db.execute(assigned_q)).all() if r[0]}
+                if cons.sales_recruiter_user_id:
+                    sr_res = await db.execute(select(User.email).where(User.id == cons.sales_recruiter_user_id))
+                    sr_email = sr_res.scalar_one_or_none()
+                    if sr_email:
+                        recruiter_emails.add(sr_email.lower().strip())
+
+                if req_acc not in recruiter_emails:
+                    raise HTTPException(status_code=403, detail="Not authorized to view this private requirement")
+
     # experience/skills are NOT real columns on Requirement — they only
     # ever live inside parsed_fields (see dedup.py / reparse_email below).
     # Reading requirement.experience / requirement.skills directly would
@@ -190,6 +246,8 @@ async def get_requirement_detail(
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
         status=requirement.status,
         received_date=requirement.received_date.isoformat() if requirement.received_date else None,
+        account_email=requirement.account_email,
+        mode=req_mode,
     )
 
 
@@ -209,6 +267,13 @@ async def update_requirement_status(
     requirement = result.scalars().first()
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
+
+    req_mode = (getattr(requirement, "mode", None) or "public").lower()
+    req_acc = (getattr(requirement, "account_email", None) or "").lower().strip()
+    if req_mode == "private" and current_user.role == "RECRUITER":
+        user_email = (current_user.email or "").lower().strip()
+        if req_acc != user_email:
+            raise HTTPException(status_code=403, detail="Not authorized to update this private requirement")
 
     if payload.status not in Requirement.VALID_STATUSES:
         raise HTTPException(
@@ -675,6 +740,14 @@ async def get_gmail_email_status_counts(
     where_clauses: list = []
     params: dict = {}
     _apply_gmail_search(where_clauses, params, search, search_body)
+    # Scope to current_user: RECRUITER only sees public + their own private emails
+    if current_user.role == "RECRUITER":
+        user_email = (current_user.email or "").lower().strip()
+        where_clauses.append(
+            "(ge.mode = 'public' OR ge.mode IS NULL OR LOWER(TRIM(ge.account_email)) = :recruiter_email)"
+        )
+        params["recruiter_email"] = user_email
+
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     if not where_sql:
         # Fast path using the ix_gmail_emails_status_desc B-tree index
@@ -806,6 +879,14 @@ async def get_gmail_emails(
         except ValueError:
             params["date_to"] = date_to
 
+    # Scope to current_user: RECRUITER only sees public + their own private emails
+    if current_user.role == "RECRUITER":
+        user_email = (current_user.email or "").lower().strip()
+        where_clauses.append(
+            "(ge.mode = 'public' OR ge.mode IS NULL OR LOWER(TRIM(ge.account_email)) = :recruiter_email)"
+        )
+        params["recruiter_email"] = user_email
+
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
     # Count total
@@ -835,12 +916,12 @@ async def get_gmail_emails(
     # only for legacy rows that predate fetched_at being populated.
     if light:
         select_cols = """
-            ge.id, ge.account_email, ge.subject, ge.from_address, ge.from_name,
+            ge.id, ge.account_email, ge.mode, ge.subject, ge.from_address, ge.from_name,
                    ge.date, ge.fetched_at, ge.category, ge.processed,
                    ge.status_desc, ge.reason,"""
     else:
         select_cols = """
-            ge.id, ge.account_id, ge.account_email, ge.message_id, ge.uid, ge.folder,
+            ge.id, ge.account_id, ge.account_email, ge.mode, ge.message_id, ge.uid, ge.folder,
                    ge.subject, ge.from_address, ge.from_name, ge.to_addresses, ge.cc_addresses,
                    ge.bcc_addresses, ge.reply_to, ge.body_text, ge.body_html, ge.date,
                    ge.is_read, ge.is_starred, ge.has_attachments, ge.attachments, ge.labels,
@@ -877,6 +958,10 @@ async def get_gmail_emails(
 # All columns included as per table structure
 # ---------------------------------------------------------------------------
 
+class UpdateGmailAccountModeRequest(BaseModel):
+    mode: str = Field(..., pattern="^(public|private)$")
+
+
 @router.get(
     "/api/admin/gmail-accounts",
     summary="Get all Gmail accounts — all columns included",
@@ -890,7 +975,7 @@ async def get_gmail_accounts(
         text("""
             SELECT id, email, label, full_name, phone,
                    skills, resume_url, imap_host, imap_port,
-                   active, last_synced, last_uid,
+                   mode, active, last_synced, last_uid,
                    sync_errors, created_at, updated_at
             FROM gmail_accounts
             ORDER BY id
@@ -898,6 +983,41 @@ async def get_gmail_accounts(
     )
     rows = result.mappings().all()
     return {"data": [dict(row) for row in rows], "total": len(rows)}
+
+
+@router.patch(
+    "/api/admin/gmail-accounts/{account_id}/mode",
+    summary="Update Gmail account mode (public or private)",
+)
+async def update_gmail_account_mode(
+    account_id: int,
+    payload: UpdateGmailAccountModeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_role(current_user, "ADMIN")
+    target_mode = payload.mode.lower().strip()
+    if target_mode not in ("public", "private"):
+        raise HTTPException(status_code=422, detail="Mode must be 'public' or 'private'")
+
+    # Update gmail_accounts — DB trigger trg_sync_gmail_account_mode automatically cascades
+    # mode update to gmail_emails and requirements
+    res = await db.execute(
+        text("""
+            UPDATE gmail_accounts
+            SET mode = :mode, updated_at = NOW()
+            WHERE id = :id
+            RETURNING id, email, mode
+        """),
+        {"id": account_id, "mode": target_mode},
+    )
+    row = res.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    await db.commit()
+    logger.info("Admin %s updated gmail_account id=%s mode to '%s'", current_user.email, account_id, target_mode)
+    return {"success": True, "account": dict(row)}
 
 
 # ---------------------------------------------------------------------------

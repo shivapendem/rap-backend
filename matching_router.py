@@ -222,6 +222,32 @@ async def get_pending_matches(
 
     pending_cutoff = datetime.now(timezone.utc) - timedelta(days=PENDING_WINDOW_DAYS)
 
+    # Pre-resolve private requirement email scope for CONSULTANT
+    consultant_allowed_emails = None
+    if current_user.role == "CONSULTANT":
+        cons_obj = (await db.execute(
+            select(Consultant).where(Consultant.user_id == current_user.id)
+        )).scalars().first()
+        if cons_obj:
+            rec_assigned_q = select(User.email).join(
+                RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id
+            ).where(
+                RecruiterConsultant.consultant_id == cons_obj.id,
+                RecruiterConsultant.is_active == True,
+            )
+            rec_emails = [r[0].lower().strip() for r in (await db.execute(rec_assigned_q)).all() if r[0]]
+            if cons_obj.sales_recruiter_user_id:
+                sr_res = await db.execute(select(User.email).where(User.id == cons_obj.sales_recruiter_user_id))
+                sr_email = sr_res.scalar_one_or_none()
+                if sr_email:
+                    rec_emails.append(sr_email.lower().strip())
+            user_email = (current_user.email or "").lower().strip()
+            if user_email:
+                rec_emails.append(user_email)
+            consultant_allowed_emails = list(set(rec_emails))
+        else:
+            consultant_allowed_emails = []
+
     def _base_stmt(select_clause):
         stmt = (
             select_clause
@@ -265,12 +291,35 @@ async def get_pending_matches(
         if current_user.role == "CONSULTANT":
             cons_subq = select(Consultant.id).where(Consultant.user_id == current_user.id).scalar_subquery()
             stmt = stmt.where(RequirementConsultantMatch.consultant_id == cons_subq)
+            # Private requirement scoping for consultant:
+            # Consultant sees matches from public jobs OR jobs received by their assigned recruiter(s) or their own email
+            if consultant_allowed_emails:
+                stmt = stmt.where(
+                    or_(
+                        Requirement.mode == "public",
+                        Requirement.mode.is_(None),
+                        func.lower(func.trim(Requirement.account_email)).in_(consultant_allowed_emails),
+                    )
+                )
+            else:
+                stmt = stmt.where(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+
         elif current_user.role == "RECRUITER":
             assigned_subq = select(RecruiterConsultant.consultant_id).where(
                 RecruiterConsultant.recruiter_id == current_user.id,
                 RecruiterConsultant.is_active == True,
             ).scalar_subquery()
             stmt = stmt.where(RequirementConsultantMatch.consultant_id.in_(assigned_subq))
+            # Private requirement scoping for recruiter:
+            # Recruiter sees matches from public jobs + private jobs matching their own email
+            user_email = (current_user.email or "").lower().strip()
+            stmt = stmt.where(
+                or_(
+                    Requirement.mode == "public",
+                    Requirement.mode.is_(None),
+                    func.lower(func.trim(Requirement.account_email)) == user_email,
+                )
+            )
         return stmt
 
     count_stmt = _base_stmt(select(func.count()).select_from(RequirementConsultantMatch))
@@ -283,6 +332,8 @@ async def get_pending_matches(
         func.coalesce(Requirement.client, Requirement.vendor).label("requirement_company"),
         Requirement.vendor_email.label("requirement_vendor_email"),
         Requirement.raw_email_id,
+        Requirement.account_email,
+        Requirement.mode,
         RequirementConsultantMatch.consultant_id,
         Consultant.full_name.label("consultant_name"),
         Consultant.email.label("consultant_email"),
@@ -345,6 +396,8 @@ async def get_pending_matches(
             "requirement_company": row["requirement_company"],
             "requirement_vendor_email": row["requirement_vendor_email"],
             "raw_email_id": row["raw_email_id"],
+            "account_email": row["account_email"],
+            "mode": (row["mode"] or "public").lower(),
             "consultant_id": row["consultant_id"],
             "consultant_name": row["consultant_name"],
             "consultant_email": row["consultant_email"],
@@ -387,8 +440,33 @@ async def _load_match_for_action(db: AsyncSession, match_id: int, current_user: 
                 Consultant.user_id == current_user.id,
             )
         )
-        if not cons_check.scalars().first():
+        cons_id = cons_check.scalars().first()
+        if not cons_id:
             raise HTTPException(status_code=404, detail="Match not found")
+
+        # Verify requirement mode visibility for consultant
+        req_res = await db.execute(select(Requirement.mode, Requirement.account_email).where(Requirement.id == match.requirement_id))
+        req_row = req_res.first()
+        if req_row and (req_row[0] or "").lower() == "private":
+            req_acc = (req_row[1] or "").lower().strip()
+            user_email = (current_user.email or "").lower().strip()
+            if req_acc != user_email:
+                cons_obj = (await db.execute(select(Consultant).where(Consultant.id == cons_id))).scalars().first()
+                rec_assigned_q = select(User.email).join(
+                    RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id
+                ).where(
+                    RecruiterConsultant.consultant_id == cons_id,
+                    RecruiterConsultant.is_active == True,
+                )
+                rec_emails = {r[0].lower().strip() for r in (await db.execute(rec_assigned_q)).all() if r[0]}
+                if cons_obj and cons_obj.sales_recruiter_user_id:
+                    sr_res = await db.execute(select(User.email).where(User.id == cons_obj.sales_recruiter_user_id))
+                    sr_email = sr_res.scalar_one_or_none()
+                    if sr_email:
+                        rec_emails.add(sr_email.lower().strip())
+                if req_acc not in rec_emails:
+                    raise HTTPException(status_code=403, detail="Not authorized to act on this private match")
+
     elif current_user.role == "RECRUITER":
         assigned_check = await db.execute(
             select(RecruiterConsultant.id).where(
@@ -399,6 +477,15 @@ async def _load_match_for_action(db: AsyncSession, match_id: int, current_user: 
         )
         if not assigned_check.scalars().first():
             raise HTTPException(status_code=404, detail="Match not found")
+
+        # Verify requirement mode visibility for recruiter
+        req_res = await db.execute(select(Requirement.mode, Requirement.account_email).where(Requirement.id == match.requirement_id))
+        req_row = req_res.first()
+        if req_row and (req_row[0] or "").lower() == "private":
+            req_acc = (req_row[1] or "").lower().strip()
+            user_email = (current_user.email or "").lower().strip()
+            if req_acc != user_email:
+                raise HTTPException(status_code=403, detail="Not authorized to act on this private match")
 
     return match
 

@@ -423,6 +423,7 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
     role = (user.role or "").upper()
 
     roster = None
+    allowed_recruiter_emails = None
     if role == "RECRUITER":
         roster = {
             r[0] for r in (await db.execute(
@@ -432,6 +433,30 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
                 )
             )).all()
         }
+    elif role == "CONSULTANT":
+        # Resolve assigned recruiters + self for private requirements
+        cons_obj = (await db.execute(
+            select(Consultant).where(Consultant.user_id == user.id)
+        )).scalars().first()
+        if cons_obj:
+            rec_assigned_q = select(User.email).join(
+                RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id
+            ).where(
+                RecruiterConsultant.consultant_id == cons_obj.id,
+                RecruiterConsultant.is_active == True,
+            )
+            rec_emails = [r[0].lower().strip() for r in (await db.execute(rec_assigned_q)).all() if r[0]]
+            if cons_obj.sales_recruiter_user_id:
+                sr_res = await db.execute(select(User.email).where(User.id == cons_obj.sales_recruiter_user_id))
+                sr_email = sr_res.scalar_one_or_none()
+                if sr_email:
+                    rec_emails.append(sr_email.lower().strip())
+            user_email = (user.email or "").lower().strip()
+            if user_email:
+                rec_emails.append(user_email)
+            allowed_recruiter_emails = list(set(rec_emails))
+        else:
+            allowed_recruiter_emails = []
 
     days: dict = {}
     for n in match_rows:
@@ -446,6 +471,33 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
     for start, grp in days.items():
         rows = grp["rows"]
         cids = sorted({n.consultant_id for n in rows})
+        where_matches = [
+            RequirementConsultantMatch.consultant_id.in_(cids),
+            RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
+            RequirementConsultantMatch.created_at >= start,
+            RequirementConsultantMatch.created_at < grp["end"],
+        ]
+        if role == "RECRUITER":
+            user_email = (user.email or "").lower().strip()
+            where_matches.append(
+                or_(
+                    Requirement.mode == "public",
+                    Requirement.mode.is_(None),
+                    func.lower(func.trim(Requirement.account_email)) == user_email,
+                )
+            )
+        elif role == "CONSULTANT":
+            if allowed_recruiter_emails:
+                where_matches.append(
+                    or_(
+                        Requirement.mode == "public",
+                        Requirement.mode.is_(None),
+                        func.lower(func.trim(Requirement.account_email)).in_(allowed_recruiter_emails),
+                    )
+                )
+            else:
+                where_matches.append(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+
         q = (
             select(
                 RequirementConsultantMatch.consultant_id,
@@ -456,12 +508,7 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
             )
             .join(Requirement, Requirement.id == RequirementConsultantMatch.requirement_id)
             .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
-            .where(
-                RequirementConsultantMatch.consultant_id.in_(cids),
-                RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
-                RequirementConsultantMatch.created_at >= start,
-                RequirementConsultantMatch.created_at < grp["end"],
-            )
+            .where(*where_matches)
             .order_by(RequirementConsultantMatch.match_score.desc())
         )
         found = (await db.execute(q)).all()
