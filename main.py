@@ -164,6 +164,8 @@ class RequirementResponse(BaseModel):
     skills: Optional[str] = None
     parse_confidence: Optional[float] = None
     raw_email_id: Optional[int] = None
+    account_email: Optional[str] = None
+    mode: Optional[str] = "public"
     # Names of consultants matched to this requirement — scoped to the
     # caller's own roster for RECRUITER, all consultants for ADMIN, and
     # left empty for CONSULTANT (not relevant/exposed on this shared
@@ -433,6 +435,7 @@ async def record_api_latency_middleware(request, call_next):
 # Phase 2 router — requirement detail/status/stats, pipeline endpoints
 # ---------------------------------------------------------------------------
 from phase2 import router as phase2_router  # noqa: E402
+from account_mode import load_account_modes, public_clause, public_or_own_clause, effective_mode  # noqa: E402
 app.include_router(phase2_router)
 
 # ---------------------------------------------------------------------------
@@ -979,7 +982,7 @@ def _coerce_skills_list(value) -> List[str]:
     return []
 
 
-def _serialize_requirement(r: Requirement) -> RequirementResponse:
+def _serialize_requirement(r: Requirement, modes=None) -> RequirementResponse:
     """Build the API row for a Requirement, filling in skills/experience
     from parsed_fields (BUG FIX: RequirementResponse.skills/experience
     were declared on the response schema but Requirement has no such
@@ -989,6 +992,9 @@ def _serialize_requirement(r: Requirement) -> RequirementResponse:
     fields so the frontend shows a dash instead of "UNKNOWN" or a
     stray sentence fragment."""
     resp = RequirementResponse.model_validate(r)
+    if modes is not None:
+        # Show the owning gmail account's live mode, not the per-row copy.
+        resp.mode = effective_mode(r.mode, r.account_email, modes)
     resp.client = _clean_display_value(resp.client)
     resp.location = _clean_display_value(resp.location)
     resp.vendor = _clean_display_value(resp.vendor)
@@ -1078,7 +1084,10 @@ async def get_requirements(
     # no time window (the Date filter narrows by received date). Enforced
     # here, not just hidden in the UI. MATCHING + APPLIED only (rejected /
     # not-eligible matches stay hidden).
+    # Also enforce mode scoping: public requirements + private requirements from
+    # their assigned recruiter(s) or their own email.
     if current_user.role == "CONSULTANT":
+        _modes = await load_account_modes(db)  # mode lives on gmail_accounts (no per-row copy rewrite)
         own_consultant = (await db.execute(
             select(Consultant).where(Consultant.user_id == current_user.id)
         )).scalars().first()
@@ -1087,7 +1096,45 @@ async def get_requirements(
             RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
         )
         query = query.where(Requirement.id.in_(own_matches))
+
+        # Mode scoping for consultant:
+        if own_consultant:
+            rec_assigned_q = select(User.email).join(
+                RecruiterConsultant, RecruiterConsultant.recruiter_id == User.id
+            ).where(
+                RecruiterConsultant.consultant_id == own_consultant.id,
+                RecruiterConsultant.is_active == True,
+            )
+            rec_emails = [r[0].lower().strip() for r in (await db.execute(rec_assigned_q)).all() if r[0]]
+            if own_consultant.sales_recruiter_user_id:
+                sr_res = await db.execute(select(User.email).where(User.id == own_consultant.sales_recruiter_user_id))
+                sr_email = sr_res.scalar_one_or_none()
+                if sr_email:
+                    rec_emails.append(sr_email.lower().strip())
+            user_email = (current_user.email or "").lower().strip()
+            if user_email:
+                rec_emails.append(user_email)
+            rec_emails = list(set(rec_emails))
+
+            if rec_emails:
+                query = query.where(
+                    public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, rec_emails)
+                )
+            else:
+                query = query.where(public_clause(Requirement.mode, Requirement.account_email, _modes))
+        else:
+            query = query.where(public_clause(Requirement.mode, Requirement.account_email, _modes))
+
         matched_only = False  # already scoped above; ignore the old N-day window
+
+    elif current_user.role == "RECRUITER":
+        # Mode scoping for recruiter:
+        # Recruiter sees all public requirements + private requirements received on their own email
+        user_email = (current_user.email or "").lower().strip()
+        _modes = await load_account_modes(db)
+        query = query.where(
+            public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
+        )
     if matched_only:
         since = datetime.now(timezone.utc) - timedelta(days=matched_days)
         matched_subq = select(RequirementConsultantMatch.requirement_id).where(
@@ -1432,8 +1479,9 @@ async def get_requirements(
             for r in reqs:
                 r.already_applied = r.id in applied_ids
 
+    _live_modes = await load_account_modes(db)  # live Public/Private from gmail_accounts
     return PaginatedRequirements(
-        data=[_serialize_requirement(r) for r in reqs],
+        data=[_serialize_requirement(r, _live_modes) for r in reqs],
         total=total,
         page=page,
         page_size=page_size,

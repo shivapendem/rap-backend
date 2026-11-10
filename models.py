@@ -191,6 +191,7 @@ class EmailAccount(Base):
     label = Column(String(100), nullable=True)
     imap_host = Column(String(255), nullable=True, default="imap.gmail.com")
     imap_port = Column(Integer, nullable=True, default=993)
+    mode = Column(String(20), nullable=False, default="public")
     active = Column(Boolean, nullable=True, default=True)
     last_synced = Column(TIMESTAMP(timezone=True), nullable=True)
     last_uid = Column(FK_TYPE, nullable=True, default=0)
@@ -308,6 +309,8 @@ class Requirement(Base):
     job_description = Column(Text, nullable=True)
     jd_hash = Column(Text, nullable=True, index=True)          # Phase 2: SHA-256 of normalized cleaned JD
     dedup_key = Column(Text, nullable=True, unique=True, index=True)  # Phase 2: vendor_email|role|jd_hash
+    account_email = Column(Text, nullable=True, index=True)
+    mode = Column(String(20), nullable=False, default="public", index=True)
     parsed_fields = JSONBColumn(nullable=True)
     parse_confidence = Column(Numeric(5, 2), default=0)
     # ats_match_count column removed — matched-consultant count is now
