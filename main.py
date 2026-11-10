@@ -982,7 +982,7 @@ def _coerce_skills_list(value) -> List[str]:
     return []
 
 
-def _serialize_requirement(r: Requirement) -> RequirementResponse:
+def _serialize_requirement(r: Requirement, modes=None) -> RequirementResponse:
     """Build the API row for a Requirement, filling in skills/experience
     from parsed_fields (BUG FIX: RequirementResponse.skills/experience
     were declared on the response schema but Requirement has no such
@@ -992,6 +992,9 @@ def _serialize_requirement(r: Requirement) -> RequirementResponse:
     fields so the frontend shows a dash instead of "UNKNOWN" or a
     stray sentence fragment."""
     resp = RequirementResponse.model_validate(r)
+    if modes is not None:
+        # Show the owning gmail account's live mode, not the per-row copy.
+        resp.mode = effective_mode(r.mode, r.account_email, modes)
     resp.client = _clean_display_value(resp.client)
     resp.location = _clean_display_value(resp.location)
     resp.vendor = _clean_display_value(resp.vendor)
@@ -1476,8 +1479,9 @@ async def get_requirements(
             for r in reqs:
                 r.already_applied = r.id in applied_ids
 
+    _live_modes = await load_account_modes(db)  # live Public/Private from gmail_accounts
     return PaginatedRequirements(
-        data=[_serialize_requirement(r) for r in reqs],
+        data=[_serialize_requirement(r, _live_modes) for r in reqs],
         total=total,
         page=page,
         page_size=page_size,
