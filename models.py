@@ -469,7 +469,7 @@ class GeneratedResume(Base):
     consultant_id = Column(FK_TYPE, ForeignKey("consultants.id", ondelete="CASCADE"), nullable=False, index=True)
     requirement_id = Column(FK_TYPE, ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False, index=True)
     created_by_user_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    ai_model = Column(Text, nullable=False, default="gpt-4o")
+    ai_model = Column(Text, nullable=False, default="gpt-6-luna")
     generation_notes = Column(Text, nullable=True)
     generation_attempt = Column(Integer, nullable=False, default=1)
     resume_content = JSONBColumn(nullable=True)

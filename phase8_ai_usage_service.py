@@ -12,10 +12,10 @@ DEFAULT_BUDGET_USD = 200.0
 
 # Rough per-1K-token pricing — adjust to match your actual AI provider
 MODEL_PRICING = {
-    "gpt-4o": {"input": 0.005, "output": 0.015},
-    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
-    "gpt-4": {"input": 0.03, "output": 0.06},
-    "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
+    "gpt-6-luna": {"input": 0.005, "output": 0.015},
+    "gpt-6-luna": {"input": 0.00015, "output": 0.0006},
+    "gpt-6-luna": {"input": 0.03, "output": 0.06},
+    "gpt-6-luna": {"input": 0.0005, "output": 0.0015},
     "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
 }
 DEFAULT_PRICING = {"input": 0.005, "output": 0.015}
