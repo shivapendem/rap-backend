@@ -435,6 +435,7 @@ async def record_api_latency_middleware(request, call_next):
 # Phase 2 router — requirement detail/status/stats, pipeline endpoints
 # ---------------------------------------------------------------------------
 from phase2 import router as phase2_router  # noqa: E402
+from account_mode import load_account_modes, public_clause, public_or_own_clause, effective_mode  # noqa: E402
 app.include_router(phase2_router)
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1084,7 @@ async def get_requirements(
     # Also enforce mode scoping: public requirements + private requirements from
     # their assigned recruiter(s) or their own email.
     if current_user.role == "CONSULTANT":
+        _modes = await load_account_modes(db)  # mode lives on gmail_accounts (no per-row copy rewrite)
         own_consultant = (await db.execute(
             select(Consultant).where(Consultant.user_id == current_user.id)
         )).scalars().first()
@@ -1113,16 +1115,12 @@ async def get_requirements(
 
             if rec_emails:
                 query = query.where(
-                    or_(
-                        Requirement.mode == "public",
-                        Requirement.mode.is_(None),
-                        func.lower(func.trim(Requirement.account_email)).in_(rec_emails),
-                    )
+                    public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, rec_emails)
                 )
             else:
-                query = query.where(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+                query = query.where(public_clause(Requirement.mode, Requirement.account_email, _modes))
         else:
-            query = query.where(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+            query = query.where(public_clause(Requirement.mode, Requirement.account_email, _modes))
 
         matched_only = False  # already scoped above; ignore the old N-day window
 
@@ -1130,12 +1128,9 @@ async def get_requirements(
         # Mode scoping for recruiter:
         # Recruiter sees all public requirements + private requirements received on their own email
         user_email = (current_user.email or "").lower().strip()
+        _modes = await load_account_modes(db)
         query = query.where(
-            or_(
-                Requirement.mode == "public",
-                Requirement.mode.is_(None),
-                func.lower(func.trim(Requirement.account_email)) == user_email,
-            )
+            public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
         )
     if matched_only:
         since = datetime.now(timezone.utc) - timedelta(days=matched_days)

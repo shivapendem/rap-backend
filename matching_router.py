@@ -13,6 +13,7 @@ from sqlalchemy.orm import aliased
 from models import User, Consultant, Requirement, RequirementConsultantMatch, RecruiterConsultant, Application
 from database import get_db
 from auth import get_current_user
+from account_mode import load_account_modes, effective_mode, public_clause, public_or_own_clause
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -248,6 +249,9 @@ async def get_pending_matches(
         else:
             consultant_allowed_emails = []
 
+    # Public/Private is decided by the owning gmail account (read once, tiny table).
+    _modes = await load_account_modes(db)
+
     def _base_stmt(select_clause):
         stmt = (
             select_clause
@@ -295,14 +299,10 @@ async def get_pending_matches(
             # Consultant sees matches from public jobs OR jobs received by their assigned recruiter(s) or their own email
             if consultant_allowed_emails:
                 stmt = stmt.where(
-                    or_(
-                        Requirement.mode == "public",
-                        Requirement.mode.is_(None),
-                        func.lower(func.trim(Requirement.account_email)).in_(consultant_allowed_emails),
-                    )
+                    public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, consultant_allowed_emails)
                 )
             else:
-                stmt = stmt.where(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+                stmt = stmt.where(public_clause(Requirement.mode, Requirement.account_email, _modes))
 
         elif current_user.role == "RECRUITER":
             assigned_subq = select(RecruiterConsultant.consultant_id).where(
@@ -314,11 +314,7 @@ async def get_pending_matches(
             # Recruiter sees matches from public jobs + private jobs matching their own email
             user_email = (current_user.email or "").lower().strip()
             stmt = stmt.where(
-                or_(
-                    Requirement.mode == "public",
-                    Requirement.mode.is_(None),
-                    func.lower(func.trim(Requirement.account_email)) == user_email,
-                )
+                public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
             )
         return stmt
 
@@ -397,7 +393,7 @@ async def get_pending_matches(
             "requirement_vendor_email": row["requirement_vendor_email"],
             "raw_email_id": row["raw_email_id"],
             "account_email": row["account_email"],
-            "mode": (row["mode"] or "public").lower(),
+            "mode": effective_mode(row["mode"], row["account_email"], _modes),
             "consultant_id": row["consultant_id"],
             "consultant_name": row["consultant_name"],
             "consultant_email": row["consultant_email"],
@@ -447,7 +443,7 @@ async def _load_match_for_action(db: AsyncSession, match_id: int, current_user: 
         # Verify requirement mode visibility for consultant
         req_res = await db.execute(select(Requirement.mode, Requirement.account_email).where(Requirement.id == match.requirement_id))
         req_row = req_res.first()
-        if req_row and (req_row[0] or "").lower() == "private":
+        if req_row and effective_mode(req_row[0], req_row[1], await load_account_modes(db)) == "private":
             req_acc = (req_row[1] or "").lower().strip()
             user_email = (current_user.email or "").lower().strip()
             if req_acc != user_email:
@@ -481,7 +477,7 @@ async def _load_match_for_action(db: AsyncSession, match_id: int, current_user: 
         # Verify requirement mode visibility for recruiter
         req_res = await db.execute(select(Requirement.mode, Requirement.account_email).where(Requirement.id == match.requirement_id))
         req_row = req_res.first()
-        if req_row and (req_row[0] or "").lower() == "private":
+        if req_row and effective_mode(req_row[0], req_row[1], await load_account_modes(db)) == "private":
             req_acc = (req_row[1] or "").lower().strip()
             user_email = (current_user.email or "").lower().strip()
             if req_acc != user_email:

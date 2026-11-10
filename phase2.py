@@ -43,6 +43,12 @@ from database import get_db
 from models import User, Requirement, Email
 from auth import get_current_user
 from cleaner import html_to_text
+from account_mode import (
+    load_account_modes,
+    effective_mode,
+    public_or_own_clause,
+    public_or_own_sql,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +129,9 @@ async def get_requirement_stats(
     where_req = []
     if current_user.role == "RECRUITER":
         user_email = (current_user.email or "").lower().strip()
+        _modes = await load_account_modes(db)
         where_req.append(
-            or_(
-                Requirement.mode == "public",
-                Requirement.mode.is_(None),
-                func.lower(func.trim(Requirement.account_email)) == user_email,
-            )
+            public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
         )
 
     subq = select(
@@ -183,8 +186,10 @@ async def get_requirement_detail(
     # ADMIN: full access.
     # RECRUITER: public requirements + private requirements received on their own email.
     # CONSULTANT: public requirements + private requirements from their assigned recruiter(s) or their own email.
-    req_mode = (getattr(requirement, "mode", None) or "public").lower()
     req_acc = (getattr(requirement, "account_email", None) or "").lower().strip()
+    # Mode is decided by the owning gmail account (single source of truth);
+    # rows with no matching account keep their own stored mode.
+    req_mode = effective_mode(getattr(requirement, "mode", None), req_acc, await load_account_modes(db))
 
     if req_mode == "private":
         if current_user.role == "RECRUITER":
@@ -268,8 +273,8 @@ async def update_requirement_status(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
-    req_mode = (getattr(requirement, "mode", None) or "public").lower()
     req_acc = (getattr(requirement, "account_email", None) or "").lower().strip()
+    req_mode = effective_mode(getattr(requirement, "mode", None), req_acc, await load_account_modes(db))
     if req_mode == "private" and current_user.role == "RECRUITER":
         user_email = (current_user.email or "").lower().strip()
         if req_acc != user_email:
@@ -744,7 +749,7 @@ async def get_gmail_email_status_counts(
     if current_user.role == "RECRUITER":
         user_email = (current_user.email or "").lower().strip()
         where_clauses.append(
-            "(ge.mode = 'public' OR ge.mode IS NULL OR LOWER(TRIM(ge.account_email)) = :recruiter_email)"
+            public_or_own_sql("ge", await load_account_modes(db), params)
         )
         params["recruiter_email"] = user_email
 
@@ -883,7 +888,7 @@ async def get_gmail_emails(
     if current_user.role == "RECRUITER":
         user_email = (current_user.email or "").lower().strip()
         where_clauses.append(
-            "(ge.mode = 'public' OR ge.mode IS NULL OR LOWER(TRIM(ge.account_email)) = :recruiter_email)"
+            public_or_own_sql("ge", await load_account_modes(db), params)
         )
         params["recruiter_email"] = user_email
 
@@ -944,8 +949,17 @@ async def get_gmail_emails(
     )
     rows = result.mappings().all()
 
+    # Show the account's live mode (the per-row copy is no longer rewritten
+    # when an admin flips an account).
+    _modes = await load_account_modes(db)
+    data = []
+    for row in rows:
+        d = dict(row)
+        d["mode"] = effective_mode(d.get("mode"), d.get("account_email"), _modes)
+        data.append(d)
+
     return {
-        "data": [dict(row) for row in rows],
+        "data": data,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -1000,8 +1014,12 @@ async def update_gmail_account_mode(
     if target_mode not in ("public", "private"):
         raise HTTPException(status_code=422, detail="Mode must be 'public' or 'private'")
 
-    # Update gmail_accounts — DB trigger trg_sync_gmail_account_mode automatically cascades
-    # mode update to gmail_emails and requirements
+    # Only the account row changes. The mode is NOT copied onto gmail_emails /
+    # requirements any more: every reader resolves it from gmail_accounts at
+    # read time (see account_mode.py), so this is a one-row update that is
+    # instant even for an account with hundreds of thousands of emails.
+    # (Run migration 2026_11_11_gmail_account_mode_single_source.sql first so
+    # the old row-rewriting trigger no longer fires on a mode change.)
     res = await db.execute(
         text("""
             UPDATE gmail_accounts

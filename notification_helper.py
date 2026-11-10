@@ -18,6 +18,8 @@ from models import (
 from sqlalchemy import and_, delete, func, text, update
 from sqlalchemy.future import select
 
+from account_mode import load_account_modes, public_clause, public_or_own_clause
+
 
 # ---------------------------------------------------------------------------
 # Schema: notifications.consultant_id (nullable)
@@ -458,6 +460,9 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
         else:
             allowed_recruiter_emails = []
 
+    # Public/Private is decided by the owning gmail account (tiny table, read once).
+    _modes = await load_account_modes(db)
+
     days: dict = {}
     for n in match_rows:
         if n.consultant_id is None:
@@ -480,23 +485,15 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
         if role == "RECRUITER":
             user_email = (user.email or "").lower().strip()
             where_matches.append(
-                or_(
-                    Requirement.mode == "public",
-                    Requirement.mode.is_(None),
-                    func.lower(func.trim(Requirement.account_email)) == user_email,
-                )
+                public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
             )
         elif role == "CONSULTANT":
             if allowed_recruiter_emails:
                 where_matches.append(
-                    or_(
-                        Requirement.mode == "public",
-                        Requirement.mode.is_(None),
-                        func.lower(func.trim(Requirement.account_email)).in_(allowed_recruiter_emails),
-                    )
+                    public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, allowed_recruiter_emails)
                 )
             else:
-                where_matches.append(or_(Requirement.mode == "public", Requirement.mode.is_(None)))
+                where_matches.append(public_clause(Requirement.mode, Requirement.account_email, _modes))
 
         q = (
             select(
