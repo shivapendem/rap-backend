@@ -205,7 +205,9 @@ class RecruiterConsultantRepository:
             )
         )
         mapping = existing.scalars().first()
+        newly_active = True
         if mapping:
+            newly_active = not mapping.is_active
             mapping.is_active = True
         else:
             mapping = RecruiterConsultant(
@@ -213,6 +215,11 @@ class RecruiterConsultantRepository:
             )
             db.add(mapping)
         await db.flush()
+        if newly_active:
+            # Tell the recruiter and clear any stale "was removed" notice.
+            # Runs in the caller's transaction; never raises.
+            from notification_helper import notify_consultant_assigned
+            await notify_consultant_assigned(db, recruiter_id, consultant_id)
         return mapping
 
     @staticmethod

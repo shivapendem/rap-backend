@@ -3278,10 +3278,18 @@ async def get_consultants_for_resumes(
             "name": u.full_name or u.email,
             "email": u.email,
             "skills": consultant_skills or u.skills,
-            "experience_years": u.experience_years or (c.total_experience_years if c else 0),
-            # For the message-template {current_location} / {visa} fills.
+            # Consultant profile is the source of truth for years of
+            # experience (it's what the consultant/admin edit); the older
+            # User.experience_years is only a fallback.
+            "experience_years": (c.total_experience_years if c and c.total_experience_years else None)
+                                or u.experience_years or 0,
+            # For the message-template {Location} / {Visa Status} /
+            # {LinkedIn URL} fills and the Apply page's signature preview
+            # (which already read linkedin_url/phone but never got them).
             "current_location": (c.current_location if c else None) or "",
             "work_authorization": (c.work_authorization if c else None) or "",
+            "linkedin_url": (c.linkedin_url if c else None) or u.linkedin_url or "",
+            "phone": (c.phone if c else None) or "",
         }
 
     matched_consultant_ids = None

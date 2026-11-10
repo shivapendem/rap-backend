@@ -1017,6 +1017,21 @@ async def _resolve_experience_consultant(
     return await _get_consultant_for_user(db, target_user)
 
 
+def has_professional_summary(resume_info) -> bool:
+    """Profile completeness: True when the consultant has written a Professional
+    Summary (User.resume_info "summary" or "career_objective"; the editor may
+    store HTML, so tags / &nbsp; are stripped before checking for real text)."""
+    if not isinstance(resume_info, dict):
+        return False
+    for key in ("summary", "career_objective"):
+        val = resume_info.get(key)
+        if isinstance(val, str):
+            text = re.sub(r"<[^>]*>", " ", val).replace("&nbsp;", " ")
+            if text.strip():
+                return True
+    return False
+
+
 async def _consultant_to_profile_response(
     db: AsyncSession, c: Consultant, experience_count: int = 0, *, include_resume_size: bool = True
 ) -> ProfileResponse:
@@ -1089,7 +1104,9 @@ async def _consultant_to_profile_response(
      
     completeness = 0
     if (c.primary_skills or "").strip():
-        completeness += 30  # Skills
+        completeness += 25  # Skills
+    if has_professional_summary(resume_info):
+        completeness += 5  # Professional Summary
     if experience_count > 0:
         completeness += 25  # Experience
     if c.preferred_employment_types:
@@ -2434,10 +2451,15 @@ async def assign_consultant(
     )
     existing = existing_q.scalars().first()
 
+    # The recruiter assigned this themselves: no "assigned" notice, but clear
+    # a stale "was removed" notice for the same consultant.
+    from notification_helper import notify_consultant_assigned
+
     if existing:
         if existing.is_active:
             raise HTTPException(409, "Consultant already assigned to this recruiter")
         existing.is_active = True
+        await notify_consultant_assigned(db, current_user.id, payload.consultantId, notice=False)
         await db.commit()
         await db.refresh(existing)
         return {"id": str(existing.id), "message": "Assignment reactivated"}
@@ -2448,6 +2470,8 @@ async def assign_consultant(
         is_active=True,
     )
     db.add(mapping)
+    await db.flush()
+    await notify_consultant_assigned(db, current_user.id, payload.consultantId, notice=False)
     await db.commit()
     await db.refresh(mapping)
 
@@ -2476,6 +2500,9 @@ async def unassign_consultant(
         )
         .values(is_active=False)
     )
+    # Their own action: drop their unread alerts for this consultant, no notice.
+    from notification_helper import retract_for_removed_consultant
+    await retract_for_removed_consultant(db, current_user.id, consultant_id, notice=False)
     await db.commit()
     logger.info("Recruiter %s unassigned consultant_id=%s", current_user.email, consultant_id)
 
@@ -2531,6 +2558,16 @@ async def set_recruiters_for_consultant(
         if not r.scalars().first():
             raise HTTPException(404, f"Active recruiter with id={rid} not found")
 
+    # Who was active before — so only real changes notify anyone.
+    prev_active = {
+        r[0] for r in (await db.execute(
+            select(RecruiterConsultant.recruiter_id).where(
+                RecruiterConsultant.consultant_id == consultant_id,
+                RecruiterConsultant.is_active == True,
+            )
+        )).all()
+    }
+
     # Deactivate all current
     await db.execute(
         update(RecruiterConsultant)
@@ -2555,6 +2592,16 @@ async def set_recruiters_for_consultant(
                 consultant_id=consultant_id,
                 is_active=True,
             ))
+    await db.flush()
+
+    # Notifications: newly assigned recruiters hear about it (and lose any
+    # stale "removed" notice); dropped recruiters get the removal cleanup.
+    from notification_helper import notify_consultant_assigned, retract_for_removed_consultant
+    new_set = set(recruiter_ids)
+    for rid in sorted(new_set - prev_active):
+        await notify_consultant_assigned(db, rid, consultant_id)
+    for rid in sorted(prev_active - new_set):
+        await retract_for_removed_consultant(db, rid, consultant_id)
 
     await db.commit()
 

@@ -143,7 +143,7 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
 
     completeness = 0
     if (c.primary_skills or "").strip():
-        completeness += 30  # Skills
+        completeness += 25  # Skills
     if experience_count > 0:
         completeness += 25  # Experience
     if c.preferred_employment_types:
@@ -186,6 +186,12 @@ async def _consultant_to_dto(db: AsyncSession, c: Consultant) -> ConsultantAdmin
         )
     )
     total_applications_sent = apps_result.scalar_one() or 0
+
+    # Professional Summary (5 pts) lives in the linked user's resume_info, so it
+    # is added here once resume_info has been fetched (Skills is now 25).
+    from phase3 import has_professional_summary
+    if has_professional_summary(resume_info):
+        completeness += 5  # Professional Summary
 
     # BUG FIX: c.ats_score is a Consultant column that is never written
     # anywhere in the codebase, so it was permanently stuck at its default
@@ -260,6 +266,7 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
     # Local import avoids a circular import at module load (phase3.py is
     # the module that owns preferred_locations normalization).
     from phase3 import normalize_preferred_locations_or_none
+    from phase3 import has_professional_summary
     """
     Batched version of _consultant_to_dto() for list endpoints.
 
@@ -361,7 +368,9 @@ async def _consultants_to_dtos_bulk(db: AsyncSession, consultants: List[Consulta
 
         completeness = 0
         if (c.primary_skills or "").strip():
-            completeness += 30
+            completeness += 25
+        if has_professional_summary(resume_info):
+            completeness += 5
         if experience_count > 0:
             completeness += 25
         if c.preferred_employment_types:
