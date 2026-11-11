@@ -1981,6 +1981,16 @@ async def admin_create_consultant(
             consultant_id=consultant.id,
             is_active=True,
         ))
+        await db.flush()
+        # BUG FIX: this inline assignment (recruiter picked on the create
+        # form) wrote the RecruiterConsultant row directly instead of going
+        # through RecruiterConsultantRepository.assign() / the
+        # set_recruiters_for_consultant endpoint below — both of which
+        # already notify the recruiter — so the recruiter never heard about
+        # a consultant assigned to them at creation time. Runs in this same
+        # transaction, before commit; never raises.
+        from notification_helper import notify_consultant_assigned
+        await notify_consultant_assigned(db, recruiter_id_int, consultant.id)
 
     await db.commit()
     await db.refresh(consultant)
