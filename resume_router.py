@@ -3271,10 +3271,20 @@ async def get_consultants_for_resumes(
             for s in (c.primary_skills or "").split(",")
             if s.strip()
         ] if c else []
+        # BUG FIX (message-template {Candidate Name} / {Location} / {LinkedIn
+        # URL} not matching the profile): the profile page saves Full Name /
+        # Location / LinkedIn URL onto the Consultant row (and mirrors them
+        # into User.resume_info) -- User.full_name is only the sign-up name and
+        # can differ. Read the profile values first; resume_info is the
+        # fallback for rows whose Consultant columns were never filled.
+        _ri = u.resume_info if isinstance(getattr(u, "resume_info", None), dict) else {}
+        _profile_full_name = ((c.full_name if c else None) or _ri.get("full_name") or "").strip()
         return {
             "id": u.id, # Keep id for backward compatibility (maps to user_id)
             "user_id": u.id,
             "consultant_id": c.id if c else None,
+            # Profile "Full Name" (additive field used by the template fill).
+            "full_name": _profile_full_name,
             "name": u.full_name or u.email,
             "email": u.email,
             "skills": consultant_skills or u.skills,
@@ -3286,10 +3296,10 @@ async def get_consultants_for_resumes(
             # For the message-template {Location} / {Visa Status} /
             # {LinkedIn URL} fills and the Apply page's signature preview
             # (which already read linkedin_url/phone but never got them).
-            "current_location": (c.current_location if c else None) or "",
+            "current_location": (c.current_location if c else None) or _ri.get("location") or "",
             "work_authorization": (c.work_authorization if c else None) or "",
-            "linkedin_url": (c.linkedin_url if c else None) or u.linkedin_url or "",
-            "phone": (c.phone if c else None) or "",
+            "linkedin_url": (c.linkedin_url if c else None) or u.linkedin_url or _ri.get("linkedin") or "",
+            "phone": (c.phone if c else None) or _ri.get("phone") or "",
         }
 
     matched_consultant_ids = None
