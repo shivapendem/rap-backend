@@ -48,7 +48,6 @@ class UserAdminRowDTO(BaseModel):
     created_at: str
     updated_at: str = ""
     skills: Optional[List[str]] = None
-    needsto_fetch_mail: bool = False
     experience_years: Optional[float] = None
     resume_info: Optional[Any] = None
     # Admin/Recruiter contact fields — see MIGRATION REQUIRED note on
@@ -168,7 +167,6 @@ class EditUserRequestDTO(BaseModel):
     recruiter_id: Optional[str] = None
     # user-level optional fields — apply regardless of role
     skills: Optional[List[str]] = None
-    needsto_fetch_mail: Optional[bool] = None
     experience_years: Optional[float] = Field(None, ge=0, le=60)
     resume_info: Optional[Any] = None
     # Admin/Recruiter contact fields — meaningless for CONSULTANT (they use

@@ -41,7 +41,6 @@ def _user_to_dto(u: User, *, include_resume_info: bool = True) -> UserAdminRowDT
         created_at=u.created_at.isoformat() if u.created_at else "",
         updated_at=u.updated_at.isoformat() if u.updated_at else "",
         skills=u.skills if isinstance(u.skills, list) else None,
-        needsto_fetch_mail=bool(u.needsto_fetch_mail),
         experience_years=float(u.experience_years) if u.experience_years is not None else None,
         resume_info=u.resume_info if include_resume_info else None,
         mobile_number=u.mobile_number,
@@ -563,8 +562,6 @@ class UserService:
         user.is_authorized = req.is_authorized
         if req.skills is not None:
             user.skills = req.skills
-        if req.needsto_fetch_mail is not None:
-            user.needsto_fetch_mail = req.needsto_fetch_mail
         if req.experience_years is not None:
             user.experience_years = req.experience_years
         if req.resume_info is not None:

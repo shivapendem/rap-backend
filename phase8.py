@@ -403,6 +403,9 @@ class PaginatedApplicationsDTO(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    # Counts per status for the tracker's "All Statuses" dropdown — same
+    # filters as the list, ignoring status. Keys: ALL, SENT, PENDING, FAILED.
+    status_counts: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -526,11 +529,28 @@ async def list_applications(
     search: Optional[str] = None,
     sort_dir: str = Query("desc"),
     created_from: Optional[str] = None,
+    # Day-wise filter (Today / 7 days / 30 days / Custom) — ISO timestamps.
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ) -> PaginatedApplicationsDTO:
     """Return paginated applications with optional filters."""
     filters = []
+    # Day-wise filter: sent time, or created time for rows never sent.
+    def _parse_dt(v: Optional[str]):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    _from, _to = _parse_dt(date_from), _parse_dt(date_to)
+    _when = func.coalesce(ApplicationsDetailView.sent_at, ApplicationsDetailView.created_at)
+    if _from:
+        filters.append(_when >= _from)
+    if _to:
+        filters.append(_when <= _to)
     # DASHBOARD FIX: optional date filter so the dashboard can get a real
     # count. "YYYY-MM-DD" = start of that day in US Central time.
     if created_from:
@@ -555,8 +575,15 @@ async def list_applications(
             filters.append(ApplicationsDetailView.requirement_id == int(requirement_id))
         except ValueError:
             pass
-    if status:
-        filters.append(ApplicationsDetailView.status == status)
+    # One or more statuses, comma-separated (multi-select Status dropdown).
+    # FAILED also matches QUEUED (a failed application being replayed).
+    # Kept aside so the status counts can ignore it.
+    status_clause = None
+    if status and status.strip():
+        _vals = {v.strip().upper() for v in status.split(",") if v.strip()}
+        if "FAILED" in _vals:
+            _vals.add("QUEUED")
+        status_clause = ApplicationsDetailView.status.in_(sorted(_vals))
     if search and search.strip():
         term = f"%{search.strip()}%"
         filters.append(
@@ -567,6 +594,23 @@ async def list_applications(
                 ApplicationsDetailView.requirement_client.ilike(term),
             )
         )
+    # Status counts for the "All Statuses" dropdown: every filter except status.
+    _counts_q = select(ApplicationsDetailView.status, func.count(ApplicationsDetailView.application_id)).select_from(ApplicationsDetailView)
+    if filters:
+        _counts_q = _counts_q.where(and_(*filters))
+    _by_status = {
+        (st or "").upper(): n
+        for st, n in (await db.execute(_counts_q.group_by(ApplicationsDetailView.status))).all()
+    }
+    status_counts = {
+        "ALL": sum(_by_status.values()),
+        "SENT": _by_status.get("SENT", 0),
+        "PENDING": _by_status.get("PENDING", 0),
+        "FAILED": _by_status.get("FAILED", 0) + _by_status.get("QUEUED", 0),
+    }
+    if status_clause is not None:
+        filters.append(status_clause)
+
     base_filter = and_(*filters) if filters else True
 
     count_q = select(func.count(ApplicationsDetailView.application_id)).select_from(ApplicationsDetailView).where(base_filter)
@@ -661,6 +705,7 @@ async def list_applications(
         page=page,
         page_size=page_size,
         total_pages=math.ceil(total / page_size) or 1,
+        status_counts=status_counts,
     )
 
 @router.post("/applications", response_model=ApplicationSentRowDTO)
