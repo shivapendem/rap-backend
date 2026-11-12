@@ -41,7 +41,7 @@ if not SECRET_KEY:
     )
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "24"))
+ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "120"))
 # SECURITY FIX: NODE_ENV is a Node.js convention and is never set in this
 # Python backend's environment (confirmed absent from .env), so
 # IS_PRODUCTION silently evaluated to False everywhere it gates something

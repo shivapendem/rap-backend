@@ -226,7 +226,8 @@ async def get_admin_reports(
     status_counts = StatusCounts(
         sent=_by_status.get("SENT", 0),
         pending=_by_status.get("PENDING", 0),
-        failed=_by_status.get("FAILED", 0),
+        # Failed applications being replayed (QUEUED) still count as failed.
+        failed=_by_status.get("FAILED", 0) + _by_status.get("QUEUED", 0),
     )
 
     # 2e. Top vendors by SENT applications.

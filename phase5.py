@@ -73,6 +73,19 @@ router = APIRouter()
 # Helpers
 # ===========================================================================
 
+def _status_in(column, status: str):
+    """
+    Tracker status filter. Accepts one status or several, comma-separated
+    ("FAILED,PENDING") for the multi-select Status dropdown. FAILED also
+    matches QUEUED (a failed application being replayed), so a replayed row
+    stays in the Failed view until the worker sends it.
+    """
+    vals = {v.strip().upper() for v in (status or "").split(",") if v.strip()}
+    if "FAILED" in vals:
+        vals.add("QUEUED")
+    return column.in_(sorted(vals))
+
+
 def _require_role(user: User, *roles: str) -> None:
     if user.role not in roles:
         raise HTTPException(
@@ -518,6 +531,8 @@ class ApplicationHistoryRow(BaseModel):
     # sent via the email-queue/Apply-to-Requirement flow, which never
     # get a GeneratedResume row at all.
     resume_filename: Optional[str] = None
+    # Why a FAILED send was not delivered (shown under the Failed badge).
+    error_message: Optional[str] = None
 
 
 class PaginatedApplicationHistory(BaseModel):
@@ -558,6 +573,10 @@ class PaginatedRecruiterApplications(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    # Counts per status for the tracker's "All Statuses" dropdown — same
+    # filters as the list (candidate, search, date) but ignoring status.
+    # Keys: ALL, SENT, PENDING, FAILED (FAILED includes QUEUED replays).
+    status_counts: Optional[dict] = None
 
 
 class ApplyResponse(BaseModel):
@@ -1614,8 +1633,9 @@ async def get_consultant_applications(
     # Consultants see every application made for them — sent by
     # themselves or by a recruiter/admin on their behalf.
     filters = [Application.consultant_id == consultant.id]
-    if status:
-        filters.append(Application.status == status)
+    # One or more statuses (multi-select dropdown), see _status_in.
+    if status and status.strip():
+        filters.append(_status_in(Application.status, status))
     # Tracker filters: search by role / client, and "last N days".
     if search and search.strip():
         like = f"%{search.strip()}%"
@@ -1684,6 +1704,7 @@ async def get_consultant_applications(
             sent_by_name=sender.full_name if sender else consultant.full_name,
             sent_by_role=sender.role if sender else "CONSULTANT",
             resume_filename=resume_filename,
+            error_message=app.error_message if app.status == "FAILED" else None,
         ))
 
     return PaginatedApplicationHistory(
@@ -1706,6 +1727,9 @@ async def get_recruiter_applications(
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
+    # Day-wise filter (Today / 7 days / 30 days / Custom) — ISO timestamps.
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1739,6 +1763,13 @@ async def get_recruiter_applications(
         .join(Requirement, Requirement.id == Application.requirement_id)
         .join(Consultant, Consultant.id == Application.consultant_id)
     )
+    # Per-status counts for the "All Statuses" dropdown (same joins).
+    counts_q = (
+        select(Application.status, func.count(Application.id))
+        .select_from(Application)
+        .join(Requirement, Requirement.id == Application.requirement_id)
+        .join(Consultant, Consultant.id == Application.consultant_id)
+    )
 
     # BUG FIX: this only ever restricted by RecruiterConsultant assignment
     # when a specific consultant_id filter was passed. The frontend's
@@ -1763,6 +1794,7 @@ async def get_recruiter_applications(
         assigned_ids = [row[0] for row in assigned_result.all()]
         q = q.where(Application.consultant_id.in_(assigned_ids))
         count_q = count_q.where(Application.consultant_id.in_(assigned_ids))
+        counts_q = counts_q.where(Application.consultant_id.in_(assigned_ids))
 
     filters = []
 
@@ -1785,8 +1817,25 @@ async def get_recruiter_applications(
                     raise HTTPException(status_code=403, detail="One or more consultants not assigned to you")
             filters.append(Application.consultant_id.in_(ids))
 
-    if status:
-        filters.append(Application.status == status)
+    # One or more statuses (multi-select dropdown), see _status_in. Kept
+    # aside so the status counts below can ignore it.
+    status_clause = _status_in(Application.status, status) if status and status.strip() else None
+
+    # Day-wise filter: sent time, or created time for rows never sent
+    # (pending / failed have no sent_at).
+    def _parse_dt(v: Optional[str]):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    _from, _to = _parse_dt(date_from), _parse_dt(date_to)
+    _when = func.coalesce(Application.sent_at, Application.created_at)
+    if _from:
+        filters.append(_when >= _from)
+    if _to:
+        filters.append(_when <= _to)
 
     # Recruiters see only the applications they sent themselves
     # (recruiter_id = sender). Admins still see everything.
@@ -1806,6 +1855,23 @@ async def get_recruiter_applications(
                 Requirement.client.ilike(term),
             )
         )
+
+    # Status counts: every filter except status.
+    if filters:
+        counts_q = counts_q.where(and_(*filters))
+    _by_status = {
+        (st or "").upper(): n
+        for st, n in (await db.execute(counts_q.group_by(Application.status))).all()
+    }
+    status_counts = {
+        "ALL": sum(_by_status.values()),
+        "SENT": _by_status.get("SENT", 0),
+        "PENDING": _by_status.get("PENDING", 0),
+        "FAILED": _by_status.get("FAILED", 0) + _by_status.get("QUEUED", 0),
+    }
+
+    if status_clause is not None:
+        filters.append(status_clause)
 
     if filters:
         base_filter = and_(*filters)
@@ -1849,13 +1915,19 @@ async def get_recruiter_applications(
         page=page,
         page_size=page_size,
         total_pages=math.ceil(total / page_size) if total else 1,
+        status_counts=status_counts,
     )
 
 
 @router.post(
     "/api/recruiter/applications/{application_id}/retry",
-    summary="Retry a failed application email",
+    summary="Replay a failed application email",
     tags=["Phase5 - Recruiter Dashboard"],
+)
+@router.post(
+    "/api/consultant/applications/{application_id}/retry",
+    summary="Replay a failed application email (consultant)",
+    tags=["Phase5 - Consultant Dashboard"],
 )
 async def retry_failed_application(
     application_id: int,
@@ -1866,17 +1938,24 @@ async def retry_failed_application(
     Puts a FAILED application's email back in the send queue (Retry send
     in the tracker popup). The existing queue worker sends it again, so
     the normal send gap, attachments and status updates all apply.
-    Recruiters can retry only applications they sent; admins any.
+    Recruiters can retry only applications they sent; admins any;
+    consultants only their own applications.
+    The application is marked QUEUED (not PENDING) so the tracker can show
+    "Replaying" instead of the "Apply" button until the worker sends it.
     """
     from models import EmailQueue
 
-    _require_role(current_user, "RECRUITER", "ADMIN")
+    _require_role(current_user, "RECRUITER", "ADMIN", "CONSULTANT")
 
     app = (await db.execute(select(Application).where(Application.id == application_id))).scalars().first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
     if current_user.role == "RECRUITER" and app.recruiter_id != current_user.id:
         raise HTTPException(status_code=404, detail="Application not found")
+    if current_user.role == "CONSULTANT":
+        consultant = await _get_consultant_for_user(db, current_user)
+        if app.consultant_id != consultant.id:
+            raise HTTPException(status_code=404, detail="Application not found")
     if app.status != "FAILED":
         raise HTTPException(status_code=400, detail="Only failed applications can be retried")
 
@@ -1895,7 +1974,7 @@ async def retry_failed_application(
     item.status = "QUEUED"
     item.status_text = None
     item.scheduled_at = datetime.now(timezone.utc)
-    app.status = "PENDING"
+    app.status = "QUEUED"
     app.error_message = None
 
     # The failed send had put the match back to MATCHING; it is being
@@ -1942,7 +2021,7 @@ async def get_recruiter_application_consultants(
         .distinct()
     )
     if status:
-        q = q.where(Application.status == status)
+        q = q.where(_status_in(Application.status, status))
 
     # Recruiter dropdown lists only candidates from applications they sent.
     if current_user.role == "RECRUITER":

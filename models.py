@@ -534,7 +534,7 @@ class Application(Base):
     # MIGRATION REQUIRED: run this against the real Postgres database
     # before deploying this change:
     #     CREATE INDEX IF NOT EXISTS ix_applications_status ON applications (status);
-    status = Column(Text, nullable=False, default="PENDING", index=True)   # PENDING | SENT | FAILED
+    status = Column(Text, nullable=False, default="PENDING", index=True)   # PENDING | QUEUED | SENT | FAILED
     vendor_email = Column(Text, nullable=True)
     recruiter_id = Column(FK_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     cc_email = Column(Text, nullable=True)
@@ -583,7 +583,8 @@ class Application(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
-    VALID_STATUSES = {"PENDING", "SENT", "FAILED"}
+    # QUEUED = a FAILED application replayed from the tracker, waiting to send.
+    VALID_STATUSES = {"PENDING", "QUEUED", "SENT", "FAILED"}
 
     __table_args__ = (
         UniqueConstraint("consultant_id", "requirement_id", name="uq_application_cons_req"),
