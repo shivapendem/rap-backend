@@ -605,10 +605,17 @@ async def list_for_user(db, user, limit: int = 50) -> list[dict]:
 
 
 async def count_unread_for_user(db, user):
-    """(unread count, fresh 'consultant removed' notice) for the bell badge.
-    Cheap: one COUNT for ordinary rows, and only the user's UNREAD match rows
-    (usually one day's worth) go through the card builder so the badge always
-    equals what the list shows."""
+    """(unread count, fresh 'consultant removed' notice, last activity) for the
+    bell badge. Cheap: one COUNT for ordinary rows, and only the user's UNREAD
+    match rows (usually one day's worth) go through the card builder so the
+    badge always equals what the list shows.
+
+    `last_activity_at` is separate from the count on purpose: a same-day
+    top-up to an already-unread match card (see notify_new_matches above)
+    bumps that row's `created_at` without changing the card count, so the
+    plain unread-count alone can't tell the caller "something new happened".
+    This timestamp can advance even when the count doesn't, so callers (the
+    bell's new-notification sound) can key off it instead of the count."""
     plain = (await db.execute(
         select(func.count()).select_from(Notification).where(
             Notification.user_id == user.id, Notification.is_read == False, ~_is_match_row()
@@ -634,7 +641,12 @@ async def count_unread_for_user(db, user):
     )).first()
     if row is not None:
         notice = {"id": row[0], "title": row[1], "body": row[2]}
-    return int(plain or 0) + len(cards), notice
+    last_activity = (await db.execute(
+        select(func.max(Notification.created_at)).where(
+            Notification.user_id == user.id, Notification.is_read == False
+        )
+    )).scalar_one_or_none()
+    return int(plain or 0) + len(cards), notice, last_activity
 
 
 async def mark_read(db, user, notification_id: int) -> bool:

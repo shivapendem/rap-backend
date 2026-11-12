@@ -1794,8 +1794,14 @@ async def get_unread_notification_count(
     from notification_helper import count_unread_for_user
     # A just-created "consultant removed" notice rides along so the bell can
     # toast it without opening the list (only for ~15 minutes).
-    count, notice = await count_unread_for_user(db, current_user)
-    return {"unread_count": count, "notice": notice}
+    count, notice, last_activity_at = await count_unread_for_user(db, current_user)
+    return {
+        "unread_count": count,
+        "notice": notice,
+        # Lets the bell detect a same-day match top-up (card count unchanged,
+        # but something genuinely new arrived) so it can still play its sound.
+        "last_activity_at": last_activity_at.isoformat() if last_activity_at else None,
+    }
 
 
 @app.patch("/api/notifications/{notification_id}/read")
