@@ -3300,6 +3300,13 @@ async def get_consultants_for_resumes(
             "work_authorization": (c.work_authorization if c else None) or "",
             "linkedin_url": (c.linkedin_url if c else None) or u.linkedin_url or _ri.get("linkedin") or "",
             "phone": (c.phone if c else None) or _ri.get("phone") or "",
+            # Additive: lets the Apply page show "Gmail not connected" before
+            # sending. Savantis-domain senders go through the service account
+            # and need no personal Gmail connection.
+            "gmail_connected": bool(
+                (c.gmail_connected if c else False)
+                or (u.email or "").strip().lower().endswith("@savantisintelli.com")
+            ),
         }
 
     matched_consultant_ids = None

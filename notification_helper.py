@@ -11,6 +11,7 @@ from models import (
     User,
     Notification,
     Consultant,
+    ConsultantExperience,
     RecruiterConsultant,
     Requirement,
     RequirementConsultantMatch,
@@ -362,6 +363,152 @@ async def notify_consultant_assigned(db, recruiter_id: int, consultant_id: int, 
         print(f"[notification_helper] FAILED to notify assignment: {e}")
 
 
+# --- Gmail disconnected ------------------------------------------------------
+# Who hears about it: the person whose Gmail it is ("Your Gmail disconnected"),
+# and - for a consultant - every recruiter the consultant is assigned to
+# ("Gmail disconnected - <name>"). Admins hear about their own Gmail only.
+GMAIL_OWN_DISCONNECTED_TITLE = "Your Gmail disconnected"
+GMAIL_OWN_DISCONNECTED_BODY = "Reconnect your Gmail so your emails can be sent."
+GMAIL_ASSIGNED_DISCONNECTED_PREFIX = "Gmail disconnected \u2014 "
+
+
+async def notify_user_gmail_disconnected(db, user_id) -> None:
+    """Tell one user their own Gmail got disconnected. Never raises."""
+    if not user_id:
+        return
+    await notify_users(db, [user_id], GMAIL_OWN_DISCONNECTED_TITLE, GMAIL_OWN_DISCONNECTED_BODY)
+
+
+async def notify_gmail_disconnected(db, consultant_id) -> None:
+    """A consultant's Gmail got disconnected: tell the consultant and the
+    recruiters it is assigned to. Never raises."""
+    try:
+        cons = (await db.execute(
+            select(Consultant).where(Consultant.id == consultant_id)
+        )).scalars().first()
+        if cons is None:
+            return
+        name = cons.full_name or "A consultant"
+        if cons.user_id:
+            await notify_users(
+                db, [cons.user_id], GMAIL_OWN_DISCONNECTED_TITLE, GMAIL_OWN_DISCONNECTED_BODY,
+                consultant_id=cons.id,
+            )
+        rec_ids = {
+            r[0] for r in (await db.execute(
+                select(RecruiterConsultant.recruiter_id).where(
+                    RecruiterConsultant.consultant_id == cons.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )).all()
+        }
+        if getattr(cons, "sales_recruiter_user_id", None):
+            rec_ids.add(cons.sales_recruiter_user_id)
+        rec_ids.discard(cons.user_id)
+        if rec_ids:
+            await notify_users(
+                db, rec_ids, f"{GMAIL_ASSIGNED_DISCONNECTED_PREFIX}{name}",
+                f"{name}'s Gmail access expired. Ask them to reconnect so applications can be sent.",
+                consultant_id=cons.id,
+            )
+    except Exception as e:
+        print(f"[notification_helper] FAILED to notify gmail disconnect: {e}")
+
+
+# --- low profile completeness (candidate only) ------------------------------
+# Below 60%: a notice at first login (re-sent weekly while still low) and a
+# banner on the dashboard. 60-79%: one notice, not repeated once read.
+# 80% and up: nothing (an old unread notice is removed). Same weights as the
+# profile page: skills 25, experience 25, employment type 20, work
+# authorization 15, location 10, summary 5.
+PROFILE_TITLE_PREFIX = "complete your profile"
+PROFILE_LOW_PCT = 60
+PROFILE_OK_PCT = 80
+_PROFILE_RENOTIFY_DAYS = 7
+_PROFILE_CHECK_EVERY = 600.0  # seconds, per user, per process
+_profile_checked: dict = {}
+
+
+async def profile_completeness_for_user(db, user):
+    """(percent, [missing labels]) for the consultant behind `user`, or None."""
+    cons = (await db.execute(
+        select(Consultant).where(Consultant.user_id == user.id)
+    )).scalars().first()
+    if cons is None:
+        return None
+    exp_count = (await db.execute(
+        select(func.count()).select_from(ConsultantExperience).where(ConsultantExperience.consultant_id == cons.id)
+    )).scalar_one() or 0
+    resume_info = getattr(user, "resume_info", None)
+    has_summary = False
+    if isinstance(resume_info, dict):
+        for key in ("summary", "career_objective"):
+            val = resume_info.get(key)
+            if isinstance(val, str) and re.sub(r"<[^>]*>", " ", val).replace("&nbsp;", " ").strip():
+                has_summary = True
+                break
+    checks = [
+        ("skills", 25, bool((cons.primary_skills or "").strip())),
+        ("experience", 25, exp_count > 0),
+        ("employment type", 20, bool(cons.preferred_employment_types)),
+        ("work authorization", 15, bool((cons.work_authorization or "").strip())),
+        ("location", 10, len((cons.current_location or "").strip()) >= 2),
+        ("summary", 5, has_summary),
+    ]
+    pct = sum(w for _, w, ok in checks if ok)
+    return pct, [label for label, _, ok in checks if not ok]
+
+
+async def ensure_profile_completeness_notice(db, user) -> None:
+    """Create / refresh / clear the consultant's own 'complete your profile'
+    notice. Cheap (throttled per user) and never raises."""
+    try:
+        if (getattr(user, "role", "") or "").upper() != "CONSULTANT":
+            return
+        now_m = time.monotonic()
+        if now_m - _profile_checked.get(user.id, 0.0) < _PROFILE_CHECK_EVERY:
+            return
+        _profile_checked[user.id] = now_m
+        res = await profile_completeness_for_user(db, user)
+        if res is None:
+            return
+        pct, missing = res
+        rows = (await db.execute(
+            select(Notification).where(
+                Notification.user_id == user.id,
+                func.lower(Notification.title).like(PROFILE_TITLE_PREFIX + "%"),
+            ).order_by(Notification.created_at.desc(), Notification.id.desc())
+        )).scalars().all()
+        if pct >= PROFILE_OK_PCT:
+            stale = [n.id for n in rows if not n.is_read]
+            if stale:
+                await db.execute(delete(Notification).where(Notification.id.in_(stale)))
+                await db.commit()
+            return
+        title = f"Complete your profile \u2014 {pct}%"
+        body = "Missing: " + ", ".join(missing) + ". Complete them to get matched." if missing else "Complete your profile to get matched."
+        unread = next((n for n in rows if not n.is_read), None)
+        if unread is not None:
+            if unread.title != title or unread.body != body:
+                unread.title, unread.body = title, body
+                await db.commit()
+            return
+        if rows:
+            last = rows[0]
+            if pct >= PROFILE_LOW_PCT:
+                return  # 60-79%: told once
+            if _as_utc(last.created_at) > datetime.now(timezone.utc) - timedelta(days=_PROFILE_RENOTIFY_DAYS):
+                return
+        db.add(Notification(user_id=user.id, title=title, body=body))
+        await db.commit()
+    except Exception as e:
+        print(f"[notification_helper] profile completeness notice failed: {e}")
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Notification type / deep-link resolution
 #
@@ -381,6 +528,13 @@ _NOTIFICATION_RULES = [
     ("failed login attempt", "security", {"ADMIN": "/admin/audit-logs"}),
     ("email failed", "email_failed", _QUEUE_LINK),
     ("email queue sync failed", "system", {"ADMIN": "/admin/error-queue"}),
+    # Gmail: "connect"/"reconnect" notices are actionable by the owner (the bell
+    # starts the Google consent flow); the rest just point at the consultant.
+    ("connect your gmail", "gmail_connect", {}),
+    ("your gmail disconnected", "gmail_connect", {}),
+    ("gmail not connected", "gmail_status", _QUEUE_LINK),
+    ("gmail disconnected", "gmail_status", {"RECRUITER": "/recruiter/consultants"}),
+    ("complete your profile", "profile", {"CONSULTANT": "/consultant/profile"}),
 ]
 
 
@@ -562,6 +716,24 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
     return cards
 
 
+# System / database / worker notices belong to admins only. They are only ever
+# created for admins; this is the read-side safety net so a recruiter or
+# consultant's bell can never show one.
+_ADMIN_ONLY_PREFIXES = (
+    "email queue sync failed",
+    "email sync failed",
+    "database backup",
+    "failed login attempt",
+)
+
+
+def _visible_to(user):
+    """SQL clause: hide admin-only notice titles from non-admin users."""
+    if (getattr(user, "role", "") or "").upper() == "ADMIN":
+        return Notification.id.is_not(None)
+    return and_(*[~func.lower(Notification.title).like(p + "%") for p in _ADMIN_ONLY_PREFIXES])
+
+
 def _is_match_row():
     return and_(Notification.consultant_id.is_not(None), func.lower(Notification.title).like("new match%"))
 
@@ -575,9 +747,10 @@ _MATCH_ROW_CAP = 500
 async def list_for_user(db, user, limit: int = 50) -> list[dict]:
     """The user's notification list as the API returns it: ordinary rows as
     they are, new-match rows collapsed into one recomputed card per day."""
+    await ensure_profile_completeness_notice(db, user)
     plain = (await db.execute(
         select(Notification)
-        .where(Notification.user_id == user.id, ~_is_match_row())
+        .where(Notification.user_id == user.id, ~_is_match_row(), _visible_to(user))
         .order_by(Notification.created_at.desc(), Notification.id.desc())
         .limit(limit)
     )).scalars().all()
@@ -605,13 +778,22 @@ async def list_for_user(db, user, limit: int = 50) -> list[dict]:
 
 
 async def count_unread_for_user(db, user):
-    """(unread count, fresh 'consultant removed' notice) for the bell badge.
-    Cheap: one COUNT for ordinary rows, and only the user's UNREAD match rows
-    (usually one day's worth) go through the card builder so the badge always
-    equals what the list shows."""
+    """(unread count, fresh 'consultant removed' notice, last activity) for the
+    bell badge. Cheap: one COUNT for ordinary rows, and only the user's UNREAD
+    match rows (usually one day's worth) go through the card builder so the
+    badge always equals what the list shows.
+
+    `last_activity_at` is separate from the count on purpose: a same-day
+    top-up to an already-unread match card (see notify_new_matches above)
+    bumps that row's `created_at` without changing the card count, so the
+    plain unread-count alone can't tell the caller "something new happened".
+    This timestamp can advance even when the count doesn't, so callers (the
+    bell's new-notification sound) can key off it instead of the count."""
+    await ensure_profile_completeness_notice(db, user)
     plain = (await db.execute(
         select(func.count()).select_from(Notification).where(
-            Notification.user_id == user.id, Notification.is_read == False, ~_is_match_row()
+            Notification.user_id == user.id, Notification.is_read == False, ~_is_match_row(),
+            _visible_to(user),
         )
     )).scalar_one()
     match_rows = (await db.execute(
@@ -634,7 +816,12 @@ async def count_unread_for_user(db, user):
     )).first()
     if row is not None:
         notice = {"id": row[0], "title": row[1], "body": row[2]}
-    return int(plain or 0) + len(cards), notice
+    last_activity = (await db.execute(
+        select(func.max(Notification.created_at)).where(
+            Notification.user_id == user.id, Notification.is_read == False, _visible_to(user)
+        )
+    )).scalar_one_or_none()
+    return int(plain or 0) + len(cards), notice, last_activity
 
 
 async def mark_read(db, user, notification_id: int) -> bool:

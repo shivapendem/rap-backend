@@ -206,10 +206,14 @@ async def resolve_employer_details(db: AsyncSession, current_user, consultant) -
 
 
 async def resolve_cc_employers(db: AsyncSession, cc_email: str, current_user, consultant) -> list:
-    """Employer Details cards for the signature = the recruiters AND admins
-    actually in the CC list, in CC order (whoever is CC'd is who is shown).
-    If none of them is in the CC it falls back to the default for the sender
-    (see resolve_employer_details)."""
+    """Employer Details cards for the signature = the recruiters actually in
+    the CC list, in CC order (whoever is CC'd is who is shown).
+    
+    When an ADMIN applies, CC automatically includes the admin + the assigned recruiter.
+    Admin users should NOT be rendered as an Employer Details card in the signature,
+    nor should multiple signatures be generated. Only authorized recruiters in CC
+    (or the assigned recruiter fallback) are shown as Employer Details.
+    If none is found, falls back to resolve_employer_details."""
     import re
     from sqlalchemy import func
     from models import User
@@ -225,7 +229,7 @@ async def resolve_cc_employers(db: AsyncSession, cc_email: str, current_user, co
         rows = (await db.execute(
             select(User).where(
                 func.lower(User.email).in_(emails),
-                User.role.in_(["RECRUITER", "ADMIN"]),
+                User.role == "RECRUITER",
                 User.is_authorized == True,
             )
         )).scalars().all()

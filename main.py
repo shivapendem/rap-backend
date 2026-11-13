@@ -385,28 +385,63 @@ app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__
 from starlette.middleware.gzip import GZipMiddleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+_CORS_ALLOWED_ORIGINS = [
+    # Production Frontend
+    "https://rap-swart.vercel.app",
+
+    # Local Development
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+
+    # Backend Server itself
+    "http://137.184.96.50:8000",
+    "http://137.184.96.50:3000",
+    "https://rapapi.techtroup.com",
+    "https://rap-ten-beta.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        # Production Frontend
-        "https://rap-swart.vercel.app",
-
-        # Local Development
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-
-        # Backend Server itself
-        "http://137.184.96.50:8000",
-        "http://137.184.96.50:3000",
-        "https://rapapi.techtroup.com",
-        "https://rap-ten-beta.vercel.app"
-        
-    ],
+    allow_origins=_CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# An unexpected server error used to leave the browser with a bare "Network
+# Error" (the response carried no CORS headers) and nothing in the admin error
+# queue. Log it for the admin and answer with a readable 500 that the browser
+# is allowed to read.
+from fastapi.responses import JSONResponse  # noqa: E402
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    import traceback as _tb
+    _tb.print_exc()
+    try:
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="unhandled_api_error", error=exc, source_type="api",
+            source_id=f"{request.method} {request.url.path}"[:200],
+        )
+    except Exception:
+        pass
+    headers = {}
+    origin = request.headers.get("origin")
+    if origin and origin in _CORS_ALLOWED_ORIGINS:
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again; an admin has been alerted."},
+        headers=headers,
+    )
 
 # BUG FIX ("delete/save appears to work, then reverts a moment later" —
 # first seen on the Base Resume View endpoint, then again on Work
@@ -1892,8 +1927,14 @@ async def get_unread_notification_count(
     from notification_helper import count_unread_for_user
     # A just-created "consultant removed" notice rides along so the bell can
     # toast it without opening the list (only for ~15 minutes).
-    count, notice = await count_unread_for_user(db, current_user)
-    return {"unread_count": count, "notice": notice}
+    count, notice, last_activity_at = await count_unread_for_user(db, current_user)
+    return {
+        "unread_count": count,
+        "notice": notice,
+        # Lets the bell detect a same-day match top-up (card count unchanged,
+        # but something genuinely new arrived) so it can still play its sound.
+        "last_activity_at": last_activity_at.isoformat() if last_activity_at else None,
+    }
 
 
 @app.patch("/api/notifications/{notification_id}/read")
