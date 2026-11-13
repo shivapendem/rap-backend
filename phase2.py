@@ -75,6 +75,8 @@ class RequirementDetailResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     id: str
+    # Linked gmail_emails row — lets the View JD popup show the original email.
+    raw_email_id: Optional[str] = None
     role: str
     vendor: Optional[str] = None
     vendor_email: Optional[str] = None
@@ -234,6 +236,7 @@ async def get_requirement_detail(
 
     return RequirementDetailResponse(
         id=str(requirement.id),
+        raw_email_id=str(requirement.raw_email_id) if requirement.raw_email_id is not None else None,
         role=requirement.role,
         vendor=requirement.vendor,
         vendor_email=requirement.vendor_email,
