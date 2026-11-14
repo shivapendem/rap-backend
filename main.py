@@ -142,6 +142,24 @@ class MatchedConsultantDetail(BaseModel):
     matching_skills: List[str] = []
     missing_skills: List[str] = []
     applied: bool = False
+    # When it was sent (ISO) and who sent it — shown under the Applied pill.
+    applied_at: Optional[str] = None
+    applied_by: Optional[str] = None
+
+
+class AppliedUnmatchedDetail(BaseModel):
+    """A consultant with a SENT application for a requirement who is NOT in
+    its matched list — the "Applied, not matched" tab on Requirements."""
+    consultant_id: int
+    name: str
+    role: Optional[str] = None
+    location: Optional[str] = None
+    # Match percentage if a (non-matching) match row exists, else None = not scored.
+    percent: Optional[int] = None
+    # Status of that match row (e.g. NOT_ELIGIBLE, REJECTED), None when there is none.
+    match_status: Optional[str] = None
+    applied_at: Optional[str] = None
+    applied_by: Optional[str] = None
 
 
 class RequirementResponse(BaseModel):
@@ -180,6 +198,8 @@ class RequirementResponse(BaseModel):
     # all (the frontend read row.submitted_consultants, but nothing here
     # ever set it), so the highlighting never actually triggered.
     submitted_consultants: List[str] = []
+    # Applied (SENT) consultants who are not in matched_details.
+    applied_unmatched: List[AppliedUnmatchedDetail] = []
     # Whether THIS caller (when a CONSULTANT) already has a SENT
     # application for this requirement. Always False for RECRUITER/ADMIN
     # on this shared endpoint — "did I personally apply" only makes sense
@@ -365,28 +385,63 @@ app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__
 from starlette.middleware.gzip import GZipMiddleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+_CORS_ALLOWED_ORIGINS = [
+    # Production Frontend
+    "https://rap-swart.vercel.app",
+
+    # Local Development
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+
+    # Backend Server itself
+    "http://137.184.96.50:8000",
+    "http://137.184.96.50:3000",
+    "https://rapapi.techtroup.com",
+    "https://rap-ten-beta.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        # Production Frontend
-        "https://rap-swart.vercel.app",
-
-        # Local Development
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-
-        # Backend Server itself
-        "http://137.184.96.50:8000",
-        "http://137.184.96.50:3000",
-        "https://rapapi.techtroup.com",
-        "https://rap-ten-beta.vercel.app"
-        
-    ],
+    allow_origins=_CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# An unexpected server error used to leave the browser with a bare "Network
+# Error" (the response carried no CORS headers) and nothing in the admin error
+# queue. Log it for the admin and answer with a readable 500 that the browser
+# is allowed to read.
+from fastapi.responses import JSONResponse  # noqa: E402
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    import traceback as _tb
+    _tb.print_exc()
+    try:
+        from error_logger import log_db_error
+        await log_db_error(
+            stage="unhandled_api_error", error=exc, source_type="api",
+            source_id=f"{request.method} {request.url.path}"[:200],
+        )
+    except Exception:
+        pass
+    headers = {}
+    origin = request.headers.get("origin")
+    if origin and origin in _CORS_ALLOWED_ORIGINS:
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again; an admin has been alerted."},
+        headers=headers,
+    )
 
 # BUG FIX ("delete/save appears to work, then reverts a moment later" —
 # first seen on the Base Resume View endpoint, then again on Work
@@ -1369,11 +1424,11 @@ async def get_requirements(
             .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
             .where(
                 RequirementConsultantMatch.requirement_id.in_(req_ids),
-                # Only currently-matching rows count as "matched" here —
-                # a REJECTED/NOT_ELIGIBLE/APPLIED row is history, not an
-                # active match, and showing it in this column (or in the
-                # count) is exactly the stale-count bug this replaces.
-                RequirementConsultantMatch.status == "MATCHING",
+                # MATCHING = still a live match. APPLIED = a match that was
+                # sent (email_queue flips the row on send) — still a match,
+                # shown as "Applied" in the Matched card. REJECTED /
+                # NOT_ELIGIBLE rows are history and stay out.
+                RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
             )
         )
         if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
@@ -1433,8 +1488,15 @@ async def get_requirements(
         # application for this requirement — powers the "highlight
         # applied consultants" treatment in the Matched Consultants column.
         submitted_q = (
-            select(Application.requirement_id, Consultant.full_name)
+            select(
+                Application.requirement_id,
+                Consultant.full_name,
+                Consultant.id,
+                func.coalesce(Application.sent_at, Application.created_at),
+                User.full_name,
+            )
             .join(Consultant, Consultant.id == Application.consultant_id)
+            .outerjoin(User, User.id == Application.recruiter_id)
             .where(
                 Application.requirement_id.in_(req_ids),
                 Application.status == "SENT",
@@ -1446,15 +1508,86 @@ async def get_requirements(
             submitted_q = submitted_q.where(Application.consultant_id.in_(filter_consultant_ids))
 
         submitted_by_req: dict[int, list[str]] = {}
-        for req_id, name in (await db.execute(submitted_q)).all():
-            submitted_by_req.setdefault(req_id, []).append(name)
+        # (requirement, consultant) -> (latest sent time, sender name)
+        applied_info: dict[tuple, tuple] = {}
+        for req_id, name, cons_id, sent_at, sender_name in (await db.execute(submitted_q)).all():
+            if name not in submitted_by_req.get(req_id, []):
+                submitted_by_req.setdefault(req_id, []).append(name)
+            prev = applied_info.get((req_id, cons_id))
+            if prev is None or (sent_at and (prev[0] is None or sent_at > prev[0])):
+                # No recruiter on the row = the consultant sent it themself.
+                applied_info[(req_id, cons_id)] = (sent_at, sender_name or name)
 
         for r in reqs:
             r.submitted_consultants = submitted_by_req.get(r.id, [])
             applied_names = set(r.submitted_consultants)
             r.matched_details = [
-                {**d, "applied": d["name"] in applied_names} for d in (r.matched_details or [])
+                {
+                    **d,
+                    "applied": d["name"] in applied_names or (r.id, d["consultant_id"]) in applied_info,
+                    "applied_at": (
+                        applied_info[(r.id, d["consultant_id"])][0].isoformat()
+                        if (r.id, d["consultant_id"]) in applied_info and applied_info[(r.id, d["consultant_id"])][0]
+                        else None
+                    ),
+                    "applied_by": (
+                        applied_info[(r.id, d["consultant_id"])][1]
+                        if (r.id, d["consultant_id"]) in applied_info
+                        else None
+                    ),
+                }
+                for d in (r.matched_details or [])
             ]
+
+        # Sent but not in the matched list -> "Applied, not matched" tab.
+        matched_ids = {r.id: {d["consultant_id"] for d in (r.matched_details or [])} for r in reqs}
+        unmatched_pairs = [
+            (rq, cid) for (rq, cid) in applied_info if cid not in matched_ids.get(rq, set())
+        ]
+        unmatched_by_req: dict[int, list[dict]] = {}
+        if unmatched_pairs:
+            u_cids = {cid for _, cid in unmatched_pairs}
+            u_rqs = {rq for rq, _ in unmatched_pairs}
+            u_cons = {
+                c.id: c
+                for c in (await db.execute(select(Consultant).where(Consultant.id.in_(u_cids)))).scalars().all()
+            }
+            u_match = {
+                (m.requirement_id, m.consultant_id): m
+                for m in (
+                    await db.execute(
+                        select(RequirementConsultantMatch).where(
+                            RequirementConsultantMatch.requirement_id.in_(u_rqs),
+                            RequirementConsultantMatch.consultant_id.in_(u_cids),
+                        )
+                    )
+                ).scalars().all()
+            }
+            for rq, cid in unmatched_pairs:
+                c = u_cons.get(cid)
+                m = u_match.get((rq, cid))
+                percent = None
+                if m is not None:
+                    have = [x for x in (m.matched_skills or []) if x]
+                    lack = [x for x in (m.missing_skills or []) if x]
+                    total_jd = len(have) + len(lack)
+                    percent = round(len(have) * 100 / total_jd) if total_jd else int(round(float(m.match_score or 0)))
+                    percent = max(0, min(100, percent))
+                sent_at, sender_name = applied_info[(rq, cid)]
+                unmatched_by_req.setdefault(rq, []).append({
+                    "consultant_id": cid,
+                    "name": (c.full_name if c else None) or "Unknown",
+                    "role": ((c.preferred_roles or "").split(",")[0].strip() or None) if c else None,
+                    "location": c.current_location if c else None,
+                    "percent": percent,
+                    "match_status": m.status if m is not None else None,
+                    "applied_at": sent_at.isoformat() if sent_at else None,
+                    "applied_by": sender_name,
+                })
+            for lst in unmatched_by_req.values():
+                lst.sort(key=lambda d: d["applied_at"] or "", reverse=True)
+        for r in reqs:
+            r.applied_unmatched = unmatched_by_req.get(r.id, [])
 
     # For a CONSULTANT viewing their own Requirements page, tell them
     # which of these requirements they've already sent an application

@@ -771,6 +771,69 @@ async def get_cc_options(
     }
 
 
+SERVICE_ACCOUNT_SENDER_SUFFIX = "@savantisintelli.com"
+
+
+def _gmail_not_connected(consultant) -> bool:
+    """True when this consultant's applications cannot be sent because their
+    Gmail is not connected. Savantis-domain addresses send through the service
+    account and never need a personal Gmail connection."""
+    if (consultant.email or "").strip().lower().endswith(SERVICE_ACCOUNT_SENDER_SUFFIX):
+        return False
+    return not bool(consultant.gmail_connected)
+
+
+async def _notify_gmail_not_connected(db, consultant, sender, requirement_id=None, notify_consultant: bool = True) -> None:
+    """In-app alerts for a blocked send: the candidate (to connect Gmail) and
+    the sender (why it was not sent). Never raises."""
+    try:
+        from notification_helper import notify_users
+        name = consultant.full_name or "the candidate"
+        if notify_consultant and consultant.user_id and consultant.user_id != sender.id:
+            await notify_users(
+                db, [consultant.user_id], "Connect your Gmail",
+                f"{sender.full_name or 'A recruiter'} tried to apply for you, but your Gmail is not connected. "
+                "Connect it so applications can be sent.",
+                consultant_id=consultant.id,
+            )
+        await notify_users(
+            db, [sender.id], "Gmail not connected",
+            f"{name}'s application was not sent because Gmail is not connected.",
+            consultant_id=consultant.id,
+        )
+    except Exception as e:
+        print(f"[email_queue] gmail-not-connected notice failed: {e}")
+
+
+class NotifyGmailConnectRequest(BaseModel):
+    consultant_id: int
+
+
+@router.post("/api/consultant/email-queue/notify-gmail-connect")
+async def notify_gmail_connect(
+    body: NotifyGmailConnectRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Admin/recruiter asks a candidate to connect Gmail (Apply page button)."""
+    if current_user.role not in ("ADMIN", "RECRUITER"):
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    from models import Consultant
+    consultant = (await db.execute(
+        select(Consultant).where(Consultant.id == body.consultant_id)
+    )).scalars().first()
+    if not consultant:
+        raise HTTPException(status_code=404, detail="Consultant not found.")
+    if consultant.user_id:
+        from notification_helper import notify_users
+        await notify_users(
+            db, [consultant.user_id], "Connect your Gmail",
+            f"{current_user.full_name or 'A recruiter'} asked you to connect your Gmail so applications can be sent for you.",
+            consultant_id=consultant.id,
+        )
+    return {"success": True}
+
+
 @router.post("/api/consultant/email-queue/send-now")
 async def send_email_now(
     body: EmailQueueCreateRequest,
@@ -906,6 +969,20 @@ async def send_email_now(
     # so the record accurately reflects who really sent it.
     # fallback_sender_used logic removed per user request: from should ALWAYS be the applicant email address.
     effective_from_email = body.from_email
+
+    # An application is sent from the candidate's own Gmail, so it cannot go
+    # out while that Gmail is not connected. Tell the candidate and the sender,
+    # and stop with a clear message instead of queueing a send that will fail.
+    if consultant is not None and _gmail_not_connected(consultant):
+        await _notify_gmail_not_connected(db, consultant, current_user, body.requirement_id)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Gmail not connected for {consultant.full_name or 'this candidate'}. Ask them to connect Gmail, then send again.",
+        )
+
+    # An application needs the candidate's resume attached.
+    if body.requirement_id and not [a for a in (body.attachments or []) if a]:
+        raise HTTPException(status_code=400, detail="Attach a resume to send this application.")
 
     # BUG FIX ("a from address not tied to any real user/consultant row
     # is being used as the sender"): body.from_email was trusted directly
