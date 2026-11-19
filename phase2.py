@@ -71,6 +71,27 @@ def _require_role(user: User, *roles: str) -> None:
 # Schemas
 # ---------------------------------------------------------------------------
 
+def _coerce_skills_list(value) -> List[str]:
+    """parsed_fields['skills'] is normally a List[str], but older rows may
+    hold a comma/semicolon separated string. Normalize so one odd row can't
+    500 the View JD popup."""
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
+    if isinstance(value, str) and value.strip():
+        return [x.strip() for x in re.split(r"[,;|\n]", value) if x.strip()]
+    return []
+
+
+def _coerce_experience(value) -> Optional[str]:
+    """experience is a string in parsed_fields; tolerate numbers/lists."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        value = ", ".join(str(v).strip() for v in value if v is not None and str(v).strip())
+    value = str(value).strip()
+    return value or None
+
+
 class RequirementDetailResponse(BaseModel):
     model_config = {"from_attributes": True}
 
@@ -88,7 +109,7 @@ class RequirementDetailResponse(BaseModel):
     rate: Optional[str] = None
     duration: Optional[str] = None
     experience: Optional[str] = None
-    skills: Optional[str] = None
+    skills: Optional[List[str]] = None
     job_description: Optional[str] = None
     parsed_fields: Optional[dict] = None
     parse_confidence: Optional[float] = None
@@ -247,8 +268,8 @@ async def get_requirement_detail(
         employment_types=requirement.employment_types,
         rate=requirement.rate,
         duration=requirement.duration,
-        experience=parsed_fields.get("experience"),
-        skills=parsed_fields.get("skills"),
+        experience=_coerce_experience(parsed_fields.get("experience")),
+        skills=_coerce_skills_list(parsed_fields.get("skills")),
         job_description=requirement.job_description,
         parsed_fields=requirement.parsed_fields,
         parse_confidence=float(requirement.parse_confidence) if requirement.parse_confidence is not None else None,
