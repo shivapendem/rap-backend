@@ -654,6 +654,8 @@ async def list_email_queue(
                 "id": str(item.id),
                 "consultant_id": str(item.consultant_id),
                 "consultant_name": cons.full_name if cons else str(item.consultant_id),
+                # Email Queue -> consultant name opens User Management (/admin/users/:userId).
+                "consultant_user_id": str(cons.user_id) if cons and cons.user_id else None,
                 "requirement_id": str(item.requirement_id) if item.requirement_id else None,
                 "from_email": item.from_email,
                 "to_email": item.to_email,
