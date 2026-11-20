@@ -71,6 +71,14 @@ class DailyActivity(BaseModel):
     applications: int
 
 
+class HourlyActivity(BaseModel):
+    # CST hour of day (0-23) and SENT applications in that hour. Only filled
+    # when the selected range is a single CST day (the "Today" view). Hours
+    # with 0 are omitted; the frontend fills the gaps.
+    hour: int
+    applications: int
+
+
 class VendorCount(BaseModel):
     vendor: str
     applications: int
@@ -92,6 +100,15 @@ class AdminReportResponse(BaseModel):
     # dates are given) so the dashboard can show a trend. None = no comparison.
     prev_jobs_applied: Optional[int] = None
     prev_emails_sent: Optional[int] = None
+    # Org-wide parsed inbound emails in the previous window (same rule as
+    # emails_processed) so that card can show a trend too.
+    prev_emails_processed: Optional[int] = None
+    # Same bucketing as daily_activity, for the previous window, so the chart
+    # can draw "this period" against "previous period" day by day.
+    prev_daily_activity: List[DailyActivity] = []
+    # Single-day ranges only: per-hour buckets for the day and the day before.
+    hourly_activity: List[HourlyActivity] = []
+    prev_hourly_activity: List[HourlyActivity] = []
     # Applications by status for the caller's scope inside the range.
     status_counts: StatusCounts = StatusCounts()
     # Vendors with the most SENT applications inside the range (top 5).
@@ -195,9 +212,51 @@ async def get_admin_reports(
     # 2c. Trend: the window of the same length right before the range.
     prev_jobs_applied = None
     prev_emails_sent = None
+    prev_emails_processed = None
+    prev_daily_activity: List[DailyActivity] = []
+    hourly_activity: List[HourlyActivity] = []
+    prev_hourly_activity: List[HourlyActivity] = []
     if start_dt and end_dt and end_dt > start_dt:
         _span = end_dt - start_dt
         _p_start, _p_end = start_dt - _span, start_dt
+        prev_emails_processed = (await db.execute(
+            select(func.count()).select_from(Email).where(
+                Email.parse_status == 'PARSED',
+                Email.received_at >= _p_start,
+                Email.received_at < _p_end,
+            )
+        )).scalar_one()
+
+        # Previous-window daily buckets + hourly buckets (one query covering
+        # both windows, bucketed in CST in Python like daily_activity).
+        _series_rows = (await db.execute(_scope_apps(
+            select(Application.sent_at).where(
+                Application.status == "SENT",
+                Application.sent_at.is_not(None),
+                Application.sent_at >= _p_start,
+                Application.sent_at <= end_dt,
+            )
+        ))).all()
+        _prev_days: Counter = Counter()
+        _cur_hours: Counter = Counter()
+        _prev_hours: Counter = Counter()
+        _single_day = _span <= datetime.timedelta(days=1)
+        # sent_at may come back naive (UTC); compare like with like.
+        _start_aware = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=datetime.timezone.utc)
+        for (ts,) in _series_rows:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=datetime.timezone.utc)
+            local = ts.astimezone(_cst)
+            if ts < _start_aware:
+                _prev_days[local.date().isoformat()] += 1
+                if _single_day:
+                    _prev_hours[local.hour] += 1
+            elif _single_day:
+                _cur_hours[local.hour] += 1
+        prev_daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_prev_days.items())]
+        if _single_day:
+            hourly_activity = [HourlyActivity(hour=h, applications=n) for h, n in sorted(_cur_hours.items())]
+            prev_hourly_activity = [HourlyActivity(hour=h, applications=n) for h, n in sorted(_prev_hours.items())]
         prev_jobs_applied = (await db.execute(_scope_apps(
             select(func.count()).select_from(Application).where(
                 Application.status == "SENT",
@@ -348,6 +407,10 @@ async def get_admin_reports(
         daily_activity=daily_activity,
         prev_jobs_applied=prev_jobs_applied,
         prev_emails_sent=prev_emails_sent,
+        prev_emails_processed=prev_emails_processed,
+        prev_daily_activity=prev_daily_activity,
+        hourly_activity=hourly_activity,
+        prev_hourly_activity=prev_hourly_activity,
         status_counts=status_counts,
         top_vendors=top_vendors,
     )
