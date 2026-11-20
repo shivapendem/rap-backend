@@ -183,6 +183,13 @@ class ResumeResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     is_base: bool = False
+    # JD match vs the requirement being applied to (only set when
+    # /list is called with requirement_id) — not the stored ats_score,
+    # which is vs the JD the resume was generated for.
+    jd_match_score: Optional[int] = None
+    jd_matched_count: Optional[int] = None
+    jd_total: Optional[int] = None
+    jd_missing: List[str] = []
 
     class Config:
         from_attributes = True
@@ -1049,12 +1056,72 @@ async def upload_resume(
 
     return new_resume
 
+_JD_SCORE_SKIP_KEYS = {"missing_skills", "generation_notes", "job_description", "ats_score", "ats", "jd_skills"}
+
+
+def _flatten_resume_text(value, out: list) -> None:
+    """Collect every string in a resume's data JSON (summary, skills,
+    experience bullets, ...) except bookkeeping keys."""
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            if k not in _JD_SCORE_SKIP_KEYS:
+                _flatten_resume_text(v, out)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _flatten_resume_text(v, out)
+
+
+async def _requirement_jd_skills(db: AsyncSession, requirement_id: int):
+    """(jd_skills, role) for a requirement — same skill sources resume
+    generation uses: parsed_fields.skills + whole-word skills in the JD."""
+    from models import Requirement
+    from phase3 import _detect_skills as _p3_detect, _SKILL_ALIASES as _p3_aliases
+    from skill_augment import verify_detected_skills
+    req_row = (await db.execute(
+        select(Requirement).where(Requirement.id == requirement_id)
+    )).scalar_one_or_none()
+    if req_row is None:
+        return [], ""
+    parsed = []
+    if isinstance(req_row.parsed_fields, dict):
+        raw = req_row.parsed_fields.get("skills")
+        if isinstance(raw, (list, tuple)):
+            parsed = [str(s).strip() for s in raw if s and str(s).strip()]
+        elif isinstance(raw, str):
+            parsed = [s.strip() for s in re.split(r"[,;|\n]", raw) if s.strip()]
+    jd_text = req_row.job_description or ""
+    detected = verify_detected_skills(jd_text, _p3_detect(jd_text), _p3_aliases)
+    seen, skills = set(), []
+    for s in [*parsed, *detected]:
+        key = s.lower()
+        if key not in seen and len(s) <= 40:
+            seen.add(key)
+            skills.append(s)
+    return skills, (req_row.role or "")
+
+
+def _score_resume_vs_jd(resume_text: str, jd_skills: list, role: str):
+    """Same scorer as generation (phase6._ats_score), with alias
+    canonicals appended so "k8s" counts for Kubernetes etc."""
+    from phase6 import _ats_score
+    from phase3 import _SKILL_ALIASES as _p3_aliases
+    from skill_augment import verify_detected_skills
+    text = resume_text or ""
+    text += " " + " ".join(verify_detected_skills(text, list(_p3_aliases.keys()), _p3_aliases))
+    total, _kw, _role, _fmt, matched, missing = _ats_score(jd_skills, text, role)
+    return int(round(total)), len(matched), missing
+
+
 @router.get("/list", response_model=PaginatedResumes)
 async def list_resumes(
+    response: Response,
     page: int = 1,
     page_size: int = 10,
     search: Optional[str] = None,
     user_id: Optional[int] = None,
+    requirement_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1091,10 +1158,16 @@ async def list_resumes(
     total = (await db.execute(count_query)).scalar_one()
 
     query = query.order_by(Resume.created_at.desc())
-    query = query.offset((page - 1) * page_size).limit(page_size)
+    # JD-match mode (Apply screen): score every resume, so no paging.
+    if requirement_id:
+        page = 1
+        page_size = max(total, 1)
+    else:
+        query = query.offset((page - 1) * page_size).limit(page_size)
 
     resumes = (await db.execute(query)).scalars().all()
     total_pages = math.ceil(total / page_size) if page_size > 0 else 0
+    base_resume_text = ""
 
     # generate s3_url for each resume
     response_data = []
@@ -1143,6 +1216,7 @@ async def list_resumes(
             # all; an empty/just-started profile still has a valid (if
             # sparse) generated resume to view/edit.
             if base_consultant:
+                base_resume_text = base_consultant.base_resume_text or ""
                 base_ts = base_consultant.updated_at or datetime.now(timezone.utc)
                 response_data.insert(0, ResumeResponse(
                     id=-1,
@@ -1163,6 +1237,46 @@ async def list_resumes(
                     is_base=True,
                 ))
                 total += 1
+
+    # --- JD match vs the requirement being applied to (Apply screen) ---
+    # Scored live per requirement; the stored ats_score is vs the JD each
+    # resume was generated for, so it can't be used to filter here.
+    if requirement_id:
+        import time
+        import logging
+        t0 = time.perf_counter()
+        try:
+            jd_skills, jd_role = await _requirement_jd_skills(db, requirement_id)
+            if jd_skills:
+                for item in response_data:
+                    if item.is_base:
+                        text = base_resume_text
+                    else:
+                        parts: list = [item.title or "", item.target_role or ""]
+                        _flatten_resume_text(item.data or {}, parts)
+                        text = " ".join(parts)
+                    score, matched_n, missing = _score_resume_vs_jd(text, jd_skills, jd_role)
+                    item.jd_match_score = score
+                    item.jd_matched_count = matched_n
+                    item.jd_total = len(jd_skills)
+                    item.jd_missing = missing[:3]
+                # Base stays first; the rest best JD match first.
+                base_items = [i for i in response_data if i.is_base]
+                others = sorted(
+                    (i for i in response_data if not i.is_base),
+                    key=lambda i: i.jd_match_score or 0,
+                    reverse=True,
+                )
+                response_data = base_items + others
+        except Exception as e:
+            from error_logger import log_db_error
+            await log_db_error(stage="jd_match_scoring", error=e)
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        response.headers["X-Score-Ms"] = str(elapsed_ms)
+        logging.getLogger(__name__).info(
+            "JD match: scored %d resumes for requirement %s in %s ms",
+            len(response_data), requirement_id, elapsed_ms,
+        )
 
     return PaginatedResumes(
         data=response_data,
