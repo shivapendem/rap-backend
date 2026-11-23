@@ -137,19 +137,24 @@ async def notify_users(db, user_ids, title: str, body: str, consultant_id=None):
     Same safety contract as notify_by_role: never raises.
     """
     try:
+        uids = sorted({u for u in user_ids if u})
+        if not uids:
+            return
         if consultant_id is not None:
             await ensure_notification_schema()
-        for uid in {u for u in user_ids if u}:
-            exists = await db.execute(
-                select(Notification.id).where(
-                    Notification.user_id == uid,
+        existing_uids = {
+            r[0] for r in (await db.execute(
+                select(Notification.user_id).where(
+                    Notification.user_id.in_(uids),
                     Notification.title == title,
                     Notification.body == body,
                     Notification.is_read == False,
-                ).limit(1)
-            )
-            if exists.first() is None:
-                extra = {"consultant_id": consultant_id} if consultant_id is not None else {}
+                )
+            )).all()
+        }
+        extra = {"consultant_id": consultant_id} if consultant_id is not None else {}
+        for uid in uids:
+            if uid not in existing_uids:
                 db.add(Notification(user_id=uid, title=title, body=body, **extra))
         await db.commit()
     except Exception as e:
@@ -618,6 +623,7 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
     _modes = await load_account_modes(db)
 
     days: dict = {}
+    all_cids: set = set()
     for n in match_rows:
         if n.consultant_id is None:
             continue
@@ -625,44 +631,61 @@ async def build_match_cards(db, user, match_rows) -> list[dict]:
             continue
         start, end = day_bounds(n.created_at)
         days.setdefault(start, {"end": end, "rows": []})["rows"].append(n)
+        all_cids.add(n.consultant_id)
+
+    if not days or not all_cids:
+        return []
+
+    min_start = min(days.keys())
+    max_end = max(g["end"] for g in days.values())
+
+    where_matches = [
+        RequirementConsultantMatch.consultant_id.in_(sorted(all_cids)),
+        RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
+        RequirementConsultantMatch.created_at >= min_start,
+        RequirementConsultantMatch.created_at < max_end,
+    ]
+    if role == "RECRUITER":
+        user_email = (user.email or "").lower().strip()
+        where_matches.append(
+            public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
+        )
+    elif role == "CONSULTANT":
+        if allowed_recruiter_emails:
+            where_matches.append(
+                public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, allowed_recruiter_emails)
+            )
+        else:
+            where_matches.append(public_clause(Requirement.mode, Requirement.account_email, _modes))
+
+    q = (
+        select(
+            RequirementConsultantMatch.consultant_id,
+            RequirementConsultantMatch.match_score,
+            Requirement.role,
+            Requirement.client,
+            Consultant.full_name,
+            RequirementConsultantMatch.created_at,
+        )
+        .join(Requirement, Requirement.id == RequirementConsultantMatch.requirement_id)
+        .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
+        .where(*where_matches)
+        .order_by(RequirementConsultantMatch.match_score.desc())
+    )
+    all_found = (await db.execute(q)).all()
+    matches_by_day: dict = {}
+    for cid, score, rrole, client, cname, m_created in all_found:
+        if m_created is None:
+            continue
+        m_start, _ = day_bounds(m_created)
+        if m_start in days:
+            matches_by_day.setdefault(m_start, []).append((cid, score, rrole, client, cname))
 
     cards = []
     for start, grp in days.items():
         rows = grp["rows"]
-        cids = sorted({n.consultant_id for n in rows})
-        where_matches = [
-            RequirementConsultantMatch.consultant_id.in_(cids),
-            RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
-            RequirementConsultantMatch.created_at >= start,
-            RequirementConsultantMatch.created_at < grp["end"],
-        ]
-        if role == "RECRUITER":
-            user_email = (user.email or "").lower().strip()
-            where_matches.append(
-                public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
-            )
-        elif role == "CONSULTANT":
-            if allowed_recruiter_emails:
-                where_matches.append(
-                    public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, allowed_recruiter_emails)
-                )
-            else:
-                where_matches.append(public_clause(Requirement.mode, Requirement.account_email, _modes))
-
-        q = (
-            select(
-                RequirementConsultantMatch.consultant_id,
-                RequirementConsultantMatch.match_score,
-                Requirement.role,
-                Requirement.client,
-                Consultant.full_name,
-            )
-            .join(Requirement, Requirement.id == RequirementConsultantMatch.requirement_id)
-            .join(Consultant, Consultant.id == RequirementConsultantMatch.consultant_id)
-            .where(*where_matches)
-            .order_by(RequirementConsultantMatch.match_score.desc())
-        )
-        found = (await db.execute(q)).all()
+        cids = {n.consultant_id for n in rows}
+        found = [m for m in matches_by_day.get(start, []) if m[0] in cids]
         if not found:
             continue
         per: dict = {}
@@ -781,14 +804,7 @@ async def count_unread_for_user(db, user):
     """(unread count, fresh 'consultant removed' notice, last activity) for the
     bell badge. Cheap: one COUNT for ordinary rows, and only the user's UNREAD
     match rows (usually one day's worth) go through the card builder so the
-    badge always equals what the list shows.
-
-    `last_activity_at` is separate from the count on purpose: a same-day
-    top-up to an already-unread match card (see notify_new_matches above)
-    bumps that row's `created_at` without changing the card count, so the
-    plain unread-count alone can't tell the caller "something new happened".
-    This timestamp can advance even when the count doesn't, so callers (the
-    bell's new-notification sound) can key off it instead of the count."""
+    badge always equals what the list shows."""
     await ensure_profile_completeness_notice(db, user)
     plain = (await db.execute(
         select(func.count()).select_from(Notification).where(

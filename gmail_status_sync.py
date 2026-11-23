@@ -234,28 +234,42 @@ async def refresh_consultant_gmail_token_on_login(user_id: int) -> None:
                       f"available — needs 'Sign in with Google'.")
                 return
 
-            client_id = os.getenv("GOOGLE_CLIENT_ID")
-            client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-            if not client_id or not client_secret:
+            consultant_id = consultant.id
+            decrypted_refresh_token = decrypt_token(token.refresh_token_encrypted)
+
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            return
+
+        # Release the DB connection while waiting on the external Google OAuth HTTP call
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": decrypted_refresh_token,
+                    "grant_type": "refresh_token",
+                },
+            )
+
+        if res.status_code != 200:
+            print(f"[gmail-sync] Login-time refresh rejected for consultant {consultant_id} "
+                  f"(status={res.status_code}). Left as-is; consultant must 'Sign in with Google'.")
+            return
+
+        new_data = res.json()
+        now = datetime.now(timezone.utc)
+        async with AsyncSessionLocal() as session:
+            consultant = (await session.execute(
+                select(Consultant).where(Consultant.id == consultant_id)
+            )).scalars().first()
+            token = (await session.execute(
+                select(ConsultantEmailToken).where(ConsultantEmailToken.consultant_id == consultant_id)
+            )).scalars().first()
+            if not consultant or not token:
                 return
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(
-                    "https://oauth2.googleapis.com/token",
-                    data={
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "refresh_token": decrypt_token(token.refresh_token_encrypted),
-                        "grant_type": "refresh_token",
-                    },
-                )
-
-            if res.status_code != 200:
-                print(f"[gmail-sync] Login-time refresh rejected for consultant {consultant.id} "
-                      f"(status={res.status_code}). Left as-is; consultant must 'Sign in with Google'.")
-                return
-
-            new_data = res.json()
             token.access_token_encrypted = encrypt_token(new_data["access_token"])
             if new_data.get("refresh_token"):
                 token.refresh_token_encrypted = encrypt_token(new_data["refresh_token"])
@@ -263,6 +277,6 @@ async def refresh_consultant_gmail_token_on_login(user_id: int) -> None:
             token.is_active = True
             consultant.gmail_connected = True
             await session.commit()
-            print(f"[gmail-sync] Gmail token refreshed and resumed on login for consultant {consultant.id}.")
+            print(f"[gmail-sync] Gmail token refreshed and resumed on login for consultant {consultant_id}.")
     except Exception as exc:
         print(f"[gmail-sync] Login-time Gmail refresh failed (ignored): {exc!r}")

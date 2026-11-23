@@ -143,11 +143,13 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
 
     norm_from = from_email.strip().lower()
 
-    # Acquire transaction-level advisory lock to serialize concurrent enqueues for the same sender
-    email_hash = int(hashlib.sha256(norm_from.encode('utf-8')).hexdigest()[:16], 16)
-    if email_hash > 9223372036854775807:
-        email_hash = email_hash - 18446744073709551616
-    await db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": email_hash})
+    # Acquire transaction-level advisory lock to serialize concurrent enqueues for the same sender (PostgreSQL only)
+    from database import DATABASE_URL as _DB_URL
+    if _DB_URL.startswith("postgresql"):
+        email_hash = int(hashlib.sha256(norm_from.encode('utf-8')).hexdigest()[:16], 16)
+        if email_hash > 9223372036854775807:
+            email_hash = email_hash - 18446744073709551616
+        await db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": email_hash})
 
     now_utc = datetime.now(timezone.utc)
 

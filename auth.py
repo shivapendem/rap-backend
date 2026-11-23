@@ -105,10 +105,18 @@ async def get_current_user(
     if not email:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
 
-    result = await db.execute(select(User).where(User.email == email))
-    user = result.scalars().first()
-    if not user:
+    # Single OUTER JOIN query fetches both User and linked Consultant.status
+    # in one round-trip instead of 2 sequential queries per request.
+    result = await db.execute(
+        select(User, Consultant.status)
+        .outerjoin(Consultant, Consultant.user_id == User.id)
+        .where(User.email == email)
+        .limit(1)
+    )
+    row = result.first()
+    if not row:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    user, consultant_status = row
 
     # BUG FIX ("deactivating a consultant doesn't stop them from logging
     # in" / "should automatically kick a currently-logged-in consultant
@@ -147,10 +155,6 @@ async def get_current_user(
     # this reuses that existing interceptor exactly as originally wired.
     if not user.is_authorized:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
-    if user.role == "CONSULTANT":
-        consultant_status_result = await db.execute(
-            select(Consultant.status).where(Consultant.user_id == user.id)
-        )
-        if consultant_status_result.scalar_one_or_none() == "INACTIVE":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    if user.role == "CONSULTANT" and consultant_status == "INACTIVE":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
     return user

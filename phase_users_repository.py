@@ -130,7 +130,7 @@ class UserRepository:
 
     @staticmethod
     async def soft_delete(db: AsyncSession, user: User) -> User:
-        user.is_active = False
+        user.is_authorized = False
         await db.flush()
         await db.refresh(user)
         return user
@@ -257,17 +257,27 @@ class RecruiterConsultantRepository:
     async def replace_for_recruiter(db: AsyncSession, recruiter_id: int, consultant_ids: List[int]) -> None:
         """Used by PUT /admin/recruiters/{id}/consultants — sets exact assignment list."""
         from models import Consultant
+        from sqlalchemy import or_
         real_consultant_ids = []
-        for cid in consultant_ids:
-            result = await db.execute(select(Consultant).where(Consultant.id == cid))
-            c = result.scalars().first()
-            if c:
-                real_consultant_ids.append(c.id)
-            else:
-                result = await db.execute(select(Consultant).where(Consultant.user_id == cid))
-                c = result.scalars().first()
-                if c:
-                    real_consultant_ids.append(c.id)
+        unique_cids = list(dict.fromkeys(consultant_ids))
+        if unique_cids:
+            rows = (
+                await db.execute(
+                    select(Consultant.id, Consultant.user_id).where(
+                        or_(
+                            Consultant.id.in_(unique_cids),
+                            Consultant.user_id.in_(unique_cids),
+                        )
+                    )
+                )
+            ).all()
+            by_id = {cid_val: cid_val for cid_val, _ in rows}
+            by_user_id = {uid_val: cid_val for cid_val, uid_val in rows if uid_val is not None}
+            for cid in unique_cids:
+                if cid in by_id:
+                    real_consultant_ids.append(by_id[cid])
+                elif cid in by_user_id:
+                    real_consultant_ids.append(by_user_id[cid])
 
         existing = await RecruiterConsultantRepository.get_assigned_consultant_ids(db, recruiter_id)
         existing_set = set(existing)

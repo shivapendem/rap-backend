@@ -81,19 +81,25 @@ async def log_ai_usage(
     return cost
 
 async def save_openai_rate_limits(db: AsyncSession, limits: dict):
-    """Save OpenAI rate limit headers to AppSettings."""
+    """Save OpenAI rate limit headers to AppSettings in a single batch query."""
     keys_to_save = [
         "tokens-limit", "tokens-remaining", "tokens-reset",
         "requests-limit", "requests-remaining", "requests-reset"
     ]
-    for key in keys_to_save:
-        if limits.get(key) is not None:
-            full_key = f"openai_ratelimit_{key}"
-            val = str(limits[key])
-            result = await db.execute(select(AppSetting).where(AppSetting.key == full_key))
-            setting = result.scalars().first()
-            if setting:
-                setting.value = val
-            else:
-                db.add(AppSetting(key=full_key, value=val))
+    updates = {
+        f"openai_ratelimit_{key}": str(limits[key])
+        for key in keys_to_save
+        if limits.get(key) is not None
+    }
+    if not updates:
+        return
+    result = await db.execute(
+        select(AppSetting).where(AppSetting.key.in_(list(updates.keys())))
+    )
+    existing = {s.key: s for s in result.scalars().all()}
+    for full_key, val in updates.items():
+        if full_key in existing:
+            existing[full_key].value = val
+        else:
+            db.add(AppSetting(key=full_key, value=val))
     await db.commit()

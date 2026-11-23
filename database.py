@@ -40,21 +40,31 @@ if use_null_pool:
     engine_kwargs["poolclass"] = NullPool
 elif not DATABASE_URL.startswith("sqlite"):
     engine_kwargs.update({
-        "pool_size": int(os.getenv("DB_POOL_SIZE", "2")),        # Strictly cap connection pool size to 2 per worker process
-        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "0")),   # 0 overflow allowed — prevents connection limit exhaustion
-        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "60")),  # Recycle idle connections after 60s
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),        # Default pool size: 10 connections per worker (calibrated for 2 CPU / 4GB RAM)
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "15")),  # Burst overflow connections during spikes
+        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")), # Recycle idle connections after 300s (avoids TLS handshake thrashing)
         "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "10")),  # Fail fast after 10s if connection queue is full
+        "pool_use_lifo": True,                                    # LIFO keeps hot connections active and lets idle ones expire cleanly
     })
 
 if not DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {
         "server_settings": {
-            "timezone": "UTC"
+            "timezone": "UTC",
+            "jit": "off",  # Disable LLVM JIT overhead on short OLTP queries for instant sub-ms execution
+            "application_name": os.getenv("DB_APPLICATION_NAME", "rap_backend"),
+            # Server-side guard so one runaway query can never hold locks or a
+            # pooled connection hostage under load (mirrors command_timeout).
+            "statement_timeout": os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"),
+            # Opt-in (0 = disabled): some endpoints keep their session open
+            # across long AI / S3 calls, so only enable once that's verified.
+            "idle_in_transaction_session_timeout": os.getenv("DB_IDLE_TX_TIMEOUT_MS", "0"),
         },
         # Fail fast (default is much longer) so a hung TLS handshake
         # doesn't stall startup for ages — pairs with the retry loop
         # in main.py's lifespan, which reattempts on failure.
         "timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "8")),
+        "command_timeout": int(os.getenv("DB_COMMAND_TIMEOUT", "30")),
     }
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
@@ -118,6 +128,9 @@ async def get_db():
                 # DB would wait for yet another connection and make it worse.
                 print(f"[get_db] connection pool exhausted (not logged to DB): {e}")
             else:
+                # Close the failed session first to release its connection back to the
+                # pool BEFORE error_logger checks out a new connection.
+                await session.close()
                 from error_logger import log_db_error
                 await log_db_error(stage="get_db_dependency", error=e)
             raise
