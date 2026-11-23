@@ -3,20 +3,14 @@
 -- File: backend/optimization_queries.sql
 --
 -- Deadlock-Proof Execution Architecture:
---   1. Runs with SET lock_timeout = '10s' to fail fast with diagnostic info if
---      an uncommitted app transaction holds conflicting row/table locks.
---   2. Strict Alphabetical Table Ordering: Indexes and table storage options
---      are applied strictly table-by-table in alphabetical order:
---        ai_usage_logs -> applications -> audit_logs -> consultant_experience ->
---        consultants -> email_queue -> generated_resumes -> gmail_accounts ->
---        gmail_emails -> notifications -> processing_errors -> recruiter_consultants ->
---        requirement_consultant_matches -> requirements -> resumes -> users
---      Locking tables in the exact same canonical order eliminates cyclic
---      AccessExclusiveLock vs AccessShareLock dependency graphs (SQL state 40P01).
---   3. All 87 indexes drop any existing definition with DROP INDEX IF EXISTS public.<idx>
---      and recreate cleanly so no stale or colliding index definitions persist.
---   4. Views drop with CASCADE before recreating to avoid column drop/rename errors.
---   5. Calibrated specifically for a 2 vCPU / 4 GB RAM host footprint.
+--   1. Zero Table Locking: All 87 indexes are built using:
+--        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+--      In PostgreSQL, CREATE INDEX CONCURRENTLY acquires only a ShareUpdateExclusiveLock
+--      instead of an AccessExclusiveLock. Reads, writes, INSERTs, and UPDATEs on
+--      all tables continue running in parallel without waiting or deadlocking.
+--   2. Runs with SET lock_timeout = '15s' and SET statement_timeout = '180s'.
+--   3. Views drop with CASCADE before recreating to avoid column drop/rename errors.
+--   4. Calibrated specifically for a 2 vCPU / 4 GB RAM host footprint.
 --
 -- Safe to execute repeatedly (100% idempotent).
 -- =============================================================================
@@ -37,52 +31,39 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- =============================================================================
 -- TABLE: public.ai_usage_logs
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_ai_usage_created_incl_cost;
-CREATE INDEX ix_ai_usage_created_incl_cost
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_ai_usage_created_incl_cost
     ON public.ai_usage_logs (created_at DESC)
     INCLUDE (purpose, estimated_cost, input_tokens, output_tokens);
-DROP INDEX IF EXISTS public.ix_ai_usage_purpose_created;
-CREATE INDEX ix_ai_usage_purpose_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_ai_usage_purpose_created
     ON public.ai_usage_logs (purpose, created_at DESC);
-DROP INDEX IF EXISTS public.ix_ai_usage_consultant_created;
-CREATE INDEX ix_ai_usage_consultant_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_ai_usage_consultant_created
     ON public.ai_usage_logs (consultant_id, created_at DESC)
     WHERE consultant_id IS NOT NULL;
 
 -- =============================================================================
 -- TABLE: public.applications
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_apps_cons_req_status;
-CREATE INDEX ix_apps_cons_req_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_cons_req_status
     ON public.applications (consultant_id, requirement_id, status);
-DROP INDEX IF EXISTS public.ix_apps_req_cons_sent_partial;
-CREATE INDEX ix_apps_req_cons_sent_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_req_cons_sent_partial
     ON public.applications (requirement_id, consultant_id, sent_at DESC)
     WHERE status = 'SENT';
-DROP INDEX IF EXISTS public.ix_apps_status_sent_at;
-CREATE INDEX ix_apps_status_sent_at
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_status_sent_at
     ON public.applications (status, sent_at DESC);
-DROP INDEX IF EXISTS public.ix_apps_effective_sent_at;
-CREATE INDEX ix_apps_effective_sent_at
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_effective_sent_at
     ON public.applications (COALESCE(sent_at, created_at) DESC, id DESC);
-DROP INDEX IF EXISTS public.ix_apps_recruiter_effective_sent;
-CREATE INDEX ix_apps_recruiter_effective_sent
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_recruiter_effective_sent
     ON public.applications (recruiter_id, COALESCE(sent_at, created_at) DESC);
-DROP INDEX IF EXISTS public.ix_apps_consultant_created_desc;
-CREATE INDEX ix_apps_consultant_created_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_consultant_created_desc
     ON public.applications (consultant_id, created_at DESC);
-DROP INDEX IF EXISTS public.ix_apps_recruiter_status_sent;
-CREATE INDEX ix_apps_recruiter_status_sent
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_recruiter_status_sent
     ON public.applications (recruiter_id, status, sent_at DESC);
-DROP INDEX IF EXISTS public.ix_apps_consultant_status_sent;
-CREATE INDEX ix_apps_consultant_status_sent
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_consultant_status_sent
     ON public.applications (consultant_id, status, sent_at DESC);
-DROP INDEX IF EXISTS public.ix_apps_created_status;
-CREATE INDEX ix_apps_created_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_created_status
     ON public.applications (created_at DESC)
     INCLUDE (status, recruiter_id, consultant_id);
-DROP INDEX IF EXISTS public.ix_apps_sent_partial_cons;
-CREATE INDEX ix_apps_sent_partial_cons
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_apps_sent_partial_cons
     ON public.applications (consultant_id, sent_at DESC)
     INCLUDE (created_at)
     WHERE status = 'SENT';
@@ -98,80 +79,61 @@ ALTER TABLE public.applications ALTER COLUMN status SET STATISTICS 500;
 -- =============================================================================
 -- TABLE: public.audit_logs
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_audit_logs_duplicate_created;
-CREATE INDEX ix_audit_logs_duplicate_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_duplicate_created
     ON public.audit_logs (created_at DESC)
     WHERE (meta->>'is_duplicate') = 'true';
-DROP INDEX IF EXISTS public.ix_audit_logs_action_created;
-CREATE INDEX ix_audit_logs_action_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_action_created
     ON public.audit_logs (action, created_at DESC);
-DROP INDEX IF EXISTS public.ix_audit_logs_meta_consultant;
-CREATE INDEX ix_audit_logs_meta_consultant
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_audit_logs_meta_consultant
     ON public.audit_logs ((meta->>'consultant_id'), created_at DESC)
     WHERE meta ? 'consultant_id';
 
 -- =============================================================================
 -- TABLE: public.consultant_experience
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_consultant_exp_cons_id;
-CREATE INDEX ix_consultant_exp_cons_id
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultant_exp_cons_id
     ON public.consultant_experience (consultant_id);
 
 -- =============================================================================
 -- TABLE: public.consultants
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_consultants_user_status;
-CREATE INDEX ix_consultants_user_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultants_user_status
     ON public.consultants (user_id, status);
-DROP INDEX IF EXISTS public.ix_consultants_status_lower_name;
-CREATE INDEX ix_consultants_status_lower_name
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultants_status_lower_name
     ON public.consultants (status, LOWER(full_name) ASC, id ASC);
-DROP INDEX IF EXISTS public.ix_consultants_full_name_trgm;
-CREATE INDEX ix_consultants_full_name_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultants_full_name_trgm
     ON public.consultants USING GIN (full_name gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_consultants_email_trgm;
-CREATE INDEX ix_consultants_email_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultants_email_trgm
     ON public.consultants USING GIN (email gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_consultants_lower_email;
-CREATE INDEX ix_consultants_lower_email
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultants_lower_email
     ON public.consultants (LOWER(email));
-DROP INDEX IF EXISTS public.ix_consultants_sales_recruiter;
-CREATE INDEX ix_consultants_sales_recruiter
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_consultants_sales_recruiter
     ON public.consultants (sales_recruiter_user_id)
     WHERE sales_recruiter_user_id IS NOT NULL;
 
 -- =============================================================================
 -- TABLE: public.email_queue
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_email_queue_req_cons_status;
-CREATE INDEX ix_email_queue_req_cons_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_req_cons_status
     ON public.email_queue (requirement_id, consultant_id, status);
-DROP INDEX IF EXISTS public.ix_email_queue_lower_from_status;
-CREATE INDEX ix_email_queue_lower_from_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_lower_from_status
     ON public.email_queue (LOWER(from_email), status)
     INCLUDE (scheduled_at, created_at);
-DROP INDEX IF EXISTS public.ix_email_queue_status_scheduled;
-CREATE INDEX ix_email_queue_status_scheduled
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_status_scheduled
     ON public.email_queue (status, scheduled_at)
     WHERE status IN ('QUEUED', 'PROCESSING');
-DROP INDEX IF EXISTS public.ix_email_queue_status_created_desc;
-CREATE INDEX ix_email_queue_status_created_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_status_created_desc
     ON public.email_queue (status, created_at DESC);
-DROP INDEX IF EXISTS public.ix_email_queue_consultant_created_desc;
-CREATE INDEX ix_email_queue_consultant_created_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_consultant_created_desc
     ON public.email_queue (consultant_id, created_at DESC);
-DROP INDEX IF EXISTS public.ix_email_queue_sender_status_created;
-CREATE INDEX ix_email_queue_sender_status_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_sender_status_created
     ON public.email_queue (sent_by_user_id, status, created_at DESC)
     WHERE sent_by_user_id IS NOT NULL;
-DROP INDEX IF EXISTS public.ix_email_queue_subject_trgm;
-CREATE INDEX ix_email_queue_subject_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_subject_trgm
     ON public.email_queue USING GIN (subject gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_email_queue_to_email_trgm;
-CREATE INDEX ix_email_queue_to_email_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_to_email_trgm
     ON public.email_queue USING GIN (to_email gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_email_queue_from_email_trgm;
-CREATE INDEX ix_email_queue_from_email_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_email_queue_from_email_trgm
     ON public.email_queue USING GIN (from_email gin_trgm_ops);
 
 -- Storage & autovacuum tuning for public.email_queue
@@ -185,65 +147,50 @@ ALTER TABLE public.email_queue ALTER COLUMN status SET STATISTICS 500;
 -- =============================================================================
 -- TABLE: public.generated_resumes
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_generated_resumes_req_cons_final;
-CREATE INDEX ix_generated_resumes_req_cons_final
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_generated_resumes_req_cons_final
     ON public.generated_resumes (requirement_id, consultant_id)
     WHERE is_final = TRUE;
-DROP INDEX IF EXISTS public.ix_generated_resumes_cons_req_created;
-CREATE INDEX ix_generated_resumes_cons_req_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_generated_resumes_cons_req_created
     ON public.generated_resumes (consultant_id, requirement_id, created_at);
-DROP INDEX IF EXISTS public.ix_generated_resumes_cons_final;
-CREATE INDEX ix_generated_resumes_cons_final
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_generated_resumes_cons_final
     ON public.generated_resumes (consultant_id)
     WHERE is_final = TRUE;
 
 -- =============================================================================
 -- TABLE: public.gmail_accounts
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_gmail_accounts_email_mode;
-CREATE INDEX ix_gmail_accounts_email_mode
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_accounts_email_mode
     ON public.gmail_accounts (LOWER(TRIM(email)))
     INCLUDE (mode, active);
 
 -- =============================================================================
 -- TABLE: public.gmail_emails
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_gmail_emails_status_processed;
-CREATE INDEX ix_gmail_emails_status_processed
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_status_processed
     ON public.gmail_emails (status_desc, processed);
-DROP INDEX IF EXISTS public.ix_gmail_emails_date_desc;
-CREATE INDEX ix_gmail_emails_date_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_date_desc
     ON public.gmail_emails (date DESC);
-DROP INDEX IF EXISTS public.ix_gmail_emails_effective_date_desc;
-CREATE INDEX ix_gmail_emails_effective_date_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_effective_date_desc
     ON public.gmail_emails ((COALESCE(fetched_at, date)) DESC, id DESC);
-DROP INDEX IF EXISTS public.ix_gmail_emails_account_effective_date;
-CREATE INDEX ix_gmail_emails_account_effective_date
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_account_effective_date
     ON public.gmail_emails (account_email, (COALESCE(fetched_at, date)) DESC);
-DROP INDEX IF EXISTS public.ix_gmail_emails_category;
-CREATE INDEX ix_gmail_emails_category
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_category
     ON public.gmail_emails (category);
-DROP INDEX IF EXISTS public.ix_gmail_emails_classified_at_desc;
-CREATE INDEX ix_gmail_emails_classified_at_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_classified_at_desc
     ON public.gmail_emails (classified_at DESC)
     WHERE classified_at IS NOT NULL;
-DROP INDEX IF EXISTS public.ix_gmail_emails_unclassified_partial;
-CREATE INDEX ix_gmail_emails_unclassified_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_unclassified_partial
     ON public.gmail_emails (id)
     WHERE (category IS NULL OR category = 'unclassified')
       AND (status_desc IS NULL OR status_desc = 'Pending');
-DROP INDEX IF EXISTS public.ix_gmail_emails_worker_status_partial;
-CREATE INDEX ix_gmail_emails_worker_status_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_worker_status_partial
     ON public.gmail_emails (status_desc, id)
     WHERE status_desc IN ('Reparse Requested', 'Reparsing', 'Batch Queued', 'Batch Submitted');
-DROP INDEX IF EXISTS public.ix_gmail_emails_subject_trgm;
-CREATE INDEX ix_gmail_emails_subject_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_subject_trgm
     ON public.gmail_emails USING GIN (subject gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_gmail_emails_from_name_trgm;
-CREATE INDEX ix_gmail_emails_from_name_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_from_name_trgm
     ON public.gmail_emails USING GIN (from_name gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_gmail_emails_from_address_trgm;
-CREATE INDEX ix_gmail_emails_from_address_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gmail_emails_from_address_trgm
     ON public.gmail_emails USING GIN (from_address gin_trgm_ops);
 
 -- Storage & autovacuum tuning for public.gmail_emails
@@ -258,15 +205,12 @@ ALTER TABLE public.gmail_emails ALTER COLUMN account_email SET STATISTICS 500;
 -- =============================================================================
 -- TABLE: public.notifications
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_notifs_user_read_created;
-CREATE INDEX ix_notifs_user_read_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_notifs_user_read_created
     ON public.notifications (user_id, is_read, created_at DESC);
-DROP INDEX IF EXISTS public.ix_notifs_user_unread_partial;
-CREATE INDEX ix_notifs_user_unread_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_notifs_user_unread_partial
     ON public.notifications (user_id, created_at DESC)
     WHERE is_read = FALSE;
-DROP INDEX IF EXISTS public.ix_notifs_user_created_desc;
-CREATE INDEX ix_notifs_user_created_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_notifs_user_created_desc
     ON public.notifications (user_id, created_at DESC);
 
 -- Storage & autovacuum tuning for public.notifications
@@ -278,57 +222,44 @@ ALTER TABLE public.notifications SET (
 -- =============================================================================
 -- TABLE: public.processing_errors
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_processing_errors_status_occurred;
-CREATE INDEX ix_processing_errors_status_occurred
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_processing_errors_status_occurred
     ON public.processing_errors (status, occurred_at DESC);
-DROP INDEX IF EXISTS public.ix_processing_errors_stage_status;
-CREATE INDEX ix_processing_errors_stage_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_processing_errors_stage_status
     ON public.processing_errors (error_stage, status);
-DROP INDEX IF EXISTS public.ix_processing_errors_open_partial;
-CREATE INDEX ix_processing_errors_open_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_processing_errors_open_partial
     ON public.processing_errors (occurred_at DESC)
     WHERE status = 'OPEN';
 
 -- =============================================================================
 -- TABLE: public.recruiter_consultants
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_rc_recruiter_active;
-CREATE INDEX ix_rc_recruiter_active
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rc_recruiter_active
     ON public.recruiter_consultants (recruiter_id, is_active, consultant_id);
-DROP INDEX IF EXISTS public.ix_rc_consultant_active;
-CREATE INDEX ix_rc_consultant_active
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rc_consultant_active
     ON public.recruiter_consultants (consultant_id, is_active, recruiter_id);
-DROP INDEX IF EXISTS public.ix_rc_recruiter_active_partial;
-CREATE INDEX ix_rc_recruiter_active_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rc_recruiter_active_partial
     ON public.recruiter_consultants (recruiter_id, consultant_id)
     WHERE is_active = TRUE;
 
 -- =============================================================================
 -- TABLE: public.requirement_consultant_matches
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_rcm_cons_status_created;
-CREATE INDEX ix_rcm_cons_status_created
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_cons_status_created
     ON public.requirement_consultant_matches (consultant_id, status, created_at DESC);
-DROP INDEX IF EXISTS public.ix_rcm_req_status;
-CREATE INDEX ix_rcm_req_status
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_req_status
     ON public.requirement_consultant_matches (requirement_id, status);
-DROP INDEX IF EXISTS public.ix_rcm_status_created_score_id;
-CREATE INDEX ix_rcm_status_created_score_id
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_status_created_score_id
     ON public.requirement_consultant_matches (status, created_at DESC, match_score DESC, id DESC);
-DROP INDEX IF EXISTS public.ix_rcm_req_matching_applied_partial;
-CREATE INDEX ix_rcm_req_matching_applied_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_req_matching_applied_partial
     ON public.requirement_consultant_matches (requirement_id, consultant_id)
     WHERE status IN ('MATCHING', 'APPLIED');
-DROP INDEX IF EXISTS public.ix_rcm_rejected_effective_updated;
-CREATE INDEX ix_rcm_rejected_effective_updated
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_rejected_effective_updated
     ON public.requirement_consultant_matches (COALESCE(updated_at, created_at) DESC)
     WHERE status = 'REJECTED';
-DROP INDEX IF EXISTS public.ix_rcm_created_desc_incl_req;
-CREATE INDEX ix_rcm_created_desc_incl_req
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_created_desc_incl_req
     ON public.requirement_consultant_matches (created_at DESC)
     INCLUDE (requirement_id, consultant_id, status);
-DROP INDEX IF EXISTS public.ix_rcm_matching_created_partial;
-CREATE INDEX ix_rcm_matching_created_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rcm_matching_created_partial
     ON public.requirement_consultant_matches (created_at DESC, consultant_id, requirement_id)
     WHERE status = 'MATCHING';
 
@@ -343,42 +274,30 @@ ALTER TABLE public.requirement_consultant_matches ALTER COLUMN status SET STATIS
 -- =============================================================================
 -- TABLE: public.requirements
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_requirements_status_received;
-CREATE INDEX ix_requirements_status_received
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_status_received
     ON public.requirements (status, received_date DESC, id DESC);
-DROP INDEX IF EXISTS public.ix_requirements_received_id_desc;
-CREATE INDEX ix_requirements_received_id_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_received_id_desc
     ON public.requirements (received_date DESC, id DESC);
-DROP INDEX IF EXISTS public.ix_requirements_mode_account_email;
-CREATE INDEX ix_requirements_mode_account_email
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_mode_account_email
     ON public.requirements (UPPER(COALESCE(mode, '')), LOWER(COALESCE(account_email, '')));
-DROP INDEX IF EXISTS public.ix_requirements_work_mode_norm;
-CREATE INDEX ix_requirements_work_mode_norm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_work_mode_norm
     ON public.requirements (UPPER(REPLACE(REPLACE(work_mode, '-', ''), ' ', '')));
-DROP INDEX IF EXISTS public.ix_requirements_employment_types_gin;
-CREATE INDEX ix_requirements_employment_types_gin
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_employment_types_gin
     ON public.requirements USING GIN (employment_types);
-DROP INDEX IF EXISTS public.ix_requirements_role_trgm;
-CREATE INDEX ix_requirements_role_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_role_trgm
     ON public.requirements USING GIN (role gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_requirements_vendor_trgm;
-CREATE INDEX ix_requirements_vendor_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_vendor_trgm
     ON public.requirements USING GIN (vendor gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_requirements_client_trgm;
-CREATE INDEX ix_requirements_client_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_client_trgm
     ON public.requirements USING GIN (client gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_requirements_vendor_email_trgm;
-CREATE INDEX ix_requirements_vendor_email_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_vendor_email_trgm
     ON public.requirements USING GIN (vendor_email gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_requirements_location_trgm;
-CREATE INDEX ix_requirements_location_trgm
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_location_trgm
     ON public.requirements USING GIN (location gin_trgm_ops);
-DROP INDEX IF EXISTS public.ix_requirements_raw_email_id;
-CREATE INDEX ix_requirements_raw_email_id
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_raw_email_id
     ON public.requirements (raw_email_id)
     WHERE raw_email_id IS NOT NULL;
-DROP INDEX IF EXISTS public.ix_requirements_created_desc;
-CREATE INDEX ix_requirements_created_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requirements_created_desc
     ON public.requirements (created_at DESC);
 
 -- Storage & autovacuum tuning for public.requirements
@@ -391,31 +310,25 @@ ALTER TABLE public.requirements SET (
 -- =============================================================================
 -- TABLE: public.resumes
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_resumes_user_created_desc;
-CREATE INDEX ix_resumes_user_created_desc
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_resumes_user_created_desc
     ON public.resumes (user_id, created_at DESC);
-DROP INDEX IF EXISTS public.ix_resumes_user_req_completed;
-CREATE INDEX ix_resumes_user_req_completed
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_resumes_user_req_completed
     ON public.resumes (user_id, requirement_id)
     WHERE status = 'completed';
-DROP INDEX IF EXISTS public.ix_resumes_user_created_incl_ats;
-CREATE INDEX ix_resumes_user_created_incl_ats
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_resumes_user_created_incl_ats
     ON public.resumes (user_id, created_at DESC)
     INCLUDE (ats_score, status);
-DROP INDEX IF EXISTS public.ix_resumes_user_active_partial;
-CREATE INDEX ix_resumes_user_active_partial
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_resumes_user_active_partial
     ON public.resumes (user_id, created_at DESC)
     WHERE deleted_at IS NULL;
 
 -- =============================================================================
 -- TABLE: public.users
 -- =============================================================================
-DROP INDEX IF EXISTS public.ix_users_email_covering;
-CREATE INDEX ix_users_email_covering
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_users_email_covering
     ON public.users (email)
     INCLUDE (id, full_name, role, is_authorized, allowed_to_send);
-DROP INDEX IF EXISTS public.ix_users_role_authorized;
-CREATE INDEX ix_users_role_authorized
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_users_role_authorized
     ON public.users (role, is_authorized)
     INCLUDE (id, email, full_name);
 
@@ -425,18 +338,18 @@ CREATE INDEX ix_users_role_authorized
 DO $$
 BEGIN
     IF to_regclass('public.feedback') IS NOT NULL THEN
-        EXECUTE 'DROP INDEX IF EXISTS public.ix_feedback_user_created; CREATE INDEX ix_feedback_user_created ON public.feedback (user_id, created_at DESC)';
-        EXECUTE 'DROP INDEX IF EXISTS public.ix_feedback_status_created; CREATE INDEX ix_feedback_status_created ON public.feedback (status, created_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS ix_feedback_user_created ON public.feedback (user_id, created_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS ix_feedback_status_created ON public.feedback (status, created_at DESC)';
     END IF;
     IF to_regclass('public.gmail_sync_logs') IS NOT NULL THEN
-        EXECUTE 'DROP INDEX IF EXISTS public.ix_gmail_sync_logs_started_desc; CREATE INDEX ix_gmail_sync_logs_started_desc ON public.gmail_sync_logs (started_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS ix_gmail_sync_logs_started_desc ON public.gmail_sync_logs (started_at DESC)';
     END IF;
     IF to_regclass('public.manual_review_queue') IS NOT NULL THEN
-        EXECUTE 'DROP INDEX IF EXISTS public.ix_manual_review_error_id; CREATE INDEX ix_manual_review_error_id ON public.manual_review_queue (error_id)';
-        EXECUTE 'DROP INDEX IF EXISTS public.ix_manual_review_status_created; CREATE INDEX ix_manual_review_status_created ON public.manual_review_queue (status, created_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS ix_manual_review_error_id ON public.manual_review_queue (error_id)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS ix_manual_review_status_created ON public.manual_review_queue (status, created_at DESC)';
     END IF;
     IF to_regclass('public.system_events') IS NOT NULL THEN
-        EXECUTE 'DROP INDEX IF EXISTS public.ix_system_events_type_broadcast; CREATE INDEX ix_system_events_type_broadcast ON public.system_events (event_type, broadcast_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS ix_system_events_type_broadcast ON public.system_events (event_type, broadcast_at DESC)';
     END IF;
 END $$;
 
