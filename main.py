@@ -343,8 +343,11 @@ async def lifespan(app: FastAPI):
             print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
 
         # High-concurrency composite indexes & pre-joined database views:
-        # Execute backend/optimization_queries.sql so all indexes and views exist on startup.
-        if DATABASE_URL.startswith("postgresql"):
+        # NOTE: optimization_queries.sql contains 87 CREATE/DROP INDEX and CREATE VIEW DDL statements.
+        # Running these synchronously inside the FastAPI lifespan startup blocks server boot (uvicorn / PM2)
+        # while taking Exclusive table locks against active cron workers or remote DB traffic.
+        # To avoid blocking application startup, it is executed out-of-band via background task or manual migration.
+        if os.getenv("RUN_DB_OPTIMIZATIONS_ON_STARTUP", "false").lower() in ("true", "1") and DATABASE_URL.startswith("postgresql"):
             _opt_sql_path = os.path.join(os.path.dirname(__file__), "optimization_queries.sql")
             if os.path.exists(_opt_sql_path):
                 try:
