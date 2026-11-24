@@ -1032,6 +1032,47 @@ def has_professional_summary(resume_info) -> bool:
     return False
 
 
+# Applications can only be sent for a candidate whose profile is 100% complete.
+PROFILE_COMPLETE_MIN_PCT = 100
+
+
+def profile_completeness_checks(c, experience_count: int, resume_info) -> list:
+    """[(label, weight, done)] -- the single definition of the profile
+    completeness weights (skills 25, summary 5, experience 25, employment type
+    20, work authorization 15, location 10). Labels match the profile page."""
+    return [
+        ("Skills", 25, bool((c.primary_skills or "").strip())),
+        ("Professional Summary", 5, has_professional_summary(resume_info)),
+        ("Experience", 25, experience_count > 0),
+        ("Employment Type", 20, bool(c.preferred_employment_types)),
+        ("Work Authorization", 15, bool((c.work_authorization or "").strip())),
+        ("Location", 10, len((c.current_location or "").strip()) >= 2),
+    ]
+
+
+async def consultant_profile_completeness(db: AsyncSession, c: Consultant):
+    """(percent, [missing labels]) for a consultant, same numbers as the
+    profile page. Used to block sending applications below 100%."""
+    exp_count = (await db.execute(
+        select(func.count()).select_from(ConsultantExperience).where(ConsultantExperience.consultant_id == c.id)
+    )).scalar_one() or 0
+    resume_info = None
+    if c.user_id:
+        resume_info = (await db.execute(
+            select(User.resume_info).where(User.id == c.user_id)
+        )).scalar_one_or_none()
+    checks = profile_completeness_checks(c, exp_count, resume_info)
+    return sum(w for _, w, ok in checks if ok), [label for label, _, ok in checks if not ok]
+
+
+def profile_incomplete_message(name, pct: int, missing: list) -> str:
+    who = name or "This candidate"
+    return (
+        f"{who}'s profile is {pct}% complete. Missing: {', '.join(missing)}. "
+        "Complete the profile (100%) before sending applications."
+    )
+
+
 async def _consultant_to_profile_response(
     db: AsyncSession,
     c: Consultant,

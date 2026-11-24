@@ -256,6 +256,19 @@ async def confirm_send(
                        f"applications can't be sent on their behalf until they're reactivated.",
             )
 
+        # Applications can only be sent for a candidate whose profile is 100%
+        # complete (same rule as the email-queue endpoints). 400 so the preview
+        # page shows it in its normal "Send Failed" box with this message.
+        from email_queue import _profile_block, _notify_profile_incomplete
+        _pc = await _profile_block(db, consultant)
+        if _pc is not None:
+            from phase3 import profile_incomplete_message
+            await _notify_profile_incomplete(db, consultant, current_user, _pc[0], _pc[1])
+            raise HTTPException(
+                status_code=400,
+                detail=profile_incomplete_message(consultant.full_name, _pc[0], _pc[1]),
+            )
+
         ats_score = request.ats_score or 0
         if ats_score < 80:
             raise HTTPException(

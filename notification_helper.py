@@ -384,21 +384,21 @@ async def notify_user_gmail_disconnected(db, user_id) -> None:
     await notify_users(db, [user_id], GMAIL_OWN_DISCONNECTED_TITLE, GMAIL_OWN_DISCONNECTED_BODY)
 
 
-async def notify_gmail_disconnected(db, consultant_id) -> None:
-    """A consultant's Gmail got disconnected: tell the consultant and the
-    recruiters it is assigned to. Never raises."""
+def gmail_disconnected_recruiter_text(name: str):
+    """(title, body) of the recruiter notice. The database trigger that fires on
+    every connected -> disconnected change writes the exact same text, so the
+    unread-duplicate check in notify_users keeps it to one notice."""
+    return (
+        f"{GMAIL_ASSIGNED_DISCONNECTED_PREFIX}{name}",
+        f"{name}'s Gmail is disconnected. Ask them to reconnect so applications can be sent.",
+    )
+
+
+async def notify_assigned_recruiters_gmail_disconnected(db, cons, exclude_user_ids=()) -> None:
+    """Tell the recruiters this consultant is assigned to (and the sales recruiter)
+    that the consultant's Gmail is disconnected, naming the consultant. Never raises."""
     try:
-        cons = (await db.execute(
-            select(Consultant).where(Consultant.id == consultant_id)
-        )).scalars().first()
-        if cons is None:
-            return
-        name = cons.full_name or "A consultant"
-        if cons.user_id:
-            await notify_users(
-                db, [cons.user_id], GMAIL_OWN_DISCONNECTED_TITLE, GMAIL_OWN_DISCONNECTED_BODY,
-                consultant_id=cons.id,
-            )
+        name = (cons.full_name or "").strip() or "A consultant"
         rec_ids = {
             r[0] for r in (await db.execute(
                 select(RecruiterConsultant.recruiter_id).where(
@@ -410,12 +410,30 @@ async def notify_gmail_disconnected(db, consultant_id) -> None:
         if getattr(cons, "sales_recruiter_user_id", None):
             rec_ids.add(cons.sales_recruiter_user_id)
         rec_ids.discard(cons.user_id)
+        for uid in (exclude_user_ids or ()):
+            rec_ids.discard(uid)
         if rec_ids:
+            title, body = gmail_disconnected_recruiter_text(name)
+            await notify_users(db, rec_ids, title, body, consultant_id=cons.id)
+    except Exception as e:
+        print(f"[notification_helper] FAILED to notify recruiters of gmail disconnect: {e}")
+
+
+async def notify_gmail_disconnected(db, consultant_id) -> None:
+    """A consultant's Gmail got disconnected: tell the consultant and the
+    recruiters it is assigned to. Never raises."""
+    try:
+        cons = (await db.execute(
+            select(Consultant).where(Consultant.id == consultant_id)
+        )).scalars().first()
+        if cons is None:
+            return
+        if cons.user_id:
             await notify_users(
-                db, rec_ids, f"{GMAIL_ASSIGNED_DISCONNECTED_PREFIX}{name}",
-                f"{name}'s Gmail access expired. Ask them to reconnect so applications can be sent.",
+                db, [cons.user_id], GMAIL_OWN_DISCONNECTED_TITLE, GMAIL_OWN_DISCONNECTED_BODY,
                 consultant_id=cons.id,
             )
+        await notify_assigned_recruiters_gmail_disconnected(db, cons)
     except Exception as e:
         print(f"[notification_helper] FAILED to notify gmail disconnect: {e}")
 

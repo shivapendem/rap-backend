@@ -322,6 +322,7 @@ async def _check_apply_eligibility(
     preloaded_consultant: Optional[Consultant] = None,
     preloaded_match: Optional[RequirementConsultantMatch] = "_unset",
     preloaded_has_sent_application: Optional[bool] = None,
+    preloaded_profile: Optional[tuple] = None,
 ) -> tuple[bool, str]:
     """
     Phase 5 spec — 6 eligibility checks for Apply button visibility.
@@ -396,6 +397,15 @@ async def _check_apply_eligibility(
     # Check 5: Base resume uploaded
     if not consultant.base_resume_file_path:
         return False, "Base resume is missing"
+
+    # Check 6: Profile 100% complete (applications are blocked below that)
+    try:
+        from phase3 import consultant_profile_completeness, PROFILE_COMPLETE_MIN_PCT
+        _pct, _missing = preloaded_profile if preloaded_profile is not None else await consultant_profile_completeness(db, consultant)
+        if _pct < PROFILE_COMPLETE_MIN_PCT:
+            return False, f"Profile is {_pct}% complete (missing: {', '.join(_missing)})"
+    except Exception:
+        pass  # never block on a failed check; the send endpoints enforce it too
 
     return True, "Allowed"
 
@@ -1270,6 +1280,15 @@ async def get_consultant_requirements_for_recruiter(
         )).scalars().all()
         sent_application_req_ids = set(sent_rows)
 
+    # Same consultant on every row: compute profile completeness once.
+    _profile_once = None
+    if results:
+        try:
+            from phase3 import consultant_profile_completeness
+            _profile_once = await consultant_profile_completeness(db, consultant)
+        except Exception:
+            _profile_once = None
+
     data: List[ConsultantFilteredRequirementResponse] = []
     for req, match, resume in results:
         can_apply, _reason = await _check_apply_eligibility(
@@ -1278,6 +1297,7 @@ async def get_consultant_requirements_for_recruiter(
             preloaded_consultant=consultant,
             preloaded_match=match,
             preloaded_has_sent_application=req.id in sent_application_req_ids,
+            preloaded_profile=_profile_once,
         )
         resume_status = "ready" if (resume and resume.generation_status == "COMPLETED") else "not_generated"
 

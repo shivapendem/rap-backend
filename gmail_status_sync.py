@@ -139,6 +139,59 @@ END;
 $$ LANGUAGE plpgsql
 """
 
+_FN_NOTIFY_RECRUITERS_ON_DISCONNECT = """
+CREATE OR REPLACE FUNCTION rap_notify_recruiters_gmail_disconnected()
+RETURNS trigger AS $$
+BEGIN
+    -- Never let a notification problem block the real update.
+    BEGIN
+        INSERT INTO notifications (user_id, title, body, is_read, consultant_id)
+        SELECT r.uid,
+               'Gmail disconnected — ' || COALESCE(NULLIF(BTRIM(NEW.full_name), ''), 'A consultant'),
+               COALESCE(NULLIF(BTRIM(NEW.full_name), ''), 'A consultant')
+                   || '''s Gmail is disconnected. Ask them to reconnect so applications can be sent.',
+               FALSE, NEW.id
+          FROM (
+                SELECT rc.recruiter_id AS uid
+                  FROM recruiter_consultants rc
+                 WHERE rc.consultant_id = NEW.id AND rc.is_active
+                UNION
+                SELECT NEW.sales_recruiter_user_id
+                 WHERE NEW.sales_recruiter_user_id IS NOT NULL
+               ) r
+         WHERE r.uid IS DISTINCT FROM NEW.user_id
+           AND NOT EXISTS (
+                SELECT 1 FROM notifications n
+                 WHERE n.user_id = r.uid
+                   AND n.consultant_id = NEW.id
+                   AND n.is_read = FALSE
+                   AND n.title LIKE 'Gmail disconnected — %'
+           );
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql
+"""
+
+_FN_CLEAR_DISCONNECT_NOTICES = """
+CREATE OR REPLACE FUNCTION rap_clear_gmail_disconnected_notices()
+RETURNS trigger AS $$
+BEGIN
+    BEGIN
+        DELETE FROM notifications
+         WHERE consultant_id = NEW.id
+           AND is_read = FALSE
+           AND title LIKE 'Gmail disconnected — %';
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql
+"""
+
 _TRIGGERS = [
     ("trg_rap_sync_consultant_gmail_connected", "consultant_email_tokens",
      "AFTER INSERT OR UPDATE OR DELETE ON consultant_email_tokens FOR EACH ROW "
@@ -151,6 +204,17 @@ _TRIGGERS = [
      "AFTER UPDATE OF is_authorized ON users FOR EACH ROW "
      "WHEN (NEW.is_authorized = FALSE AND OLD.is_authorized IS DISTINCT FROM NEW.is_authorized) "
      "EXECUTE FUNCTION rap_pause_gmail_on_user_deauthorized()"),
+    # Any connected -> disconnected change (logout, inactive, deauthorized,
+    # token rejected, token removed ...) tells the assigned recruiters, by
+    # consultant name. Reconnecting removes the unread notice again.
+    ("trg_rap_notify_recruiters_gmail_disconnected", "consultants",
+     "AFTER UPDATE OF gmail_connected ON consultants FOR EACH ROW "
+     "WHEN (OLD.gmail_connected IS TRUE AND NEW.gmail_connected IS FALSE) "
+     "EXECUTE FUNCTION rap_notify_recruiters_gmail_disconnected()"),
+    ("trg_rap_clear_gmail_disconnected_on_reconnect", "consultants",
+     "AFTER UPDATE OF gmail_connected ON consultants FOR EACH ROW "
+     "WHEN (OLD.gmail_connected IS NOT TRUE AND NEW.gmail_connected IS TRUE) "
+     "EXECUTE FUNCTION rap_clear_gmail_disconnected_notices()"),
 ]
 
 # Constant key so several workers (backend + cron) booting at once don't race.
@@ -166,7 +230,8 @@ async def install_gmail_connected_trigger(engine) -> None:
         async with engine.begin() as conn:
             # asyncpg runs one statement per call, so execute them separately.
             await conn.execute(text(f"SELECT pg_advisory_xact_lock({_ADVISORY_LOCK_KEY})"))
-            for fn_sql in (_FN_SYNC_FLAG, _FN_PAUSE_ON_CONSULTANT_INACTIVE, _FN_PAUSE_ON_USER_DEAUTHORIZED):
+            for fn_sql in (_FN_SYNC_FLAG, _FN_PAUSE_ON_CONSULTANT_INACTIVE, _FN_PAUSE_ON_USER_DEAUTHORIZED,
+                       _FN_NOTIFY_RECRUITERS_ON_DISCONNECT, _FN_CLEAR_DISCONNECT_NOTICES):
                 await conn.execute(text(fn_sql))
             for name, table, body in _TRIGGERS:
                 await conn.execute(text(f"DROP TRIGGER IF EXISTS {name} ON {table}"))

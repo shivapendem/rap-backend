@@ -3308,6 +3308,43 @@ async def download_base_resume(
         headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
 
+async def _add_profile_flags(db, rows):
+    """Adds profile_complete / profile_percent / profile_missing to each
+    consultant row (one batched query), so the Apply and compose screens can
+    block sending applications until the profile is 100% complete. A failed
+    check leaves the rows unflagged (screens treat missing as 'unknown')."""
+    ids = [r["consultant_id"] for r in rows if r.get("consultant_id")]
+    if not ids:
+        return rows
+    try:
+        from sqlalchemy import func as _func
+        from phase3 import profile_completeness_checks, PROFILE_COMPLETE_MIN_PCT
+        exp = dict((await db.execute(
+            select(ConsultantExperience.consultant_id, _func.count())
+            .where(ConsultantExperience.consultant_id.in_(ids))
+            .group_by(ConsultantExperience.consultant_id)
+        )).all())
+        cons = (await db.execute(
+            select(Consultant, User.resume_info)
+            .outerjoin(User, User.id == Consultant.user_id)
+            .where(Consultant.id.in_(ids))
+        )).all()
+        info = {}
+        for c, ri in cons:
+            checks = profile_completeness_checks(c, exp.get(c.id, 0), ri)
+            pct = sum(w for _, w, ok in checks if ok)
+            info[c.id] = (pct, [label for label, _, ok in checks if not ok])
+        for r in rows:
+            got = info.get(r.get("consultant_id"))
+            if got is not None:
+                r["profile_percent"] = got[0]
+                r["profile_missing"] = got[1]
+                r["profile_complete"] = got[0] >= PROFILE_COMPLETE_MIN_PCT
+    except Exception as e:
+        print(f"[resume_router] profile completeness flags failed: {e}")
+    return rows
+
+
 async def _with_applied_flag(db, requirement_id, rows, matched_ids=None):
     """Adds already_applied (SENT application or queued send for THIS
     requirement + THAT consultant) and matched (consultant is matched to this
@@ -3315,6 +3352,7 @@ async def _with_applied_flag(db, requirement_id, rows, matched_ids=None):
     _m = matched_ids or set()
     for r in rows:
         r["matched"] = r.get("consultant_id") in _m
+    await _add_profile_flags(db, rows)
     if not requirement_id or not rows:
         return rows
     from models import Application, EmailQueue
@@ -3515,7 +3553,7 @@ async def get_consultants_for_resumes(
             Consultant.status == "ACTIVE",
         )
         results = (await db.execute(query)).all()
-        return [map_user_consultant(u, c) for u, c in results]
+        return await _add_profile_flags(db, [map_user_consultant(u, c) for u, c in results])
     elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and (requirement_id or consultant_id):
         # Apply screen: EXACTLY the admin rule — the consultants matched to
         # this requirement (whoever they are assigned to); if nobody matched,
