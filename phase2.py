@@ -900,19 +900,21 @@ async def get_gmail_emails(
         try:
             params["date_from"] = _parse_admin_date_filter(date_from, end_of_day=False)
         except ValueError:
-            params["date_from"] = date_from
+            raise HTTPException(status_code=422, detail=f"Invalid date_from format: {date_from}")
     if date_to:
         where_clauses.append("date <= :date_to")
         try:
             params["date_to"] = _parse_admin_date_filter(date_to, end_of_day=True)
         except ValueError:
-            params["date_to"] = date_to
+            raise HTTPException(status_code=422, detail=f"Invalid date_to format: {date_to}")
+
+    _modes = await load_account_modes(db)
 
     # Scope to current_user: RECRUITER only sees public + their own private emails
     if current_user.role == "RECRUITER":
         user_email = (current_user.email or "").lower().strip()
         where_clauses.append(
-            public_or_own_sql("ge", await load_account_modes(db), params)
+            public_or_own_sql("ge", _modes, params)
         )
         params["recruiter_email"] = user_email
 
@@ -975,7 +977,6 @@ async def get_gmail_emails(
 
     # Show the account's live mode (the per-row copy is no longer rewritten
     # when an admin flips an account).
-    _modes = await load_account_modes(db)
     data = []
     for row in rows:
         d = dict(row)
@@ -1077,6 +1078,9 @@ async def get_gmail_sync_logs(
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "ADMIN")
+
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
 
     count_result = await db.execute(text("SELECT COUNT(*) FROM gmail_sync_logs"))
     total = count_result.scalar_one()

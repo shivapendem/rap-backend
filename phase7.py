@@ -256,6 +256,19 @@ async def confirm_send(
                        f"applications can't be sent on their behalf until they're reactivated.",
             )
 
+        # Applications can only be sent for a candidate whose profile is 100%
+        # complete (same rule as the email-queue endpoints). 400 so the preview
+        # page shows it in its normal "Send Failed" box with this message.
+        from email_queue import _profile_block, _notify_profile_incomplete
+        _pc = await _profile_block(db, consultant)
+        if _pc is not None:
+            from phase3 import profile_incomplete_message
+            await _notify_profile_incomplete(db, consultant, current_user, _pc[0], _pc[1])
+            raise HTTPException(
+                status_code=400,
+                detail=profile_incomplete_message(consultant.full_name, _pc[0], _pc[1]),
+            )
+
         ats_score = request.ats_score or 0
         if ats_score < 80:
             raise HTTPException(
@@ -441,26 +454,40 @@ async def confirm_send(
         raise
     except Exception as e:
         await db.rollback()
+        resolved_cons_id = consultant.id if "consultant" in locals() and consultant else request.consultant_id
         from error_logger import log_db_error
         await log_db_error(
             stage="confirm_send",
             error=e,
             source_type="application",
             requirement_id=request.requirement_id,
-            consultant_id=request.consultant_id,
+            consultant_id=resolved_cons_id,
         )
-        try:
-            failed_app = Application(
-                requirement_id=request.requirement_id,
-                consultant_id=request.consultant_id,
-                status="FAILED",
-                error_message=str(e),
-                sent_at=datetime.now(timezone.utc),
-            )
-            db.add(failed_app)
-            await db.commit()
-        except Exception:
-            pass
+        if resolved_cons_id is not None:
+            try:
+                existing_app = (await db.execute(
+                    select(Application).where(
+                        Application.requirement_id == request.requirement_id,
+                        Application.consultant_id == resolved_cons_id,
+                    )
+                )).scalars().first()
+                if existing_app:
+                    if existing_app.status != "SENT":
+                        existing_app.status = "FAILED"
+                        existing_app.error_message = str(e)
+                        existing_app.sent_at = datetime.now(timezone.utc)
+                else:
+                    failed_app = Application(
+                        requirement_id=request.requirement_id,
+                        consultant_id=resolved_cons_id,
+                        status="FAILED",
+                        error_message=str(e),
+                        sent_at=datetime.now(timezone.utc),
+                    )
+                    db.add(failed_app)
+                await db.commit()
+            except Exception:
+                await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to send application: {str(e)}")
 
 

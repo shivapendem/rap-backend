@@ -59,7 +59,7 @@ from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from database import get_db
+from database import get_db, DATABASE_URL
 from experience_order import (
     renumber_experiences_chronologically,
     sort_experiences_chronologically,
@@ -1032,16 +1032,68 @@ def has_professional_summary(resume_info) -> bool:
     return False
 
 
+# Applications can only be sent for a candidate whose profile is 100% complete.
+PROFILE_COMPLETE_MIN_PCT = 100
+
+
+def profile_completeness_checks(c, experience_count: int, resume_info) -> list:
+    """[(label, weight, done)] -- the single definition of the profile
+    completeness weights (skills 25, summary 5, experience 25, employment type
+    20, work authorization 15, location 10). Labels match the profile page."""
+    return [
+        ("Skills", 25, bool((c.primary_skills or "").strip())),
+        ("Professional Summary", 5, has_professional_summary(resume_info)),
+        ("Experience", 25, experience_count > 0),
+        ("Employment Type", 20, bool(c.preferred_employment_types)),
+        ("Work Authorization", 15, bool((c.work_authorization or "").strip())),
+        ("Location", 10, len((c.current_location or "").strip()) >= 2),
+    ]
+
+
+async def consultant_profile_completeness(db: AsyncSession, c: Consultant):
+    """(percent, [missing labels]) for a consultant, same numbers as the
+    profile page. Used to block sending applications below 100%."""
+    exp_count = (await db.execute(
+        select(func.count()).select_from(ConsultantExperience).where(ConsultantExperience.consultant_id == c.id)
+    )).scalar_one() or 0
+    resume_info = None
+    if c.user_id:
+        resume_info = (await db.execute(
+            select(User.resume_info).where(User.id == c.user_id)
+        )).scalar_one_or_none()
+    checks = profile_completeness_checks(c, exp_count, resume_info)
+    return sum(w for _, w, ok in checks if ok), [label for label, _, ok in checks if not ok]
+
+
+def profile_incomplete_message(name, pct: int, missing: list) -> str:
+    who = name or "This candidate"
+    return (
+        f"{who}'s profile is {pct}% complete. Missing: {', '.join(missing)}. "
+        "Complete the profile (100%) before sending applications."
+    )
+
+
 async def _consultant_to_profile_response(
-    db: AsyncSession, c: Consultant, experience_count: int = 0, *, include_resume_size: bool = True
+    db: AsyncSession,
+    c: Consultant,
+    experience_count: int = 0,
+    *,
+    include_resume_size: bool = True,
+    preloaded_resume_info: Optional[Dict[str, Any]] = None,
+    preloaded_ats_score: Optional[float] = None,
+    has_preloaded_ats: bool = False,
+    preloaded_active_apps_count: Optional[int] = None,
 ) -> ProfileResponse:
     # BUG FIX: title/summary/education/linkedin have no Consultant
     # column — read them from the linked User.resume_info JSON instead,
     # the same blob update_own_profile now writes them into.
-    resume_info: Dict[str, Any] = {}
-    if c.user_id:
-        user_result = await db.execute(select(User.resume_info).where(User.id == c.user_id))
-        resume_info = user_result.scalar_one_or_none() or {}
+    if preloaded_resume_info is not None:
+        resume_info: Dict[str, Any] = preloaded_resume_info
+    else:
+        resume_info = {}
+        if c.user_id:
+            user_result = await db.execute(select(User.resume_info).where(User.id == c.user_id))
+            resume_info = user_result.scalar_one_or_none() or {}
     """Map ORM Consultant → ProfileResponse matching frontend ConsultantProfileDTO."""
     primary = [s.strip() for s in (c.primary_skills or "").split(",") if s.strip()]
     emp_types = c.preferred_employment_types or []
@@ -1085,13 +1137,18 @@ async def _consultant_to_profile_response(
     # written by phase6.py/resume_router.py whenever a tailored resume is
     # built). Use the consultant's most recently generated resume's score
     # instead — same signal the resume screens already show.
-    latest_resume_result = await db.execute(
-        select(Resume.ats_score)
-        .where(Resume.user_id == c.user_id, Resume.ats_score.isnot(None))
-        .order_by(Resume.created_at.desc())
-        .limit(1)
-    )
-    latest_ats_score = latest_resume_result.scalar_one_or_none() if c.user_id else None
+    if has_preloaded_ats:
+        latest_ats_score = preloaded_ats_score
+    elif c.user_id:
+        latest_resume_result = await db.execute(
+            select(Resume.ats_score)
+            .where(Resume.user_id == c.user_id, Resume.ats_score.isnot(None))
+            .order_by(Resume.created_at.desc())
+            .limit(1)
+        )
+        latest_ats_score = latest_resume_result.scalar_one_or_none()
+    else:
+        latest_ats_score = None
 
     # BUG FIX: profileCompleteness and activeApplicationsCount were not
     # returned by this endpoint at all — ConsultantCard (recruiter roster
@@ -1116,12 +1173,15 @@ async def _consultant_to_profile_response(
     if len((c.current_location or "").strip()) >= 2:
         completeness += 10  # Location
 
-    active_apps_result = await db.execute(
-        select(func.count()).select_from(Application).where(
-            Application.consultant_id == c.id, Application.status == "SENT"
+    if preloaded_active_apps_count is not None:
+        active_applications_count = preloaded_active_apps_count
+    else:
+        active_apps_result = await db.execute(
+            select(func.count()).select_from(Application).where(
+                Application.consultant_id == c.id, Application.status == "SENT"
+            )
         )
-    )
-    active_applications_count = active_apps_result.scalar_one() or 0
+        active_applications_count = active_apps_result.scalar_one() or 0
 
     return ProfileResponse(
         id=str(c.id),
@@ -1734,15 +1794,22 @@ async def list_consultants(
     current_user: User = Depends(get_current_user),
 ):
     _require_role(current_user, "ADMIN", "RECRUITER")
+    from sqlalchemy import or_
 
-    query = select(Consultant)
+    # Flat join with User (and RecruiterConsultant when recruiter) + COUNT(*) OVER()
+    # eliminates the User subquery, the count subquery wrapper, and the extra User.resume_info query.
+    query = (
+        select(Consultant, User.resume_info, func.count().over().label("_total"))
+        .outerjoin(User, User.id == Consultant.user_id)
+    )
 
     if current_user.role == "RECRUITER":
-        assigned = select(RecruiterConsultant.consultant_id).where(
-            RecruiterConsultant.recruiter_id == current_user.id,
-            RecruiterConsultant.is_active == True,
+        query = query.join(
+            RecruiterConsultant,
+            (RecruiterConsultant.consultant_id == Consultant.id)
+            & (RecruiterConsultant.recruiter_id == current_user.id)
+            & (RecruiterConsultant.is_active == True),
         )
-        query = query.where(Consultant.id.in_(assigned))
 
     if status:
         if status not in Consultant.VALID_STATUSES:
@@ -1750,57 +1817,121 @@ async def list_consultants(
                 422,
                 f"status must be one of {sorted(Consultant.VALID_STATUSES)}",
             )
-
         query = query.where(Consultant.status == status)
-
     else:
-        from sqlalchemy import or_
-
         query = query.where(
-            Consultant.status == "ACTIVE"
-        ).where(
+            Consultant.status == "ACTIVE",
             or_(
                 Consultant.user_id.is_(None),
-                Consultant.user_id.in_(
-                    select(User.id).where(User.is_authorized == True)
-                ),
-            )
+                User.is_authorized == True,
+            ),
         )
 
-    total = (
-        await db.execute(
-            select(func.count()).select_from(query.subquery())
-        )
-    ).scalar_one()
-
-    rows = (
+    page_rows = (
         await db.execute(
             query
             .order_by(func.lower(Consultant.full_name).asc(), Consultant.id.asc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
-    ).scalars().all()
+    ).all()
 
-    # Batch-count experience rows for this whole page in one query instead
-    # of N+1 — profileCompleteness now factors in Experience, so leaving
-    # this defaulted to 0 here would show every consultant on this roster
-    # as missing Experience regardless of their real data.
+    rows = [r[0] for r in page_rows]
+    user_resume_infos: Dict[int, Dict[str, Any]] = {
+        r[0].user_id: (r[1] or {}) for r in page_rows if r[0].user_id is not None
+    }
+    if page_rows:
+        total = int(page_rows[0][2] or 0)
+    elif page > 1:
+        count_q = query.with_only_columns(func.count(Consultant.id)).order_by(None)
+        total = int((await db.execute(count_q)).scalar_one() or 0)
+    else:
+        total = 0
+
     exp_counts: Dict[int, int] = {}
+    latest_ats_scores: Dict[int, Optional[float]] = {}
+    active_app_counts: Dict[int, int] = {}
+
     if rows:
-        exp_rows = (await db.execute(
-            select(ConsultantExperience.consultant_id, func.count())
-            .where(ConsultantExperience.consultant_id.in_([c.id for c in rows]))
-            .group_by(ConsultantExperience.consultant_id)
-        )).all()
-        exp_counts = {cons_id: cnt for cons_id, cnt in exp_rows}
+        cons_ids = [c.id for c in rows]
+        user_ids = list({c.user_id for c in rows if c.user_id is not None})
+
+        # Try reading from pre-defined database view v_consultant_directory_metrics in 1 round-trip
+        _loaded_from_view = False
+        if DATABASE_URL.startswith("postgresql"):
+            try:
+                from sqlalchemy import table as _sa_table, column as _sa_col
+                _v_cdm = _sa_table(
+                    "v_consultant_directory_metrics",
+                    _sa_col("consultant_id"),
+                    _sa_col("user_id"),
+                    _sa_col("experience_count"),
+                    _sa_col("active_application_count"),
+                    _sa_col("latest_ats_score"),
+                )
+                v_rows = (await db.execute(
+                    select(
+                        _v_cdm.c.consultant_id,
+                        _v_cdm.c.user_id,
+                        _v_cdm.c.experience_count,
+                        _v_cdm.c.active_application_count,
+                        _v_cdm.c.latest_ats_score,
+                    ).where(_v_cdm.c.consultant_id.in_(cons_ids))
+                )).all()
+                for cid, uid, exp_c, app_c, ats_s in v_rows:
+                    exp_counts[cid] = int(exp_c or 0)
+                    active_app_counts[cid] = int(app_c or 0)
+                    if uid is not None and ats_s is not None:
+                        latest_ats_scores[uid] = float(ats_s)
+                _loaded_from_view = True
+            except Exception:
+                await db.rollback()
+
+        if not _loaded_from_view:
+            exp_rows = (await db.execute(
+                select(ConsultantExperience.consultant_id, func.count())
+                .where(ConsultantExperience.consultant_id.in_(cons_ids))
+                .group_by(ConsultantExperience.consultant_id)
+            )).all()
+            exp_counts = {cons_id: cnt for cons_id, cnt in exp_rows}
+
+            app_rows = (await db.execute(
+                select(Application.consultant_id, func.count())
+                .where(Application.consultant_id.in_(cons_ids), Application.status == "SENT")
+                .group_by(Application.consultant_id)
+            )).all()
+            active_app_counts = {cons_id: cnt for cons_id, cnt in app_rows}
+
+            if user_ids:
+                rn = func.row_number().over(
+                    partition_by=Resume.user_id,
+                    order_by=Resume.created_at.desc(),
+                ).label("rn")
+                ranked_sq = (
+                    select(Resume.user_id, Resume.ats_score, rn)
+                    .where(Resume.user_id.in_(user_ids), Resume.ats_score.isnot(None))
+                    .subquery()
+                )
+                ats_rows = (await db.execute(
+                    select(ranked_sq.c.user_id, ranked_sq.c.ats_score)
+                    .where(ranked_sq.c.rn == 1)
+                )).all()
+                latest_ats_scores = {uid: float(score) for uid, score in ats_rows if score is not None}
 
     data = [
-        await _consultant_to_profile_response(db, c, exp_counts.get(c.id, 0))
+        await _consultant_to_profile_response(
+            db,
+            c,
+            exp_counts.get(c.id, 0),
+            include_resume_size=False,
+            preloaded_resume_info=user_resume_infos.get(c.user_id, {}) if c.user_id else {},
+            preloaded_ats_score=latest_ats_scores.get(c.user_id) if c.user_id else None,
+            has_preloaded_ats=True,
+            preloaded_active_apps_count=active_app_counts.get(c.id, 0),
+        )
         for c in rows
     ]
     return ConsultantListResponse(
-
         data=data,
         total=total,
         page=page,
@@ -2561,39 +2692,41 @@ async def set_recruiters_for_consultant(
     _require_role(current_user, "ADMIN")
     consultant = await _get_consultant_or_404(db, consultant_id)
 
-    for rid in recruiter_ids:
-        r = await db.execute(
-            select(User).where(User.id == rid, User.role == "RECRUITER", User.is_authorized == True)
+    recruiter_ids = list(dict.fromkeys(recruiter_ids))
+    if recruiter_ids:
+        found_rids = set(
+            (await db.execute(
+                select(User.id).where(
+                    User.id.in_(recruiter_ids),
+                    User.role == "RECRUITER",
+                    User.is_authorized == True,
+                )
+            )).scalars().all()
         )
-        if not r.scalars().first():
-            raise HTTPException(404, f"Active recruiter with id={rid} not found")
+        for rid in recruiter_ids:
+            if rid not in found_rids:
+                raise HTTPException(404, f"Active recruiter with id={rid} not found")
+
+    # Fetch all existing RecruiterConsultant rows for this consultant in one query
+    existing_rows = (
+        await db.execute(
+            select(RecruiterConsultant).where(
+                RecruiterConsultant.consultant_id == consultant_id
+            )
+        )
+    ).scalars().all()
+    existing_by_rid = {rc.recruiter_id: rc for rc in existing_rows}
 
     # Who was active before — so only real changes notify anyone.
-    prev_active = {
-        r[0] for r in (await db.execute(
-            select(RecruiterConsultant.recruiter_id).where(
-                RecruiterConsultant.consultant_id == consultant_id,
-                RecruiterConsultant.is_active == True,
-            )
-        )).all()
-    }
+    prev_active = {rc.recruiter_id for rc in existing_rows if rc.is_active}
 
     # Deactivate all current
-    await db.execute(
-        update(RecruiterConsultant)
-        .where(RecruiterConsultant.consultant_id == consultant_id)
-        .values(is_active=False)
-    )
+    for rc in existing_rows:
+        rc.is_active = False
 
     # Activate or create specified ones
     for rid in recruiter_ids:
-        existing_q = await db.execute(
-            select(RecruiterConsultant).where(
-                RecruiterConsultant.recruiter_id == rid,
-                RecruiterConsultant.consultant_id == consultant_id,
-            )
-        )
-        existing = existing_q.scalars().first()
+        existing = existing_by_rid.get(rid)
         if existing:
             existing.is_active = True
         else:

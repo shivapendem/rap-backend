@@ -143,11 +143,13 @@ async def calculate_next_scheduled_at(db: AsyncSession, from_email: str) -> date
 
     norm_from = from_email.strip().lower()
 
-    # Acquire transaction-level advisory lock to serialize concurrent enqueues for the same sender
-    email_hash = int(hashlib.sha256(norm_from.encode('utf-8')).hexdigest()[:16], 16)
-    if email_hash > 9223372036854775807:
-        email_hash = email_hash - 18446744073709551616
-    await db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": email_hash})
+    # Acquire transaction-level advisory lock to serialize concurrent enqueues for the same sender (PostgreSQL only)
+    from database import DATABASE_URL as _DB_URL
+    if _DB_URL.startswith("postgresql"):
+        email_hash = int(hashlib.sha256(norm_from.encode('utf-8')).hexdigest()[:16], 16)
+        if email_hash > 9223372036854775807:
+            email_hash = email_hash - 18446744073709551616
+        await db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": email_hash})
 
     now_utc = datetime.now(timezone.utc)
 
@@ -314,6 +316,30 @@ async def create_email_queue(
         consultant_id = consultant.id if consultant else body.consultant_id
         if not consultant_id:
             raise HTTPException(status_code=400, detail="Consultant profile not found.")
+
+    # An application can only be sent for a candidate whose profile is 100%
+    # complete. Admin/recruiter sends are always on a candidate's behalf; a
+    # consultant's own plain (non-requirement) emails are not applications.
+    if consultant is not None and (body.requirement_id or current_user.role in ("ADMIN", "RECRUITER")):
+        _pc = await _profile_block(db, consultant)
+        if _pc is not None:
+            from phase3 import profile_incomplete_message
+            await _notify_profile_incomplete(db, consultant, current_user, _pc[0], _pc[1])
+            raise HTTPException(
+                status_code=409,
+                detail=profile_incomplete_message(consultant.full_name, _pc[0], _pc[1]),
+            )
+
+    # An application is sent from the candidate's own Gmail, so it cannot be
+    # queued while that Gmail is disconnected (same rule as send-now below).
+    # Tell the candidate, the sender and the assigned recruiter, and stop with a
+    # clear message instead of queueing an email that is bound to fail.
+    if consultant is not None and _gmail_not_connected(consultant):
+        await _notify_gmail_not_connected(db, consultant, current_user, body.requirement_id)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Gmail not connected for {consultant.full_name or 'this candidate'}. Ask them to connect Gmail, then send again.",
+        )
 
     # BUG FIX ("a from address not tied to any real user/consultant row
     # is being used as the sender"): body.from_email was trusted directly
@@ -803,8 +829,47 @@ async def _notify_gmail_not_connected(db, consultant, sender, requirement_id=Non
             f"{name}'s application was not sent because Gmail is not connected.",
             consultant_id=consultant.id,
         )
+        # The recruiter(s) this candidate is assigned to hear about it too, by
+        # name (not the sender - they just got the notice above).
+        from notification_helper import notify_assigned_recruiters_gmail_disconnected
+        await notify_assigned_recruiters_gmail_disconnected(db, consultant, exclude_user_ids={sender.id})
     except Exception as e:
         print(f"[email_queue] gmail-not-connected notice failed: {e}")
+
+
+async def _profile_block(db, consultant):
+    """(percent, missing) when this candidate's profile is below 100%, else None.
+    Never blocks a send because the check itself failed."""
+    try:
+        from phase3 import consultant_profile_completeness, PROFILE_COMPLETE_MIN_PCT
+        pct, missing = await consultant_profile_completeness(db, consultant)
+        return (pct, missing) if pct < PROFILE_COMPLETE_MIN_PCT else None
+    except Exception as e:
+        print(f"[email_queue] profile completeness check failed: {e}")
+        return None
+
+
+async def _notify_profile_incomplete(db, consultant, sender, pct, missing) -> None:
+    """In-app alerts for an application blocked by an incomplete profile: the
+    candidate (to finish it) and the sender (why it was not sent). Never raises."""
+    try:
+        from notification_helper import notify_users
+        name = consultant.full_name or "the candidate"
+        miss = ", ".join(missing)
+        if consultant.user_id and consultant.user_id != sender.id:
+            await notify_users(
+                db, [consultant.user_id], "Profile incomplete - applications blocked",
+                f"{sender.full_name or 'A recruiter'} tried to apply for you, but your profile is {pct}% complete. "
+                f"Missing: {miss}. Complete it to 100% so applications can be sent.",
+                consultant_id=consultant.id,
+            )
+        await notify_users(
+            db, [sender.id], "Application not sent - profile incomplete",
+            f"{name}'s application was not sent: profile is {pct}% complete (missing: {miss}).",
+            consultant_id=consultant.id,
+        )
+    except Exception as e:
+        print(f"[email_queue] profile-incomplete notice failed: {e}")
 
 
 class NotifyGmailConnectRequest(BaseModel):
@@ -971,6 +1036,19 @@ async def send_email_now(
     # so the record accurately reflects who really sent it.
     # fallback_sender_used logic removed per user request: from should ALWAYS be the applicant email address.
     effective_from_email = body.from_email
+
+    # An application can only be sent for a candidate whose profile is 100%
+    # complete. Admin/recruiter sends are always on a candidate's behalf; a
+    # consultant's own plain (non-requirement) emails are not applications.
+    if consultant is not None and (body.requirement_id or current_user.role in ("ADMIN", "RECRUITER")):
+        _pc = await _profile_block(db, consultant)
+        if _pc is not None:
+            from phase3 import profile_incomplete_message
+            await _notify_profile_incomplete(db, consultant, current_user, _pc[0], _pc[1])
+            raise HTTPException(
+                status_code=409,
+                detail=profile_incomplete_message(consultant.full_name, _pc[0], _pc[1]),
+            )
 
     # An application is sent from the candidate's own Gmail, so it cannot go
     # out while that Gmail is not connected. Tell the candidate and the sender,

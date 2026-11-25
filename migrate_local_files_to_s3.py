@@ -1,4 +1,4 @@
-﻿"""
+"""
 One-off: move resume files that were written to the server's disk into
 DigitalOcean Spaces, then point the DB at the S3 key.
 

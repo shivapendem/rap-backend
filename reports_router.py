@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func
-from database import get_db
+from sqlalchemy import func, text, and_, literal_column
+from database import get_db, DATABASE_URL
 from models import Email, Application, EmailQueue, User, Consultant, Requirement
 from account_mode import load_account_modes, public_clause, private_clause
 from auth import get_current_user
@@ -162,12 +162,31 @@ async def get_admin_reports(
     # equivalent (emails aren't addressed to consultants), so this stays
     # an org-wide figure for every role. The frontend already labels it
     # "system-wide" when shown on a scoped (recruiter/consultant) view.
-    email_query = select(func.count()).select_from(Email).where(Email.parse_status == 'PARSED')
-    if start_dt:
-        email_query = email_query.where(Email.received_at >= start_dt)
-    if end_dt:
-        email_query = email_query.where(Email.received_at <= end_dt)
-    emails_processed = (await db.execute(email_query)).scalar_one()
+    emails_processed = 0
+    try:
+        ge_clauses = [
+            "(status_desc IN ('Parsed', 'Parsed - NR', 'Parsed - Dup')"
+            " OR (status_desc IS NULL AND processed = true))"
+        ]
+        ge_params = {}
+        if start_dt:
+            ge_clauses.append("COALESCE(fetched_at, date) >= :start_dt")
+            ge_params["start_dt"] = start_dt
+        if end_dt:
+            ge_clauses.append("COALESCE(fetched_at, date) <= :end_dt")
+            ge_params["end_dt"] = end_dt
+        ge_where = " AND ".join(ge_clauses)
+        emails_processed = (
+            await db.execute(text(f"SELECT COUNT(*) FROM gmail_emails WHERE {ge_where}"), ge_params)
+        ).scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        email_query = select(func.count()).select_from(Email).where(Email.parse_status == 'PARSED')
+        if start_dt:
+            email_query = email_query.where(Email.received_at >= start_dt)
+        if end_dt:
+            email_query = email_query.where(Email.received_at <= end_dt)
+        emails_processed = (await db.execute(email_query)).scalar_one() or 0
 
     # Resolve the current user's own Consultant row up front (only exists
     # for CONSULTANT accounts) — used to scope the two queries below.
@@ -252,100 +271,120 @@ async def get_admin_reports(
             )
         emails_processed = emails_processed_public + emails_processed_private
 
-    # 2. Jobs Applied (Applications)
-    # BUG FIX: was counting every Application row regardless of status
-    # (PENDING/FAILED included) — "Jobs Applied" should mean applications
-    # that actually went out, matching how "Emails Sent" below already
-    # filters EmailQueue.status == 'SENT'.
-    app_query = select(func.count()).select_from(Application).where(Application.status == "SENT")
-    if start_dt:
-        app_query = app_query.where(Application.sent_at >= start_dt)
-    if end_dt:
-        app_query = app_query.where(Application.sent_at <= end_dt)
-    # Role scope + Consultant/Recruiter filters (no Consultant row → -1 → zero rows).
-    app_query = _scope_apps(app_query)
-    jobs_applied = (await db.execute(app_query)).scalar_one()
-
-    # 2b. Daily activity — same scope/filters as jobs_applied, bucketed per
-    # CST day in Python (portable across Postgres/SQLite).
-    _cst = ZoneInfo("America/Chicago")
-    day_query = select(Application.sent_at).where(
-        Application.status == "SENT", Application.sent_at.is_not(None)
-    )
-    if start_dt:
-        day_query = day_query.where(Application.sent_at >= start_dt)
-    if end_dt:
-        day_query = day_query.where(Application.sent_at <= end_dt)
-    day_query = _scope_apps(day_query)
-    _day_counts: Counter = Counter()
-    for (ts,) in (await db.execute(day_query)).all():
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=datetime.timezone.utc)
-        _day_counts[ts.astimezone(_cst).date().isoformat()] += 1
-    daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_day_counts.items())]
-
-    # 2c. Trend: the window of the same length right before the range.
-    prev_jobs_applied = None
-    prev_emails_sent = None
+    # 2. Jobs Applied (Applications) + 2c. previous-window trend, in ONE
+    # round-trip. "Jobs Applied" = applications that actually went out
+    # (status SENT), matching how "Emails Sent" filters EmailQueue.status.
+    # Each window is a FILTER aggregate over one index range scan on
+    # (recruiter_id|consultant_id, status, sent_at).
+    has_prev = bool(start_dt and end_dt and end_dt > start_dt)
+    _p_start = _p_end = None
     prev_emails_processed = None
     prev_daily_activity: List[DailyActivity] = []
     hourly_activity: List[HourlyActivity] = []
     prev_hourly_activity: List[HourlyActivity] = []
-    if start_dt and end_dt and end_dt > start_dt:
+
+    if has_prev:
         _span = end_dt - start_dt
         _p_start, _p_end = start_dt - _span, start_dt
-        prev_emails_processed = (await db.execute(
-            select(func.count()).select_from(Email).where(
-                Email.parse_status == 'PARSED',
-                Email.received_at >= _p_start,
-                Email.received_at < _p_end,
-            )
-        )).scalar_one()
+        try:
+            prev_ge_clauses = [
+                "(status_desc IN ('Parsed', 'Parsed - NR', 'Parsed - Dup')"
+                " OR (status_desc IS NULL AND processed = true))",
+                "COALESCE(fetched_at, date) >= :p_start",
+                "COALESCE(fetched_at, date) < :p_end",
+            ]
+            prev_ge_params = {"p_start": _p_start, "p_end": _p_end}
+            prev_ge_where = " AND ".join(prev_ge_clauses)
+            prev_emails_processed = (
+                await db.execute(text(f"SELECT COUNT(*) FROM gmail_emails WHERE {prev_ge_where}"), prev_ge_params)
+            ).scalar_one() or 0
+        except Exception:
+            await db.rollback()
+            prev_emails_processed = (await db.execute(
+                select(func.count()).select_from(Email).where(
+                    Email.parse_status == 'PARSED',
+                    Email.received_at >= _p_start,
+                    Email.received_at < _p_end,
+                )
+            )).scalar_one() or 0
 
-        # Previous-window daily buckets + hourly buckets (one query covering
-        # both windows, bucketed in CST in Python like daily_activity).
-        _series_rows = (await db.execute(_scope_apps(
-            select(Application.sent_at).where(
-                Application.status == "SENT",
-                Application.sent_at.is_not(None),
-                Application.sent_at >= _p_start,
-                Application.sent_at <= end_dt,
-            )
-        ))).all()
-        _prev_days: Counter = Counter()
-        _cur_hours: Counter = Counter()
-        _prev_hours: Counter = Counter()
-        _single_day = _span <= datetime.timedelta(days=1)
-        # sent_at may come back naive (UTC); compare like with like.
-        _start_aware = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=datetime.timezone.utc)
-        for (ts,) in _series_rows:
+    cur_cond = []
+    if start_dt:
+        cur_cond.append(Application.sent_at >= start_dt)
+    if end_dt:
+        cur_cond.append(Application.sent_at <= end_dt)
+
+    sent_cols = [func.count().filter(and_(*cur_cond)) if cur_cond else func.count()]
+    if has_prev:
+        sent_cols.append(func.count().filter(and_(
+            Application.sent_at >= _p_start, Application.sent_at < _p_end,
+        )))
+    sent_q = select(*sent_cols).select_from(Application).where(Application.status == "SENT")
+    lower_bound = _p_start if has_prev else start_dt
+    if lower_bound:
+        sent_q = sent_q.where(Application.sent_at >= lower_bound)
+    if end_dt:
+        sent_q = sent_q.where(Application.sent_at <= end_dt)
+    sent_row = (await db.execute(_scope_apps(sent_q))).one()
+    jobs_applied = int(sent_row[0] or 0)
+    prev_jobs_applied = int(sent_row[1] or 0) if has_prev else None
+
+    # 2b. Daily activity + Hourly activity (when single-day range)
+    _cst = ZoneInfo("America/Chicago")
+    _day_counts: Counter = Counter()
+    _cur_hours: Counter = Counter()
+    _prev_hours: Counter = Counter()
+    _prev_days: Counter = Counter()
+    _single_day = has_prev and (_span <= datetime.timedelta(days=1))
+    _start_aware = (start_dt if (start_dt and start_dt.tzinfo) else (start_dt.replace(tzinfo=datetime.timezone.utc) if start_dt else None))
+
+    if DATABASE_URL.startswith("postgresql") and not has_prev:
+        # Constants are inlined (literal_column) so the SELECT and GROUP BY
+        # expressions are textually identical — separate bind params would
+        # make Postgres reject the GROUP BY.
+        day_col = func.to_char(
+            func.timezone(literal_column("'America/Chicago'"), Application.sent_at),
+            literal_column("'YYYY-MM-DD'"),
+        )
+        day_query = (
+            select(day_col, func.count())
+            .where(Application.status == "SENT", Application.sent_at.is_not(None))
+            .group_by(day_col)
+        )
+        if start_dt:
+            day_query = day_query.where(Application.sent_at >= start_dt)
+        if end_dt:
+            day_query = day_query.where(Application.sent_at <= end_dt)
+        for d, n in (await db.execute(_scope_apps(day_query))).all():
+            _day_counts[d] = int(n)
+        daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_day_counts.items())]
+    else:
+        # Fetch timestamps covering both windows (if has_prev) or current window
+        series_q = select(Application.sent_at).where(
+            Application.status == "SENT", Application.sent_at.is_not(None)
+        )
+        if lower_bound:
+            series_q = series_q.where(Application.sent_at >= lower_bound)
+        if end_dt:
+            series_q = series_q.where(Application.sent_at <= end_dt)
+        for (ts,) in (await db.execute(_scope_apps(series_q))).all():
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=datetime.timezone.utc)
             local = ts.astimezone(_cst)
-            if ts < _start_aware:
+            if _start_aware and ts < _start_aware:
                 _prev_days[local.date().isoformat()] += 1
                 if _single_day:
                     _prev_hours[local.hour] += 1
-            elif _single_day:
-                _cur_hours[local.hour] += 1
-        prev_daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_prev_days.items())]
-        if _single_day:
-            hourly_activity = [HourlyActivity(hour=h, applications=n) for h, n in sorted(_cur_hours.items())]
-            prev_hourly_activity = [HourlyActivity(hour=h, applications=n) for h, n in sorted(_prev_hours.items())]
-        prev_jobs_applied = (await db.execute(_scope_apps(
-            select(func.count()).select_from(Application).where(
-                Application.status == "SENT",
-                Application.sent_at >= _p_start,
-                Application.sent_at < _p_end,
-            )
-        ))).scalar_one()
-        _pq = select(func.count()).select_from(EmailQueue).where(
-            EmailQueue.status == "SENT",
-            EmailQueue.created_at >= _p_start,
-            EmailQueue.created_at < _p_end,
-        )
-        _pq = _scope_queue(_pq)
-        prev_emails_sent = (await db.execute(_pq)).scalar_one()
+            else:
+                _day_counts[local.date().isoformat()] += 1
+                if _single_day:
+                    _cur_hours[local.hour] += 1
+        daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_day_counts.items())]
+        if has_prev:
+            prev_daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_prev_days.items())]
+            if _single_day:
+                hourly_activity = [HourlyActivity(hour=h, applications=n) for h, n in sorted(_cur_hours.items())]
+                prev_hourly_activity = [HourlyActivity(hour=h, applications=n) for h, n in sorted(_prev_hours.items())]
 
     # 2d. Status breakdown (created_at because PENDING/FAILED have no sent_at).
     _sq = select(Application.status, func.count()).select_from(Application).group_by(Application.status)
@@ -380,14 +419,27 @@ async def get_admin_reports(
         if (v or "").strip()
     ]
 
-    # 3. Emails Sent (EmailQueue)
-    queue_query = select(func.count()).select_from(EmailQueue).where(EmailQueue.status == 'SENT')
+    # 3. Emails Sent (EmailQueue) + previous-window trend in ONE round-trip.
+    eq_cur = []
     if start_dt:
-        queue_query = queue_query.where(EmailQueue.created_at >= start_dt)
+        eq_cur.append(EmailQueue.created_at >= start_dt)
+    if end_dt:
+        eq_cur.append(EmailQueue.created_at <= end_dt)
+    eq_cols = [func.count().filter(and_(*eq_cur)) if eq_cur else func.count()]
+    if has_prev:
+        eq_cols.append(func.count().filter(and_(
+            EmailQueue.created_at >= _p_start, EmailQueue.created_at < _p_end,
+        )))
+    queue_query = select(*eq_cols).select_from(EmailQueue).where(EmailQueue.status == 'SENT')
+    eq_lower = _p_start if has_prev else start_dt
+    if eq_lower:
+        queue_query = queue_query.where(EmailQueue.created_at >= eq_lower)
     if end_dt:
         queue_query = queue_query.where(EmailQueue.created_at <= end_dt)
     queue_query = _scope_queue(queue_query)
-    emails_sent = (await db.execute(queue_query)).scalar_one()
+    eq_row = (await db.execute(queue_query)).one()
+    emails_sent = int(eq_row[0] or 0)
+    prev_emails_sent = int(eq_row[1] or 0) if has_prev else None
 
     # 4. User Stats (Applications per user).
     # ADMIN: every sender. RECRUITER / CONSULTANT: only their own row

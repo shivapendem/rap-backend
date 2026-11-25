@@ -5,7 +5,7 @@ import math
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, exists, text
+from sqlalchemy import func, or_, and_, exists, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import aliased
@@ -215,16 +215,13 @@ async def get_pending_matches(
     # requirement is APPLIED, whatever the match row still says — this is the
     # per-consultant (requirement + consultant) check, so other consultants
     # on the same requirement are unaffected.
-    applied_exists = exists().where(
-        Application.requirement_id == RequirementConsultantMatch.requirement_id,
-        Application.consultant_id == RequirementConsultantMatch.consultant_id,
-        Application.status == "SENT",
-    )
-
     pending_cutoff = datetime.now(timezone.utc) - timedelta(days=PENDING_WINDOW_DAYS)
 
-    # Pre-resolve private requirement email scope for CONSULTANT
+    # Pre-resolve private requirement email scope for CONSULTANT and assigned roster for RECRUITER
+    # once upfront so the main query uses flat index scans without correlated subqueries.
     consultant_allowed_emails = None
+    cons_obj = None
+    recruiter_assigned_ids: list[int] = []
     if current_user.role == "CONSULTANT":
         cons_obj = (await db.execute(
             select(Consultant).where(Consultant.user_id == current_user.id)
@@ -248,9 +245,23 @@ async def get_pending_matches(
             consultant_allowed_emails = list(set(rec_emails))
         else:
             consultant_allowed_emails = []
+    elif current_user.role == "RECRUITER":
+        recruiter_assigned_ids = [
+            r[0] for r in (await db.execute(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )).all()
+        ]
 
     # Public/Private is decided by the owning gmail account (read once, tiny table).
     _modes = await load_account_modes(db)
+
+    # 1:1 LEFT JOIN on applications (unique on consultant_id + requirement_id) replaces
+    # the correlated EXISTS subquery in both WHERE and SELECT.
+    has_sent_app = Application.id.is_not(None)
+    no_sent_app = Application.id.is_(None)
 
     def _base_stmt(select_clause):
         stmt = (
@@ -258,6 +269,14 @@ async def get_pending_matches(
             .join(Requirement, RequirementConsultantMatch.requirement_id == Requirement.id)
             .join(Consultant, RequirementConsultantMatch.consultant_id == Consultant.id)
             .join(User, User.id == Consultant.user_id)
+            .outerjoin(
+                Application,
+                and_(
+                    Application.requirement_id == RequirementConsultantMatch.requirement_id,
+                    Application.consultant_id == RequirementConsultantMatch.consultant_id,
+                    Application.status == "SENT",
+                ),
+            )
             .where(
                 Consultant.status == "ACTIVE",
                 User.is_authorized == True,
@@ -265,14 +284,14 @@ async def get_pending_matches(
         )
         if not show_all_statuses:
             if target_status in ("MATCHING", "NOT_ELIGIBLE"):
-                stmt = stmt.where(RequirementConsultantMatch.status == target_status, ~applied_exists)
+                stmt = stmt.where(RequirementConsultantMatch.status == target_status, no_sent_app)
                 # Pending and Not Eligible show only matches from the last
                 # PENDING_WINDOW_DAYS days (older ones are hidden, not deleted).
                 stmt = stmt.where(RequirementConsultantMatch.created_at >= pending_cutoff)
             elif target_status == "APPLIED":
                 stmt = stmt.where(or_(
                     RequirementConsultantMatch.status == "APPLIED",
-                    applied_exists & (RequirementConsultantMatch.status != "REJECTED"),
+                    has_sent_app & (RequirementConsultantMatch.status != "REJECTED"),
                 ))
             else:
                 stmt = stmt.where(RequirementConsultantMatch.status == target_status)
@@ -293,8 +312,7 @@ async def get_pending_matches(
                 _normalize_ws_col(Consultant.email).ilike(pattern),
             ))
         if current_user.role == "CONSULTANT":
-            cons_subq = select(Consultant.id).where(Consultant.user_id == current_user.id).scalar_subquery()
-            stmt = stmt.where(RequirementConsultantMatch.consultant_id == cons_subq)
+            stmt = stmt.where(RequirementConsultantMatch.consultant_id == (cons_obj.id if cons_obj else -1))
             # Private requirement scoping for consultant:
             # Consultant sees matches from public jobs OR jobs received by their assigned recruiter(s) or their own email
             if consultant_allowed_emails:
@@ -305,11 +323,10 @@ async def get_pending_matches(
                 stmt = stmt.where(public_clause(Requirement.mode, Requirement.account_email, _modes))
 
         elif current_user.role == "RECRUITER":
-            assigned_subq = select(RecruiterConsultant.consultant_id).where(
-                RecruiterConsultant.recruiter_id == current_user.id,
-                RecruiterConsultant.is_active == True,
-            ).scalar_subquery()
-            stmt = stmt.where(RequirementConsultantMatch.consultant_id.in_(assigned_subq))
+            if recruiter_assigned_ids:
+                stmt = stmt.where(RequirementConsultantMatch.consultant_id.in_(recruiter_assigned_ids))
+            else:
+                stmt = stmt.where(RequirementConsultantMatch.consultant_id == -1)
             # Private requirement scoping for recruiter:
             # Recruiter sees matches from public jobs + private jobs matching their own email
             user_email = (current_user.email or "").lower().strip()
@@ -318,9 +335,8 @@ async def get_pending_matches(
             )
         return stmt
 
-    count_stmt = _base_stmt(select(func.count()).select_from(RequirementConsultantMatch))
-    total_count = (await db.execute(count_stmt)).scalar_one()
-
+    # Fetch rows and total_count in a single pass via COUNT(*) OVER() window function
+    # instead of executing the 5-table join twice.
     stmt = _base_stmt(select(
         RequirementConsultantMatch.id,
         RequirementConsultantMatch.requirement_id,
@@ -340,14 +356,9 @@ async def get_pending_matches(
         RequirementConsultantMatch.resume_status,
         RequirementConsultantMatch.created_at,
         RequirementConsultantMatch.updated_at,
-        applied_exists.label("has_sent_application"),
+        has_sent_app.label("has_sent_application"),
+        func.count().over().label("_total_count"),
     ))
-    # Same reasoning as before: order by match quality first, not by when
-    # it happened to be scored, so a stronger match always sorts above a
-    # weaker one; created_at as a stable tiebreaker for equal scores.
-    # Newest match always first. Score-first buried every new match under
-    # older 100% matches, so page 1 looked like matching had stopped.
-    # Score and id are only tie-breakers (same timestamp) for stable paging.
     stmt = (
         stmt.order_by(
             RequirementConsultantMatch.created_at.desc(),
@@ -360,6 +371,13 @@ async def get_pending_matches(
 
     result = await db.execute(stmt)
     rows = result.mappings().all()
+    if rows:
+        total_count = int(rows[0]["_total_count"] or 0)
+    elif page > 1:
+        count_stmt = _base_stmt(select(func.count(RequirementConsultantMatch.id)).select_from(RequirementConsultantMatch))
+        total_count = int((await db.execute(count_stmt)).scalar_one() or 0)
+    else:
+        total_count = 0
 
     # PERF: Batch-load the "N matched" and "N more rejected" counts for the
     # current page's unique requirements in one quick grouped query, rather
@@ -371,7 +389,9 @@ async def get_pending_matches(
         counts_stmt = (
             select(
                 RequirementConsultantMatch.requirement_id,
-                func.count(RequirementConsultantMatch.id).label("match_total"),
+                func.count(RequirementConsultantMatch.id)
+                .filter(RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")))
+                .label("match_total"),
                 func.count(RequirementConsultantMatch.id)
                 .filter(RequirementConsultantMatch.status == "REJECTED")
                 .label("rejected_total"),

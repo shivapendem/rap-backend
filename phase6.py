@@ -36,7 +36,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user
@@ -219,6 +219,7 @@ Return exactly this JSON structure with no markdown, no code fences, no extra te
 def _build_profile_resume_info(
     consultant: Consultant,
     experiences: List[ConsultantExperience],
+    user_resume_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Assemble the resume_info payload for a consultant from BOTH data
@@ -265,7 +266,7 @@ def _build_profile_resume_info(
 
     primary = [s.strip() for s in (consultant.primary_skills or "").split(",") if s.strip()]
 
-    profile_json = consultant.resume_info or {}
+    profile_json = user_resume_info if user_resume_info is not None else (getattr(consultant, "resume_info", None) or {})
     tech_stack_json = profile_json.get("tech_stack") or {}
 
     if not primary:
@@ -312,7 +313,7 @@ def _build_profile_resume_info(
         "skills": primary,
         "base_resume_text": consultant.base_resume_text or "",
         "experience": experience_payload,
-        "education": profile_json.get("education") or profile_json.get("educational_background") or [],
+        "education": consultant.education or profile_json.get("education") or profile_json.get("educational_background") or [],
         "certifications": profile_json.get("certifications") or [],
     }
 
@@ -324,6 +325,7 @@ async def _call_ai_tailoring(
     matched_skills: List[str],
     missing_skills: List[str],
     db: Optional[AsyncSession] = None,
+    user_resume_info: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """
     Generate a tailored resume via Anthropic Claude (claude_service).
@@ -341,15 +343,16 @@ async def _call_ai_tailoring(
             detail="ANTHROPIC_API_KEY is not configured. Set it in .env to enable resume generation.",
         )
 
-    resume_info = _build_profile_resume_info(consultant, experiences)
+    if user_resume_info is None and db is not None and consultant.user_id:
+        info_res = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
+        user_resume_info = info_res.scalar_one_or_none() or {}
+
+    resume_info = _build_profile_resume_info(consultant, experiences, user_resume_info)
 
     # Professional Summary = base resume's summary as-is (same source/
     # fallback as the Base Resume pane in resume_router).
     from resume_router import _build_base_career_objective  # lazy: avoid circular import
-    base_summary = ""
-    if db is not None and consultant.user_id:
-        info_res = await db.execute(select(User.resume_info).where(User.id == consultant.user_id))
-        base_summary = ((info_res.scalar_one_or_none() or {}).get("summary") or "")
+    base_summary = (user_resume_info or {}).get("summary") or ""
     resume_info["summary"] = base_summary or _build_base_career_objective(consultant)
 
     # ── Requirement context (preserves everything the old prompt carried) ──
@@ -1598,12 +1601,12 @@ async def generate_resume(
 
     # Check max attempts — frontend MAX_ATTEMPTS = 3
     existing_count_result = await db.execute(
-        select(GeneratedResume).where(
+        select(func.count()).select_from(GeneratedResume).where(
             GeneratedResume.consultant_id == consultant.id,
             GeneratedResume.requirement_id == requirement_id,
         )
     )
-    existing_count = len(existing_count_result.scalars().all())
+    existing_count = existing_count_result.scalar_one() or 0
     if existing_count >= MAX_GENERATION_ATTEMPTS:
         raise HTTPException(
             status_code=422,
@@ -1623,7 +1626,9 @@ async def generate_resume(
         .order_by(ConsultantExperience.sort_order.asc())
     )
     experiences_for_check = exp_result.scalars().all()
-    profile_resume_info = _build_profile_resume_info(consultant, experiences_for_check)
+    profile_resume_info = _build_profile_resume_info(
+        consultant, experiences_for_check, current_user.resume_info or {}
+    )
     missing_fields = get_missing_resume_fields(profile_resume_info)
     if missing_fields:
         raise HTTPException(

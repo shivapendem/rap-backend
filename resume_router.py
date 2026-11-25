@@ -261,7 +261,7 @@ async def _build_resume_info(
     """Assemble the resume_info payload (skills/experience/education/etc.)
     used both to actually call the AI and to check profile completeness."""
     consultant_res = await db.execute(select(Consultant).where(Consultant.user_id == target_user.id))
-    consultant = consultant_res.scalar_one_or_none()
+    consultant = consultant_res.scalars().first()
 
     profile_experiences = []
     if consultant:
@@ -420,7 +420,7 @@ async def get_resume_completeness(
     # recruiter only finding out something's off after generating anyway.
     consultant_status = None
     consultant_res = await db.execute(select(Consultant.status).where(Consultant.user_id == target_user_id))
-    consultant_status = consultant_res.scalar_one_or_none()
+    consultant_status = consultant_res.scalars().first()
 
     return {
         "user_id": target_user_id,
@@ -449,7 +449,7 @@ async def generate_resume_from_template(
     
     # Get the rich text template
     result = await db.execute(select(Consultant).where(Consultant.user_id == target_user_id))
-    consultant = result.scalar_one_or_none()
+    consultant = result.scalars().first()
     
     if not consultant or not consultant.resume_rich_text:
         raise HTTPException(
@@ -471,7 +471,9 @@ async def generate_resume_from_template(
 
     try:
         from claude_service import generate_template_values
-        generated_data, rate_limits, usage_info = generate_template_values(resume_info, request.job_description or "General Role")
+        generated_data, rate_limits, usage_info = await asyncio.to_thread(
+            generate_template_values, resume_info, request.job_description or "General Role"
+        )
         if rate_limits:
             await save_openai_rate_limits(db, rate_limits)
         if usage_info:
@@ -650,8 +652,7 @@ async def generate_resume_from_template(
         # sync.
         data=docx_data if not request.draft else generated_data,
         template=resume_template,
-        is_base=False,
-        is_draft=request.draft,
+        status='draft' if request.draft else ('completed' if s3_key else 'failed_upload'),
         s3_key=s3_key,
         ats_score=ats_score
     )
@@ -662,7 +663,7 @@ async def generate_resume_from_template(
     return {
         "id": new_resume.id,
         "title": new_resume.title,
-        "is_draft": new_resume.is_draft,
+        "is_draft": new_resume.status == "draft",
         "s3_url": generate_presigned_url(new_resume.s3_key) if new_resume.s3_key else None,
         "ats_score": new_resume.ats_score,
         "data": new_resume.data,
@@ -711,9 +712,12 @@ async def generate_resume(
             request.job_description or "", _p3_detect(request.job_description or ""), _p3_aliases
         )
         jd_skills = list(dict.fromkeys([*(jd_skills or []), *jd_text_skills]))
-        generated_data, rate_limits, usage_info = generate_tailored_resume(
-            resume_info, request.job_description or "General Role", target_role=request.target_role,
-            jd_skills=jd_skills,
+        generated_data, rate_limits, usage_info = await asyncio.to_thread(
+            generate_tailored_resume,
+            resume_info,
+            request.job_description or "General Role",
+            request.target_role,
+            jd_skills,
         )
         if rate_limits:
             await save_openai_rate_limits(db, rate_limits)
@@ -1211,7 +1215,7 @@ async def list_resumes(
         if base_target_user_id is not None and (not search or search.lower() in "base resume"):
             base_consultant = (await db.execute(
                 select(Consultant).where(Consultant.user_id == base_target_user_id)
-            )).scalar_one_or_none()
+            )).scalars().first()
 
             # FEATURE CHANGE: base resume is now generated from the
             # profile (see sync_base_resume_text in this file, called by
@@ -1323,7 +1327,7 @@ async def get_base_resume_text(
     
     consultant = (await db.execute(
         select(Consultant).where(Consultant.user_id == resolved_id)
-    )).scalar_one_or_none()
+    )).scalars().first()
     
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
@@ -1351,7 +1355,7 @@ async def update_base_resume_text(
     
     consultant = (await db.execute(
         select(Consultant).where(Consultant.user_id == resolved_id)
-    )).scalar_one_or_none()
+    )).scalars().first()
     
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
@@ -2644,7 +2648,7 @@ async def get_base_resume_content(
 
     consultant = (await db.execute(
         select(Consultant).where(Consultant.user_id == resolved_id)
-    )).scalar_one_or_none()
+    )).scalars().first()
 
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
@@ -2757,7 +2761,7 @@ async def update_base_resume_content(
 
     consultant = (await db.execute(
         select(Consultant).where(Consultant.user_id == resolved_id)
-    )).scalar_one_or_none()
+    )).scalars().first()
 
     if not consultant:
         raise HTTPException(status_code=404, detail="Consultant profile not found")
@@ -3132,7 +3136,7 @@ async def download_base_resume(
         else:
             target_consultant = (await db.execute(
                 select(Consultant).where(Consultant.user_id == user_id)
-            )).scalar_one_or_none()
+            )).scalars().first()
             if not target_consultant:
                 raise HTTPException(status_code=404, detail="Consultant not found")
             allowed = (await db.execute(
@@ -3150,7 +3154,7 @@ async def download_base_resume(
 
     consultant = (await db.execute(
         select(Consultant).where(Consultant.user_id == target_user_id)
-    )).scalar_one_or_none()
+    )).scalars().first()
 
     if not consultant or not consultant.base_resume_file_path:
         raise HTTPException(status_code=404, detail="No base resume uploaded yet.")
@@ -3319,6 +3323,43 @@ async def download_base_resume(
         headers={"Content-Disposition": f'inline; filename="{display_name}"'},
     )
 
+async def _add_profile_flags(db, rows):
+    """Adds profile_complete / profile_percent / profile_missing to each
+    consultant row (one batched query), so the Apply and compose screens can
+    block sending applications until the profile is 100% complete. A failed
+    check leaves the rows unflagged (screens treat missing as 'unknown')."""
+    ids = [r["consultant_id"] for r in rows if r.get("consultant_id")]
+    if not ids:
+        return rows
+    try:
+        from sqlalchemy import func as _func
+        from phase3 import profile_completeness_checks, PROFILE_COMPLETE_MIN_PCT
+        exp = dict((await db.execute(
+            select(ConsultantExperience.consultant_id, _func.count())
+            .where(ConsultantExperience.consultant_id.in_(ids))
+            .group_by(ConsultantExperience.consultant_id)
+        )).all())
+        cons = (await db.execute(
+            select(Consultant, User.resume_info)
+            .outerjoin(User, User.id == Consultant.user_id)
+            .where(Consultant.id.in_(ids))
+        )).all()
+        info = {}
+        for c, ri in cons:
+            checks = profile_completeness_checks(c, exp.get(c.id, 0), ri)
+            pct = sum(w for _, w, ok in checks if ok)
+            info[c.id] = (pct, [label for label, _, ok in checks if not ok])
+        for r in rows:
+            got = info.get(r.get("consultant_id"))
+            if got is not None:
+                r["profile_percent"] = got[0]
+                r["profile_missing"] = got[1]
+                r["profile_complete"] = got[0] >= PROFILE_COMPLETE_MIN_PCT
+    except Exception as e:
+        print(f"[resume_router] profile completeness flags failed: {e}")
+    return rows
+
+
 async def _with_applied_flag(db, requirement_id, rows, matched_ids=None):
     """Adds already_applied (SENT application or queued send for THIS
     requirement + THAT consultant) and matched (consultant is matched to this
@@ -3326,6 +3367,7 @@ async def _with_applied_flag(db, requirement_id, rows, matched_ids=None):
     _m = matched_ids or set()
     for r in rows:
         r["matched"] = r.get("consultant_id") in _m
+    await _add_profile_flags(db, rows)
     if not requirement_id or not rows:
         return rows
     from models import Application, EmailQueue
@@ -3537,7 +3579,7 @@ async def get_consultants_for_resumes(
             Consultant.status == "ACTIVE",
         )
         results = (await db.execute(query.options(*_lite))).all()
-        return [map_user_consultant(u, c) for u, c in results]
+        return await _add_profile_flags(db, [map_user_consultant(u, c) for u, c in results])
     elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and (requirement_id or consultant_id):
         # Apply screen: EXACTLY the admin rule — the consultants matched to
         # this requirement (whoever they are assigned to); if nobody matched,

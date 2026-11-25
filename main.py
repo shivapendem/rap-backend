@@ -260,7 +260,8 @@ async def _connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
     for attempt in range(1, max_attempts + 1):
         try:
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                _tables = [t for t in Base.metadata.sorted_tables if not t.name.startswith("v_")]
+                await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_tables))
             return
         except Exception as e:
             last_err = e
@@ -340,6 +341,34 @@ async def lifespan(app: FastAPI):
             print("Successfully synchronized gmail_connected state with active tokens.")
         except Exception as sync_err:
             print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
+
+        # High-concurrency composite indexes & pre-joined database views:
+        # NOTE: optimization_queries.sql contains 87 CREATE/DROP INDEX and CREATE VIEW DDL statements.
+        # Running these synchronously inside the FastAPI lifespan startup blocks server boot (uvicorn / PM2)
+        # while taking Exclusive table locks against active cron workers or remote DB traffic.
+        # To avoid blocking application startup, it is executed out-of-band via background task or manual migration.
+        if os.getenv("RUN_DB_OPTIMIZATIONS_ON_STARTUP", "false").lower() in ("true", "1") and DATABASE_URL.startswith("postgresql"):
+            _opt_sql_path = os.path.join(os.path.dirname(__file__), "optimization_queries.sql")
+            if os.path.exists(_opt_sql_path):
+                try:
+                    with open(_opt_sql_path, "r", encoding="utf-8") as _f:
+                        _raw_sql = _f.read()
+                    _clean_lines = [
+                        line for line in _raw_sql.splitlines()
+                        if not line.strip().startswith("--")
+                    ]
+                    for _stmt in "\n".join(_clean_lines).split(";"):
+                        _stmt_str = _stmt.strip()
+                        if _stmt_str:
+                            try:
+                                await session.execute(text(_stmt_str))
+                                await session.commit()
+                            except Exception as _ddl_err:
+                                await session.rollback()
+                                print(f"[db-opt] skipped statement ({_ddl_err})")
+                    print("[db-opt] Applied optimization_queries.sql indexes and views.")
+                except Exception as idx_err:
+                    print(f"[db-opt] Failed loading optimization_queries.sql: {idx_err}")
 
     # BUG FIX ("Gmail status not updated until server restart"): the UPDATE
     # above only reconciles gmail_connected once, at boot. Install DB
@@ -658,7 +687,7 @@ async def login(
             metadata={"full_name": user.full_name, "email": user.email, "role": user.role},
         )
     except Exception as e:
-        logger.warning(f"[login-audit] FAILED: {e}")
+        print(f"[login-audit] FAILED: {e}")
 
     await db.commit()
 
@@ -1141,8 +1170,19 @@ async def get_requirements(
     # not-eligible matches stay hidden).
     # Also enforce mode scoping: public requirements + private requirements from
     # their assigned recruiter(s) or their own email.
+    _modes = await load_account_modes(db)  # mode lives on gmail_accounts (no per-row copy rewrite)
+    own_consultant: Optional[Consultant] = None
+    assigned_ids: list[int] = []
+    if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
+        assigned_ids = [
+            row[0] for row in (await db.execute(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )).all()
+        ]
     if current_user.role == "CONSULTANT":
-        _modes = await load_account_modes(db)  # mode lives on gmail_accounts (no per-row copy rewrite)
         own_consultant = (await db.execute(
             select(Consultant).where(Consultant.user_id == current_user.id)
         )).scalars().first()
@@ -1186,7 +1226,6 @@ async def get_requirements(
         # Mode scoping for recruiter:
         # Recruiter sees all public requirements + private requirements received on their own email
         user_email = (current_user.email or "").lower().strip()
-        _modes = await load_account_modes(db)
         query = query.where(
             public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
         )
@@ -1203,13 +1242,9 @@ async def get_requirements(
         # check — "matched" and "matched to you" silently disagreed.
         # Scope to the caller's own matches when they're a consultant.
         if current_user.role == "CONSULTANT":
-            cons_result = await db.execute(
-                select(Consultant).where(Consultant.user_id == current_user.id)
-            )
-            consultant = cons_result.scalars().first()
-            if consultant:
+            if own_consultant:
                 matched_subq = matched_subq.where(
-                    RequirementConsultantMatch.consultant_id == consultant.id
+                    RequirementConsultantMatch.consultant_id == own_consultant.id
                 )
             else:
                 # No consultant profile at all — no matches are possible.
@@ -1246,12 +1281,7 @@ async def get_requirements(
             # column (that column is roster-scoped further down).
             if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
                 matched_consultant_subq = matched_consultant_subq.where(
-                    RequirementConsultantMatch.consultant_id.in_(
-                        select(RecruiterConsultant.consultant_id).where(
-                            RecruiterConsultant.recruiter_id == current_user.id,
-                            RecruiterConsultant.is_active == True,
-                        )
-                    )
+                    RequirementConsultantMatch.consultant_id.in_(assigned_ids)
                 )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
 
@@ -1271,10 +1301,9 @@ async def get_requirements(
             RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
         ]
         if current_user.role == "CONSULTANT":
-            _own = (await db.execute(
-                select(Consultant.id).where(Consultant.user_id == current_user.id)
-            )).scalar_one_or_none()
-            _nm_where.append(RequirementConsultantMatch.consultant_id == (_own if _own else -1))
+            _nm_where.append(RequirementConsultantMatch.consultant_id == (own_consultant.id if own_consultant else -1))
+        elif current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
+            _nm_where.append(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
         elif current_user.role == "RECRUITER":
             _nm_where.append(RequirementConsultantMatch.consultant_id.in_(
                 select(RecruiterConsultant.consultant_id).where(
@@ -1386,7 +1415,7 @@ async def get_requirements(
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid date_to format")
 
-    count_query = select(func.count()).select_from(query.subquery())
+    count_query = query.with_only_columns(func.count(Requirement.id)).order_by(None)
     total = (await db.execute(count_query)).scalar_one()
 
     actual_sort = "received_date" if sort_by == "received_at" else sort_by
@@ -1432,13 +1461,6 @@ async def get_requirements(
             )
         )
         if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
-            assigned_result = await db.execute(
-                select(RecruiterConsultant.consultant_id).where(
-                    RecruiterConsultant.recruiter_id == current_user.id,
-                    RecruiterConsultant.is_active == True,
-                )
-            )
-            assigned_ids = [row[0] for row in assigned_result.all()]
             matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
 
         # BUG FIX: when the caller filtered by specific consultant(s) via
@@ -1595,15 +1617,11 @@ async def get_requirements(
     # "Applied" badge instead of always showing "Apply", regardless of
     # whether it was actually sent.
     if current_user.role == "CONSULTANT" and reqs:
-        cons_result = await db.execute(
-            select(Consultant).where(Consultant.user_id == current_user.id)
-        )
-        consultant = cons_result.scalars().first()
-        if consultant:
+        if own_consultant:
             req_ids = [r.id for r in reqs]
             applied_result = await db.execute(
                 select(Application.requirement_id).where(
-                    Application.consultant_id == consultant.id,
+                    Application.consultant_id == own_consultant.id,
                     Application.requirement_id.in_(req_ids),
                     Application.status == "SENT",
                 )
@@ -1612,24 +1630,14 @@ async def get_requirements(
             for r in reqs:
                 r.already_applied = r.id in applied_ids
 
-    _live_modes = await load_account_modes(db)  # live Public/Private from gmail_accounts
     return PaginatedRequirements(
-        data=[_serialize_requirement(r, _live_modes) for r in reqs],
+        data=[_serialize_requirement(r, _modes) for r in reqs],
         total=total,
         page=page,
         page_size=page_size,
         total_pages=total_pages,
         new_match_count=new_match_count,
     )
-
-
-@app.get("/api/consultants", response_model=List[ConsultantResponse])
-async def get_consultants(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    result = await db.execute(select(Consultant))
-    return result.scalars().all()
 
 
 class UpdateMeRequest(BaseModel):

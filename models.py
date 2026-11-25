@@ -374,6 +374,7 @@ class ConsultantExperience(Base):
         "REMOTE",            # fully remote, no office presence
         "ONSITE",            # fully onsite at client location
         "HYBRID",            # mix of remote and onsite
+        "TRAVEL_REQUIRED",   # periodic travel required
     }
 
     @validates("work_mode")
@@ -896,6 +897,8 @@ class ApplicationsDetailView(Base):
     
     recruiter_name = Column(Text)
     recruiter_email = Column(Text)
+    requirement_account_email = Column(Text)
+    requirement_mode = Column(Text)
 
 
 # ---------------------------------------------------------------------------

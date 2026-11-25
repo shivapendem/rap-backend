@@ -24,7 +24,7 @@
 #   POST /api/admin/resumes/generate         trigger resume generation (admin/recruiter)
 #
 # WebSocket:
-#   WS   /api/ws/dashboard                  real-time events via Redis pub/sub
+#   WS   /api/ws/dashboard                  real-time events via WebSocket
 #
 # NOTE on enum casing: the two frontend type files disagree on casing for the
 # same concepts (types/consultant.ts uses "REMOTE"/"C2C" upper-case; lib/types/
@@ -322,6 +322,7 @@ async def _check_apply_eligibility(
     preloaded_consultant: Optional[Consultant] = None,
     preloaded_match: Optional[RequirementConsultantMatch] = "_unset",
     preloaded_has_sent_application: Optional[bool] = None,
+    preloaded_profile: Optional[tuple] = None,
 ) -> tuple[bool, str]:
     """
     Phase 5 spec — 6 eligibility checks for Apply button visibility.
@@ -396,6 +397,15 @@ async def _check_apply_eligibility(
     # Check 5: Base resume uploaded
     if not consultant.base_resume_file_path:
         return False, "Base resume is missing"
+
+    # Check 6: Profile 100% complete (applications are blocked below that)
+    try:
+        from phase3 import consultant_profile_completeness, PROFILE_COMPLETE_MIN_PCT
+        _pct, _missing = preloaded_profile if preloaded_profile is not None else await consultant_profile_completeness(db, consultant)
+        if _pct < PROFILE_COMPLETE_MIN_PCT:
+            return False, f"Profile is {_pct}% complete (missing: {', '.join(_missing)})"
+    except Exception:
+        pass  # never block on a failed check; the send endpoints enforce it too
 
     return True, "Allowed"
 
@@ -840,11 +850,11 @@ async def get_consultant_requirements(
 
     base_q = base_q.where(and_(*filters))
 
-    count_q = select(func.count()).select_from(
-        select(RequirementConsultantMatch.id)
+    count_q = (
+        select(func.count(RequirementConsultantMatch.id))
+        .select_from(RequirementConsultantMatch)
         .join(Requirement, Requirement.id == RequirementConsultantMatch.requirement_id)
         .where(and_(*filters))
-        .subquery()
     )
     total = (await db.execute(count_q)).scalar_one()
 
@@ -857,20 +867,9 @@ async def get_consultant_requirements(
     ).all()
 
     # Batch-load: which requirement_ids has this consultant already SENT an
-    # application for? One query for the whole page instead of one per row.
+    # application for, and when? One query for the whole page instead of two.
     page_requirement_ids = [req.id for _, req, _ in results]
     sent_application_req_ids: set[int] = set()
-    if page_requirement_ids:
-        sent_rows = (await db.execute(
-            select(Application.requirement_id).where(
-                Application.consultant_id == consultant.id,
-                Application.requirement_id.in_(page_requirement_ids),
-                Application.status == "SENT",
-            )
-        )).scalars().all()
-        sent_application_req_ids = set(sent_rows)
-
-    # Batch-load sent_at for appliedAt field
     sent_at_by_req: dict[int, str] = {}
     if page_requirement_ids:
         sent_at_rows = (await db.execute(
@@ -880,6 +879,7 @@ async def get_consultant_requirements(
                 Application.status == "SENT",
             )
         )).all()
+        sent_application_req_ids = {rid for rid, _ in sent_at_rows}
         sent_at_by_req = {rid: sent_at.isoformat() if sent_at else None for rid, sent_at in sent_at_rows}
 
     # Batch-load manually-authored resumes for JD-less requirements — the
@@ -1280,6 +1280,15 @@ async def get_consultant_requirements_for_recruiter(
         )).scalars().all()
         sent_application_req_ids = set(sent_rows)
 
+    # Same consultant on every row: compute profile completeness once.
+    _profile_once = None
+    if results:
+        try:
+            from phase3 import consultant_profile_completeness
+            _profile_once = await consultant_profile_completeness(db, consultant)
+        except Exception:
+            _profile_once = None
+
     data: List[ConsultantFilteredRequirementResponse] = []
     for req, match, resume in results:
         can_apply, _reason = await _check_apply_eligibility(
@@ -1288,6 +1297,7 @@ async def get_consultant_requirements_for_recruiter(
             preloaded_consultant=consultant,
             preloaded_match=match,
             preloaded_has_sent_application=req.id in sent_application_req_ids,
+            preloaded_profile=_profile_once,
         )
         resume_status = "ready" if (resume and resume.generation_status == "COMPLETED") else "not_generated"
 
@@ -1872,17 +1882,19 @@ async def get_recruiter_applications(
 
     if status_clause is not None:
         filters.append(status_clause)
+        _vals = {v.strip().upper() for v in status.split(",") if v.strip()}
+        if "FAILED" in _vals:
+            _vals.add("QUEUED")
+        total = sum(_by_status.get(s, 0) for s in _vals)
+    else:
+        total = status_counts["ALL"]
 
     if filters:
-        base_filter = and_(*filters)
-        q = q.where(base_filter)
-        count_q = count_q.where(base_filter)
+        q = q.where(and_(*filters))
 
-    total = (await db.execute(count_q)).scalar_one()
-
-    order_col = Application.sent_at.asc().nullslast() if sort_dir == "asc" else Application.sent_at.desc().nullslast()
+    order_col = _when.asc().nullslast() if sort_dir == "asc" else _when.desc().nullslast()
     results = (await db.execute(
-        q.order_by(order_col)
+        q.order_by(order_col, Application.id.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )).all()
 
@@ -2211,36 +2223,13 @@ async def dashboard_stats(
 # WebSocket — real-time dashboard events
 # ===========================================================================
 
-# In-memory connection registry (Redis pub/sub with fallback)
+# In-memory WebSocket connection registry
 _ws_connections: Set[WebSocket] = set()
-
-
-_broadcast_redis_client = None
-
-
-async def _get_broadcast_redis_client():
-    """Lazily create the Redis client used for publishing dashboard
-    events, once, and reuse it across every _broadcast_event call.
-    Previously a brand new connection was opened and torn down
-    (from_url + aclose) on every single broadcast — real per-call
-    overhead on top of the connection setup itself. If the cached client
-    is ever unusable (e.g. Redis restarted), the caller's own try/except
-    already handles that by falling back to in-memory broadcast, and a
-    fresh client gets created on the next call since the module-level
-    reference is cleared here whenever a publish fails."""
-    global _broadcast_redis_client
-    if _broadcast_redis_client is None:
-        import os
-        import redis.asyncio as aioredis
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        _broadcast_redis_client = await aioredis.from_url(redis_url, decode_responses=True)
-    return _broadcast_redis_client
 
 
 async def _broadcast_event(event_type: str, payload: dict):
     """
-    Broadcast event to all connected WebSocket clients.
-    Tries Redis pub/sub first, falls back to in-memory broadcast.
+    Broadcast event directly to all connected WebSocket clients in-memory.
     """
     message = json.dumps({
         "event": event_type,
@@ -2248,19 +2237,6 @@ async def _broadcast_event(event_type: str, payload: dict):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
-    # Try Redis pub/sub
-    try:
-        global _broadcast_redis_client
-        r = await _get_broadcast_redis_client()
-        await r.publish("dashboard_events", message)
-        return
-    except Exception:
-        # Clear the cached client so a genuinely dead connection (e.g.
-        # Redis restarted) doesn't keep failing forever — the next call
-        # creates a fresh one.
-        _broadcast_redis_client = None
-
-    # Fallback: broadcast directly to connected clients
     dead = set()
     for ws in list(_ws_connections):
         try:
@@ -2307,29 +2283,6 @@ async def dashboard_websocket(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }))
 
-    # Try Redis subscription
-    redis_task = None
-    try:
-        import redis.asyncio as aioredis
-        import os
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-        async def redis_listener():
-            r = await aioredis.from_url(redis_url, decode_responses=True)
-            pubsub = r.pubsub()
-            await pubsub.subscribe("dashboard_events")
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    try:
-                        await websocket.send_text(message["data"])
-                    except Exception:
-                        break
-            await r.aclose()
-
-        redis_task = asyncio.create_task(redis_listener())
-    except Exception:
-        pass  # Fall back to in-memory broadcast
-
     try:
         while True:
             msg = await websocket.receive_text()
@@ -2339,5 +2292,3 @@ async def dashboard_websocket(
         logger.info(f"WS disconnected: {payload.get('sub')}")
     finally:
         _ws_connections.discard(websocket)
-        if redis_task:
-            redis_task.cancel()
