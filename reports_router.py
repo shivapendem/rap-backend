@@ -4,6 +4,7 @@ from sqlalchemy.future import select
 from sqlalchemy import func
 from database import get_db
 from models import Email, Application, EmailQueue, User, Consultant, Requirement
+from account_mode import load_account_modes, public_clause, private_clause
 from auth import get_current_user
 from pydantic import BaseModel
 from typing import List, Optional
@@ -92,6 +93,15 @@ class StatusCounts(BaseModel):
 
 class AdminReportResponse(BaseModel):
     emails_processed: int
+    # "Requirements Received" card: emails_processed = public + private.
+    # ADMIN: private = every Private Gmail account (or only the picked
+    # recruiters' own Private Gmail when the Recruiter filter is on).
+    # RECRUITER: private = their own Private Gmail only.
+    # CONSULTANT: both None (card stays a system-wide total).
+    emails_processed_public: Optional[int] = None
+    emails_processed_private: Optional[int] = None
+    # "all" | "own" | "recruiters" — tells the UI how to label Private.
+    emails_processed_private_scope: Optional[str] = None
     jobs_applied: int
     emails_sent: int
     applications_per_user: List[UserReportStat]
@@ -118,6 +128,10 @@ class AdminReportResponse(BaseModel):
 async def get_admin_reports(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    # Admin-only filters (comma-separated ids). consultant_ids = consultants
+    # the applications were made for; recruiter_ids = users who sent them.
+    consultant_ids: Optional[str] = Query(None),
+    recruiter_ids: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -163,6 +177,81 @@ async def get_admin_reports(
         own_consultant = cons_res.scalars().first()
         own_consultant_id = own_consultant.id if own_consultant else None
 
+    def _ids(raw: Optional[str]) -> List[int]:
+        return [int(p) for p in (raw or "").split(",") if p.strip().isdigit()]
+
+    # Reporting page Consultant / Recruiter dropdowns — admin only; the
+    # cards and the User Activity table both follow them.
+    f_cons = _ids(consultant_ids) if current_user.role == "ADMIN" else []
+    f_recs = _ids(recruiter_ids) if current_user.role == "ADMIN" else []
+
+    def _scope_apps(q):
+        if current_user.role == "RECRUITER":
+            q = q.where(Application.recruiter_id == current_user.id)
+        elif current_user.role == "CONSULTANT":
+            q = q.where(Application.consultant_id == (own_consultant_id or -1))
+        if f_cons:
+            q = q.where(Application.consultant_id.in_(f_cons))
+        if f_recs:
+            q = q.where(Application.recruiter_id.in_(f_recs))
+        return q
+
+    def _scope_queue(q):
+        if current_user.role == "RECRUITER":
+            q = q.where(EmailQueue.sent_by_user_id == current_user.id)
+        elif current_user.role == "CONSULTANT":
+            q = q.where(EmailQueue.consultant_id == (own_consultant_id or -1))
+        if f_cons:
+            q = q.where(EmailQueue.consultant_id.in_(f_cons))
+        if f_recs:
+            q = q.where(EmailQueue.sent_by_user_id.in_(f_recs))
+        return q
+
+    # 1b. Requirements Received — counts REQUIREMENTS only (one row per
+    # de-duplicated requirement), not every parsed email (non-requirement
+    # emails, application replies etc. are not counted). Split into
+    # Public + Private with the same rule the Requirements screen uses
+    # (account_mode: the Gmail account's mode decides). Overrides
+    # emails_processed for ADMIN / RECRUITER; CONSULTANT keeps the old
+    # system-wide parsed-email figure.
+    emails_processed_public = None
+    emails_processed_private = None
+    emails_processed_private_scope = None
+    if current_user.role in ("ADMIN", "RECRUITER"):
+        _modes = await load_account_modes(db)
+        _req_day = func.coalesce(Requirement.received_date, Requirement.created_at)
+        _req_inbox = func.lower(func.trim(func.coalesce(Requirement.account_email, "")))
+
+        def _req_count(*conds):
+            q = select(func.count()).select_from(Requirement).where(*conds)
+            if start_dt:
+                q = q.where(_req_day >= start_dt)
+            if end_dt:
+                q = q.where(_req_day <= end_dt)
+            return q
+
+        emails_processed_public = (await db.execute(_req_count(
+            public_clause(Requirement.mode, Requirement.account_email, _modes)
+        ))).scalar_one()
+
+        _priv = private_clause(Requirement.mode, Requirement.account_email, _modes)
+        if current_user.role == "ADMIN" and not f_recs:
+            emails_processed_private_scope = "all"
+            emails_processed_private = (await db.execute(_req_count(_priv))).scalar_one()
+        else:
+            if current_user.role == "RECRUITER":
+                _own = [current_user.email or ""]
+                emails_processed_private_scope = "own"
+            else:
+                _own = (await db.execute(select(User.email).where(User.id.in_(f_recs)))).scalars().all()
+                emails_processed_private_scope = "recruiters"
+            _own_norm = sorted({(e or "").lower().strip() for e in _own if (e or "").strip()})
+            emails_processed_private = (
+                (await db.execute(_req_count(_priv, _req_inbox.in_(_own_norm)))).scalar_one()
+                if _own_norm else 0
+            )
+        emails_processed = emails_processed_public + emails_processed_private
+
     # 2. Jobs Applied (Applications)
     # BUG FIX: was counting every Application row regardless of status
     # (PENDING/FAILED included) — "Jobs Applied" should mean applications
@@ -173,12 +262,8 @@ async def get_admin_reports(
         app_query = app_query.where(Application.sent_at >= start_dt)
     if end_dt:
         app_query = app_query.where(Application.sent_at <= end_dt)
-    if current_user.role == "RECRUITER":
-        app_query = app_query.where(Application.recruiter_id == current_user.id)
-    elif current_user.role == "CONSULTANT":
-        # No Consultant row for this user yet (shouldn't normally happen)
-        # — force zero rows rather than accidentally returning org-wide.
-        app_query = app_query.where(Application.consultant_id == (own_consultant_id or -1))
+    # Role scope + Consultant/Recruiter filters (no Consultant row → -1 → zero rows).
+    app_query = _scope_apps(app_query)
     jobs_applied = (await db.execute(app_query)).scalar_one()
 
     # 2b. Daily activity — same scope/filters as jobs_applied, bucketed per
@@ -191,23 +276,13 @@ async def get_admin_reports(
         day_query = day_query.where(Application.sent_at >= start_dt)
     if end_dt:
         day_query = day_query.where(Application.sent_at <= end_dt)
-    if current_user.role == "RECRUITER":
-        day_query = day_query.where(Application.recruiter_id == current_user.id)
-    elif current_user.role == "CONSULTANT":
-        day_query = day_query.where(Application.consultant_id == (own_consultant_id or -1))
+    day_query = _scope_apps(day_query)
     _day_counts: Counter = Counter()
     for (ts,) in (await db.execute(day_query)).all():
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=datetime.timezone.utc)
         _day_counts[ts.astimezone(_cst).date().isoformat()] += 1
     daily_activity = [DailyActivity(date=d, applications=n) for d, n in sorted(_day_counts.items())]
-
-    def _scope_apps(q):
-        if current_user.role == "RECRUITER":
-            return q.where(Application.recruiter_id == current_user.id)
-        if current_user.role == "CONSULTANT":
-            return q.where(Application.consultant_id == (own_consultant_id or -1))
-        return q
 
     # 2c. Trend: the window of the same length right before the range.
     prev_jobs_applied = None
@@ -269,10 +344,7 @@ async def get_admin_reports(
             EmailQueue.created_at >= _p_start,
             EmailQueue.created_at < _p_end,
         )
-        if current_user.role == "RECRUITER":
-            _pq = _pq.where(EmailQueue.sent_by_user_id == current_user.id)
-        elif current_user.role == "CONSULTANT":
-            _pq = _pq.where(EmailQueue.consultant_id == (own_consultant_id or -1))
+        _pq = _scope_queue(_pq)
         prev_emails_sent = (await db.execute(_pq)).scalar_one()
 
     # 2d. Status breakdown (created_at because PENDING/FAILED have no sent_at).
@@ -314,10 +386,7 @@ async def get_admin_reports(
         queue_query = queue_query.where(EmailQueue.created_at >= start_dt)
     if end_dt:
         queue_query = queue_query.where(EmailQueue.created_at <= end_dt)
-    if current_user.role == "RECRUITER":
-        queue_query = queue_query.where(EmailQueue.sent_by_user_id == current_user.id)
-    elif current_user.role == "CONSULTANT":
-        queue_query = queue_query.where(EmailQueue.consultant_id == (own_consultant_id or -1))
+    queue_query = _scope_queue(queue_query)
     emails_sent = (await db.execute(queue_query)).scalar_one()
 
     # 4. User Stats (Applications per user).
@@ -352,6 +421,10 @@ async def get_admin_reports(
         )
         if not is_admin:
             stats_query = stats_query.where(User.id == current_user.id)
+        if f_cons:
+            stats_query = stats_query.where(Application.consultant_id.in_(f_cons))
+        if f_recs:
+            stats_query = stats_query.where(User.id.in_(f_recs))
         if start_dt:
             stats_query = stats_query.where(Application.sent_at >= start_dt)
         if end_dt:
@@ -373,6 +446,10 @@ async def get_admin_reports(
         )
         if not is_admin:
             emails_query = emails_query.where(EmailQueue.sent_by_user_id == current_user.id)
+        if f_cons:
+            emails_query = emails_query.where(EmailQueue.consultant_id.in_(f_cons))
+        if f_recs:
+            emails_query = emails_query.where(EmailQueue.sent_by_user_id.in_(f_recs))
         if start_dt:
             emails_query = emails_query.where(EmailQueue.created_at >= start_dt)
         if end_dt:
@@ -401,6 +478,9 @@ async def get_admin_reports(
 
     return AdminReportResponse(
         emails_processed=emails_processed,
+        emails_processed_public=emails_processed_public,
+        emails_processed_private=emails_processed_private,
+        emails_processed_private_scope=emails_processed_private_scope,
         jobs_applied=jobs_applied,
         emails_sent=emails_sent,
         applications_per_user=applications_per_user,
