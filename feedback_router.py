@@ -252,6 +252,29 @@ async def create_feedback(
         ))
     await db.commit()
     await db.refresh(f)
+
+    # Tell the admins a recruiter / consultant submitted feedback. Best effort:
+    # notify_users never raises, and the guard below keeps any unexpected
+    # problem from affecting the 201 response (the feedback is already saved).
+    if reporter_role in ("RECRUITER", "CONSULTANT"):
+        try:
+            from notification_helper import notify_users
+            admin_ids = (await db.execute(
+                select(User.id).where(User.role == "ADMIN", User.is_authorized == True)
+            )).scalars().all()
+            await notify_users(
+                db, admin_ids,
+                "New feedback",
+                f"{reporter_name} ({reporter_role.title()}) submitted {_ref(f.id)} \u00b7 "
+                f"{ftype.title()}: {title_v}",
+            )
+        except Exception as e:
+            print(f"[feedback] could not notify admins: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
     out = _to_dict(f, full=True)
     out["images"] = await _image_list(db, f)
     return out
