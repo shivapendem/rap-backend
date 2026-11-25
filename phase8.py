@@ -304,7 +304,11 @@ class AdminStatsDTO(BaseModel):
     total_ai_cost_usd: float
 
 class DashboardReportSummaryDTO(BaseModel):
+    # Today (America/Chicago) only. emails_processed = real requirements
+    # (gmail_emails.status_desc = 'Parsed') = public + private.
     emails_processed: int = 0
+    emails_processed_public: int = 0
+    emails_processed_private: int = 0
     jobs_applied: int = 0
     emails_sent: int = 0
 
@@ -2099,24 +2103,57 @@ async def get_dashboard_summary(
         tokens_reset="End of Month"
     )
 
-    # 10. Reporting Summary (7 days)
-    rep_emails_processed = (await db.execute(
-        text("SELECT COUNT(*) FROM emails WHERE parse_status = 'PARSED' AND received_at >= :start_dt"),
-        {"start_dt": seven_days_ago}
-    )).scalar_one()
+    # 10. Reporting Summary (TODAY, America/Chicago — same "Today" as the
+    # Reporting page). Requirements = PARSED requirement emails only
+    # (gmail_emails.status_desc = 'Parsed'; no Parsed - NR / Parsed - Dup /
+    # Pending / Failed), split Public + Private with the account_mode rule —
+    # identical to reports_router's "Requirements Received" card.
+    from account_mode import load_account_modes
+    _modes = await load_account_modes(db)
+    _rp: dict = {"rr_start": today_start_utc}
+    _norm = "LOWER(TRIM(COALESCE(ge.account_email, '')))"
+
+    def _in_list(values, tag):
+        keys = []
+        for i, v in enumerate(sorted(values)):
+            k = f"rr_{tag}_{i}"
+            _rp[k] = v
+            keys.append(f":{k}")
+        return ", ".join(keys)
+
+    _priv_parts = []
+    if _modes.private:
+        _priv_parts.append(f"{_norm} IN ({_in_list(_modes.private, 'p')})")
+    _unlinked = "COALESCE(ge.mode, 'public') <> 'public'"
+    if _modes.known:
+        _unlinked = f"({_unlinked} AND {_norm} NOT IN ({_in_list(_modes.known, 'k')}))"
+    _priv_parts.append(_unlinked)
+    _priv_sql = "(" + " OR ".join(_priv_parts) + ")"
+
+    _rr = (await db.execute(text(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE NOT {_priv_sql}) AS pub,
+            COUNT(*) FILTER (WHERE {_priv_sql}) AS priv
+        FROM gmail_emails ge
+        WHERE ge.status_desc = 'Parsed' AND ge.date >= :rr_start
+    """), _rp)).one()
+    rep_public = int(_rr.pub or 0)
+    rep_private = int(_rr.priv or 0)
 
     rep_jobs_applied = (await db.execute(
         select(func.count()).select_from(Application)
-        .where(Application.status == "SENT", Application.sent_at >= seven_days_ago)
+        .where(Application.status == "SENT", Application.sent_at >= today_start_utc)
     )).scalar_one()
 
     rep_emails_sent = (await db.execute(
         select(func.count()).select_from(EmailQueue)
-        .where(EmailQueue.status == "SENT", EmailQueue.created_at >= seven_days_ago)
+        .where(EmailQueue.status == "SENT", EmailQueue.created_at >= today_start_utc)
     )).scalar_one()
 
     reports_summary_dto = DashboardReportSummaryDTO(
-        emails_processed=rep_emails_processed,
+        emails_processed=rep_public + rep_private,
+        emails_processed_public=rep_public,
+        emails_processed_private=rep_private,
         jobs_applied=rep_jobs_applied,
         emails_sent=rep_emails_sent,
     )
