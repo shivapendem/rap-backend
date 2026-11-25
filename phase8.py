@@ -38,7 +38,21 @@ from models import (
 )
 from phase8_audit_service import log_action, build_metadata_preview, describe_audit_rows
 from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost
-from phase8_cache import check_redis_health
+# Redis health check for the System health card (was phase8_cache.py,
+# which was deleted). Optional: Redis being down never breaks the app.
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+
+async def check_redis_health() -> bool:
+    try:
+        import redis.asyncio as aioredis
+        r = await aioredis.from_url(REDIS_URL, decode_responses=True)
+        await r.ping()
+        await r.aclose()
+        return True
+    except Exception as e:
+        logging.getLogger("rap.cache").warning(f"Redis health check failed: {e}")
+        return False
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
 
