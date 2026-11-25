@@ -579,6 +579,13 @@ def resolve_notification_meta(title: str, role: str, body: str = None):
                 m = re.search(r"queue #(\d+)", body or "")
                 if m:
                     link += f"&highlight={m.group(1)}"
+            if ntype == "feedback" and link:
+                # Open the All feedback tab and highlight the submitted row
+                # (the body carries its ref, e.g. "FB-0007").
+                link += "?tab=all"
+                m = re.search(r"FB-(\d+)", body or "")
+                if m:
+                    link += f"&highlight={int(m.group(1))}"
             return ntype, link
     return "general", None
 
