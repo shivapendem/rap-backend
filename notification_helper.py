@@ -558,6 +558,7 @@ _NOTIFICATION_RULES = [
     ("gmail not connected", "gmail_status", _QUEUE_LINK),
     ("gmail disconnected", "gmail_status", {"RECRUITER": "/recruiter/consultants"}),
     ("complete your profile", "profile", {"CONSULTANT": "/consultant/profile"}),
+    ("new feedback", "feedback", {"ADMIN": "/admin/feedback"}),
 ]
 
 
