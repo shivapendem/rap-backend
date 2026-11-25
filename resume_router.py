@@ -14,6 +14,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import true, func, or_, and_
+from sqlalchemy.orm import load_only
 
 from database import get_db
 from models import User, Resume, ConsultantExperience, Consultant, RecruiterConsultant
@@ -190,6 +191,10 @@ class ResumeResponse(BaseModel):
     jd_matched_count: Optional[int] = None
     jd_total: Optional[int] = None
     jd_missing: List[str] = []
+    # PERF (Apply screen): /list?requirement_id=… drops the heavy `data`
+    # JSON and job_description from each row; this flag tells the page
+    # whether the resume has structured content (which editor to open).
+    has_structured_data: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -1174,6 +1179,8 @@ async def list_resumes(
     base_resume_text = ""
 
     # generate s3_url for each resume
+    # PERF: the Apply screen (requirement_id) never uses s3_url — skip the
+    # per-resume presign there.
     response_data = []
     for r in resumes:
         r_dict = {
@@ -1185,7 +1192,7 @@ async def list_resumes(
             "job_description": r.job_description,
             "data": r.data or {},
             "s3_key": r.s3_key,
-            "s3_url": generate_presigned_url(r.s3_key) if r.s3_key else None,
+            "s3_url": generate_presigned_url(r.s3_key) if (r.s3_key and not requirement_id) else None,
             "ats_score": r.ats_score,
             "status": r.status,
             "download_count": r.download_count,
@@ -1277,6 +1284,14 @@ async def list_resumes(
             await log_db_error(stage="jd_match_scoring", error=e)
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         response.headers["X-Score-Ms"] = str(elapsed_ms)
+
+        # PERF: Apply screen only needs title/role/dates/scores — drop the
+        # full resume JSON and JD text from the payload (scored above).
+        for item in response_data:
+            d = item.data or {}
+            item.has_structured_data = any(k != "raw_text" for k in d.keys())
+            item.data = {}
+            item.job_description = None
         logging.getLogger(__name__).info(
             "JD match: scored %d resumes for requirement %s in %s ms",
             len(response_data), requirement_id, elapsed_ms,
@@ -3495,6 +3510,17 @@ async def get_consultants_for_resumes(
 
     _matched_set = set(matched_consultant_ids or []) if (requirement_id and not consultant_id) else set()
 
+    # PERF: the dropdown needs only these columns — skip the heavy ones
+    # (base_resume_text / base_resume_content / education JSON etc.).
+    _lite = (
+        load_only(User.id, User.full_name, User.email, User.skills, User.experience_years,
+                  User.resume_info, User.linkedin_url),
+        load_only(Consultant.id, Consultant.user_id, Consultant.full_name, Consultant.primary_skills,
+                  Consultant.total_experience_years, Consultant.current_location,
+                  Consultant.work_authorization, Consultant.linkedin_url, Consultant.phone,
+                  Consultant.gmail_connected),
+    )
+
     # include_all (admin/recruiter Apply page): keep _matched_set above for
     # the matched flag, but stop restricting the query to matched ids, and
     # order matched consultants first (then A-Z within each group).
@@ -3544,7 +3570,7 @@ async def get_consultants_for_resumes(
         )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
-        results = (await db.execute(query)).all()
+        results = (await db.execute(query.options(*_lite))).all()
         return _matched_first(await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set))
     elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and all_consultants and not (requirement_id or consultant_id):
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
@@ -3552,7 +3578,7 @@ async def get_consultants_for_resumes(
             User.is_authorized == True,
             Consultant.status == "ACTIVE",
         )
-        results = (await db.execute(query)).all()
+        results = (await db.execute(query.options(*_lite))).all()
         return await _add_profile_flags(db, [map_user_consultant(u, c) for u, c in results])
     elif current_user.role == "RECRUITER" and RECRUITER_CAN_TARGET_ANY_CONSULTANT and (requirement_id or consultant_id):
         # Apply screen: EXACTLY the admin rule — the consultants matched to
@@ -3565,7 +3591,7 @@ async def get_consultants_for_resumes(
         )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
-        results = (await db.execute(query)).all()
+        results = (await db.execute(query.options(*_lite))).all()
         return _matched_first(await _with_applied_flag(
             db, requirement_id,
             [map_user_consultant(u, c) for u, c in results],
@@ -3584,7 +3610,7 @@ async def get_consultants_for_resumes(
         )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
-        results = (await db.execute(query)).all()
+        results = (await db.execute(query.options(*_lite))).all()
         return _matched_first(await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set))
     else:
         query = select(User, Consultant).join(Consultant, Consultant.user_id == User.id).where(
@@ -3595,7 +3621,7 @@ async def get_consultants_for_resumes(
         )
         if matched_consultant_ids is not None:
             query = query.where(Consultant.id.in_(matched_consultant_ids))
-        results = (await db.execute(query)).all()
+        results = (await db.execute(query.options(*_lite))).all()
         return await _with_applied_flag(db, requirement_id, [map_user_consultant(u, c) for u, c in results], matched_ids=_matched_set)
 
 @router.get("/{id}", response_model=ResumeResponse)

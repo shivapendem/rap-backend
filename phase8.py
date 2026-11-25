@@ -1986,7 +1986,12 @@ async def get_dashboard_summary(
     today_start_cst = now_cst.replace(hour=0, minute=0, second=0, microsecond=0)
     today_start_utc = today_start_cst.astimezone(timezone.utc)
     month_start_utc = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    five_min_ago_utc = now_utc - timedelta(minutes=5)
+    # gmail_emails.classified_at is `timestamp WITHOUT time zone` (UTC wall-clock).
+    # asyncpg refuses to encode a tz-AWARE datetime for a naive timestamp column
+    # ("can't subtract offset-naive and offset-aware datetimes"), which used to
+    # blow up the whole combined query below and silently zero every card.
+    # So this one parameter must be a NAIVE UTC datetime.
+    five_min_ago_utc = (now_utc - timedelta(minutes=5)).replace(tzinfo=None)
 
     # Combined gmail_emails scan (ingested today, 7d processed, classifier health) in ONE query
     emails_ingested_today = 0
@@ -2027,6 +2032,10 @@ async def get_dashboard_summary(
             processed_last_5_min = int(ge_row["processed_5m"] or 0)
             last_classified_at = ge_row["last_classified"]
     except Exception:
+        # Never swallow this silently again: a failure here makes Emails Ingested
+        # Today / Classifier Status / Reporting Emails all read 0.
+        import logging
+        logging.getLogger(__name__).exception("dashboard-summary: gmail_emails aggregate query failed")
         await db.rollback()
         try:
             rep_emails_processed = (await db.execute(
@@ -2107,7 +2116,8 @@ async def get_dashboard_summary(
         openai_cost = summary["cost_usd"]
         openai_total_tokens = summary["tokens"]
     except Exception:
-        pass
+        import logging
+        logging.getLogger(__name__).exception("dashboard-summary: OpenAI usage fetch failed")
 
     ai_cost_month_usd = round(float(claude_cost or 0) + float(openai_cost or 0), 2)
 
