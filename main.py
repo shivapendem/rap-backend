@@ -260,8 +260,7 @@ async def _connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
     for attempt in range(1, max_attempts + 1):
         try:
             async with engine.begin() as conn:
-                _tables = [t for t in Base.metadata.sorted_tables if not t.name.startswith("v_")]
-                await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_tables))
+                await conn.run_sync(Base.metadata.create_all)
             return
         except Exception as e:
             last_err = e
@@ -341,34 +340,6 @@ async def lifespan(app: FastAPI):
             print("Successfully synchronized gmail_connected state with active tokens.")
         except Exception as sync_err:
             print(f"Failed to synchronize gmail_connected state on startup: {sync_err}")
-
-        # High-concurrency composite indexes & pre-joined database views:
-        # NOTE: optimization_queries.sql contains 87 CREATE/DROP INDEX and CREATE VIEW DDL statements.
-        # Running these synchronously inside the FastAPI lifespan startup blocks server boot (uvicorn / PM2)
-        # while taking Exclusive table locks against active cron workers or remote DB traffic.
-        # To avoid blocking application startup, it is executed out-of-band via background task or manual migration.
-        if os.getenv("RUN_DB_OPTIMIZATIONS_ON_STARTUP", "false").lower() in ("true", "1") and DATABASE_URL.startswith("postgresql"):
-            _opt_sql_path = os.path.join(os.path.dirname(__file__), "optimization_queries.sql")
-            if os.path.exists(_opt_sql_path):
-                try:
-                    with open(_opt_sql_path, "r", encoding="utf-8") as _f:
-                        _raw_sql = _f.read()
-                    _clean_lines = [
-                        line for line in _raw_sql.splitlines()
-                        if not line.strip().startswith("--")
-                    ]
-                    for _stmt in "\n".join(_clean_lines).split(";"):
-                        _stmt_str = _stmt.strip()
-                        if _stmt_str:
-                            try:
-                                await session.execute(text(_stmt_str))
-                                await session.commit()
-                            except Exception as _ddl_err:
-                                await session.rollback()
-                                print(f"[db-opt] skipped statement ({_ddl_err})")
-                    print("[db-opt] Applied optimization_queries.sql indexes and views.")
-                except Exception as idx_err:
-                    print(f"[db-opt] Failed loading optimization_queries.sql: {idx_err}")
 
     # BUG FIX ("Gmail status not updated until server restart"): the UPDATE
     # above only reconciles gmail_connected once, at boot. Install DB
@@ -519,7 +490,7 @@ async def record_api_latency_middleware(request, call_next):
 # Phase 2 router — requirement detail/status/stats, pipeline endpoints
 # ---------------------------------------------------------------------------
 from phase2 import router as phase2_router  # noqa: E402
-from account_mode import load_account_modes, public_clause, public_or_own_clause, effective_mode  # noqa: E402
+from account_mode import load_account_modes, public_clause, private_clause, public_or_own_clause, effective_mode  # noqa: E402
 app.include_router(phase2_router)
 
 # ---------------------------------------------------------------------------
@@ -687,7 +658,7 @@ async def login(
             metadata={"full_name": user.full_name, "email": user.email, "role": user.role},
         )
     except Exception as e:
-        print(f"[login-audit] FAILED: {e}")
+        logger.warning(f"[login-audit] FAILED: {e}")
 
     await db.commit()
 
@@ -1114,7 +1085,6 @@ async def get_requirements(
     # RequirementConsultantMatch.created_at within matched_days).
     matched_only: bool = False,
     matched_days: int = 7,
-    confidence_filter: Optional[str] = None,
     employment_type: Optional[str] = None,
     # BUG FIX: Requirements page had no way to filter by matched
     # consultant at all — mirrors the same comma-separated-ids pattern
@@ -1129,6 +1099,10 @@ async def get_requirements(
     # Scoped to the caller (own matches / own roster / everyone for admin).
     matched_since: Optional[str] = None,
     matched_since_only: bool = False,
+    # All Requirements "All / Public / Private" toggle. Omitted or "all" =
+    # no filter. Applied on top of the role scoping below, so a recruiter's
+    # "private" is still only private requirements from their own Gmail.
+    visibility: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1170,19 +1144,8 @@ async def get_requirements(
     # not-eligible matches stay hidden).
     # Also enforce mode scoping: public requirements + private requirements from
     # their assigned recruiter(s) or their own email.
-    _modes = await load_account_modes(db)  # mode lives on gmail_accounts (no per-row copy rewrite)
-    own_consultant: Optional[Consultant] = None
-    assigned_ids: list[int] = []
-    if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
-        assigned_ids = [
-            row[0] for row in (await db.execute(
-                select(RecruiterConsultant.consultant_id).where(
-                    RecruiterConsultant.recruiter_id == current_user.id,
-                    RecruiterConsultant.is_active == True,
-                )
-            )).all()
-        ]
     if current_user.role == "CONSULTANT":
+        _modes = await load_account_modes(db)  # mode lives on gmail_accounts (no per-row copy rewrite)
         own_consultant = (await db.execute(
             select(Consultant).where(Consultant.user_id == current_user.id)
         )).scalars().first()
@@ -1226,9 +1189,19 @@ async def get_requirements(
         # Mode scoping for recruiter:
         # Recruiter sees all public requirements + private requirements received on their own email
         user_email = (current_user.email or "").lower().strip()
+        _modes = await load_account_modes(db)
         query = query.where(
             public_or_own_clause(Requirement.mode, Requirement.account_email, _modes, user_email)
         )
+    _vis = (visibility or "").strip().lower()
+    if _vis in ("public", "private"):
+        _vis_modes = await load_account_modes(db)
+        query = query.where(
+            public_clause(Requirement.mode, Requirement.account_email, _vis_modes)
+            if _vis == "public"
+            else private_clause(Requirement.mode, Requirement.account_email, _vis_modes)
+        )
+
     if matched_only:
         since = datetime.now(timezone.utc) - timedelta(days=matched_days)
         matched_subq = select(RequirementConsultantMatch.requirement_id).where(
@@ -1242,9 +1215,13 @@ async def get_requirements(
         # check — "matched" and "matched to you" silently disagreed.
         # Scope to the caller's own matches when they're a consultant.
         if current_user.role == "CONSULTANT":
-            if own_consultant:
+            cons_result = await db.execute(
+                select(Consultant).where(Consultant.user_id == current_user.id)
+            )
+            consultant = cons_result.scalars().first()
+            if consultant:
                 matched_subq = matched_subq.where(
-                    RequirementConsultantMatch.consultant_id == own_consultant.id
+                    RequirementConsultantMatch.consultant_id == consultant.id
                 )
             else:
                 # No consultant profile at all — no matches are possible.
@@ -1281,7 +1258,12 @@ async def get_requirements(
             # column (that column is roster-scoped further down).
             if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
                 matched_consultant_subq = matched_consultant_subq.where(
-                    RequirementConsultantMatch.consultant_id.in_(assigned_ids)
+                    RequirementConsultantMatch.consultant_id.in_(
+                        select(RecruiterConsultant.consultant_id).where(
+                            RecruiterConsultant.recruiter_id == current_user.id,
+                            RecruiterConsultant.is_active == True,
+                        )
+                    )
                 )
             query = query.where(Requirement.id.in_(matched_consultant_subq))
 
@@ -1301,9 +1283,10 @@ async def get_requirements(
             RequirementConsultantMatch.status.in_(("MATCHING", "APPLIED")),
         ]
         if current_user.role == "CONSULTANT":
-            _nm_where.append(RequirementConsultantMatch.consultant_id == (own_consultant.id if own_consultant else -1))
-        elif current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
-            _nm_where.append(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
+            _own = (await db.execute(
+                select(Consultant.id).where(Consultant.user_id == current_user.id)
+            )).scalar_one_or_none()
+            _nm_where.append(RequirementConsultantMatch.consultant_id == (_own if _own else -1))
         elif current_user.role == "RECRUITER":
             _nm_where.append(RequirementConsultantMatch.consultant_id.in_(
                 select(RecruiterConsultant.consultant_id).where(
@@ -1319,26 +1302,6 @@ async def get_requirements(
         )).scalar_one() or 0)
         if matched_since_only:
             query = query.where(Requirement.id.in_(new_match_subq))
-
-    # BUG FIX: the FilterBar (admin Requirements page) has always sent
-    # confidence_filter and employment_type as real query params, but this
-    # endpoint never declared or read either one — FastAPI silently drops
-    # unrecognized query params rather than erroring, so both filters were
-    # completely non-functional: picking "Low confidence" or an employment
-    # type and clicking Apply returned the exact same unfiltered list.
-    # confidence_filter: "low" (< 0.5, the original value) or a comma-separated
-    # mix of low / medium (0.5 to < 0.8) / high (>= 0.8) — multi-select.
-    if confidence_filter:
-        _conf = {x.strip().lower() for x in confidence_filter.split(",") if x.strip()}
-        _conf_clauses = []
-        if "low" in _conf:
-            _conf_clauses.append(Requirement.parse_confidence < 0.5)
-        if "medium" in _conf:
-            _conf_clauses.append(and_(Requirement.parse_confidence >= 0.5, Requirement.parse_confidence < 0.8))
-        if "high" in _conf:
-            _conf_clauses.append(Requirement.parse_confidence >= 0.8)
-        if _conf_clauses:
-            query = query.where(or_(*_conf_clauses))
 
     # work_mode: one value or a comma-separated list (multi-select).
     if work_mode:
@@ -1415,7 +1378,7 @@ async def get_requirements(
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid date_to format")
 
-    count_query = query.with_only_columns(func.count(Requirement.id)).order_by(None)
+    count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar_one()
 
     actual_sort = "received_date" if sort_by == "received_at" else sort_by
@@ -1461,6 +1424,13 @@ async def get_requirements(
             )
         )
         if current_user.role == "RECRUITER" and not RECRUITER_CAN_TARGET_ANY_CONSULTANT:
+            assigned_result = await db.execute(
+                select(RecruiterConsultant.consultant_id).where(
+                    RecruiterConsultant.recruiter_id == current_user.id,
+                    RecruiterConsultant.is_active == True,
+                )
+            )
+            assigned_ids = [row[0] for row in assigned_result.all()]
             matches_q = matches_q.where(RequirementConsultantMatch.consultant_id.in_(assigned_ids))
 
         # BUG FIX: when the caller filtered by specific consultant(s) via
@@ -1617,11 +1587,15 @@ async def get_requirements(
     # "Applied" badge instead of always showing "Apply", regardless of
     # whether it was actually sent.
     if current_user.role == "CONSULTANT" and reqs:
-        if own_consultant:
+        cons_result = await db.execute(
+            select(Consultant).where(Consultant.user_id == current_user.id)
+        )
+        consultant = cons_result.scalars().first()
+        if consultant:
             req_ids = [r.id for r in reqs]
             applied_result = await db.execute(
                 select(Application.requirement_id).where(
-                    Application.consultant_id == own_consultant.id,
+                    Application.consultant_id == consultant.id,
                     Application.requirement_id.in_(req_ids),
                     Application.status == "SENT",
                 )
@@ -1630,14 +1604,24 @@ async def get_requirements(
             for r in reqs:
                 r.already_applied = r.id in applied_ids
 
+    _live_modes = await load_account_modes(db)  # live Public/Private from gmail_accounts
     return PaginatedRequirements(
-        data=[_serialize_requirement(r, _modes) for r in reqs],
+        data=[_serialize_requirement(r, _live_modes) for r in reqs],
         total=total,
         page=page,
         page_size=page_size,
         total_pages=total_pages,
         new_match_count=new_match_count,
     )
+
+
+@app.get("/api/consultants", response_model=List[ConsultantResponse])
+async def get_consultants(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Consultant))
+    return result.scalars().all()
 
 
 class UpdateMeRequest(BaseModel):

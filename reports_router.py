@@ -226,37 +226,42 @@ async def get_admin_reports(
             q = q.where(EmailQueue.sent_by_user_id.in_(f_recs))
         return q
 
-    # 1b. Requirements Received — counts REQUIREMENTS only (one row per
-    # de-duplicated requirement), not every parsed email (non-requirement
-    # emails, application replies etc. are not counted). Split into
-    # Public + Private with the same rule the Requirements screen uses
-    # (account_mode: the Gmail account's mode decides). Overrides
-    # emails_processed for ADMIN / RECRUITER; CONSULTANT keeps the old
-    # system-wide parsed-email figure.
+    # 1b. Requirements Received = PARSED requirement emails only
+    # (gmail_emails.status_desc = 'Parsed') — the same number as the Gmail
+    # Ingestion page's "Parsed" count. Not counted: Parsed - NR (not a
+    # requirement), Parsed - Dup (duplicate), Pending, Failed. Dated by the
+    # email's own date (same column the Gmail page filters on) and split
+    # Public + Private with the account_mode rule. Overrides
+    # emails_processed for ADMIN / RECRUITER; CONSULTANT keeps the
+    # system-wide figure above.
     emails_processed_public = None
     emails_processed_private = None
     emails_processed_private_scope = None
     if current_user.role in ("ADMIN", "RECRUITER"):
         _modes = await load_account_modes(db)
-        _req_day = func.coalesce(Requirement.received_date, Requirement.created_at)
-        _req_inbox = func.lower(func.trim(func.coalesce(Requirement.account_email, "")))
+        _p: dict = {}
+        _norm = "LOWER(TRIM(COALESCE(ge.account_email, '')))"
 
-        def _req_count(*conds):
-            q = select(func.count()).select_from(Requirement).where(*conds)
-            if start_dt:
-                q = q.where(_req_day >= start_dt)
-            if end_dt:
-                q = q.where(_req_day <= end_dt)
-            return q
+        def _in_list(values, tag):
+            keys = []
+            for i, v in enumerate(sorted(values)):
+                k = f"rr_{tag}_{i}"
+                _p[k] = v
+                keys.append(f":{k}")
+            return ", ".join(keys)
 
-        emails_processed_public = (await db.execute(_req_count(
-            public_clause(Requirement.mode, Requirement.account_email, _modes)
-        ))).scalar_one()
+        _priv_parts = []
+        if _modes.private:
+            _priv_parts.append(f"{_norm} IN ({_in_list(_modes.private, 'p')})")
+        _unlinked = "COALESCE(ge.mode, 'public') <> 'public'"
+        if _modes.known:
+            _unlinked = f"({_unlinked} AND {_norm} NOT IN ({_in_list(_modes.known, 'k')}))"
+        _priv_parts.append(_unlinked)
+        _priv_sql = "(" + " OR ".join(_priv_parts) + ")"
 
-        _priv = private_clause(Requirement.mode, Requirement.account_email, _modes)
         if current_user.role == "ADMIN" and not f_recs:
             emails_processed_private_scope = "all"
-            emails_processed_private = (await db.execute(_req_count(_priv))).scalar_one()
+            _own_sql = "TRUE"
         else:
             if current_user.role == "RECRUITER":
                 _own = [current_user.email or ""]
@@ -264,11 +269,25 @@ async def get_admin_reports(
             else:
                 _own = (await db.execute(select(User.email).where(User.id.in_(f_recs)))).scalars().all()
                 emails_processed_private_scope = "recruiters"
-            _own_norm = sorted({(e or "").lower().strip() for e in _own if (e or "").strip()})
-            emails_processed_private = (
-                (await db.execute(_req_count(_priv, _req_inbox.in_(_own_norm)))).scalar_one()
-                if _own_norm else 0
-            )
+            _own_norm = {(e or "").lower().strip() for e in _own if (e or "").strip()}
+            _own_sql = f"{_norm} IN ({_in_list(_own_norm, 'o')})" if _own_norm else "FALSE"
+
+        _where = ["ge.status_desc = 'Parsed'"]
+        if start_dt:
+            _where.append("ge.date >= :rr_start")
+            _p["rr_start"] = start_dt
+        if end_dt:
+            _where.append("ge.date <= :rr_end")
+            _p["rr_end"] = end_dt
+        _row = (await db.execute(text(f"""
+            SELECT
+                COUNT(*) FILTER (WHERE NOT {_priv_sql}) AS pub,
+                COUNT(*) FILTER (WHERE {_priv_sql} AND {_own_sql}) AS priv
+            FROM gmail_emails ge
+            WHERE {" AND ".join(_where)}
+        """), _p)).one()
+        emails_processed_public = int(_row.pub or 0)
+        emails_processed_private = int(_row.priv or 0)
         emails_processed = emails_processed_public + emails_processed_private
 
     # 2. Jobs Applied (Applications) + 2c. previous-window trend, in ONE

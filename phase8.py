@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, text, literal_column
+from sqlalchemy import select, func, and_, or_, text
 from sqlalchemy.future import select as fselect
 
 from database import get_db
@@ -36,8 +36,9 @@ from models import (
     AIUsageLog,
     AppSetting,
 )
-from phase8_audit_service import log_action, build_metadata_preview
+from phase8_audit_service import log_action, build_metadata_preview, describe_audit_rows
 from phase8_ai_usage_service import get_budget_threshold, set_budget_threshold, estimate_cost
+from phase8_cache import check_redis_health
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Phase 8 - Admin Monitoring"])
 
@@ -106,6 +107,15 @@ class AuditLogRowDTO(BaseModel):
     metadata_preview: str = ""
     ip_address: Optional[str] = None
     created_at: str
+    # Readable form (dashboard Recent activity / Audit Logs): actor's name,
+    # "assigned 8 consultants to" + target name + " · Surya P., +6",
+    # a tag label and Field/Before/After changes for the detail popup.
+    actor_display: Optional[str] = None
+    verb: Optional[str] = None
+    target: Optional[str] = None
+    extra: Optional[str] = None
+    tag: Optional[str] = None
+    changes: List[dict] = []
 
 
 class PaginatedAuditLogsDTO(BaseModel):
@@ -452,6 +462,15 @@ async def list_audit_logs(
         .offset((page - 1) * page_size).limit(page_size)
     )).scalars().all()
 
+    described = await describe_audit_rows(db, rows)
+
+    def _readable_preview(r):
+        d = described.get(r.id)
+        if not d:
+            return build_metadata_preview(r.meta)
+        # Details column = the sentence without the actor (shown separately).
+        return " ".join(p for p in (d["verb"], d["target"]) if p) + (d["extra"] or "")
+
     data = [
         AuditLogRowDTO(
             id=str(r.id),
@@ -460,9 +479,15 @@ async def list_audit_logs(
             action=r.action,
             entity_type=r.entity_type,
             entity_id=r.entity_id,
-            metadata_preview=build_metadata_preview(r.meta),
+            metadata_preview=_readable_preview(r),
             ip_address=r.ip_address,
             created_at=r.created_at.isoformat() if r.created_at else "",
+            actor_display=(described.get(r.id) or {}).get("actor_display"),
+            verb=(described.get(r.id) or {}).get("verb"),
+            target=(described.get(r.id) or {}).get("target"),
+            extra=(described.get(r.id) or {}).get("extra"),
+            tag=(described.get(r.id) or {}).get("tag"),
+            changes=(described.get(r.id) or {}).get("changes") or [],
         )
         for r in rows
     ]
@@ -594,7 +619,6 @@ async def list_applications(
             )
         )
     # Status counts for the "All Statuses" dropdown: every filter except status.
-    # Deriving `total` directly from `_by_status` avoids a second full COUNT(*) scan on v_applications_detail.
     _counts_q = select(ApplicationsDetailView.status, func.count(ApplicationsDetailView.application_id)).select_from(ApplicationsDetailView)
     if filters:
         _counts_q = _counts_q.where(and_(*filters))
@@ -610,11 +634,11 @@ async def list_applications(
     }
     if status_clause is not None:
         filters.append(status_clause)
-        total = sum(_by_status.get(s, 0) for s in _vals)
-    else:
-        total = status_counts["ALL"]
 
     base_filter = and_(*filters) if filters else True
+
+    count_q = select(func.count(ApplicationsDetailView.application_id)).select_from(ApplicationsDetailView).where(base_filter)
+    total = (await db.execute(count_q)).scalar_one()
 
     q = select(ApplicationsDetailView).where(base_filter)
     order = ApplicationsDetailView.created_at.desc() if sort_dir == "desc" else ApplicationsDetailView.created_at.asc()
@@ -625,19 +649,17 @@ async def list_applications(
         .limit(page_size)
     )).scalars().all()
 
-    # v_applications_detail (updated in optimization_queries.sql) already exposes
-    # consultant_email and error_message directly; only run fallback query if any row is missing them.
-    _missing_ids = [
-        r.application_id for r in results
-        if getattr(r, "consultant_email", None) is None and r.consultant_id is not None
-    ]
+    # consultant email + failure reason come straight from their own tables
+    # (one extra query for this page) so the v_applications_detail view
+    # doesn't need a migration.
+    _ids = [r.application_id for r in results]
     _extra = {}
-    if _missing_ids:
+    if _ids:
         from models import Application as _App, Consultant as _Cons
         _rows = (await db.execute(
             select(_App.id, _App.error_message, _Cons.email)
             .join(_Cons, _Cons.id == _App.consultant_id)
-            .where(_App.id.in_(_missing_ids))
+            .where(_App.id.in_(_ids))
         )).all()
         _extra = {r[0]: (r[1], r[2]) for r in _rows}
 
@@ -664,11 +686,8 @@ async def list_applications(
     data = [
         ApplicationSentRowDTO(
             resume_filename=_resume_name(row),
-            consultant_email=getattr(row, "consultant_email", None) or (_extra.get(row.application_id) or (None, None))[1],
-            error_message=(
-                (getattr(row, "error_message", None) or (_extra.get(row.application_id) or (None, None))[0])
-                if row.status == "FAILED" else None
-            ),
+            consultant_email=(_extra.get(row.application_id) or (None, None))[1],
+            error_message=((_extra.get(row.application_id) or (None, None))[0] if row.status == "FAILED" else None),
             id=str(row.application_id),
             timestamp=row.created_at.isoformat() if row.created_at else "",
             consultant_name=row.consultant_name if row.consultant_name else str(row.consultant_id),
@@ -720,14 +739,9 @@ async def create_application(
     _: dict = Depends(require_admin),
 ) -> ApplicationSentRowDTO:
     """Create a new application record. UI supplies required fields via payload."""
-    try:
-        cons_id = int(payload.consultant_id)
-        req_id = int(payload.requirement_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="consultant_id and requirement_id must be valid integer IDs")
     new_app = Application(
-        consultant_id=cons_id,
-        requirement_id=req_id,
+        consultant_id=payload.consultant_id,
+        requirement_id=payload.requirement_id,
         vendor_email=payload.vendor_email,
         status=payload.status,
         ats_score_at_send=payload.ats_score,
@@ -739,11 +753,11 @@ async def create_application(
         id=str(new_app.id),
         timestamp=new_app.created_at.isoformat() if new_app.created_at else "",
         consultant_name=payload.consultant_name,
-        consultant_id=str(new_app.consultant_id),
-        requirement_id=str(new_app.requirement_id),
+        consultant_id=new_app.consultant_id,
+        requirement_id=new_app.requirement_id,
         role=payload.role,
         vendor_email=new_app.vendor_email,
-        ats_score=float(new_app.ats_score_at_send) if new_app.ats_score_at_send is not None else None,
+        ats_score=None,
         resume_id=None,
         status=new_app.status,
     )
@@ -815,10 +829,7 @@ async def list_errors(
     if category:
         stages = _stages_for_category(category)
         if stages is not None:
-            if stages:
-                filters.append(ProcessingError.error_stage.in_(stages))
-            else:
-                filters.append(ProcessingError.id == -1)
+            filters.append(ProcessingError.error_stage.in_(stages))
     if signature:
         filters.append(ProcessingError.error_message.like(signature.rstrip() + "%"))
     if search and search.strip():
@@ -902,15 +913,13 @@ def _category_for_stage(stage: Optional[str]) -> str:
 
 
 def _stages_for_category(category: str):
-    """None = do not filter (unknown category). [] = known category with 0 matching stages."""
+    """None = do not filter (unknown category)."""
     wanted = (category or "").strip().lower()
     if not wanted or wanted == "all":
         return None
-    if wanted == "other":
-        return _STAGE_CACHE.get("Other", [])
     for name, _ in _CATEGORY_RULES:
         if name.lower() == wanted:
-            return _STAGE_CACHE.get(name, [])
+            return None if name == "Other" else _STAGE_CACHE.get(name)
     return None
 
 
@@ -1022,10 +1031,7 @@ async def errors_grouped(
     if category and category.lower() != "all":
         stages = _stages_for_category(category)
         if stages is not None:
-            if stages:
-                filters.append(ProcessingError.error_stage.in_(stages))
-            else:
-                filters.append(ProcessingError.id == -1)
+            filters.append(ProcessingError.error_stage.in_(stages))
     if search and search.strip():
         term = f"%{search.strip()}%"
         filters.append(or_(
@@ -1162,7 +1168,7 @@ async def get_error_detail(
             rq = (await db.execute(select(_Req).where(_Req.id == int(requirement_id)))).scalars().first()
             if rq:
                 raw_email_id = raw_email_id or (str(getattr(rq, "raw_email_id", None)) if getattr(rq, "raw_email_id", None) is not None else None)
-                title = getattr(rq, "role", None) or getattr(rq, "title", None) or getattr(rq, "job_title", None)
+                title = getattr(rq, "title", None) or getattr(rq, "job_title", None)
                 if title:
                     extra.setdefault("Requirement", str(title))
     except Exception:
@@ -1269,38 +1275,15 @@ async def bulk_error_action(
 
     now = datetime.now(timezone.utc)
     requeued = 0
-    if action == "retry":
-        from models import EmailQueue
-        email_errs = [
-            err for err in rows
-            if _category_for_stage(err.error_stage) == "Email"
-            and err.source_id and str(err.source_id).isdigit()
-        ]
-        eq_by_id = {}
-        if email_errs:
-            eq_ids = list({int(err.source_id) for err in email_errs})
-            eq_rows = (
-                await db.execute(select(EmailQueue).where(EmailQueue.id.in_(eq_ids)))
-            ).scalars().all()
-            eq_by_id = {item.id: item for item in eq_rows}
-
-        for err in rows:
-            item = (
-                eq_by_id.get(int(err.source_id))
-                if (_category_for_stage(err.error_stage) == "Email" and err.source_id and str(err.source_id).isdigit())
-                else None
-            )
-            if item and item.status == "FAILED":
-                item.status = "QUEUED"
-                item.status_text = None
-                item.scheduled_at = now
+    for err in rows:
+        if action == "retry":
+            if await _requeue_email_for(db, err):
                 requeued += 1
                 err.status = "CLOSED"
                 err.resolved_at = now
             err.retry_count = (err.retry_count or 0) + 1
             err.last_retry_at = now
-    else:
-        for err in rows:
+        else:
             err.status = "CLOSED"
             err.resolved_at = now
     await db.commit()
@@ -1563,9 +1546,7 @@ async def ai_usage_daily(
     openai_daily = ouc.daily_costs_from_api(cost_buckets or [])
 
     start_dt = datetime.fromtimestamp(start_ts, timezone.utc)
-    # literal_column keeps the SELECT and GROUP BY expressions identical
-    # (two separate bind params would make Postgres reject the GROUP BY).
-    day_col = func.date(func.timezone(literal_column("'UTC'"), AIUsageLog.created_at))
+    day_col = func.date(func.timezone("UTC", AIUsageLog.created_at))
     rows = (await db.execute(
         select(day_col, func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
         .where(AIUsageLog.created_at >= start_dt, AIUsageLog.purpose != "email_parsing")
@@ -1847,6 +1828,9 @@ async def system_health(
     except Exception as e:
         indicators.append(HealthIndicator(name="database", status="error", detail=str(e)))
 
+    redis_ok = await check_redis_health()
+    indicators.append(HealthIndicator(name="redis", status="ok" if redis_ok else "unavailable"))
+
     overall = "ok" if all(i.status == "ok" for i in indicators if i.name == "database") else "degraded"
 
     latency_ms, latency_samples = get_api_latency_5m()
@@ -1878,11 +1862,8 @@ async def list_duplicates(
     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db), _: dict = Depends(require_admin),
 ):
-    dup_query = select(AuditLog).where(AuditLog.action == "PARSE")
-    if _IS_POSTGRES:
-        dup_query = dup_query.where(AuditLog.meta["is_duplicate"].astext == "true")
     result = await db.execute(
-        dup_query.order_by(AuditLog.created_at.desc()).limit(5000)
+        select(AuditLog).where(AuditLog.action == "PARSE").order_by(AuditLog.created_at.desc())
     )
     dup_rows = [r for r in result.scalars().all() if (r.meta or {}).get("is_duplicate")]
 
@@ -1975,10 +1956,8 @@ async def get_dashboard_summary(
     eliminating 10+ separate round-trips and OPTIONS pre-flights on dashboard mount.
     """
     import os
-    import asyncio
     import openai_usage_client as ouc
-    from models import Requirement, RequirementConsultantMatch, EmailQueue, Consultant, User
-    from matching_router import PENDING_WINDOW_DAYS
+    from models import Requirement, RequirementConsultantMatch, EmailQueue
 
     now_utc = datetime.now(timezone.utc)
     seven_days_ago = now_utc - timedelta(days=7)
@@ -1986,152 +1965,73 @@ async def get_dashboard_summary(
     today_start_cst = now_cst.replace(hour=0, minute=0, second=0, microsecond=0)
     today_start_utc = today_start_cst.astimezone(timezone.utc)
     month_start_utc = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    # gmail_emails.classified_at is `timestamp WITHOUT time zone` (UTC wall-clock).
-    # asyncpg refuses to encode a tz-AWARE datetime for a naive timestamp column
-    # ("can't subtract offset-naive and offset-aware datetimes"), which used to
-    # blow up the whole combined query below and silently zero every card.
-    # So this one parameter must be a NAIVE UTC datetime.
-    five_min_ago_utc = (now_utc - timedelta(minutes=5)).replace(tzinfo=None)
 
-    # Combined gmail_emails scan (ingested today, 7d processed, classifier health) in ONE query
-    emails_ingested_today = 0
-    rep_emails_processed = 0
-    unclassified_count = 0
-    processed_last_5_min = 0
-    last_classified_at = None
-    try:
-        ge_row = (await db.execute(
-            text("""
-                SELECT
-                    COUNT(*) FILTER (WHERE date >= :today_start) AS ingested_today,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(fetched_at, date) >= :seven_days_ago
-                        AND (
-                            status_desc IN ('Parsed', 'Parsed - NR', 'Parsed - Dup')
-                            OR (status_desc IS NULL AND processed = true)
-                        )
-                    ) AS rep_processed_7d,
-                    COUNT(*) FILTER (
-                        WHERE (category IS NULL OR category = 'unclassified')
-                        AND (status_desc IS NULL OR status_desc = 'Pending')
-                    ) AS unclassified_cnt,
-                    COUNT(*) FILTER (WHERE classified_at > :five_min_ago) AS processed_5m,
-                    MAX(classified_at) AS last_classified
-                FROM gmail_emails
-            """),
-            {
-                "today_start": today_start_utc,
-                "seven_days_ago": seven_days_ago,
-                "five_min_ago": five_min_ago_utc,
-            },
-        )).mappings().first()
-        if ge_row:
-            emails_ingested_today = int(ge_row["ingested_today"] or 0)
-            rep_emails_processed = int(ge_row["rep_processed_7d"] or 0)
-            unclassified_count = int(ge_row["unclassified_cnt"] or 0)
-            processed_last_5_min = int(ge_row["processed_5m"] or 0)
-            last_classified_at = ge_row["last_classified"]
-    except Exception:
-        # Never swallow this silently again: a failure here makes Emails Ingested
-        # Today / Classifier Status / Reporting Emails all read 0.
-        import logging
-        logging.getLogger(__name__).exception("dashboard-summary: gmail_emails aggregate query failed")
-        await db.rollback()
-        try:
-            rep_emails_processed = (await db.execute(
-                text("SELECT COUNT(*) FROM emails WHERE parse_status = 'PARSED' AND received_at >= :start_dt"),
-                {"start_dt": seven_days_ago}
-            )).scalar_one() or 0
-        except Exception:
-            await db.rollback()
+    # 1. Emails Ingested Today
+    emails_ingested_today = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE date >= :date_from"),
+        {"date_from": today_start_utc}
+    )).scalar_one()
 
-    # Combined core ORM counts in ONE scalar-subquery round-trip (using 1:1 LEFT JOIN on applications
-    # instead of a correlated EXISTS subquery for pending_apps_count)
-    pending_cutoff = now_utc - timedelta(days=PENDING_WINDOW_DAYS)
+    # 2. Unique Requirements (7d)
+    unique_req_7d = (await db.execute(
+        select(func.count()).select_from(Requirement).where(Requirement.received_date >= seven_days_ago)
+    )).scalar_one()
 
-    counts_row = (await db.execute(
-        select(
-            select(func.count()).select_from(Requirement)
-            .where(Requirement.received_date >= seven_days_ago)
-            .scalar_subquery(),
-            select(func.count(func.distinct(RequirementConsultantMatch.requirement_id)))
-            .where(RequirementConsultantMatch.created_at >= seven_days_ago)
-            .scalar_subquery(),
-            select(func.count()).select_from(Application)
-            .where(Application.status == "SENT", Application.sent_at >= seven_days_ago)
-            .scalar_subquery(),
-            select(func.count()).select_from(ProcessingError)
-            .where(ProcessingError.status == "OPEN")
-            .scalar_subquery(),
-            select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
-            .where(AIUsageLog.created_at >= month_start_utc, AIUsageLog.purpose != "email_parsing")
-            .scalar_subquery(),
-            select(func.count(RequirementConsultantMatch.id)).select_from(RequirementConsultantMatch)
-            .join(Requirement, RequirementConsultantMatch.requirement_id == Requirement.id)
-            .join(Consultant, RequirementConsultantMatch.consultant_id == Consultant.id)
-            .join(User, User.id == Consultant.user_id)
-            .outerjoin(
-                Application,
-                and_(
-                    Application.requirement_id == RequirementConsultantMatch.requirement_id,
-                    Application.consultant_id == RequirementConsultantMatch.consultant_id,
-                    Application.status == "SENT",
-                ),
-            )
-            .where(
-                Consultant.status == "ACTIVE",
-                User.is_authorized == True,
-                RequirementConsultantMatch.status == "MATCHING",
-                Application.id.is_(None),
-                RequirementConsultantMatch.created_at >= pending_cutoff,
-            )
-            .scalar_subquery(),
-            select(func.count()).select_from(EmailQueue)
-            .where(EmailQueue.status == "SENT", EmailQueue.created_at >= seven_days_ago)
-            .scalar_subquery(),
-        )
-    )).one()
+    # 3. New Matches (7d)
+    new_matches_7d = (await db.execute(
+        select(func.count(func.distinct(RequirementConsultantMatch.requirement_id)))
+        .where(RequirementConsultantMatch.created_at >= seven_days_ago)
+    )).scalar_one()
 
-    (
-        unique_req_7d,
-        new_matches_7d,
-        apps_sent_7d,
-        open_errors,
-        claude_cost,
-        pending_apps_count,
-        rep_emails_sent,
-    ) = counts_row
-    rep_jobs_applied = apps_sent_7d
+    # 4. Applications Sent (7d)
+    apps_sent_7d = (await db.execute(
+        select(func.count()).select_from(Application)
+        .where(Application.status == "SENT", Application.sent_at >= seven_days_ago)
+    )).scalar_one()
 
-    # 6. AI Cost this month (Claude from DB + OpenAI usage in parallel)
+    # 5. Open Errors
+    open_errors = (await db.execute(
+        select(func.count()).select_from(ProcessingError).where(ProcessingError.status == "OPEN")
+    )).scalar_one()
+
+    # 6. AI Cost this month (Claude from DB + OpenAI from client)
+    claude_cost = (await db.execute(
+        select(func.coalesce(func.sum(AIUsageLog.estimated_cost), 0))
+        .where(AIUsageLog.created_at >= month_start_utc, AIUsageLog.purpose != "email_parsing")
+    )).scalar_one()
+
     openai_cost = 0.0
     openai_total_tokens = 0
     try:
         month_ts = ouc.month_start_ts()
-        cost_buckets, usage_buckets = await asyncio.gather(
-            ouc.fetch_costs_buckets(month_ts),
-            ouc.fetch_usage_buckets(month_ts),
-        )
+        cost_buckets = await ouc.fetch_costs_buckets(month_ts)
+        usage_buckets = await ouc.fetch_usage_buckets(month_ts)
         summary = ouc.summarize(usage_buckets or [], cost_buckets=cost_buckets)
         openai_cost = summary["cost_usd"]
         openai_total_tokens = summary["tokens"]
     except Exception:
-        import logging
-        logging.getLogger(__name__).exception("dashboard-summary: OpenAI usage fetch failed")
+        pass
 
     ai_cost_month_usd = round(float(claude_cost or 0) + float(openai_cost or 0), 2)
 
+    # 7. Classifier Health
+    unclassified_count = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE (category IS NULL OR category = 'unclassified') AND (status_desc IS NULL OR status_desc = 'Pending')")
+    )).scalar_one()
+
+    processed_last_5_min = (await db.execute(
+        text("SELECT COUNT(*) FROM gmail_emails WHERE classified_at > now() - interval '5 minutes'")
+    )).scalar_one()
+
+    last_classified_at = (await db.execute(
+        text("SELECT MAX(classified_at) FROM gmail_emails WHERE classified_at IS NOT NULL")
+    )).scalar_one()
+
     minutes_since_last_cycle = None
     if last_classified_at:
-        if isinstance(last_classified_at, str):
-            try:
-                last_classified_at = datetime.fromisoformat(last_classified_at.replace("Z", "+00:00"))
-            except ValueError:
-                last_classified_at = None
-        if last_classified_at:
-            if last_classified_at.tzinfo is None:
-                last_classified_at = last_classified_at.replace(tzinfo=timezone.utc)
-            minutes_since_last_cycle = (now_utc - last_classified_at).total_seconds() / 60
+        if last_classified_at.tzinfo is None:
+            last_classified_at = last_classified_at.replace(tzinfo=timezone.utc)
+        minutes_since_last_cycle = (now_utc - last_classified_at).total_seconds() / 60
 
     if minutes_since_last_cycle is not None and minutes_since_last_cycle > 5:
         classifier_status = "no_recent_activity"
@@ -2148,6 +2048,32 @@ async def get_dashboard_summary(
         status=classifier_status,
     )
 
+    # 8. Pending Applications count (total active matches awaiting review in the pending window)
+    from models import Consultant, User
+    from sqlalchemy.sql import exists
+    from matching_router import PENDING_WINDOW_DAYS
+
+    pending_cutoff = now_utc - timedelta(days=PENDING_WINDOW_DAYS)
+    applied_exists = exists().where(
+        Application.requirement_id == RequirementConsultantMatch.requirement_id,
+        Application.consultant_id == RequirementConsultantMatch.consultant_id,
+        Application.status == "SENT",
+    )
+
+    pending_apps_count = (await db.execute(
+        select(func.count()).select_from(RequirementConsultantMatch)
+        .join(Requirement, RequirementConsultantMatch.requirement_id == Requirement.id)
+        .join(Consultant, RequirementConsultantMatch.consultant_id == Consultant.id)
+        .join(User, User.id == Consultant.user_id)
+        .where(
+            Consultant.status == "ACTIVE",
+            User.is_authorized == True,
+            RequirementConsultantMatch.status == "MATCHING",
+            ~applied_exists,
+            RequirementConsultantMatch.created_at >= pending_cutoff,
+        )
+    )).scalar_one()
+
     # 9. OpenAI Limits
     openai_limit = int(os.getenv("OPENAI_MONTHLY_TOKEN_LIMIT", "300000000"))
     remaining_tokens = max(0, openai_limit - openai_total_tokens)
@@ -2158,6 +2084,22 @@ async def get_dashboard_summary(
         tokens_used_pct=round(used_pct, 2),
         tokens_reset="End of Month"
     )
+
+    # 10. Reporting Summary (7 days)
+    rep_emails_processed = (await db.execute(
+        text("SELECT COUNT(*) FROM emails WHERE parse_status = 'PARSED' AND received_at >= :start_dt"),
+        {"start_dt": seven_days_ago}
+    )).scalar_one()
+
+    rep_jobs_applied = (await db.execute(
+        select(func.count()).select_from(Application)
+        .where(Application.status == "SENT", Application.sent_at >= seven_days_ago)
+    )).scalar_one()
+
+    rep_emails_sent = (await db.execute(
+        select(func.count()).select_from(EmailQueue)
+        .where(EmailQueue.status == "SENT", EmailQueue.created_at >= seven_days_ago)
+    )).scalar_one()
 
     reports_summary_dto = DashboardReportSummaryDTO(
         emails_processed=rep_emails_processed,
